@@ -1,8 +1,7 @@
 # pve-meta HTTP API (v1, trusted-lab)
 
 Served natively by PVE (pveproxy/pvedaemon) on port **8006** as the API module
-`PVE::API2::Meta` (see `docs/NATIVE-API-SPEC.md`); the standalone `pve-metad` daemon on
-port 8007 exposes the same tree and is optional. All paths are under `/api2/json`.
+`PVE::API2::Meta` (see `docs/NATIVE-API-SPEC.md`). All paths are under `/api2/json`.
 Bodies are ordinary PVE request parameters (form-encoded or JSON); object-valued
 parameters (`patch`) are passed as JSON-encoded strings. Shapes follow PVE conventions: responses are `{"data": ...}`, errors are HTTP 4xx/5xx with a
 plain-text or `{"errors": {...}}` body, optimistic concurrency uses a `digest`

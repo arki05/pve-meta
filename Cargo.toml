@@ -2,9 +2,6 @@
 resolver = "2"
 members = [
     "crates/pve-meta-core",
-    "crates/pve-meta-api",
-    "crates/pve-metad",
-    "crates/pve-meta-cli",
     "crates/pve-meta-perl",
 ]
 # pve-meta-perl (PVE::RS::Meta perlmod bindings) needs `libperl-dev` headers
@@ -15,9 +12,6 @@ members = [
 # `cargo build --workspace` still targets every member, pve-meta-rs included.
 default-members = [
     "crates/pve-meta-core",
-    "crates/pve-meta-api",
-    "crates/pve-metad",
-    "crates/pve-meta-cli",
 ]
 exclude = ["ui"]
 
@@ -37,73 +31,7 @@ indexmap = { version = "2", features = ["serde"] }
 toml_edit = "0.25"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
-hmac = "0.12"
 hex = "0.4"
 regex = "1"
 tracing = "0.1"
 saphyr-parser = "0.0"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
-http = "1"
-hyper = "1"
-hyper-util = { version = "0.1", features = ["server-graceful"] }
-openssl = "0.10"
-libc = "0.2"
-proxmox-api-macro = "1"
-proxmox-auth-api = { version = "1", default-features = false, features = ["ticket", "api-types"] }
-proxmox-base64 = "1"
-proxmox-daemon = "1"
-proxmox-http = { version = "1", features = ["body"] }
-proxmox-log = "1"
-proxmox-rest-server = "1"
-proxmox-router = { version = "3", features = ["server", "cli"] }
-proxmox-schema = { version = "5", features = ["api-macro"] }
-proxmox-systemd = "1"
-
-[patch.crates-io]
-pwt = { git = "https://git.proxmox.com/git/ui/proxmox-yew-widget-toolkit.git", rev = "3ce6f16957f26e2bb3c04c79a7d007de6a000020" }
-pwt-macros = { git = "https://git.proxmox.com/git/ui/proxmox-yew-widget-toolkit.git", rev = "3ce6f16957f26e2bb3c04c79a7d007de6a000020" }
-proxmox-yew-comp = { git = "https://git.proxmox.com/git/ui/proxmox-yew-comp.git", rev = "2384eea02c13d5da2798202226f7f5a9f8d1b2eb" }
-proxmox-client = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-login = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-schema = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-api-macro = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-base64 = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-human-byte = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-rrd-api-types = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-serde = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-time = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-tfa = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-auth-api = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-apt-api-types = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-access-control = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-dns-api = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-network-api = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-network-types = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-node-status = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-deb-version = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-sortable-macro = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-lang = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-http-error = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-section-config = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-uuid = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-sys = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-io = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-borrow = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-router = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-async = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-compression = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-http = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-log = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-product-config = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-config-digest = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-shared-memory = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-worker-task = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-rest-server = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-daemon = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-systemd = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-openid = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-proxmox-ldap = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-pve-api-types = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }
-pbs-api-types = { git = "https://git.proxmox.com/git/proxmox.git", rev = "7c2efa386352388c8a55902c0bb84741b8aed860" }

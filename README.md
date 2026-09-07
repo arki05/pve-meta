@@ -7,12 +7,10 @@ fails over with the rest of the cluster config for free, participates in guest
 snapshot/clone/destroy/backup like any other piece of guest state, and is reachable
 through an API that behaves exactly like the rest of Proxmox's own `/api2` — because
 it *is* the rest of Proxmox's own `/api2`: `pve-meta` registers a native
-`PVE::API2::Meta` module served by pveproxy/pvedaemon on port 8006, plus a CLI, a
-Yew/wasm editor embedded as a "Metadata" tab on every guest and the datacenter, and a
-set of reversible `dpkg-divert` patches that wire it into the surrounding PVE
-packages. It knows nothing about what anyone stores in it — no operator logic, no
-Traefik/NetBird/GPU-assignment opinions — those live one layer up, in
-[`pve-operators`](../pve-operators). See [`../docs/VISION.typ`](../docs/VISION.typ)
+`PVE::API2::Meta` module served by pveproxy/pvedaemon on port 8006, a Yew/wasm editor
+embedded as a "Metadata" tab on every guest and the datacenter, and a set of
+reversible `dpkg-divert` patches that wire it into the surrounding PVE packages. It
+knows nothing about what anyone stores in it. See [`../docs/VISION.typ`](../docs/VISION.typ)
 for the full design rationale and roadmap.
 
 ## Status
@@ -58,21 +56,16 @@ namespace-claims authorization yet — see "Known limitations".
  /etc/pve/meta/<vmid>.<snapname>.<ext>
 
  also driving pve-meta-core, independently of the API above:
-   • pve-meta            — CLI, runs the same handlers in-process, no daemon needed
    • pve-meta-lifecycle-patch — dpkg-divert patches into pve-container / qemu-server /
      libpve-guest-common-perl / vzdump, calling PVE::RS::Meta on snapshot, rollback,
      delsnap, clone, destroy and backup export/import
-   • pve-metad (optional, not installed by default) — standalone HTTPS daemon on
-     port 8007 exposing the identical API tree, for setups that don't want the
-     native pve-manager patches
 ```
 
 Everything below the ExtJS layer is a thin Perl shim over Rust: `PVE::API2::Meta`'s
 methods are one or two lines each, calling into `PVE::RS::Meta::api_*` functions
-(`crates/pve-meta-perl`) that wrap `pve-meta-core`. The same core crate backs the
-CLI (`crates/pve-meta-cli`), the optional standalone daemon (`crates/pve-metad`, on
-top of `crates/pve-meta-api`), and the lifecycle bindings — one document model, one
-patch engine, one set of format writers, four call sites.
+(`crates/pve-meta-perl`) that wrap `pve-meta-core` — one document model, one patch
+engine, one set of format writers, backing both the native API and the lifecycle
+hooks.
 
 ## The document format
 
@@ -96,20 +89,14 @@ keys survive, but real `#`/`//`-style file comments and original quoting do not.
 Example `/etc/pve/meta/105.yaml`:
 
 ```yaml
-traefik:
-  spec:
-    host: wiki.arkenberg.eu
-    host__: public name — DNS for it is managed by the netbird operator
-    port: 8080
-
-netbird:
-  groups: [lan-services, wiki]
+backup:
+  schedule: "03:00"
+  schedule__: local time, cron-ish, interpreted by whatever reads this key
+  retention: 7
 ```
 
-Two independent operators (a Traefik router controller claiming `traefik`, a
-NetBird sync controller claiming `netbird`) can read/write their own namespace
-without knowing the other exists; the UI renders each top-level key as its own
-collapsible panel.
+Any top-level key is its own namespace; the UI renders each as its own collapsible
+panel.
 
 ## Install
 
@@ -124,13 +111,11 @@ apt update
 apt install pve-meta
 ```
 
-Until then, build the three `.deb`s yourself (see "Building" below) and install
-them directly:
+Until then, build the two `.deb`s yourself (see "Building" below) and install them
+directly:
 
 ```sh
 dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
-# pve-metad_*.deb is optional — only needed for the standalone daemon, not the
-# native pveproxy/pvedaemon integration that pve-meta uses by default.
 ```
 
 `pve-meta` depends on `pve-manager (>= 9.0)` and `libpve-meta-rs-perl`
@@ -176,27 +161,6 @@ uninstalling the package — they are guest data, not package state.
 
 ## Usage
 
-### CLI
-
-`pve-meta` runs the same handlers as the HTTP API in-process against
-`/etc/pve/meta`, no daemon required:
-
-```sh
-pve-meta list --has traefik
-pve-meta get 105 traefik.spec --output-format json
-pve-meta set 105 traefik.spec.host=wiki.arkenberg.eu traefik.spec.port=8080
-pve-meta patch 105 '{"traefik":{"spec":{"port":8081}}}'
-pve-meta delete 105 traefik.spec.port
-pve-meta raw 105                 # print the file text
-pve-meta edit 105                # round-trip through $EDITOR
-pve-meta convert 105 toml        # switch format (comments in the file are lost; comment keys survive)
-pve-meta snapshot 105 before-upgrade
-pve-meta rollback 105 before-upgrade
-pve-meta clone 105 106
-pve-meta datacenter get
-pve-meta version
-```
-
 ### `pvesh` / curl, against the native API
 
 Because `PVE::API2::Meta` is a regular PVE API module, `pvesh` works against it like
@@ -205,7 +169,7 @@ any other tree:
 ```sh
 pvesh get /meta/version
 pvesh get /meta/guests/105
-pvesh set /meta/guests/105 -patch '{"traefik":{"spec":{"host":"wiki.arkenberg.eu"}}}'
+pvesh set /meta/guests/105 -patch '{"backup":{"schedule":"03:00"}}'
 ```
 
 Or with a PVE API token over HTTPS on port 8006 (`pveum user token add ...`):
@@ -217,7 +181,7 @@ curl -sk \
 
 curl -sk -X PUT \
   -H "Authorization: PVEAPIToken=root@pam!meta=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
-  --data-urlencode 'patch={"traefik":{"spec":{"port":8081}}}' \
+  --data-urlencode 'patch={"backup":{"retention":7}}' \
   https://pve1:8006/api2/json/meta/guests/105
 ```
 
@@ -237,38 +201,6 @@ as the PVE UI, no separate login:
 https://<node>:8006/pve2/js/pve-meta-ui/index.html?vmid=105&theme=light
 https://<node>:8006/pve2/js/pve-meta-ui/index.html?dc=1
 ```
-
-### Python client
-
-```python
-import os
-from pvemeta import Client, Operator
-
-client = Client("https://pve1:8006", token=os.environ["PVEMETA_TOKEN"])
-operator = Operator(client, "traefik")
-
-def show_routers(vmid: int, traefik: dict) -> None:
-    for router in traefik.get("routers", []):
-        print(f"{vmid}: {router.get('rule', '<no rule>')}")
-
-operator.run_once(show_routers)          # once, e.g. from cron
-# operator.run_forever(show_routers)     # or long-running, polling /meta/version
-```
-
-See [`pve-operators/pyclient/README.md`](../pve-operators/pyclient/README.md) for
-the full client surface (`get`, `patch`, `put_raw`, `convert`, `snapshot`,
-`rollback`, `clone`, `watch`, ...).
-
-### The operator pattern
-
-An "operator" is nothing more than anything holding a PVE API token that reads the
-store and reconciles the world against it — a long-running service, a ten-line
-Python script, or a cron job are all equally valid; there is no separate account
-system or registration requirement to read the store or write within a namespace no
-one else claims. The [Traefik–Proxmox provider](https://github.com/arki05/traefik-proxmox-plugin)
-(branch `pve-meta`) is the reference consumer: it reads a guest's `traefik`
-namespace instead of parsing the Notes field, and is a good template for a new
-operator.
 
 ## Permissions
 
@@ -307,16 +239,13 @@ Identity is a PVE API token or a browser ticket — `pveum` issues and revokes b
   `apt dist-upgrade` is never blocked by it.
 * **No claims/authorization enforcement yet.** The native API enforces normal PVE
   object permissions (above), but nothing yet stops an authorized writer from
-  touching a namespace another operator claims — the "trusted-lab" framing from
+  touching a namespace another client claims — the "trusted-lab" framing from
   `docs/VISION.typ`. Every write's touched-path set is already computed and returned
-  in the response, which is the seam claims enforcement slots into later. (The
-  optional standalone `pve-metad` daemon has *no* ACL layer at all — any caller who
-  can authenticate may read or write anything — and is meant only for setups that
-  deliberately don't want the pve-manager patches.)
+  in the response, which is the seam claims enforcement slots into later.
 * **YAML and JSON writes are canonical dumps, not format-preserving edits.** Order
   and comment keys (`key__`) survive every write in every format; real `#`-style
   file comments and original quoting/whitespace survive only in TOML (via
-  `toml_edit`). Hand-edit a YAML/JSON file in `/etc/pve/meta/` and the next API/CLI
+  `toml_edit`). Hand-edit a YAML/JSON file in `/etc/pve/meta/` and the next API
   write will re-dump it canonically.
 
 ## Building
@@ -329,35 +258,28 @@ on macOS at all — only `pve-meta-core` compiles there; develop the rest on the
 build host and `rsync` over).
 
 ```sh
-make build          # cargo build --release -p pve-metad -p pve-meta-cli, + the perl crate
+make build          # builds crates/pve-meta-perl (the libpve-meta-rs-perl cdylib)
 make ui             # trunk build in ui/ (falls back to a placeholder page if trunk is missing)
 make deb            # == dpkg-buildpackage -b -us -uc -d
 ```
 
-`make deb` produces `../pve-meta_<version>_<arch>.deb`,
-`../libpve-meta-rs-perl_<version>_<arch>.deb`, and
-`../pve-metad_<version>_<arch>.deb` (three binary packages from one source package —
-see `debian/control`). `dh_installsystemd` enables `pve-metad.service`
-automatically if that package is installed, though it isn't required for the
-default, native deployment. See `docs/BUILD.md` for the exact rsync/ssh incantation
-for the Linux build host, and `scripts/smoke.sh` for exercising a running daemon
-over HTTP(S) with curl.
+`make deb` produces two binary packages from one source package (see
+`debian/control`): `../pve-meta_<version>_<arch>.deb` and
+`../libpve-meta-rs-perl_<version>_<arch>.deb`. See `docs/BUILD.md` for the exact
+rsync/ssh incantation for the Linux build host.
 
 ## Repo layout
 
 | Path | What |
 |---|---|
 | `crates/pve-meta-core` | Document model, YAML/TOML/JSON formats, merge-patch engine, file store — pure Rust, builds on macOS and Linux |
-| `crates/pve-meta-api` | `#[api]` handlers, router tree, PVE ticket/token/CSRF auth — shared by the daemon and CLI |
-| `crates/pve-meta-cli` | The `pve-meta` binary — runs the API handlers in-process, no HTTP |
-| `crates/pve-metad` | The optional standalone HTTPS daemon (port 8007), not installed by default |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings exposing lifecycle hooks and the `api_*` functions to Perl |
 | `perl/PVE/API2/Meta.pm` | The native `PVE::API2::Meta` REST module, thin over `PVE::RS::Meta` |
 | `ui/` | The Yew/`pwt`/wasm editor SPA (Form + Source views), served by pveproxy from `/pve2/js/pve-meta-ui/` |
 | `pve-manager-patch/` | `pve-meta-patch` — injects the "Metadata" tab into the PVE web UI |
 | `pve-manager-patches/lifecycle/` | The eight Perl diffs + `pve-meta-lifecycle-patch`, wiring snapshot/clone/destroy/backup hooks and registering `PVE::API2::Meta` |
 | `debian/` | The `pve-meta` source package: `control`, `rules`, triggers, `postinst`/`prerm`/`postrm` |
-| `docs/` | `API.md`, `NATIVE-API-SPEC.md`, `DAEMON-SPEC.md`, `UI-SPEC.md`, `PERL-BINDINGS-SPEC.md`, `LIFECYCLE-PATCHES.md`, `BUILD.md`, `DISTRIBUTION.md` |
+| `docs/` | `API.md`, `NATIVE-API-SPEC.md`, `UI-SPEC.md`, `PERL-BINDINGS-SPEC.md`, `LIFECYCLE-PATCHES.md`, `BUILD.md`, `DISTRIBUTION.md` |
 | `scripts/apt-repo/` | Static signed-apt-repo build/publish scripts (Cloudflare R2) |
 | `scripts/watch-pve/` | The ceiling-watcher CI job |
 | `ceilings.toml` | Tested-ceiling versions for the four patched upstream packages |

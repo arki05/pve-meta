@@ -4,26 +4,26 @@
 
 Development and CI happen on a Debian 13 (trixie) host with a [rustup](https://rustup.rs/)
 toolchain installed under `~/.cargo/bin` (rustc 1.98 at the time of writing) — **not** the
-`cargo`/`rustc` Debian packages. `pve-meta-api`/`pve-metad`/`pve-meta-cli` depend on
-`proxmox-sys`/`openssl`-linking crates that do not build on macOS; only `pve-meta-core` compiles
-there. Use the Linux build host for anything else:
+`cargo`/`rustc` Debian packages. `pve-meta-perl` (the perlmod bindings) needs `libperl-dev`
+headers and only builds on Linux; `pve-meta-core` is pure Rust and also compiles on macOS.
+Use the Linux build host for anything else:
 
 ```sh
 rsync -az --exclude target --exclude .git --exclude dist ./ pve-meta-build:/root/pve-meta/
-ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && cargo build -p pve-metad -p pve-meta-cli --release'
+ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && cargo build -p pve-meta-rs --release'
 ```
 
 ## Plain (non-packaged) build
 
 ```sh
-make build   # cargo build --release -p pve-metad -p pve-meta-cli
+make build   # builds crates/pve-meta-perl in release mode
 make ui      # trunk build in ui/ (falls back to a placeholder if trunk is not installed)
 make install DESTDIR=/some/root PREFIX=/usr
 ```
 
 ## Debian package
 
-The `.deb` is built with `dpkg-buildpackage`, but **without** relying on Debian's own
+The `.deb`s are built with `dpkg-buildpackage`, but **without** relying on Debian's own
 `cargo`/`rustc` packages — `debian/rules` calls `make`, and the `Makefile` resolves `cargo` as
 `~/.cargo/bin/cargo` when present (the rustup toolchain), falling back to a plain `cargo` on
 `$PATH` otherwise. Because `debian/control`'s `Build-Depends` intentionally does **not** list
@@ -37,13 +37,6 @@ sudo apt install dpkg-dev debhelper
 make deb   # == dpkg-buildpackage -b -us -uc -d
 ```
 
-This produces `../pve-meta_<version>_<arch>.deb` (dpkg-buildpackage places the artifact in the
-parent directory). Install it with `dpkg -i ../pve-meta_*.deb`; `dh_installsystemd` enables and
-starts `pve-metad.service` automatically (it's a `Type=notify` unit, `After=pve-cluster.service`
-since `/etc/pve` is a pmxcfs FUSE mount that must already be up).
-
-## Smoke test
-
-`scripts/smoke.sh` exercises a running daemon over HTTP(S) with `curl`. See that script's header
-comment for the required environment variables (`PVE_META_URL` plus either a ticket/CSRF pair or
-an API token).
+This produces two binary packages, `../pve-meta_<version>_<arch>.deb` and
+`../libpve-meta-rs-perl_<version>_<arch>.deb` (dpkg-buildpackage places the artifacts in the
+parent directory). Install both with `dpkg -i ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb`.

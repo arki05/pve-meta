@@ -24,10 +24,9 @@ PREFIX ?= /usr
 UI_DIR := ui
 UI_DIST := $(UI_DIR)/dist
 
-.PHONY: build ui deb install install-cli install-daemon clean check test
+.PHONY: build ui deb install clean check test
 
 build:
-	$(CARGO) build --release -p pve-metad -p pve-meta-cli
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
 
 # Builds the wasm editor UI with trunk. Falls back to a minimal static placeholder if `trunk`
@@ -43,20 +42,16 @@ ui:
 	fi
 
 # Per docs/NATIVE-API-SPEC.md the API is served natively by pveproxy/pvedaemon
-# (PVE::API2::Meta); pve-metad (the standalone HTTPS daemon) is a separate, optional
-# package. Three binary packages come from this source (see debian/control):
-#   - `pve-meta`:            install-cli (below)
-#   - `pve-metad`:           install-daemon (below)
+# (PVE::API2::Meta). Two binary packages come from this source (see debian/control):
+#   - `pve-meta`:            install (below)
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own `install` target, invoked with
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
-install: install-cli install-daemon
-
-# Everything in the `pve-meta` package: the CLI, the native PVE::API2::Meta module (if
-# it's been generated yet -- see docs/NATIVE-API-SPEC.md, written alongside this by
-# another part of the project), the wasm editor UI (served by pveproxy, not pve-metad),
-# and the web UI / guest-lifecycle integration patch tools.
-install-cli:
-	install -D -m 0755 target/release/pve-meta $(DESTDIR)$(PREFIX)/bin/pve-meta
+#
+# Everything in the `pve-meta` package: the native PVE::API2::Meta module (if it's
+# been generated yet -- see docs/NATIVE-API-SPEC.md, written alongside this by
+# another part of the project), the wasm editor UI (served by pveproxy), and the
+# web UI / guest-lifecycle integration patch tools.
+install:
 	if [ -f perl/PVE/API2/Meta.pm ]; then \
 		install -D -m 0644 perl/PVE/API2/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Meta.pm; \
 	else \
@@ -78,12 +73,6 @@ install-cli:
 		echo "warning: pve-manager-patches/lifecycle/pve-meta-lifecycle-patch not present yet, skipping" >&2; \
 	fi
 
-# The `pve-metad` package: the standalone, optional HTTPS daemon + its systemd unit.
-# Nothing else -- it does not need the CLI, the UI, or either patch tool.
-install-daemon:
-	install -D -m 0755 target/release/pve-metad $(DESTDIR)$(PREFIX)/sbin/pve-metad
-	install -D -m 0644 debian/pve-metad.service $(DESTDIR)$(PREFIX)/lib/systemd/system/pve-metad.service
-
 deb:
 	dpkg-buildpackage -b -us -uc -d
 
@@ -91,7 +80,7 @@ check:
 	$(CARGO) clippy --workspace --exclude pve-meta-ui -- -D warnings
 
 test:
-	$(CARGO) test -p pve-meta-core -p pve-meta-api
+	$(CARGO) test -p pve-meta-core
 
 clean:
 	$(CARGO) clean

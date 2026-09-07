@@ -17,11 +17,9 @@ Description: Structured, versioned metadata store for Proxmox VE
  pve-meta adds a structured (YAML/TOML/JSON) metadata document per guest and
  for the datacenter, stored under /etc/pve/meta and replicated by pmxcfs like
  any other cluster file. The API is served natively by pveproxy/pvedaemon
- (PVE::API2::Meta, see docs/NATIVE-API-SPEC.md) under /api2/json/meta/...; this
- package also ships the pve-meta CLI (runs the same handlers in-process
- against the store, no daemon needed), the wasm editor UI, and the web UI /
- guest-lifecycle integration patches. The standalone HTTPS daemon
- alternative (pve-metad, port 8007) is a separate, optional package.
+ (PVE::API2::Meta, see docs/NATIVE-API-SPEC.md) under /api2/json/meta/...;
+ this package also ships the wasm editor UI and the web UI /
+ guest-lifecycle integration patches.
 
 Package: libpve-meta-rs-perl
 Architecture: any
@@ -32,12 +30,3 @@ Description: pve-meta guest lifecycle hooks for PVE (Rust, perlmod)
  vzdump backup/restore export/import for use from PVE's own Perl code
  (pve-container, qemu-server, pve-guest-common). Also used by
  PVE::API2::Meta (package pve-meta) to serve the pve-meta API natively.
-
-Package: pve-metad
-Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: pve-meta HTTPS API daemon (standalone, optional)
- pve-metad serves the pve-meta API on its own HTTPS port (8007), as a
- standalone alternative to the native pveproxy/pvedaemon integration
- provided by the pve-meta package (see docs/NATIVE-API-SPEC.md). Not
- installed or required by default, and not depended on by pve-meta.
