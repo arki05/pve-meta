@@ -1,5 +1,8 @@
 # libpve-meta-rs-perl — `PVE::RS::Meta` specification
 
+> Lifecycle functions below are current. The `api_*` functions are specified by
+> `DESIGN.md` §3 (revision 4: views and scopes) and supersede anything older.
+
 Rust cdylib exposing the store's lifecycle operations to PVE's Perl code through
 `perlmod`, packaged exactly like upstream `libpve-rs-perl`. Reference guide with
 file:line citations: the research report
