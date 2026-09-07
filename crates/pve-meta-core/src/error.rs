@@ -64,6 +64,11 @@ pub enum Error {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
+    /// The datacenter document's `scopes` map (or one of its entries) does
+    /// not have the shape [`crate::scopes::parse_scopes`] expects.
+    #[error("invalid scopes: {0}")]
+    InvalidScopes(String),
+
     /// An underlying I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

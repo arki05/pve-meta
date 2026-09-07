@@ -49,7 +49,7 @@ fn walk_patch(v: &Value, path: &Path, out: &mut Vec<Lint>) {
                     out.push(Lint {
                         path: child_path.clone(),
                         msg: format!(
-                            "invalid key '{k}': keys must match ^[A-Za-z0-9_-]+$ and contain no dots"
+                            "invalid key '{k}': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots"
                         ),
                     });
                 }
@@ -94,7 +94,7 @@ pub fn apply_patch(doc: &mut Value, patch: &Value) -> Vec<Touched> {
     touched
 }
 
-fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &mut Vec<Touched>) {
+pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &mut Vec<Touched>) {
     let patch_map = match patch.as_object() {
         Some(m) => m,
         None => return,
@@ -142,7 +142,7 @@ pub fn diff(old: &Value, new: &Value) -> Vec<Touched> {
     out
 }
 
-fn diff_at(old: &Value, new: &Value, path: &Path, out: &mut Vec<Touched>) {
+pub(crate) fn diff_at(old: &Value, new: &Value, path: &Path, out: &mut Vec<Touched>) {
     match (old, new) {
         (Value::Object(om), Value::Object(nm)) => {
             for (k, nv) in nm.iter() {

@@ -202,7 +202,7 @@ mod pve_rs_meta {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    // -- API-shaped exports (`PVE::API2::Meta`, `docs/NATIVE-API-SPEC.md`) --
+    // -- API-shaped exports (`PVE::API2::Ext::Meta`, `docs/DESIGN.md` §3) --
     //
     // Thin wrappers over `super::api` (see that module's docs for the wire
     // contract). All of these die with a Rust `anyhow::Error` whose
@@ -215,112 +215,59 @@ mod pve_rs_meta {
         super::api::version()
     }
 
-    /// `GET /meta/health` -> `{ store: {root, files, bytes}, version, hooks: {} }`.
+    /// The datacenter document's `scopes` entries for `$authid`, as a JSON
+    /// array of `{prefix, mode}` (used by `GET /meta/access` and to build
+    /// the `grants_json` passed to the other `api_*` functions).
     #[export]
-    pub fn api_health() -> Result<super::api::ApiHealth, Error> {
-        super::api::health()
+    pub fn api_grants(authid: &str) -> Result<String, Error> {
+        super::api::grants(authid)
     }
 
-    /// `GET /meta/inventory` -> guests from `.vmlist`, enriched with their
-    /// display name.
+    /// `GET /meta/guests` -> every vmid the caller can read anything of,
+    /// with `keys` filtered to what they may see. `grants_json` maps each
+    /// vmid (decimal string) to that vmid's grants (see `super::api::list_guests`).
     #[export]
-    pub fn api_inventory() -> Result<Vec<super::api::InventoryEntry>, Error> {
-        super::api::inventory()
-    }
-
-    /// `GET /meta/guests` -> guest documents, optionally filtered by `has`
-    /// (a dotted path that must be present).
-    #[export]
-    pub fn api_list_guests(has: Option<&str>) -> Result<Vec<super::api::GuestListEntry>, Error> {
-        super::api::list_guests(has)
+    pub fn api_list_guests(grants_json: &str, has: Option<&str>) -> Result<Vec<super::api::GuestListEntry>, Error> {
+        super::api::list_guests(grants_json, has)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
     /// or `"datacenter"`).
     #[export]
-    pub fn api_get(id: &str, comments: bool, raw: bool) -> Result<super::api::ApiDocument, Error> {
-        super::api::get_document(id, comments, raw)
-    }
-
-    /// `GET .../subtree?path=...` -> `{ data_json, digest }`. 404s if
-    /// nothing exists at `path`.
-    #[export]
-    pub fn api_subtree(id: &str, path: &str) -> Result<super::api::ApiSubtree, Error> {
-        super::api::get_subtree(id, path)
-    }
-
-    /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`: merge-patch.
-    /// `patch_json` is a JSON-encoded string (avoids Perl number/string
-    /// ambiguity); creates the document if it does not exist.
-    #[export]
-    pub fn api_patch(id: &str, patch_json: &str, digest: Option<&str>, dry_run: bool) -> Result<super::api::ApiDocument, Error> {
-        super::api::patch_document(id, patch_json, digest, dry_run)
-    }
-
-    /// `PUT .../raw`: full-text replace.
-    #[export]
-    pub fn api_put_raw(
+    pub fn api_get(
         id: &str,
-        content: &str,
-        format: Option<&str>,
+        view: Option<&str>,
+        format: &str,
+        comments: bool,
+        grants_json: &str,
+    ) -> Result<super::api::ApiViewDocument, Error> {
+        super::api::get_document(id, view, format, comments, grants_json)
+    }
+
+    /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
+    #[export]
+    #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §3)
+    pub fn api_put(
+        id: &str,
+        view: Option<&str>,
+        format: &str,
+        payload: &str,
+        mode: &str,
         digest: Option<&str>,
         dry_run: bool,
-    ) -> Result<super::api::ApiDocument, Error> {
-        super::api::put_raw_document(id, content, format, digest, dry_run)
-    }
-
-    /// `POST .../convert`: re-dumps the document in another format.
-    #[export]
-    pub fn api_convert(id: &str, format: &str, digest: Option<&str>) -> Result<super::api::ApiDocument, Error> {
-        super::api::convert_document(id, format, digest)
+        grants_json: &str,
+    ) -> Result<super::api::ApiPutResult, Error> {
+        super::api::put_document(id, view, format, payload, mode, digest, dry_run, grants_json)
     }
 
     /// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`.
     #[export]
-    pub fn api_delete(id: &str) -> Result<bool, Error> {
-        super::api::delete_document(id)
-    }
-
-    /// `GET /meta/guests/{vmid}/snapshots` -> snapshot names.
-    #[export]
-    pub fn api_snapshots(vmid: u32) -> Result<Vec<String>, Error> {
-        super::api::list_guest_snapshots(vmid)
-    }
-
-    /// `POST /meta/guests/{vmid}/snapshot` -> `{ created }`.
-    #[export]
-    pub fn api_snapshot(vmid: u32, name: &str) -> Result<super::api::ApiCreated, Error> {
-        super::api::snapshot_guest(vmid, name)
-    }
-
-    /// `POST /meta/guests/{vmid}/rollback` -> `{ outcome }`.
-    #[export]
-    pub fn api_rollback(vmid: u32, name: &str) -> Result<super::api::ApiOutcome, Error> {
-        super::api::rollback_guest(vmid, name)
-    }
-
-    /// `DELETE /meta/guests/{vmid}/snapshots/{name}`.
-    #[export]
-    pub fn api_delete_snapshot(vmid: u32, name: &str) -> Result<bool, Error> {
-        super::api::delete_guest_snapshot(vmid, name)
-    }
-
-    /// `POST /meta/guests/{vmid}/clone` -> the new guest's document.
-    #[export]
-    pub fn api_clone(vmid: u32, newid: u32) -> Result<super::api::ApiDocument, Error> {
-        super::api::clone_document(vmid, newid)
-    }
-
-    /// `GET /meta/registry` -> a view of `datacenter.operators`.
-    #[export]
-    pub fn api_registry() -> Result<Vec<super::api::ApiRegistryEntry>, Error> {
-        super::api::registry()
-    }
-
-    /// `GET /meta/schemas/{vmid}` -> the JSON schemas applicable to a
-    /// guest's document, as a JSON object string keyed by namespace prefix.
-    #[export]
-    pub fn api_schemas(vmid: u32) -> Result<String, Error> {
-        super::api::schemas_for_guest(vmid)
+    pub fn api_delete(
+        id: &str,
+        view: Option<&str>,
+        digest: Option<&str>,
+        grants_json: &str,
+    ) -> Result<super::api::ApiPutResult, Error> {
+        super::api::delete_document(id, view, digest, grants_json)
     }
 }

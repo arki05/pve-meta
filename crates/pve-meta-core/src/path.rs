@@ -6,11 +6,16 @@ use std::str::FromStr;
 use crate::error::Error;
 
 /// Returns `true` if `s` is a syntactically valid path/object-key segment:
-/// `^[A-Za-z0-9_-]+$`.
+/// `^[A-Za-z0-9_@!-]+$`. `@` and `!` are allowed (in addition to the base
+/// `^[A-Za-z0-9_-]+$` object-key charset) specifically so a PVE authid
+/// (`user@realm`, or `user@realm!tokenid`) can be used verbatim as a key --
+/// e.g. the datacenter document's `scopes` map, keyed by authid
+/// (`docs/DESIGN.md` §2). Neither character is a path separator (those are
+/// `.` and `/`), so this does not introduce any addressing ambiguity.
 pub(crate) fn is_valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '!')
 }
 
 /// A path into a document: a sequence of object-key or array-index segments.
@@ -112,6 +117,29 @@ impl FromStr for Path {
     }
 }
 
+/// Serializes as the dotted string form (`Display`), e.g. for a
+/// [`crate::scopes::Scope`]'s `prefix` in the `grants_json` wire shape
+/// (`{"prefix":"traefik","mode":"rw"}`).
+impl serde::Serialize for Path {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// Deserializes from the dotted/slash string form via [`Path::parse`].
+impl<'de> serde::Deserialize<'de> for Path {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Path::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +175,17 @@ mod tests {
     }
 
     #[test]
+    fn authid_shaped_segments_allowed() {
+        // `@` and `!` are allowed so a PVE authid can be used as a segment
+        // (a datacenter `scopes` key, `docs/DESIGN.md` §2), and are not path
+        // separators (those are `.` and `/`).
+        assert!(is_valid_segment("svc@pve!traefik"));
+        assert!(is_valid_segment("scoped@pve"));
+        let p = Path::parse("scopes/svc@pve!traefik").unwrap();
+        assert_eq!(p.segments(), &["scopes", "svc@pve!traefik"]);
+    }
+
+    #[test]
     fn numeric_segments_allowed() {
         let p = Path::parse("a.0.b").unwrap();
         assert_eq!(p.segments(), &["a", "0", "b"]);
@@ -164,6 +203,21 @@ mod tests {
         assert!(!ab.is_prefix_of(&a));
         assert!(!ac.is_prefix_of(&ab));
         assert!(ab.is_prefix_of(&ab));
+    }
+
+    #[test]
+    fn serde_round_trips_through_the_dotted_string_form() {
+        let p = Path::parse("a.b.c").unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(json, "\"a.b.c\"");
+        let back: Path = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+
+        let root_json = serde_json::to_string(&Path::root()).unwrap();
+        assert_eq!(root_json, "\"\"");
+        assert_eq!(serde_json::from_str::<Path>(&root_json).unwrap(), Path::root());
+
+        assert!(serde_json::from_str::<Path>("\"a..b\"").is_err());
     }
 
     #[test]

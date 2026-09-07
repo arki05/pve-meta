@@ -20,7 +20,8 @@ pub fn is_comment_key(k: &str) -> bool {
     k.ends_with(COMMENT_SUFFIX)
 }
 
-/// `true` if `k` is a syntactically valid object key: `^[A-Za-z0-9_-]+$`.
+/// `true` if `k` is a syntactically valid object key: `^[A-Za-z0-9_@!-]+$`
+/// (see [`crate::path::is_valid_segment`]).
 pub(crate) fn is_valid_key(k: &str) -> bool {
     is_valid_segment(k)
 }
@@ -49,7 +50,9 @@ impl fmt::Display for Lint {
 ///
 /// 1. the top level must be an object;
 /// 2. no `null` anywhere (absent means unset);
-/// 3. every object key must match `^[A-Za-z0-9_-]+$`;
+/// 3. every object key must match `^[A-Za-z0-9_@!-]+$` (the extra `@`/`!`
+///    accommodate PVE authids used as keys, e.g. the datacenter document's
+///    `scopes` map);
 /// 4. a comment key's value must be a string;
 /// 5. numbers must be integers or finite floats (already guaranteed by
 ///    `serde_json::Value` without the `arbitrary_precision` feature, so this
@@ -62,6 +65,18 @@ pub fn lint(doc: &Value) -> Vec<Lint> {
             msg: "top level must be an object".to_string(),
         });
     }
+    out.extend(lint_relaxed(doc));
+    out
+}
+
+/// Like [`lint`], but does not require the top level to be an object.
+///
+/// Used by [`crate::view`] to validate a *view*'s value, which need not
+/// itself be an object at its own root (e.g. a view of an array-valued key):
+/// only [`lint`]'s recursive rules (no nulls, valid keys, comment key values
+/// are strings) apply.
+pub fn lint_relaxed(doc: &Value) -> Vec<Lint> {
+    let mut out = Vec::new();
     walk(doc, &Path::root(), &mut out);
     out
 }
@@ -84,7 +99,7 @@ fn walk(v: &Value, path: &Path, out: &mut Vec<Lint>) {
                     out.push(Lint {
                         path: child_path.clone(),
                         msg: format!(
-                            "invalid key '{k}': keys must match ^[A-Za-z0-9_-]+$ and contain no dots"
+                            "invalid key '{k}': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots"
                         ),
                     });
                 }
@@ -181,6 +196,14 @@ mod tests {
     }
 
     #[test]
+    fn lint_accepts_pve_authid_shaped_keys() {
+        // The datacenter document's `scopes` map is keyed by authid
+        // (`user@realm`, or `user@realm!tokenid`) -- see `docs/DESIGN.md` §2.
+        let doc = json!({"scopes": {"svc@pve!traefik": [], "scoped@pve": []}});
+        assert!(lint(&doc).is_empty());
+    }
+
+    #[test]
     fn lint_accepts_comment_keys_with_string_values() {
         let doc = json!({"__": "doc comment", "foo": 1, "foo__": "about foo"});
         assert!(lint(&doc).is_empty());
@@ -220,6 +243,22 @@ mod tests {
     #[test]
     fn namespaces_of_non_object_is_empty() {
         assert!(namespaces(&json!([1, 2])).is_empty());
+    }
+
+    #[test]
+    fn lint_relaxed_allows_non_object_top_level() {
+        assert!(lint_relaxed(&json!([1, 2, 3])).is_empty());
+        assert!(lint_relaxed(&json!("scalar")).is_empty());
+        let lints = lint_relaxed(&json!([1, null]));
+        assert_eq!(lints.len(), 1);
+        assert!(lints[0].msg.contains("null"));
+    }
+
+    #[test]
+    fn lint_relaxed_still_checks_recursive_rules() {
+        let lints = lint_relaxed(&json!({"bad key": 1}));
+        assert_eq!(lints.len(), 1);
+        assert!(lint(&json!({"a": 1})).len() == lint_relaxed(&json!({"a": 1})).len());
     }
 
     #[test]

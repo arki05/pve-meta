@@ -21,6 +21,13 @@
 //!   throughout the store.
 //! - [`store`] — [`store::MetaStore`], the atomic on-disk file store: guest
 //!   and datacenter documents, snapshots, and cheap version polling.
+//! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
+//!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
+//!   operations (`docs/DESIGN.md` §1), plus [`view::render`]/[`view::parse`]
+//!   for a view's wire text.
+//! - [`scopes`] — [`scopes::Grants`] (a principal's effective access) and
+//!   [`scopes::parse_scopes`] (the datacenter document's `scopes` map),
+//!   implementing `docs/DESIGN.md` §2.
 //! - [`vmlist`] — parsing pmxcfs's own `/etc/pve/.vmlist`.
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
 //!   alias) returned throughout this crate.
@@ -42,7 +49,9 @@ pub mod format;
 pub mod model;
 pub mod patch;
 pub mod path;
+pub mod scopes;
 pub mod store;
+pub mod view;
 pub mod vmlist;
 
 pub use error::{Error, Result};

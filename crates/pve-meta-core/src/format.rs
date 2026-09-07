@@ -61,6 +61,24 @@ impl FromStr for Format {
     }
 }
 
+/// Parses `text` as `format` into a [`Value`], with no [`model::lint`]
+/// pass -- used directly by [`parse`] (which adds the full document lint)
+/// and by [`crate::view::parse`] (which adds [`model::lint_relaxed`]
+/// instead, since a view's value need not be an object at its own root).
+///
+/// # Errors
+/// [`Error::Parse`] on a syntax error (or a format-specific rejection: TOML
+/// datetimes; YAML anchors, aliases, explicit tags, or non-string keys).
+pub(crate) fn parse_raw(format: Format, text: &str) -> Result<Value, Error> {
+    match format {
+        Format::Json => {
+            serde_json::from_str(text).map_err(|e| Error::Parse { format, msg: e.to_string() })
+        }
+        Format::Yaml => parse_yaml(text),
+        Format::Toml => parse_toml(text),
+    }
+}
+
 /// Parses `text` as `format`, then runs [`model::lint`] on the result.
 ///
 /// # Errors
@@ -68,13 +86,7 @@ impl FromStr for Format {
 /// datetimes; YAML anchors, aliases, explicit tags, or non-string keys).
 /// [`Error::Lint`] if the parsed value fails document-model validation.
 pub fn parse(format: Format, text: &str) -> Result<Value, Error> {
-    let value = match format {
-        Format::Json => {
-            serde_json::from_str(text).map_err(|e| Error::Parse { format, msg: e.to_string() })?
-        }
-        Format::Yaml => parse_yaml(text)?,
-        Format::Toml => parse_toml(text)?,
-    };
+    let value = parse_raw(format, text)?;
     let lints = model::lint(&value);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
