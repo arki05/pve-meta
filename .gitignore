@@ -1,0 +1,8 @@
+/target
+**/target
+*.deb
+*.buildinfo
+*.changes
+/dist
+.venv
+__pycache__/
