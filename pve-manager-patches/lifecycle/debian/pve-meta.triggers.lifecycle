@@ -1,0 +1,7 @@
+interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm
+interest-noawait /usr/share/perl5/PVE/API2/LXC.pm
+interest-noawait /usr/share/perl5/PVE/LXC/Create.pm
+interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm
+interest-noawait /usr/share/perl5/PVE/API2/Qemu.pm
+interest-noawait /usr/share/perl5/PVE/QemuServer.pm
+interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm

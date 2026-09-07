@@ -1,0 +1,23 @@
+# postrm snippet for the pve-meta package - lifecycle-hook variant.
+#
+# Ensures all seven dpkg-diversions created by pve-meta-lifecycle-patch are
+# undone and the seven files restored to their pristine upstream content
+# when the pve-meta package is removed/purged. Fold this into the real
+# pve-meta package's postrm alongside postrm (the UI-patch variant); this
+# file is a snippet, not a standalone maintainer script.
+
+PVE_META_LIFECYCLE_PATCH=/usr/sbin/pve-meta-lifecycle-patch
+
+case "$1" in
+    remove|purge)
+        if [ -x "$PVE_META_LIFECYCLE_PATCH" ]; then
+            "$PVE_META_LIFECYCLE_PATCH" remove || {
+                echo "pve-meta: warning: pve-meta-lifecycle-patch remove failed for one or more files, some lifecycle-hook diversions may still be active." >&2
+            }
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        ;;
+esac
