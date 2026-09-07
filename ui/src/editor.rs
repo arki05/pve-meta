@@ -1,582 +1,639 @@
-//! Per-document editor: loads a [`Document`], hosts the Form/Source view toggle, the
-//! local working copy + pending-patch bar, apply/discard, the 409-conflict dialog, and
-//! reacts to the version-poll banner from `crate::app`.
+//! The metadata editor page.
+//!
+//! One `LoadableComponent` for one document (`docs/DESIGN.md` §6), structured exactly
+//! like `proxmox_yew_comp::NotesView`: `load()` fetches a text document and its digest,
+//! `toolbar()` returns the standard three-class `Toolbar`, `main_view()` fills the
+//! remaining height, and `dialog_view()` returns the one modal. Everything else — the
+//! outer column, the load-error strip, dialog stacking, off-screen refresh suspension —
+//! comes from `LoadableComponentMaster`.
+//!
+//! The one deviation from the pwt stack is the editor itself: Monaco, mounted into a
+//! plain `Container` from `rendered()` through the glue in `js/pve-meta-monaco.js`
+//! (`crate::monaco`).
 
-use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 
 use anyhow::Error;
-use serde_json::{json, Value};
-use yew::html::Scope;
-use yew::prelude::*;
+use wasm_bindgen::prelude::Closure;
+use web_sys::Element;
+use yew::html::IntoPropValue;
+use yew::virtual_dom::{VComp, VNode};
 
+use pwt::css::{AlignItems, ColorScheme, FlexFit, FontStyle, JustifyContent};
 use pwt::prelude::*;
-use pwt::widget::{ActionIcon, Button, Column, Dialog, Row};
+use pwt::state::ThemeObserver;
+use pwt::widget::form::Combobox;
+use pwt::widget::{Button, Column, Container, Dialog, Fa, Row, Toolbar, error_message};
+use pwt_macros::builder;
 
-use crate::api::{self, Operator};
-use crate::form::{FormEvent, FormRoot};
-use crate::model::{DocId, Document, Touched};
-use crate::patch;
-use crate::source::{ConvertConfirmDialog, DiffDialog, SourceEvent, SourceView, VerifyOutcome};
+use proxmox_yew_comp::{
+    ConfirmButton, LoadableComponent, LoadableComponentContext, LoadableComponentMaster,
+    LoadableComponentScopeExt, LoadableComponentState,
+};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ViewMode {
-    Form,
-    Source,
+use crate::api::{self, GuestEntry, WriteResult};
+use crate::model::{Access, DocId};
+use crate::monaco;
+
+/// `GET /meta/version` is polled this often. Its token covers the whole store, so a
+/// change only triggers a digest check of this one document.
+const VERSION_POLL_MS: u32 = 5_000;
+
+/// The "View as" entry standing for the whole document (the empty prefix). A sentinel is
+/// needed because a `Combobox` cannot hold an empty value — the same trick PDM's
+/// `ViewSelector` uses for its `__dashboard__` entry.
+const WHOLE_DOCUMENT: &str = "__document__";
+
+/// Everything one load produces.
+pub struct Loaded {
+    /// Only on the first load — the grants do not change under us.
+    access: Option<Access>,
+    /// Only on the first load — the guest's name and node, for the identity line.
+    guest: Option<GuestEntry>,
+    /// Top-level keys of the whole document, for the "View as" selector.
+    keys: Vec<String>,
+    digest: String,
+    text: String,
 }
 
-#[derive(Properties, PartialEq, Clone)]
-pub struct EditorProps {
-    pub id: DocId,
-    pub schemas: Rc<HashMap<String, Value>>,
-    pub registry: Rc<Vec<Operator>>,
-    /// The latest `GET /meta/version` token known by `crate::app`'s long-poll loop.
-    /// Changing this (while unchanged `id`) triggers a digest check.
-    pub version_token: Option<String>,
-}
-
-struct DiffState {
-    old: String,
-    new: String,
-    touched: Vec<Touched>,
+/// Modal states of the page.
+#[derive(PartialEq)]
+pub enum ViewState {
+    ConfirmApply,
 }
 
 pub enum Msg {
-    Loaded(Result<Document, Error>),
-    FormEdit(FormEvent),
+    Loaded(Box<Loaded>),
+    SelectView(String),
+    EditorInput(String),
+    ShowDiff,
+    CloseDialog,
+    Apply,
+    Applied(Result<WriteResult, Error>),
     Discard,
-    ApplyClicked,
-    ApplyResult(Result<Document, Error>),
-    Reload,
-    ReloadResult(Result<Document, Error>),
-    DismissError,
-    SwitchView(ViewMode),
-    ConfirmSwitchDiscard,
-    ConfirmSwitchCancel,
-    ConflictCancel,
-    SourceEdit(SourceEvent),
-    ConvertConfirmed,
-    ConvertCancelled,
-    ConvertResult(Result<Document, Error>),
-    VerifyResult(Result<Document, Error>),
-    SourceApplyDryRunResult(Result<Document, Error>),
-    DiffConfirmed,
-    DiffCancelled,
-    SourceApplyResult(Result<Document, Error>),
-    ServerCheckResult(Result<Document, Error>),
+    VersionToken(String),
+    ServerDigest(String),
+    ThemeChanged(bool),
 }
 
-pub struct Editor {
-    id: DocId,
-    loaded: Option<Document>,
-    error: Option<String>,
-    working: Value,
-    view: ViewMode,
-    pending_view: Option<ViewMode>,
-    show_switch_confirm: bool,
-    applying: bool,
-    conflict: bool,
-    server_changed_banner: bool,
-    pending_server_doc: Option<Document>,
-    source_text: String,
-    source_format: String,
-    source_busy: bool,
-    verify_outcome: Option<VerifyOutcome>,
-    show_convert_confirm: bool,
-    diff_dialog: Option<DiffState>,
+/// The metadata editor for one document.
+#[derive(Clone, PartialEq, Properties)]
+#[builder]
+pub struct MetaEditor {
+    /// Document to edit.
+    pub doc: DocId,
+
+    /// Guest type (`lxc` or `qemu`), as passed by the tab loader.
+    #[builder(IntoPropValue, into_prop_value)]
+    #[prop_or_default]
+    pub guest_type: Option<AttrValue>,
+
+    /// Node the guest lives on, as passed by the tab loader.
+    #[builder(IntoPropValue, into_prop_value)]
+    #[prop_or_default]
+    pub node: Option<AttrValue>,
 }
 
-impl Editor {
-    fn is_dirty(&self) -> bool {
-        match &self.loaded {
-            None => false,
-            Some(doc) => {
-                !patch::patch_is_empty(&patch::make_patch(&doc.data, &self.working))
-                    || self.source_text != doc.raw.clone().unwrap_or_default()
-            }
-        }
-    }
-
-    /// Replace `loaded` with `fresh`, re-applying whatever local form patch was pending
-    /// on top of it (a no-op if there was none — including right after our own
-    /// successful write, where re-applying the just-written patch is idempotent).
-    /// Raw-text (Source view) edits are left untouched: they aren't expressible as a
-    /// merge patch, so the user re-applies/re-verifies them against the new digest.
-    fn apply_reload(&mut self, fresh: Document) {
-        let old_data = self
-            .loaded
-            .as_ref()
-            .map(|d| d.data.clone())
-            .unwrap_or(Value::Null);
-        let pending_patch = patch::make_patch(&old_data, &self.working);
-        self.working = patch::apply_patch(&fresh.data, &pending_patch);
-        self.loaded = Some(fresh);
-        self.conflict = false;
-        self.server_changed_banner = false;
-        self.pending_server_doc = None;
-        self.error = None;
-    }
-
-    fn apply_form_event(&mut self, ev: FormEvent) {
-        match ev {
-            FormEvent::SetValue { path, value } => patch::set_path(&mut self.working, &path, value),
-            FormEvent::SetComment { mut path, text } => {
-                if let Some(last) = path.pop() {
-                    let mut comment_path = path;
-                    comment_path.push(format!("{last}__"));
-                    if text.is_empty() {
-                        patch::delete_path(&mut self.working, &comment_path);
-                    } else {
-                        patch::set_path(&mut self.working, &comment_path, Value::String(text));
-                    }
-                }
-            }
-            FormEvent::DeleteKey { path } => patch::delete_path(&mut self.working, &path),
-            FormEvent::AddKey { mut path, key, value } => {
-                path.push(key);
-                patch::set_path(&mut self.working, &path, value);
-            }
-            FormEvent::RemoveNamespace { namespace } => {
-                patch::delete_path(&mut self.working, std::slice::from_ref(&namespace))
-            }
-            FormEvent::AddNamespace { namespace } => {
-                patch::set_path(&mut self.working, std::slice::from_ref(&namespace), json!({}))
-            }
-        }
+impl MetaEditor {
+    /// Create a new instance.
+    pub fn new(doc: DocId) -> Self {
+        yew::props!(Self { doc })
     }
 }
 
-impl Component for Editor {
-    type Message = Msg;
-    type Properties = EditorProps;
+#[doc(hidden)]
+pub struct PveMetaEditor {
+    state: LoadableComponentState<ViewState>,
+    /// The caller's effective grants.
+    access: Access,
+    /// Set once the grants have been fetched.
+    access_loaded: bool,
+    /// Guest name and node, for the identity line.
+    guest: Option<GuestEntry>,
+    /// The selected view: a key-path prefix, empty for the whole document.
+    view: String,
+    /// The prefixes the "View as" selector offers.
+    views: Rc<Vec<AttrValue>>,
+    /// Text and digest as loaded.
+    loaded: String,
+    digest: String,
+    /// Live editor buffer; `None` while unmodified.
+    draft: Option<String>,
+    /// Bumped by every load, so `rendered()` knows when to push new text into Monaco.
+    generation: u64,
+    mounted_generation: Option<u64>,
+    /// The last message of a failed write, shown verbatim under the editor.
+    write_error: Option<String>,
+    /// A poll found this document's digest changed while there were unapplied edits,
+    /// or a write was refused with a 409.
+    stale: bool,
+    version_token: Option<String>,
+    editor_ref: NodeRef,
+    editor_id: Option<String>,
+    diff_ref: NodeRef,
+    diff_id: Option<String>,
+    dialog_open: bool,
+    /// Kept alive for as long as the editor exists.
+    on_change: Option<Closure<dyn Fn(String)>>,
+    /// Kept alive so the `pwt-theme-changed` listeners stay registered.
+    _theme_observer: ThemeObserver,
+    dark_mode: bool,
+}
 
-    fn create(ctx: &Context<Self>) -> Self {
-        let id = ctx.props().id;
-        ctx.link()
-            .send_future(async move { Msg::Loaded(api::get(id, true, true).await) });
-        Self {
-            id,
-            loaded: None,
-            error: None,
-            working: Value::Null,
-            view: ViewMode::Form,
-            pending_view: None,
-            show_switch_confirm: false,
-            applying: false,
-            conflict: false,
-            server_changed_banner: false,
-            pending_server_doc: None,
-            source_text: String::new(),
-            source_format: String::new(),
-            source_busy: false,
-            verify_outcome: None,
-            show_convert_confirm: false,
-            diff_dialog: None,
-        }
+pwt::impl_deref_mut_property!(PveMetaEditor, state, LoadableComponentState<ViewState>);
+
+impl PveMetaEditor {
+    /// True if the caller may edit the selected view.
+    fn writable(&self, ctx: &LoadableComponentContext<Self>) -> bool {
+        self.access.may_write(ctx.props().doc, &self.view)
     }
 
-    fn changed(&mut self, ctx: &Context<Self>, old_props: &Self::Properties) -> bool {
-        if ctx.props().version_token.is_some() && ctx.props().version_token != old_props.version_token {
-            let id = self.id;
-            ctx.link()
-                .send_future(async move { Msg::ServerCheckResult(api::get(id, true, true).await) });
-        }
-        true
+    /// The text the editor currently shows.
+    fn current_text(&self) -> &str {
+        self.draft.as_deref().unwrap_or(&self.loaded)
     }
 
-    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        let id = self.id;
-        match msg {
-            Msg::Loaded(Ok(doc)) => {
-                self.source_text = doc.raw.clone().unwrap_or_default();
-                self.source_format = doc.format.clone();
-                self.working = doc.data.clone();
-                self.loaded = Some(doc);
-                self.error = None;
-            }
-            Msg::Loaded(Err(e)) if api::is_not_found(&e) => {
-                // No metadata file yet for this guest/datacenter — start from an
-                // empty document; the first Apply creates it (docs/API.md).
-                let doc = Document::empty(&self.id);
-                self.source_text = doc.raw.clone().unwrap_or_default();
-                self.source_format = doc.format.clone();
-                self.working = doc.data.clone();
-                self.loaded = Some(doc);
-                self.error = None;
-            }
-            Msg::Loaded(Err(e)) => self.error = Some(api::error_text(&e)),
-            Msg::FormEdit(ev) => self.apply_form_event(ev),
-            Msg::Discard => {
-                if let Some(doc) = &self.loaded {
-                    self.working = doc.data.clone();
+    /// The document identity line, e.g. `200 traefik` + `(lxc, node1)`.
+    fn header(&self, ctx: &LoadableComponentContext<Self>) -> Row {
+        let props = ctx.props();
+
+        let (icon, title) = match props.doc {
+            DocId::Datacenter => ("building", tr!("Datacenter")),
+            DocId::Guest(vmid) => {
+                let icon = match props.guest_type.as_deref() {
+                    Some("lxc") => "cube",
+                    _ => "desktop",
+                };
+                let name = self.guest.as_ref().and_then(|g| g.name.clone());
+                match name {
+                    Some(name) if !name.is_empty() => (icon, format!("{vmid} {name}")),
+                    _ => (icon, vmid.to_string()),
                 }
             }
-            Msg::ApplyClicked => {
-                if let Some(doc) = &self.loaded {
-                    let patch = patch::make_patch(&doc.data, &self.working);
-                    if !patch::patch_is_empty(&patch) {
-                        self.applying = true;
-                        let digest = doc.digest.clone();
-                        ctx.link().send_future(async move {
-                            Msg::ApplyResult(api::patch(id, patch, api::digest_opt(&digest), false).await)
-                        });
-                    }
-                }
-            }
-            Msg::ApplyResult(Ok(_)) => {
-                self.applying = false;
-                ctx.link()
-                    .send_future(async move { Msg::ReloadResult(api::get(id, true, true).await) });
-            }
-            Msg::ApplyResult(Err(e)) => {
-                self.applying = false;
-                if api::is_conflict(&e) {
-                    self.conflict = true;
-                } else {
-                    self.error = Some(api::error_text(&e));
-                }
-            }
-            Msg::Reload => {
-                if let Some(doc) = self.pending_server_doc.take() {
-                    self.apply_reload(doc);
-                } else {
-                    ctx.link()
-                        .send_future(async move { Msg::ReloadResult(api::get(id, true, true).await) });
-                }
-            }
-            Msg::ReloadResult(Ok(doc)) => self.apply_reload(doc),
-            Msg::ReloadResult(Err(e)) => self.error = Some(api::error_text(&e)),
-            Msg::DismissError => self.error = None,
-            Msg::SwitchView(target) => {
-                if target != self.view {
-                    if self.is_dirty() {
-                        self.pending_view = Some(target);
-                        self.show_switch_confirm = true;
-                    } else {
-                        self.view = target;
-                    }
-                }
-            }
-            Msg::ConfirmSwitchDiscard => {
-                match self.view {
-                    ViewMode::Form => {
-                        if let Some(doc) = &self.loaded {
-                            self.working = doc.data.clone();
-                        }
-                    }
-                    ViewMode::Source => {
-                        if let Some(doc) = &self.loaded {
-                            self.source_text = doc.raw.clone().unwrap_or_default();
-                        }
-                    }
-                }
-                if let Some(target) = self.pending_view.take() {
-                    self.view = target;
-                }
-                self.show_switch_confirm = false;
-            }
-            Msg::ConfirmSwitchCancel => {
-                self.pending_view = None;
-                self.show_switch_confirm = false;
-            }
-            Msg::ConflictCancel => self.conflict = false,
-            Msg::SourceEdit(SourceEvent::TextChanged(text)) => {
-                self.source_text = text;
-                self.verify_outcome = None;
-            }
-            Msg::SourceEdit(SourceEvent::FormatChanged(format)) => self.source_format = format,
-            Msg::SourceEdit(SourceEvent::ConvertClicked) => self.show_convert_confirm = true,
-            Msg::SourceEdit(SourceEvent::VerifyClicked) => {
-                if let Some(doc) = &self.loaded {
-                    self.source_busy = true;
-                    let digest = doc.digest.clone();
-                    let content = self.source_text.clone();
-                    ctx.link().send_future(async move {
-                        Msg::VerifyResult(api::put_raw(id, content, None, api::digest_opt(&digest), true).await)
-                    });
-                }
-            }
-            Msg::VerifyResult(result) => {
-                self.source_busy = false;
-                match result {
-                    Ok(doc) => self.verify_outcome = Some(VerifyOutcome::Touched(doc.touched)),
-                    Err(e) if api::is_conflict(&e) => self.conflict = true,
-                    Err(e) => self.verify_outcome = Some(VerifyOutcome::Error(api::error_text(&e))),
-                }
-            }
-            Msg::SourceEdit(SourceEvent::ApplyClicked) => {
-                if let Some(doc) = &self.loaded {
-                    self.source_busy = true;
-                    let digest = doc.digest.clone();
-                    let content = self.source_text.clone();
-                    ctx.link().send_future(async move {
-                        Msg::SourceApplyDryRunResult(
-                            api::put_raw(id, content, None, api::digest_opt(&digest), true).await,
-                        )
-                    });
-                }
-            }
-            Msg::SourceApplyDryRunResult(result) => {
-                self.source_busy = false;
-                match result {
-                    Ok(doc) => {
-                        let old = self.loaded.as_ref().and_then(|d| d.raw.clone()).unwrap_or_default();
-                        self.diff_dialog = Some(DiffState {
-                            old,
-                            new: self.source_text.clone(),
-                            touched: doc.touched,
-                        });
-                    }
-                    Err(e) if api::is_conflict(&e) => self.conflict = true,
-                    Err(e) => self.verify_outcome = Some(VerifyOutcome::Error(api::error_text(&e))),
-                }
-            }
-            Msg::DiffCancelled => self.diff_dialog = None,
-            Msg::DiffConfirmed => {
-                if let Some(doc) = &self.loaded {
-                    self.source_busy = true;
-                    let digest = doc.digest.clone();
-                    let content = self.source_text.clone();
-                    ctx.link().send_future(async move {
-                        Msg::SourceApplyResult(api::put_raw(id, content, None, api::digest_opt(&digest), false).await)
-                    });
-                }
-            }
-            Msg::SourceApplyResult(result) => {
-                self.source_busy = false;
-                self.diff_dialog = None;
-                match result {
-                    Ok(_) => {
-                        ctx.link()
-                            .send_future(async move { Msg::ReloadResult(api::get(id, true, true).await) });
-                    }
-                    Err(e) if api::is_conflict(&e) => self.conflict = true,
-                    Err(e) => self.error = Some(api::error_text(&e)),
-                }
-            }
-            Msg::ConvertCancelled => self.show_convert_confirm = false,
-            Msg::ConvertConfirmed => {
-                self.show_convert_confirm = false;
-                if let Some(doc) = &self.loaded {
-                    self.source_busy = true;
-                    let digest = doc.digest.clone();
-                    let target = self.source_format.clone();
-                    ctx.link().send_future(async move {
-                        Msg::ConvertResult(api::convert(id, &target, api::digest_opt(&digest)).await)
-                    });
-                }
-            }
-            Msg::ConvertResult(result) => {
-                self.source_busy = false;
-                match result {
-                    Ok(_) => {
-                        ctx.link()
-                            .send_future(async move { Msg::ReloadResult(api::get(id, true, true).await) });
-                    }
-                    Err(e) if api::is_conflict(&e) => self.conflict = true,
-                    Err(e) => self.error = Some(api::error_text(&e)),
-                }
-            }
-            Msg::ServerCheckResult(Ok(fresh)) => {
-                let changed = self
-                    .loaded
-                    .as_ref()
-                    .map(|d| d.digest != fresh.digest)
-                    .unwrap_or(false);
-                if changed {
-                    if self.is_dirty() {
-                        self.server_changed_banner = true;
-                        self.pending_server_doc = Some(fresh);
-                    } else {
-                        self.apply_reload(fresh);
-                    }
-                }
-            }
-            Msg::ServerCheckResult(Err(e)) => {
-                log::warn!("pve-meta-ui: version-poll digest check failed: {e}");
-            }
+        };
+
+        let mut details: Vec<String> = Vec::new();
+        if let Some(guest_type) = props.guest_type.as_deref() {
+            details.push(guest_type.to_string());
         }
-        true
-    }
-
-    fn view(&self, ctx: &Context<Self>) -> Html {
-        let link = ctx.link();
-
-        if self.loaded.is_none() {
-            return match &self.error {
-                Some(err) => error_panel(err),
-                None => html! {<div class="pve-meta-loading">{"Loading…"}</div>},
-            };
+        if let Some(node) = props.node.as_deref() {
+            details.push(node.to_string());
         }
-        let doc = self.loaded.as_ref().expect("checked above");
 
-        let mut toolbar = Row::new()
-            .class("pve-meta-toolbar pwt-align-items-center")
-            .gap(2)
+        Row::new()
+            .class(AlignItems::Baseline)
+            .class("pwt-border-bottom")
             .padding(2)
+            .gap(2)
+            .with_child(Fa::new(icon))
             .with_child(
-                Button::new("Form")
-                    .pressed(self.view == ViewMode::Form)
-                    .onclick(link.callback(|_: MouseEvent| Msg::SwitchView(ViewMode::Form))),
+                Container::from_tag("span")
+                    .class(FontStyle::TitleMedium)
+                    .with_child(title),
+            )
+            .with_optional_child((!details.is_empty()).then(|| {
+                Container::from_tag("span")
+                    .class("pwt-color-on-neutral-alt")
+                    .with_child(format!("({})", details.join(", ")))
+            }))
+    }
+
+    /// The non-modal "changed on the server" notice.
+    fn stale_banner(&self, ctx: &LoadableComponentContext<Self>) -> Row {
+        let link = ctx.link().clone();
+        Row::new()
+            .padding(2)
+            .gap(2)
+            .class(AlignItems::Center)
+            .class(ColorScheme::WarningContainer)
+            .class("pwt-default-colors")
+            .class("pwt-border-bottom")
+            .with_child(Fa::new("exclamation-triangle"))
+            .with_child(tr!(
+                "This document was changed on the server since it was loaded."
+            ))
+            .with_flex_spacer()
+            .with_child(Button::new(tr!("Reload")).on_activate(move |_| link.send_reload()))
+    }
+
+    /// The Apply confirmation: a Monaco diff of the loaded text against the edited one.
+    fn diff_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link();
+        Dialog::new(tr!("Apply") + ": " + &tr!("Changes"))
+            .width(900)
+            .height(600)
+            .resizable(true)
+            .on_close(link.callback(|_| Msg::CloseDialog))
+            .with_child(
+                Container::new()
+                    .class(FlexFit)
+                    .class("pve-meta-monaco-host")
+                    .into_html_with_ref(self.diff_ref.clone()),
             )
             .with_child(
-                Button::new("Source")
-                    .pressed(self.view == ViewMode::Source)
-                    .onclick(link.callback(|_: MouseEvent| Msg::SwitchView(ViewMode::Source))),
+                Row::new()
+                    .padding(2)
+                    .gap(2)
+                    .class(JustifyContent::FlexEnd)
+                    .class("pwt-border-top")
+                    .with_child(
+                        Button::new(tr!("Cancel")).on_activate(link.callback(|_| Msg::CloseDialog)),
+                    )
+                    .with_child(
+                        Button::new(tr!("Apply"))
+                            .class(ColorScheme::Primary)
+                            .on_activate(link.callback(|_| Msg::Apply)),
+                    ),
             )
-            .with_flex_spacer();
+            .into()
+    }
 
-        if self.server_changed_banner {
-            toolbar.add_child(html! {<span class="pwt-color-warning">{"\u{25CF} changed on server"}</span>});
-            toolbar.add_child(
-                ActionIcon::new("fa fa-refresh")
-                    .aria_label("reload")
-                    .on_activate(link.callback(|_: web_sys::Event| Msg::Reload)),
-            );
+    fn dispose_diff(&mut self) {
+        if let Some(id) = self.diff_id.take() {
+            monaco::dispose(&id);
         }
-
-        let mut col = Column::new().class("pve-meta-editor").with_child(toolbar);
-
-        if let Some(err) = &self.error {
-            col.add_child(error_banner(err, link.callback(|_: MouseEvent| Msg::DismissError)));
-        }
-
-        match self.view {
-            ViewMode::Form => {
-                let working = Rc::new(self.working.clone());
-                let schemas = ctx.props().schemas.clone();
-                let registry = ctx.props().registry.clone();
-                let on_event = link.callback(Msg::FormEdit);
-                col.add_child(html! {
-                    <FormRoot working={working} schemas={schemas} registry={registry} on_event={on_event} />
-                });
-
-                let patch = patch::make_patch(&doc.data, &self.working);
-                if !patch::patch_is_empty(&patch) {
-                    col.add_child(pending_bar(&patch, self.applying, link));
-                }
-            }
-            ViewMode::Source => {
-                let on_event = link.callback(Msg::SourceEdit);
-                col.add_child(html! {
-                    <SourceView
-                        text={self.source_text.clone()}
-                        format={self.source_format.clone()}
-                        busy={self.source_busy}
-                        verify_outcome={self.verify_outcome.clone()}
-                        on_event={on_event}
-                    />
-                });
-            }
-        }
-
-        if self.show_switch_confirm {
-            col.add_child(switch_confirm_dialog(link));
-        }
-        if self.conflict {
-            col.add_child(conflict_dialog(link));
-        }
-        if self.show_convert_confirm {
-            let on_confirm = link.callback(|_| Msg::ConvertConfirmed);
-            let on_cancel = link.callback(|_| Msg::ConvertCancelled);
-            col.add_child(html! {
-                <ConvertConfirmDialog target_format={self.source_format.clone()} on_confirm={on_confirm} on_cancel={on_cancel} />
-            });
-        }
-        if let Some(diff) = &self.diff_dialog {
-            let on_confirm = link.callback(|_| Msg::DiffConfirmed);
-            let on_cancel = link.callback(|_| Msg::DiffCancelled);
-            col.add_child(html! {
-                <DiffDialog old={diff.old.clone()} new={diff.new.clone()} touched={diff.touched.clone()} on_confirm={on_confirm} on_cancel={on_cancel} />
-            });
-        }
-
-        col.into()
     }
 }
 
-fn pending_bar(patch: &Value, applying: bool, link: &Scope<Editor>) -> Html {
-    let items = patch::describe_patch(patch);
-    let summary = items
-        .iter()
-        .map(|(p, op)| format!("{p} ({op})"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Row::new()
-        .class("pve-meta-pending-bar pwt-align-items-center")
-        .gap(2)
-        .padding(2)
-        .with_child(html! {<span class="pve-meta-pending-label">{format!("Pending: {summary}")}</span>})
-        .with_flex_spacer()
-        .with_child(
-            Button::new("Discard")
-                .disabled(applying)
-                .onclick(link.callback(|_: MouseEvent| Msg::Discard)),
-        )
-        .with_child(
-            Button::new("Apply")
-                .disabled(applying)
-                .onclick(link.callback(|_: MouseEvent| Msg::ApplyClicked)),
-        )
-        .into()
+impl Drop for PveMetaEditor {
+    fn drop(&mut self) {
+        // Monaco leaks a ResizeObserver and a model otherwise.
+        if let Some(id) = self.editor_id.take() {
+            monaco::dispose(&id);
+        }
+        self.dispose_diff();
+    }
 }
 
-fn conflict_dialog(link: &Scope<Editor>) -> Html {
-    Dialog::new("Document changed")
-        .on_close(link.callback(|_| Msg::ConflictCancel))
-        .with_child(html! {
-            <p class="pve-meta-dialog-message">
-                {"The document changed on the server. Reload and re-apply your changes?"}
-            </p>
-        })
-        .with_child(
-            Row::new()
-                .gap(2)
-                .padding(2)
-                .with_flex_spacer()
-                .with_child(Button::new("Cancel").onclick(link.callback(|_: MouseEvent| Msg::ConflictCancel)))
-                .with_child(Button::new("Reload").onclick(link.callback(|_: MouseEvent| Msg::Reload))),
-        )
-        .into()
-}
+impl LoadableComponent for PveMetaEditor {
+    type Properties = MetaEditor;
+    type Message = Msg;
+    type ViewState = ViewState;
 
-fn switch_confirm_dialog(link: &Scope<Editor>) -> Html {
-    Dialog::new("Unapplied changes")
-        .on_close(link.callback(|_| Msg::ConfirmSwitchCancel))
-        .with_child(html! {
-            <p class="pve-meta-dialog-message">
-                {"You have unapplied changes in this view. Discard them to switch, or Cancel and use Apply first."}
-            </p>
+    fn create(ctx: &LoadableComponentContext<Self>) -> Self {
+        let theme_observer =
+            ThemeObserver::new(ctx.link().callback(|(_, dark)| Msg::ThemeChanged(dark)));
+        let dark_mode = theme_observer.dark_mode();
+
+        // The store's content hash, polled on an interval — the native module answers
+        // `GET /meta/version` immediately, there is no long poll.
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(VERSION_POLL_MS).await;
+                match api::version().await {
+                    Ok(info) => link.send_message(Msg::VersionToken(info.token)),
+                    Err(err) => log::warn!("pve-meta-ui: version poll failed: {err}"),
+                }
+            }
+        });
+
+        Self {
+            state: LoadableComponentState::new(),
+            access: Access::default(),
+            access_loaded: false,
+            guest: None,
+            view: String::new(),
+            views: Rc::new(vec![AttrValue::from(WHOLE_DOCUMENT)]),
+            loaded: String::new(),
+            digest: String::new(),
+            draft: None,
+            generation: 0,
+            mounted_generation: None,
+            write_error: None,
+            stale: false,
+            version_token: None,
+            editor_ref: NodeRef::default(),
+            editor_id: None,
+            diff_ref: NodeRef::default(),
+            diff_id: None,
+            dialog_open: false,
+            on_change: None,
+            _theme_observer: theme_observer,
+            dark_mode,
+        }
+    }
+
+    fn load(
+        &self,
+        ctx: &LoadableComponentContext<Self>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Error>>>> {
+        let doc = ctx.props().doc;
+        let view = self.view.clone();
+        let need_access = !self.access_loaded;
+        let need_guest = matches!(doc, DocId::Guest(_)) && self.guest.is_none();
+        let link = ctx.link().clone();
+
+        Box::pin(async move {
+            let access = match need_access {
+                true => Some(api::access().await?),
+                false => None,
+            };
+
+            // The identity line wants the guest's name; a failure here is not worth
+            // failing the page over.
+            let guest = match need_guest {
+                true => api::guests()
+                    .await
+                    .map_err(|err| log::warn!("pve-meta-ui: failed to list guests: {err}"))
+                    .ok()
+                    .and_then(|list| {
+                        list.into_iter()
+                            .find(|entry| DocId::Guest(entry.vmid) == doc)
+                    }),
+                false => None,
+            };
+
+            // The whole document, for the top-level keys the "View as" selector offers.
+            let keys = crate::model::top_level_keys(&api::get_data(doc).await?.data);
+            let document = api::get_text(doc, &view).await?;
+
+            link.send_message(Msg::Loaded(Box::new(Loaded {
+                access,
+                guest,
+                keys,
+                digest: document.digest,
+                text: document.text,
+            })));
+
+            Ok(())
         })
-        .with_child(
-            Row::new()
-                .gap(2)
-                .padding(2)
-                .with_flex_spacer()
-                .with_child(Button::new("Cancel").onclick(link.callback(|_: MouseEvent| Msg::ConfirmSwitchCancel)))
+    }
+
+    fn update(&mut self, ctx: &LoadableComponentContext<Self>, msg: Self::Message) -> bool {
+        match msg {
+            Msg::Loaded(loaded) => {
+                let Loaded {
+                    access,
+                    guest,
+                    keys,
+                    digest,
+                    text,
+                } = *loaded;
+
+                if let Some(access) = access {
+                    self.access = access;
+                    self.access_loaded = true;
+                }
+                if guest.is_some() {
+                    self.guest = guest;
+                }
+
+                let options = self.access.view_options(&keys);
+                // Fall back to the whole document when the selected prefix is gone.
+                if !options.contains(&self.view) {
+                    self.view = String::new();
+                }
+                self.views = Rc::new(
+                    options
+                        .into_iter()
+                        .map(|option| match option.is_empty() {
+                            true => AttrValue::from(WHOLE_DOCUMENT),
+                            false => AttrValue::from(option),
+                        })
+                        .collect(),
+                );
+
+                self.loaded = text;
+                self.digest = digest;
+                self.draft = None;
+                self.stale = false;
+                self.write_error = None;
+                self.generation += 1;
+            }
+            Msg::SelectView(view) => {
+                let view = match view.as_str() {
+                    WHOLE_DOCUMENT => String::new(),
+                    other => other.to_string(),
+                };
+                if view == self.view {
+                    return false;
+                }
+                self.view = view;
+                self.draft = None;
+                self.write_error = None;
+                ctx.link().send_reload();
+            }
+            Msg::EditorInput(text) => {
+                self.draft = (text != self.loaded).then_some(text);
+            }
+            Msg::ShowDiff => {
+                self.dialog_open = true;
+                ctx.link().change_view(Some(ViewState::ConfirmApply));
+            }
+            Msg::CloseDialog => {
+                self.dialog_open = false;
+                self.dispose_diff();
+                ctx.link().change_view(None);
+            }
+            Msg::Apply => {
+                self.dialog_open = false;
+                self.dispose_diff();
+                ctx.link().change_view(None);
+
+                let doc = ctx.props().doc;
+                let view = self.view.clone();
+                let text = self.current_text().to_string();
+                let digest = self.digest.clone();
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let result = api::put_text(doc, &view, text, &digest).await;
+                    link.send_message(Msg::Applied(result));
+                });
+            }
+            Msg::Applied(Ok(_)) => {
+                self.write_error = None;
+                ctx.link().send_reload();
+            }
+            Msg::Applied(Err(err)) => {
+                // A 409 is not an error the user can act on by reading it — it means the
+                // document moved underneath, so show the notice that offers a reload.
+                self.stale = api::is_conflict(&err);
+                // Everything else is the server's own message, shown verbatim.
+                self.write_error = Some(err.to_string());
+            }
+            Msg::Discard => {
+                self.draft = None;
+                self.write_error = None;
+                // Force `rendered()` to put the loaded text back into the editor.
+                self.generation += 1;
+            }
+            Msg::VersionToken(token) => {
+                if self.version_token.as_deref() == Some(token.as_str()) {
+                    return false;
+                }
+                self.version_token = Some(token);
+                // The store token covers every document, so it only says "something,
+                // somewhere, moved". Ask this one whether it was this document.
+                let doc = ctx.props().doc;
+                let view = self.view.clone();
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    match api::get_text(doc, &view).await {
+                        Ok(document) => link.send_message(Msg::ServerDigest(document.digest)),
+                        Err(err) => log::warn!("pve-meta-ui: digest check failed: {err}"),
+                    }
+                });
+                return false;
+            }
+            Msg::ServerDigest(digest) => {
+                if digest == self.digest {
+                    return false;
+                }
+                // Never throw away unapplied edits: say so and offer the reload instead.
+                if self.draft.is_some() {
+                    self.stale = true;
+                } else {
+                    ctx.link().send_reload();
+                    return false;
+                }
+            }
+            Msg::ThemeChanged(dark) => {
+                self.dark_mode = dark;
+                monaco::set_theme(dark);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn toolbar(&self, ctx: &LoadableComponentContext<Self>) -> Option<Html> {
+        let link = ctx.link();
+        let dirty = self.draft.is_some();
+        let writable = self.writable(ctx);
+
+        let selected = match self.view.is_empty() {
+            true => AttrValue::from(WHOLE_DOCUMENT),
+            false => AttrValue::from(self.view.clone()),
+        };
+
+        let view_as = Combobox::new()
+            .aria_label(tr!("View as"))
+            // Not clearable: an empty value has no meaning here, and `required` is what
+            // suppresses the field's clear trigger (`PWT/src/widget/form/selector.rs`).
+            .required(true)
+            .items(self.views.clone())
+            .value(selected)
+            .render_value(|value: &AttrValue| match value.as_str() {
+                WHOLE_DOCUMENT => html! {{ tr!("Whole document") }},
+                other => html! {{ other }},
+            })
+            .on_change(link.callback(Msg::SelectView));
+
+        Some(
+            Toolbar::new()
+                .class("pwt-w-100")
+                .class("pwt-overflow-hidden")
+                .class("pwt-border-bottom")
+                .with_child(Container::from_tag("span").with_child(tr!("View as") + ":"))
+                .with_child(view_as)
+                .with_spacer()
                 .with_child(
-                    Button::new("Discard")
-                        .onclick(link.callback(|_: MouseEvent| Msg::ConfirmSwitchDiscard)),
-                ),
+                    Button::new(tr!("Apply"))
+                        .disabled(!dirty || !writable)
+                        .on_activate(link.callback(|_| Msg::ShowDiff)),
+                )
+                .with_child(
+                    ConfirmButton::new(tr!("Discard"))
+                        .dangerous(true)
+                        .disabled(!dirty)
+                        .confirm_message(tr!("Discard all unapplied changes?"))
+                        .on_activate(link.callback(|_| Msg::Discard)),
+                )
+                .with_flex_spacer()
+                .with_optional_child((!writable).then(|| {
+                    Container::from_tag("span")
+                        .class("pwt-color-on-neutral-alt")
+                        .with_child(tr!("Read-only"))
+                }))
+                .with_child(Button::refresh(self.loading()).on_activate({
+                    let link = link.clone();
+                    move |_| link.send_reload()
+                }))
+                .into(),
         )
-        .into()
+    }
+
+    fn main_view(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        Column::new()
+            .class(FlexFit)
+            .with_child(self.header(ctx).key("header"))
+            .with_optional_child(
+                self.stale
+                    .then(|| self.stale_banner(ctx).key("stale-banner")),
+            )
+            .with_child(
+                Container::new()
+                    .key("editor")
+                    .class(FlexFit)
+                    .class("pve-meta-monaco-host")
+                    .into_html_with_ref(self.editor_ref.clone()),
+            )
+            .with_optional_child(self.write_error.as_deref().map(|err| {
+                error_message(err)
+                    .key("write-error")
+                    .class("pwt-border-top")
+            }))
+            .into()
+    }
+
+    fn dialog_view(
+        &self,
+        ctx: &LoadableComponentContext<Self>,
+        view_state: &Self::ViewState,
+    ) -> Option<Html> {
+        match view_state {
+            ViewState::ConfirmApply => Some(self.diff_dialog(ctx)),
+        }
+    }
+
+    fn rendered(&mut self, ctx: &LoadableComponentContext<Self>, _first_render: bool) {
+        let read_only = !self.writable(ctx);
+
+        match &self.editor_id {
+            None => {
+                if let Some(el) = self.editor_ref.cast::<Element>() {
+                    let id = monaco::mount(
+                        &el,
+                        &monaco::MountOptions {
+                            value: &self.loaded,
+                            language: "yaml",
+                            read_only,
+                            theme: if self.dark_mode { "dark" } else { "light" },
+                        },
+                    );
+                    let link = ctx.link().clone();
+                    self.on_change = Some(monaco::on_change(&id, move |text| {
+                        link.send_message(Msg::EditorInput(text))
+                    }));
+                    self.mounted_generation = Some(self.generation);
+                    self.editor_id = Some(id);
+                }
+            }
+            Some(id) => {
+                // Never write over the buffer the user is typing in: only a load, a
+                // discard or a view switch bumps the generation.
+                if self.mounted_generation != Some(self.generation) {
+                    monaco::set_value(id, &self.loaded);
+                    self.mounted_generation = Some(self.generation);
+                }
+                monaco::set_read_only(id, read_only);
+            }
+        }
+
+        if self.dialog_open && self.diff_id.is_none() {
+            if let Some(el) = self.diff_ref.cast::<Element>() {
+                self.diff_id = Some(monaco::mount_diff(&el, &self.loaded, self.current_text()));
+            }
+        }
+    }
 }
 
-fn error_banner(text: &str, on_dismiss: Callback<MouseEvent>) -> Html {
-    Row::new()
-        .class("pve-meta-error-banner pwt-color-error pwt-align-items-center")
-        .gap(2)
-        .padding(2)
-        .with_child(html! {<span>{text.to_string()}</span>})
-        .with_flex_spacer()
-        .with_child(Button::new("Dismiss").onclick(on_dismiss))
-        .into()
-}
-
-fn error_panel(text: &str) -> Html {
-    Column::new()
-        .class("pve-meta-error-panel")
-        .padding(4)
-        .with_child(html! {<p class="pwt-color-error">{text.to_string()}</p>})
-        .into()
+impl From<MetaEditor> for VNode {
+    fn from(val: MetaEditor) -> Self {
+        let comp = VComp::new::<LoadableComponentMaster<PveMetaEditor>>(Rc::new(val), None);
+        VNode::from(comp)
+    }
 }

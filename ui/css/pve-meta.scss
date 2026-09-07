@@ -1,190 +1,40 @@
-/* pve-meta UI overrides */
+/* pve-meta editor page.
+ *
+ * The page is composed entirely from pwt widgets and pwt utility classes, so this file
+ * carries only what no pwt token can express — the same role `PDM/css/pdm.scss` plays
+ * for the Datacenter Manager. Two things:
+ *
+ *  1. The font. pwt ships Roboto Flex as a webfont and hard-codes the family name in
+ *     `_theme_post.scss` (after every `@import`, so the `$pwt-font-sans-serif` variable
+ *     cannot be overridden from the outside). PVE's ExtJS chrome next to us uses the
+ *     plain system stack, and at the same pixel size the two differ visibly in colour,
+ *     x-height and metrics — the single most obvious giveaway that the tab is foreign
+ *     (see docs/design/PDM-DESIGN-LANGUAGE.md section 12.3). Redefining the `@font-face`
+ *     rule for that exact family retargets every one of pwt's `font-family` declarations
+ *     at once, including the `!important` ones the `pwt-font-*` classes emit, without
+ *     touching a single selector — and it stops the 2.5 MB webfont download.
+ *
+ *  2. Monaco's host box, which must be allowed to shrink below its content height.
+ */
 
-.pve-meta-source {
-    font-family: monospace;
-    white-space: pre;
+$pve-font-sans-serif: helvetica, arial, verdana, sans-serif;
+
+@font-face {
+    font-family: "Roboto Flex";
+    src:
+        local("Helvetica"),
+        local("Arial"),
+        local("Helvetica Neue"),
+        local("Liberation Sans"),
+        local("DejaVu Sans");
 }
 
-.pve-meta-app {
-    height: 100%;
+:root {
+    font-family: $pve-font-sans-serif;
 }
 
-.pve-meta-header {
-    flex: none;
-}
-
-.pve-meta-current-label {
-    opacity: 0.85;
-    font-size: 0.9em;
-}
-
-.pve-meta-content {
-    flex: 1 1 auto;
+/* Monaco does not grow from content and its host must be able to shrink inside the
+   flex chain, the same trick `COMP/src/markdown_editor.rs` uses for its textarea. */
+.pve-meta-monaco-host {
     min-height: 0;
-    overflow: hidden;
-}
-
-.pve-meta-guest-list {
-    flex: none;
-    width: 240px;
-    overflow-y: auto;
-    border-right: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-guest-row {
-    cursor: pointer;
-    border-bottom: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-guest-row:hover {
-    background-color: var(--pwt-color-surface-container);
-}
-
-.pve-meta-guest-row-selected {
-    background-color: var(--pwt-color-surface-tint);
-    color: var(--pwt-color-on-primary);
-}
-
-.pve-meta-guest-marker {
-    width: 0.8em;
-    display: inline-block;
-    color: transparent;
-}
-
-.pve-meta-guest-marker-active {
-    color: var(--pwt-color-success, green);
-}
-
-.pve-meta-guest-meta {
-    opacity: 0.7;
-    font-size: 0.9em;
-}
-
-.pve-meta-placeholder,
-.pve-meta-loading,
-.pve-meta-error-panel {
-    padding: 2em;
-}
-
-.pve-meta-editor {
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
-}
-
-.pve-meta-toolbar {
-    flex: none;
-    border-bottom: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-form-root {
-    flex: 1 1 auto;
-}
-
-.pve-meta-namespace-panel {
-    border: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-panel-title {
-    cursor: pointer;
-    user-select: none;
-}
-
-.pve-meta-owner-label {
-    font-size: 0.85em;
-}
-
-.pve-meta-namespace-body {
-    border-top: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-section {
-    border-left: 2px solid var(--pwt-color-border);
-    padding-left: 0.75em;
-}
-
-.pve-meta-section-title {
-    cursor: pointer;
-    user-select: none;
-    font-weight: 500;
-}
-
-.pve-meta-section-body {
-    padding-left: 0.5em;
-}
-
-.pve-meta-value-row {
-    border-bottom: 1px solid var(--pwt-color-border);
-}
-
-.pve-meta-row-label {
-    min-width: 12em;
-    flex: none;
-}
-
-.pve-meta-row-widget {
-    flex: 1 1 auto;
-    min-width: 12em;
-}
-
-.pve-meta-required {
-    color: var(--pwt-color-error, crimson);
-}
-
-.pve-meta-comment-text {
-    font-style: italic;
-    font-size: 0.9em;
-}
-
-.pve-meta-comment-field {
-    max-width: 16em;
-}
-
-.pve-meta-readonly-array pre {
-    max-height: 12em;
-    overflow: auto;
-    background-color: var(--pwt-color-surface-container);
-    padding: 0.5em;
-}
-
-.pve-meta-pending-bar {
-    flex: none;
-    border-top: 1px solid var(--pwt-color-border);
-    background-color: var(--pwt-color-surface-container);
-}
-
-.pve-meta-error-banner {
-    flex: none;
-}
-
-.pve-meta-source-view {
-    flex: 1 1 auto;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-}
-
-.pve-meta-source-view .pve-meta-source {
-    flex: 1 1 auto;
-    min-height: 20em;
-    width: 100%;
-}
-
-.pve-meta-diff {
-    max-height: 24em;
-    overflow: auto;
-}
-
-.pve-meta-touched-list {
-    max-height: 12em;
-    overflow: auto;
-}
-
-.pve-meta-dialog-message {
-    max-width: 32em;
-}
-
-.pve-meta-not-logged-in {
-    max-width: 32em;
-    margin: 2em auto;
 }

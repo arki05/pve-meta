@@ -1,192 +1,136 @@
-//! Typed wrappers over the `PVE::API2::Meta` HTTP API (`docs/API.md`,
-//! `docs/NATIVE-API-SPEC.md`), served natively by pveproxy/pvedaemon at
-//! `/api2/json/meta/...` on the same origin as the PVE web UI.
+//! Typed wrappers over the native metadata API (`docs/DESIGN.md` §3), served by
+//! pveproxy/pvedaemon at `/api2/json/meta/...` on the same origin as the PVE web UI.
 //!
-//! This module talks to `fetch` directly (via `gloo-net`) rather than going through
-//! `proxmox_yew_comp::http_get/http_put/http_post`, for two reasons specific to the
-//! native module:
-//!
-//! * PVE request parameters are form/JSON parameters where **object-valued parameters
-//!   are JSON-encoded strings** — the `patch` parameter of the patch endpoint is a JSON
-//!   string, not a nested JSON object — which `http_put`'s plain `serde_json::to_value`
-//!   body encoding doesn't do.
-//! * Error classification (409/400/404) must be based on the actual HTTP status code.
-//!   `proxmox_yew_comp`'s `http_*` helpers funnel every response through
-//!   `proxmox_client`'s `RawApiResponse`, which derives the status from an (optional,
-//!   defaulting to 400) `status` field *inside the JSON body* — not the transport-level
-//!   status pveproxy actually replies with (`{"data": null, "message": "...", "errors":
-//!   {...}}`, per `docs/NATIVE-API-SPEC.md`). Reading `Response::status()` directly
-//!   avoids that mismatch.
+//! This module talks to `fetch` (via `gloo-net`) rather than going through
+//! `proxmox_yew_comp::http_get`/`http_put`, because error classification (409 digest
+//! conflict, 403 out-of-scope write) must follow the actual HTTP status code.
+//! `proxmox_yew_comp`'s helpers funnel every response through `proxmox_client`'s
+//! `RawApiResponse`, which derives the status from an optional `status` field *inside*
+//! the JSON body — not the transport-level status pveproxy replies with.
 //!
 //! The CSRF token is read fresh on every mutating call via
 //! `proxmox_yew_comp::http_get_auth()`, so it stays correct across `crate::auth`'s
-//! bootstrap and `proxmox_yew_comp`'s own background ticket-refresh loop.
+//! bootstrap and `proxmox_yew_comp`'s own background ticket refresh.
 
-use std::collections::HashMap;
 use std::fmt;
 
-use anyhow::{anyhow, Error};
-use serde::de::DeserializeOwned;
+use anyhow::{Error, anyhow};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
 
 use proxmox_yew_comp::{http_get_auth, json_object_to_query};
 
-use crate::model::{DocId, Document};
+use crate::model::{Access, DocId};
 
-/// One entry of `GET /meta/inventory`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct InventoryEntry {
+/// One entry of `GET /meta/guests`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GuestEntry {
     pub vmid: u32,
+    #[serde(default)]
     pub node: String,
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub guest_type: String,
     #[serde(default)]
     pub name: Option<String>,
-    // PVE's `type => 'boolean'` schema fields are commonly rendered as a plain 0/1
-    // integer on the wire, not a JSON `true`/`false` (observed live against
-    // `PVE::API2::Meta`) — `proxmox_serde::perl::deserialize_bool` accepts either.
-    #[serde(default, deserialize_with = "proxmox_serde::perl::deserialize_bool")]
-    pub has_meta: bool,
     #[serde(default)]
-    pub format: Option<String>,
-}
-
-/// One claim of an operator in the registry.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Claim {
-    pub prefix: String,
-    pub scope: String,
-}
-
-/// One entry of `GET /meta/registry`.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct Operator {
-    pub name: String,
+    pub digest: String,
     #[serde(default)]
-    pub claims: Vec<Claim>,
+    pub keys: Vec<String>,
+}
+
+/// A document view rendered as text (`format=yaml`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct DocText {
     #[serde(default)]
-    pub schemas: HashMap<String, Value>,
+    pub digest: String,
     #[serde(default)]
-    pub description: Option<String>,
+    pub text: String,
 }
 
-impl Operator {
-    /// The claim covering `namespace` (an exact top-level-key match), if any.
-    pub fn claim_for<'a>(&'a self, namespace: &str) -> Option<&'a Claim> {
-        self.claims.iter().find(|c| c.prefix == namespace)
-    }
+/// A document view as data (`format=json`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct DocData {
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub data: Value,
 }
 
-/// Find the first operator claiming `namespace`, and the scope of that claim.
-pub fn find_owner<'a>(registry: &'a [Operator], namespace: &str) -> Option<(&'a Operator, &'a str)> {
-    registry
-        .iter()
-        .find_map(|op| op.claim_for(namespace).map(|c| (op, c.scope.as_str())))
+/// The result of a write.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct WriteResult {
+    #[serde(default)]
+    pub digest: String,
+    /// The paths the write touched. Kept opaque on purpose: `docs/DESIGN.md` §3 spells
+    /// this as a list of paths while the API module answers `{op, path}` objects, and
+    /// the page displays neither — it reloads instead.
+    #[serde(default)]
+    pub touched: Vec<Value>,
 }
 
-/// `GET /meta/version` response.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+/// `GET /meta/version` — a content hash over the store, to be polled.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct VersionInfo {
-    pub token: String,
     #[serde(default)]
-    pub changed: i64,
+    pub token: String,
 }
 
-pub async fn inventory() -> Result<Vec<InventoryEntry>, Error> {
-    get_json("/meta/inventory", None).await
+/// The caller's effective grants (`GET /meta/access`).
+pub async fn access() -> Result<Access, Error> {
+    get_json("/meta/access", None).await
 }
 
-pub async fn registry() -> Result<Vec<Operator>, Error> {
-    get_json("/meta/registry", None).await
+/// Every guest in the vmlist, with the top-level keys visible to the caller.
+pub async fn guests() -> Result<Vec<GuestEntry>, Error> {
+    get_json("/meta/guests", None).await
 }
 
-/// The JSON schemas applicable to a guest document, keyed by namespace prefix. There is
-/// no equivalent endpoint for the datacenter document.
-pub async fn schemas(vmid: u32) -> Result<HashMap<String, Value>, Error> {
-    get_json(&format!("/meta/schemas/{vmid}"), None).await
-}
-
-/// Fetch a document. `comments` keeps `key__`/`__` comment keys in `data`; `raw` also
-/// fetches the file text.
-pub async fn get(id: DocId, comments: bool, raw: bool) -> Result<Document, Error> {
-    let mut params = Map::new();
-    if comments {
-        params.insert("comments".into(), json!(1));
+/// A view of a document as YAML text. An empty `view` is the whole document.
+pub async fn get_text(doc: DocId, view: &str) -> Result<DocText, Error> {
+    let mut query = Map::new();
+    query.insert("format".into(), json!("yaml"));
+    if !view.is_empty() {
+        query.insert("view".into(), json!(view));
     }
-    if raw {
-        params.insert("raw".into(), json!(1));
-    }
-    let query = if params.is_empty() {
-        None
-    } else {
-        Some(Value::Object(params))
-    };
-    get_json(&id.api_path(), query).await
+    get_json(&doc.api_path(), Some(Value::Object(query))).await
 }
 
-/// Apply a merge patch. `digest` pins optimistic concurrency (a `409` means the
-/// document changed on the server since it was loaded); `dry_run` validates and returns
-/// the would-be result without writing.
-pub async fn patch(
-    id: DocId,
-    patch: Value,
-    digest: Option<&str>,
-    dry_run: bool,
-) -> Result<Document, Error> {
+/// The whole document as data — the "View as" selector needs its top-level keys.
+pub async fn get_data(doc: DocId) -> Result<DocData, Error> {
+    get_json(&doc.api_path(), Some(json!({ "format": "json" }))).await
+}
+
+/// Replace `view` of `doc` with `text`. `digest` pins optimistic concurrency: a 409
+/// means the document changed on the server since it was loaded.
+pub async fn put_text(
+    doc: DocId,
+    view: &str,
+    text: String,
+    digest: &str,
+) -> Result<WriteResult, Error> {
     let mut body = Map::new();
-    // Object-valued PVE parameters are JSON-encoded strings, not nested JSON.
-    body.insert("patch".into(), json!(serde_json::to_string(&patch)?));
-    if let Some(d) = digest {
-        body.insert("digest".into(), json!(d));
+    // No `format` here: the write endpoint infers it from which payload parameter is
+    // sent — `text` is YAML, `data` is JSON — and rejects a `format` key outright.
+    body.insert("mode".into(), json!("replace"));
+    body.insert("text".into(), json!(text));
+    if !view.is_empty() {
+        body.insert("view".into(), json!(view));
     }
-    if dry_run {
-        body.insert("dry_run".into(), json!(1));
+    // An empty digest means "no document yet" and must not be sent as an expected one.
+    if !digest.is_empty() {
+        body.insert("digest".into(), json!(digest));
     }
-    send_json("PUT", &id.api_path(), Value::Object(body)).await
+    send_json("PUT", &doc.api_path(), Value::Object(body)).await
 }
 
-/// Full text replace (`PUT .../raw`). `format` switches the file extension/format.
-pub async fn put_raw(
-    id: DocId,
-    content: String,
-    format: Option<&str>,
-    digest: Option<&str>,
-    dry_run: bool,
-) -> Result<Document, Error> {
-    let mut body = Map::new();
-    body.insert("content".into(), json!(content));
-    if let Some(f) = format {
-        body.insert("format".into(), json!(f));
-    }
-    if let Some(d) = digest {
-        body.insert("digest".into(), json!(d));
-    }
-    if dry_run {
-        body.insert("dry_run".into(), json!(1));
-    }
-    send_json("PUT", &format!("{}/raw", id.api_path()), Value::Object(body)).await
-}
-
-/// Re-dump the document in a new format (`POST .../convert`).
-pub async fn convert(id: DocId, format: &str, digest: Option<&str>) -> Result<Document, Error> {
-    let mut body = Map::new();
-    body.insert("format".into(), json!(format));
-    if let Some(d) = digest {
-        body.insert("digest".into(), json!(d));
-    }
-    send_json("POST", &format!("{}/convert", id.api_path()), Value::Object(body)).await
-}
-
-/// `GET /meta/version`. No long-poll on the native module (`docs/NATIVE-API-SPEC.md`):
-/// it answers immediately, `wait`/`since` are accepted but ignored — poll this on an
-/// interval instead (`crate::app` does so every 5s).
+/// `GET /meta/version`. The native module answers immediately (no long poll), so this is
+/// polled on an interval.
 pub async fn version() -> Result<VersionInfo, Error> {
     get_json("/meta/version", None).await
 }
 
-/// An API error carrying the actual HTTP status code (not a body-embedded one — see
-/// this module's doc comment).
+/// An API error carrying the actual HTTP status code (not a body-embedded one).
 #[derive(Debug)]
 pub struct ApiError {
     pub status: u16,
@@ -195,58 +139,28 @@ pub struct ApiError {
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (HTTP {})", self.message, self.status)
+        // The server message verbatim — `docs/DESIGN.md` §6 asks for exactly that.
+        f.write_str(&self.message)
     }
 }
 
 impl std::error::Error for ApiError {}
 
-/// True if `err` is an HTTP 409 (digest conflict: the document changed on the server).
+/// True if `err` is an HTTP 409: the document changed on the server since it was loaded.
 pub fn is_conflict(err: &Error) -> bool {
     status_of(err) == Some(409)
-}
-
-/// True if `err` is an HTTP 400 (lint/parse error from the daemon).
-pub fn is_bad_request(err: &Error) -> bool {
-    status_of(err) == Some(400)
-}
-
-/// True if `err` is an HTTP 404 (no document yet for this guest/datacenter — writing
-/// one creates it, per `docs/API.md`).
-pub fn is_not_found(err: &Error) -> bool {
-    status_of(err) == Some(404)
 }
 
 fn status_of(err: &Error) -> Option<u16> {
     err.downcast_ref::<ApiError>().map(|e| e.status)
 }
 
-/// A user-facing message for any error from an API call.
-pub fn error_text(err: &Error) -> String {
-    match err.downcast_ref::<ApiError>() {
-        Some(e) => e.to_string(),
-        None => err.to_string(),
-    }
-}
-
-/// `Some(digest)` unless it's empty (an empty digest means "no document yet" —
-/// see [`crate::model::Document::empty`] — and must not be sent as an expected digest).
-pub fn digest_opt(digest: &str) -> Option<&str> {
-    if digest.is_empty() {
-        None
-    } else {
-        Some(digest)
-    }
-}
-
-/// The `{"data": ..., "message": "...", "errors": {...}}` envelope every PVE API
-/// response (success or failure) is wrapped in.
+/// The `{"data": ..., "message": "..."}` envelope every PVE API response is wrapped in.
 #[derive(Deserialize)]
 struct Envelope<T> {
-    // Note: no `#[serde(default)]` here — that would make serde-derive require
-    // `T: Default` for the whole struct (it doesn't see through `Option<T>`'s own
-    // blanket `Default` impl). PVE's envelope always includes `"data"`, `null` on
-    // failure, which plain `Option<T>` already deserializes as `None` on its own.
+    // No `#[serde(default)]`: that would make serde-derive require `T: Default` for the
+    // whole struct. PVE's envelope always includes `"data"`, `null` on failure, which
+    // plain `Option<T>` already deserializes as `None`.
     data: Option<T>,
     #[serde(default)]
     message: Option<String>,

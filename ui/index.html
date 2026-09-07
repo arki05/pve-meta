@@ -8,7 +8,15 @@
          `sed` fix-up (see Trunk.toml) that only a build-stage hook, not trunk's own
          asset-hashing pipeline, can reliably apply before promotion. -->
     <link rel="stylesheet" href="font-awesome.css"/>
-    <link data-trunk href="pwt-assets/assets/fonts" rel="copy-dir"/>
+    <!-- Only the font-awesome face is copied: pwt's Roboto Flex is retargeted at the
+         system stack in css/pve-meta.scss, so its 2.5 MB of webfonts is dead weight. -->
+    <link data-trunk href="pwt-assets/assets/fonts/fontawesome-webfont.woff2" rel="copy-file" data-target-path="fonts"/>
+    <!-- Monaco ships in the package, never from a CDN. `npm install` puts it in
+         node_modules; trunk copies the minified AMD tree to dist/vs, where the glue's
+         own loader picks it up. -->
+    <link data-trunk href="node_modules/monaco-editor/min/vs" rel="copy-dir" data-target-path="vs"/>
+    <link data-trunk href="js/pve-meta-monaco.js" rel="copy-file" data-target-path="js"/>
+    <script src="js/pve-meta-monaco.js"></script>
     <style>
       @media (prefers-color-scheme: dark ) { body { background: #333; } }
       @media (prefers-color-scheme: light) { body { background: #fff; } }

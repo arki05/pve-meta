@@ -16,39 +16,33 @@ path = "src/lib.rs"
 name = "pve-meta-ui"
 path = "src/main.rs"
 
-# Dependencies needed by the pure, natively-testable modules (model/patch/schema) as well
+# Dependencies needed by the pure, natively-testable module (model) as well
 # as the wasm binary. Keep this list free of anything that only compiles for wasm32 so
 # that `cargo test --lib` works unmodified on the Mac.
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-similar = "2"
 
 # Everything below only compiles for wasm32 (Yew/pwt/proxmox-yew-comp all assume a
 # browser). Declaring them as target-specific dependencies means `cargo test --lib` on
 # the Mac never needs to fetch or build them at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-futures = "0.3"
 gloo-net = "0.4"
-gloo-timers = "0.3"
+gloo-timers = { version = "0.3", features = ["futures"] }
 js-sys = "0.3"
 log = "0.4"
 percent-encoding = "2"
-proxmox-serde = "1"
 url = "2"
 wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
 wasm-logger = "0.2"
-web-sys = { version = "0.3", features = ["Location", "Window", "Document", "HtmlTextAreaElement"] }
+web-sys = { version = "0.3", features = ["Element", "Location", "Window", "Document"] }
 yew = { version = "0.21", features = ["csr"] }
 
 pwt = "0.8"
 pwt-macros = "0.5"
 proxmox-yew-comp = { version = "0.8" }
-proxmox-client = "1"
 proxmox-login = "1"
-proxmox-schema = "5"
 
 # Proxmox crates are not published on crates.io; pull them from git.proxmox.com at
 # pinned revisions (the same ones vendored for research on 2026-09-07).

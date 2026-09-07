@@ -58,7 +58,7 @@ PVE conventions (form/JSON parameters; nested values are JSON-encoded strings).
 |---|---|---|---|
 | GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller] }]` — every guest in the vmlist, `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ vmid, view, digest, data }` or `{ vmid, view, digest, text }` |
-| PUT | `/meta/guests/{vmid}` | `view` (optional), `format`, `data` (JSON string) or `text` (YAML), `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [path...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
+| PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
 | GET | `/meta/access` | — | the caller's effective grants: `{ full: [vmids or "*"], scopes: [{prefix, mode}] }` (what the UI's "view as" offers) |

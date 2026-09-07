@@ -20,7 +20,7 @@ use js_sys::{Object, Reflect};
 use wasm_bindgen::JsValue;
 
 use proxmox_login::{Authentication, Login, TicketResult};
-use proxmox_yew_comp::{get_cookie, store_csrf_token, ExistingProduct, ProjectInfo};
+use proxmox_yew_comp::{ExistingProduct, ProjectInfo, get_cookie, store_csrf_token};
 
 /// Resolve a usable [`Authentication`] for the current session, or `None` if there's no
 /// usable ticket cookie at all (not logged in to PVE on this host).
@@ -151,7 +151,9 @@ async fn renew_ticket(ticket: proxmox_login::Ticket) -> Option<Authentication> {
 fn remember_csrf_token(token: &str) {
     store_csrf_token(token);
 
-    let Some(window) = web_sys::window() else { return };
+    let Some(window) = web_sys::window() else {
+        return;
+    };
     let proxmox = get_or_create_object(&window, "Proxmox");
     let _ = Reflect::set(
         &proxmox,

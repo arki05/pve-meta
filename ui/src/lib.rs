@@ -1,13 +1,11 @@
 //! pve-meta editor UI.
 //!
-//! `model`, `patch` and `schema` are pure (no `web-sys`/`wasm-bindgen`) and unit-tested
-//! natively (`cargo test --lib`). Everything else only compiles for `wasm32` (it pulls
-//! in Yew/pwt/proxmox-yew-comp, which assume a browser) and is gated accordingly so a
+//! `model` is pure (no `web-sys`/`wasm-bindgen`) and unit-tested natively
+//! (`cargo test --lib`). Everything else only compiles for `wasm32` — it pulls in
+//! Yew/pwt/proxmox-yew-comp, which assume a browser — and is gated accordingly, so a
 //! native `cargo test --lib` never needs to fetch or build those crates.
 
 pub mod model;
-pub mod patch;
-pub mod schema;
 
 #[cfg(target_arch = "wasm32")]
 pub mod api;
@@ -18,8 +16,6 @@ pub mod auth;
 #[cfg(target_arch = "wasm32")]
 pub mod editor;
 #[cfg(target_arch = "wasm32")]
-pub mod form;
+pub mod monaco;
 #[cfg(target_arch = "wasm32")]
-pub mod guests;
-#[cfg(target_arch = "wasm32")]
-pub mod source;
+pub mod theme;

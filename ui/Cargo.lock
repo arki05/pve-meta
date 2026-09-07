@@ -1685,25 +1685,19 @@ name = "pve-meta-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "futures",
  "gloo-net 0.4.0",
  "gloo-timers 0.3.0",
  "js-sys",
  "log",
  "percent-encoding",
- "proxmox-client",
  "proxmox-login",
- "proxmox-schema",
- "proxmox-serde",
  "proxmox-yew-comp",
  "pwt",
  "pwt-macros",
  "serde",
  "serde_json",
- "similar",
  "url",
  "wasm-bindgen",
- "wasm-bindgen-futures",
  "wasm-logger",
  "web-sys",
  "yew",
@@ -1993,12 +1987,6 @@ dependencies = [
  "ryu",
  "serde",
 ]
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"
