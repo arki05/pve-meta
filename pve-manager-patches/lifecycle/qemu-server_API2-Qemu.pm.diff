@@ -1,0 +1,41 @@
+--- a/PVE/API2/Qemu.pm
++++ b/PVE/API2/Qemu.pm
+@@ -56,6 +56,7 @@
+ use PVE::INotify;
+ use PVE::Network;
+ use PVE::Firewall;
++use PVE::RS::Meta;
+ use PVE::API2::Firewall::VM;
+ use PVE::API2::Qemu::Agent;
+ use PVE::API2::Qemu::HMPPerms;
+@@ -2871,6 +2872,10 @@
+ 
+                     PVE::AccessControl::remove_vm_access($vmid);
+                     PVE::Firewall::remove_vmfw_conf($vmid);
++
++                    eval { PVE::RS::Meta::on_destroy($vmid) };
++                    warn "pve-meta: on_destroy($vmid) failed: $@" if $@;
++
+                     if ($param->{purge}) {
+                         print "purging VM $vmid from related configurations..\n";
+                         PVE::ReplicationConfig::remove_vmid_jobs($vmid);
+@@ -4616,6 +4621,9 @@
+ 
+             PVE::Firewall::clone_vmfw_conf($vmid, $newid);
+ 
++            eval { PVE::RS::Meta::on_clone($vmid, $newid) };
++            warn "pve-meta: on_clone($vmid, $newid) failed: $@" if $@;
++
+             my $newvollist = [];
+             my $jobs = {};
+ 
+@@ -4722,6 +4730,9 @@
+ 
+                 PVE::Firewall::remove_vmfw_conf($newid);
+ 
++                eval { PVE::RS::Meta::on_destroy($newid) };
++                warn "pve-meta: on_destroy($newid) failed: $@" if $@;
++
+                 unlink $conffile; # avoid races -> last thing before die
+ 
+                 die "clone failed: $err";

@@ -1,0 +1,64 @@
+--- a/PVE/QemuServer.pm
++++ b/PVE/QemuServer.pm
+@@ -42,6 +42,7 @@
+ use PVE::PBSClient;
+ use PVE::RESTEnvironment qw(log_warn);
+ use PVE::RPCEnvironment;
++use PVE::RS::Meta;
+ use PVE::SafeSyslog;
+ use PVE::Storage;
+ use PVE::SysFSTools;
+@@ -7028,6 +7029,8 @@
+         }
+         my $has_firewall_config =
+             scalar(grep { $_->{filename} eq 'fw.conf.blob' } @{ $index->{files} });
++        my $has_meta_config =
++            scalar(grep { $_->{filename} eq 'meta.conf.blob' } @{ $index->{files} });
+ 
+         $param = [$pbs_backup_name, "qemu-server.conf", $cfgfn];
+         PVE::Storage::PBSPlugin::run_raw_client_cmd($scfg, $storeid, $cmd, $param);
+@@ -7041,6 +7044,16 @@
+             PVE::Tools::file_copy($firewall_config_fn, "${pve_firewall_dir}/$vmid.fw");
+         }
+ 
++        if ($has_meta_config) {
++            my $meta_config_fn = "$tmpdir/meta.conf";
++            $param = [$pbs_backup_name, "meta.conf", $meta_config_fn];
++            PVE::Storage::PBSPlugin::run_raw_client_cmd($scfg, $storeid, $cmd, $param);
++
++            my $meta_raw = PVE::Tools::file_get_contents($meta_config_fn);
++            eval { PVE::RS::Meta::import_from_backup($vmid, $meta_raw) };
++            warn "pve-meta: import_from_backup($vmid) failed: $@" if $@;
++        }
++
+         my $fh = IO::File->new($cfgfn, "r")
+             || die "unable to read qemu-server.conf - $!\n";
+ 
+@@ -7219,6 +7232,13 @@
+             PVE::Tools::file_copy($firewall_config_fn, "${pve_firewall_dir}/$vmid.fw");
+         }
+ 
++        # optional: only providers that implement this method can supply pve-meta data
++        if ($backup_provider->can('archive_get_meta_config')
++            && ($data = $backup_provider->archive_get_meta_config($volname))) {
++            eval { PVE::RS::Meta::import_from_backup($vmid, $data) };
++            warn "pve-meta: import_from_backup($vmid) failed: $@" if $@;
++        }
++
+         my $fh = IO::File->new($cfgfn, "r") or die "unable to read qemu-server.conf - $!\n";
+ 
+         $virtdev_hash =
+@@ -7628,6 +7648,13 @@
+             PVE::Tools::file_copy($fwcfgfn, "${pve_firewall_dir}/$vmid.fw");
+         }
+ 
++        my $metacfgfn = "$tmpdir/qemu-server.meta";
++        if (-f $metacfgfn) {
++            my $meta_raw = PVE::Tools::file_get_contents($metacfgfn);
++            eval { PVE::RS::Meta::import_from_backup($vmid, $meta_raw) };
++            warn "pve-meta: import_from_backup($vmid) failed: $@" if $@;
++        }
++
+         $virtdev_hash = $parse_backup_hints->($rpcenv, $user, $cfg, $fh, $devinfo, $opts);
+ 
+         foreach my $info (values %{$virtdev_hash}) {
