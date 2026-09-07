@@ -43,7 +43,10 @@ pub struct InventoryEntry {
     pub guest_type: String,
     #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
+    // PVE's `type => 'boolean'` schema fields are commonly rendered as a plain 0/1
+    // integer on the wire, not a JSON `true`/`false` (observed live against
+    // `PVE::API2::Meta`) — `proxmox_serde::perl::deserialize_bool` accepts either.
+    #[serde(default, deserialize_with = "proxmox_serde::perl::deserialize_bool")]
     pub has_meta: bool,
     #[serde(default)]
     pub format: Option<String>,

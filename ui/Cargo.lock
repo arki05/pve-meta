@@ -1694,6 +1694,7 @@ dependencies = [
  "proxmox-client",
  "proxmox-login",
  "proxmox-schema",
+ "proxmox-serde",
  "proxmox-yew-comp",
  "pwt",
  "pwt-macros",

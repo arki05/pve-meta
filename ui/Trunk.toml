@@ -4,12 +4,40 @@ release = true
 # `ui` Makefile target installs `dist/` to /usr/share/pve-manager/js/pve-meta-ui/.
 public_url = "/pve2/js/pve-meta-ui/"
 
+# pwt-assets' CSS assumes a `css/<file>.css` + sibling `fonts/` layout: font urls
+# inside it are `../fonts/...`, relative to the CSS file. We flatten everything into
+# one `dist/` directory instead (every CSS file and `fonts/` as direct siblings), so
+# `../fonts/...` would resolve one level *above* dist (404/500 in the browser) rather
+# than to `dist/fonts/`. Fix it up with `sed` right after each file is produced, in the
+# same hook invocation that produces it — trunk runs same-stage hooks concurrently and
+# promotes `dist/.stage/*` into `dist/` only *after* all "build" stage hooks finish (a
+# `post_build` hook runs before that promotion, so it can't see the final files either)
+# — so a hook can only reliably operate on a file it just wrote itself into `.stage`.
 [[hooks]]
 stage = "build"
-command = "grass"
-command_arguments = ["css/desktop-yew-style.scss", "dist/.stage/desktop-yew-style.css"]
+command = "sh"
+command_arguments = [
+  "-c",
+  "grass css/desktop-yew-style.scss dist/.stage/desktop-yew-style.css && sed -i 's#\\.\\./fonts/#fonts/#g' dist/.stage/desktop-yew-style.css",
+]
 
 [[hooks]]
 stage = "build"
-command = "grass"
-command_arguments = ["css/crisp-yew-style.scss", "dist/.stage/crisp-yew-style.css"]
+command = "sh"
+command_arguments = [
+  "-c",
+  "grass css/crisp-yew-style.scss dist/.stage/crisp-yew-style.css && sed -i 's#\\.\\./fonts/#fonts/#g' dist/.stage/crisp-yew-style.css",
+]
+
+# font-awesome.css has the same `../fonts/...` problem, but it's a vendored, unchanged
+# file (not compiled by us) that index.html used to pull in via a `data-trunk
+# rel="css"` link, which trunk hashes/promotes on its own schedule we can't hook into.
+# Copy it ourselves (fixed filename, referenced by a plain non-`data-trunk` `<link>` in
+# index.html) instead, so it goes through the same "write to .stage, then sed" path.
+[[hooks]]
+stage = "build"
+command = "sh"
+command_arguments = [
+  "-c",
+  "cp pwt-assets/assets/font-awesome.css dist/.stage/font-awesome.css && sed -i 's#\\.\\./fonts/#fonts/#g' dist/.stage/font-awesome.css",
+]

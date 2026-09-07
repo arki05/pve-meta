@@ -34,6 +34,15 @@ fn main() {
     http_setup(&ExistingProduct::PVE);
     pwt::state::set_available_themes(&["Desktop", "Crisp"]);
 
+    // `DesktopApp` wraps its body in a `CatalogLoader`, which — even for the default
+    // ("en", no catalog fetched) language — calls `pwt::state::get_language_info`
+    // once loading "finishes"; that panics ("cannot access available languages
+    // before they've been set") unless `set_available_languages` was called first.
+    // We don't otherwise use i18n (no `.catalog_url_builder` is set, so only English
+    // is ever loaded), but pwt still needs the list to exist. Same call PDM's
+    // `ui/src/main.rs` makes before rendering.
+    pwt::state::set_available_languages(proxmox_yew_comp::available_language_list());
+
     yew::Renderer::<pve_meta_ui::app::App>::new().render();
 }
 

@@ -4,7 +4,10 @@
     <meta http-equiv="Content-type" content="text/html; charset=utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>pve-meta</title>
-    <link data-trunk href="pwt-assets/assets/font-awesome.css" rel="css"/>
+    <!-- Not a `data-trunk rel="css"` link: font-awesome.css's own font urls need a
+         `sed` fix-up (see Trunk.toml) that only a build-stage hook, not trunk's own
+         asset-hashing pipeline, can reliably apply before promotion. -->
+    <link rel="stylesheet" href="font-awesome.css"/>
     <link data-trunk href="pwt-assets/assets/fonts" rel="copy-dir"/>
     <style>
       @media (prefers-color-scheme: dark ) { body { background: #333; } }
