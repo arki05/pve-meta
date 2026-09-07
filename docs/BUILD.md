@@ -34,12 +34,23 @@ to skip the build-dependency check:
 # one-time, if missing:
 sudo apt install dpkg-dev debhelper
 
-make deb   # == dpkg-buildpackage -b -us -uc -d
+make deb   # builds pve-ext (make -C pve-ext deb) and this source's own two
+           # binaries (dpkg-buildpackage -b -us -uc -d), and collects every
+           # artifact in the parent directory
 ```
 
-This produces two binary packages, `../pve-meta_<version>_<arch>.deb` and
-`../libpve-meta-rs-perl_<version>_<arch>.deb` (dpkg-buildpackage places the artifacts in the
-parent directory). Install both with `dpkg -i ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb`.
+This produces three binary packages: `../pve-ext_<version>_all.deb`,
+`../pve-meta_<version>_<arch>.deb` and `../libpve-meta-rs-perl_<version>_<arch>.deb`
+(plus a `libpve-meta-rs-perl-dbgsym` package; dpkg-buildpackage places artifacts in the
+parent directory, and the root `deb` target moves pve-ext's own output there too, since
+a plain `dpkg-buildpackage` run from `pve-ext/` would otherwise drop them one level
+short, in this repo's own top directory). `pve-meta` depends on `pve-ext`, so install (or
+upgrade) it first — apt resolves the order for you either way:
+
+```sh
+apt install ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb
+# or: dpkg -i ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb && apt-get -f install
+```
 
 `libpve-meta-rs-perl` ships `activate-noawait pve-api-updates`
 (`debian/libpve-meta-rs-perl.triggers`, same as upstream `libpve-rs-perl`), so `pve-manager`

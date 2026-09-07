@@ -31,10 +31,13 @@ build:
 
 # Builds the wasm editor UI with trunk. Falls back to a minimal static placeholder if `trunk`
 # is not installed, so packaging/install/the API-only smoke test still work without the full
-# wasm toolchain (the UI itself is specified separately in docs/UI-SPEC.md).
+# wasm toolchain (the UI itself is specified in docs/DESIGN.md section 6).
+#
+# `npm install` fetches Monaco, which trunk copies into dist/vs -- the editor is shipped in
+# the package, never loaded from a CDN (see ui/README.md).
 ui:
 	@if command -v trunk >/dev/null 2>&1; then \
-		cd $(UI_DIR) && trunk build --release; \
+		cd $(UI_DIR) && npm install && trunk build --release; \
 	else \
 		echo "warning: trunk not found, shipping a placeholder UI (see docs/UI-SPEC.md)" >&2; \
 		mkdir -p $(UI_DIST); \
@@ -54,9 +57,8 @@ ui:
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
 #
 # Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module (if
-# it's been generated yet -- see docs/NATIVE-API-SPEC.md, written alongside this by
-# another part of the project), the wasm editor UI (served by pveproxy), and the
-# pve-ext page/patch manifests.
+# it's been generated yet -- see docs/DESIGN.md section 3), the wasm editor UI
+# (served by pveproxy), and the pve-ext page/patch manifests.
 install:
 	if [ -f perl/PVE/API2/Ext/Meta.pm ]; then \
 		install -D -m 0644 perl/PVE/API2/Ext/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext/Meta.pm; \
@@ -73,7 +75,16 @@ install:
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
 
+# `make deb` builds every package this repo ships, in one call:
+#   - pve-ext:                    its own source package, built via `make -C pve-ext deb`.
+#     dpkg-buildpackage places pve-ext's artifacts in the parent of `pve-ext/`, i.e. this
+#     directory -- move them up one more level so they land next to pve-meta's own output
+#     (dpkg-buildpackage always drops artifacts in the parent of the source root it's
+#     invoked from).
+#   - pve-meta, libpve-meta-rs-perl: this source package's two binaries (see debian/control).
 deb:
+	$(MAKE) -C pve-ext deb
+	for f in pve-ext_*.deb pve-ext_*.buildinfo pve-ext_*.changes; do [ -e "$$f" ] && mv -f "$$f" ..; done
 	dpkg-buildpackage -b -us -uc -d
 
 check:

@@ -10,16 +10,16 @@ Homepage: https://github.com/arki05/pve-meta
 Package: pve-meta
 Architecture: any
 Depends: pve-manager (>= 9.0),
-         pve-ext,
+         pve-ext (>= 0.1.0),
          libpve-meta-rs-perl (= ${binary:Version}),
          ${shlibs:Depends}, ${misc:Depends}
 Description: Structured, versioned metadata store for Proxmox VE
  pve-meta adds a structured (YAML/TOML/JSON) metadata document per guest and
  for the datacenter, stored under /etc/pve/meta and replicated by pmxcfs like
  any other cluster file. The API is served natively by pveproxy/pvedaemon
- (PVE::API2::Ext::Meta, discovered by pve-ext, see docs/NATIVE-API-SPEC.md)
- under /api2/json/meta/...; this package also ships the wasm editor UI (as
- a pve-ext page manifest) and the guest-lifecycle integration patches (as a
+ (PVE::API2::Ext::Meta, discovered by pve-ext, see docs/DESIGN.md) under
+ /api2/json/meta/...; this package also ships the wasm editor UI (as a
+ pve-ext page manifest) and the guest-lifecycle integration patches (as a
  pve-ext managed-patch manifest).
 
 Package: libpve-meta-rs-perl
