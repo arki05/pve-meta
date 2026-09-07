@@ -48,10 +48,32 @@ Proxmox/Lib/PVEMeta.pm $(PERLMOD_PACKAGE_FILES) &: genpackage.pl
 check: all
 	$(MAKE) -C test test
 
+# NOTE (important, do not "simplify" the .so install back into a plain copy):
+# `libpve_meta_rs.so` is `mmap`ed by every running pveproxy/pvedaemon process
+# (`DynaLoader::dl_load_file` from `Proxmox/Lib/PVEMeta.pm`). Its text pages are
+# file-backed and MAP_PRIVATE but never written to, so they are *never* copied on
+# write: rewriting the bytes of that same inode swaps the code out from under
+# every process that has it open. Those daemons never call back into the library
+# once they are up, so nothing goes wrong until they exit -- at which point
+# glibc's `__run_exit_handlers` has ld.so's `_dl_fini` call the library's
+# `DT_FINI_ARRAY` destructor, the one and only piece of our code that runs at
+# shutdown, and it executes bytes belonging to a different build. That is the
+# `pveproxy worker[...]: segfault ... in libpve_meta_rs.so` / `pvedaemon.service:
+# Main process exited, code=killed, status=11/SEGV` crash: purely a deployment
+# artefact of writing through the installed file, reproducible on demand with a
+# plain `cp new.so /usr/lib/.../auto/libpve_meta_rs.so` on a live node.
+#
+# The destination must therefore always be *replaced* (a new inode), never
+# written through. `install`(1) unlinks the destination first and `dpkg` unpacks
+# to `.dpkg-new` and renames, so both are already safe; installing via a
+# temporary file plus `mv` (rename(2)) makes that guarantee explicit and holds
+# even for a non-GNU `install`. Any ad-hoc deploy onto a live node
+# (`cp`/`scp`/`rsync --inplace`/`cat >`) must do the same -- see docs/BUILD.md.
 .PHONY: install
 install: ../../target/release/libpve_meta_rs.so Proxmox/Lib/PVEMeta.pm $(PERLMOD_PACKAGE_FILES)
 	install -d -m755 $(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto
-	install -m644 ../../target/release/libpve_meta_rs.so $(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto/libpve_meta_rs.so
+	install -m644 ../../target/release/libpve_meta_rs.so $(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto/libpve_meta_rs.so.new
+	mv -f $(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto/libpve_meta_rs.so.new $(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto/libpve_meta_rs.so
 	install -d -m755 $(DESTDIR)$(PERL_INSTALLVENDORLIB)
 	install -d -m755 $(DESTDIR)$(PERL_INSTALLVENDORLIB)/Proxmox/Lib
 	install -m644 Proxmox/Lib/PVEMeta.pm $(DESTDIR)$(PERL_INSTALLVENDORLIB)/Proxmox/Lib/PVEMeta.pm

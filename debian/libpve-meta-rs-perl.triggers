@@ -1,0 +1,14 @@
+# Mirrors upstream `libpve-rs-perl` (proxmox-perl-rs/pve-rs/debian/triggers),
+# which is the package this one is modelled on.
+#
+# `pve-manager` declares `interest-noawait pve-api-updates` and, in its
+# `triggered` case, `reload-or-try-restart`s pvedaemon/pveproxy/pvestatd/
+# spiceproxy/pvescheduler. Those daemons `mmap` libpve_meta_rs.so at startup
+# (Proxmox/Lib/PVEMeta.pm -> DynaLoader) and never re-read it, so without this
+# trigger an upgrade of *only* this package leaves every running daemon on the
+# replaced (now unlinked) inode: the new PVE::RS::Meta code does not take
+# effect until the next manual restart, and the old library stays pinned in
+# memory. `pve-meta`'s own file triggers do not cover it -- this package's
+# only file under a path pve-manager watches is PVE/RS/Meta.pm, which rarely
+# changes, whereas the .so changes on every build.
+activate-noawait pve-api-updates

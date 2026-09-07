@@ -40,3 +40,43 @@ make deb   # == dpkg-buildpackage -b -us -uc -d
 This produces two binary packages, `../pve-meta_<version>_<arch>.deb` and
 `../libpve-meta-rs-perl_<version>_<arch>.deb` (dpkg-buildpackage places the artifacts in the
 parent directory). Install both with `dpkg -i ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb`.
+
+`libpve-meta-rs-perl` ships `activate-noawait pve-api-updates`
+(`debian/libpve-meta-rs-perl.triggers`, same as upstream `libpve-rs-perl`), so `pve-manager`
+restarts pvedaemon/pveproxy after the `.so` changes and the daemons actually pick the new
+library up.
+
+## Installing onto a live node
+
+**Never write through the installed `libpve_meta_rs.so`.** Every running pveproxy/pvedaemon
+has that file `mmap`ed (`Proxmox/Lib/PVEMeta.pm` → `DynaLoader::dl_load_file`), and its text
+pages are file-backed and never copied on write, so rewriting the bytes of that inode replaces
+the code inside every running daemon. Nothing calls into the library after startup, so the
+daemons keep working — until they exit, when ld.so's `_dl_fini` runs the library's
+`DT_FINI_ARRAY` destructor (the only code of ours that runs at shutdown) out of a different
+build and the process dies:
+
+```
+pveproxy worker[21973]: segfault at bf ip ... error 6 in libpve_meta_rs.so[...]
+pvedaemon.service: Main process exited, code=killed, status=11/SEGV
+```
+
+`dpkg -i` (unpacks to `.dpkg-new`, then renames) and `make install` (installs to a temporary
+name and `mv`s it into place) are both safe. A hand-rolled deploy is only safe if it replaces
+the destination inode too:
+
+```sh
+# safe: new inode, running daemons keep the old one until they exit
+scp libpve_meta_rs.so node1:/tmp/
+ssh node1 'mv -f /tmp/libpve_meta_rs.so \
+    /usr/lib/x86_64-linux-gnu/perl5/5.40/auto/libpve_meta_rs.so && \
+    systemctl restart pvedaemon pveproxy'
+
+# UNSAFE: writes through the existing inode -> SIGSEGV in every daemon at exit
+scp libpve_meta_rs.so node1:/usr/lib/x86_64-linux-gnu/perl5/5.40/auto/
+cp libpve_meta_rs.so /usr/lib/x86_64-linux-gnu/perl5/5.40/auto/
+rsync --inplace ...
+```
+
+`rsync` without `--inplace` and GNU `install`(1) (which unlinks the destination first) are
+also safe.

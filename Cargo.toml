@@ -15,6 +15,17 @@ default-members = [
 ]
 exclude = ["ui"]
 
+# Keep debug info in release builds, like upstream `pve-rs` does (it sets the
+# same thing in `proxmox-perl-rs/pve-rs/.cargo/config.toml`). `libpve_meta_rs.so`
+# is loaded into pveproxy/pvedaemon, so when one of them dies the only way to
+# read the core dump is to have symbols for our .so -- without this,
+# `coredumpctl gdb` shows nothing but `?? ()` for every frame inside it.
+# `dh_strip` still strips the shipped .so and moves the symbols into an
+# automatic `libpve-meta-rs-perl-dbgsym` package, so this does not bloat the
+# installed package; it only makes `target/release/libpve_meta_rs.so` larger.
+[profile.release]
+debug = true
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
