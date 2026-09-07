@@ -1,34 +1,40 @@
 //! `pve-meta-core`: the pure-Rust, platform-independent document model,
-//! formats, patch engine and file store shared by the `pve-meta` daemon, CLI
-//! and Perl bindings.
+//! formats, patch engine and file store behind `pve-meta`.
+//!
+//! Its only consumer is `crates/pve-meta-perl` (`PVE::RS::Meta`), which
+//! exposes the guest lifecycle hooks and the `api_*` functions backing
+//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §3). There is no daemon and
+//! no CLI.
 //!
 //! No networking, no async, no PVE-specific crates. Builds and passes tests
 //! on macOS and Linux.
 //!
 //! # Module map
 //!
+//! - [`api`] — the request-shaped API layer (view reads/writes, write
+//!   authorization, `touched` reporting) that `PVE::RS::Meta`'s `api_*`
+//!   functions export to `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §3).
 //! - [`model`] — the [`model::Value`] alias (an order-preserving
 //!   `serde_json::Value`), document [`model::lint`] rules, comment-key
 //!   handling (`foo__`), and path lookup.
 //! - [`path`] — [`path::Path`], dotted/slash addressing into a document.
 //! - [`patch`] — merge-patch semantics (RFC 7386) with explicit delete:
-//!   [`patch::apply_patch`], [`patch::diff`], [`patch::make_patch`].
-//! - [`format`] — [`format::Format`] (YAML/TOML/JSON) and canonical
-//!   [`format::parse`]/[`format::dump`].
-//! - [`edit`] — [`edit::apply_patch_text`], applying a patch to a document's
-//!   *text*; format-preserving for TOML.
+//!   [`patch::apply_patch`], [`patch::diff`], [`patch::lint_patch`].
+//! - [`crate::format`] — [`format::Format`] (YAML on disk, JSON as a wire format
+//!   only) and canonical [`format::parse`]/[`format::dump`].
 //! - [`digest`] — [`digest::digest`], the SHA-256 content digest used
 //!   throughout the store.
 //! - [`store`] — [`store::MetaStore`], the atomic on-disk file store: guest
-//!   and datacenter documents, snapshots, and cheap version polling.
+//!   and datacenter documents, snapshot copies, and content-hashed version
+//!   polling.
 //! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
-//!   operations (`docs/DESIGN.md` §1), plus [`view::render`]/[`view::parse`]
-//!   for a view's wire text.
+//!   operations (`docs/DESIGN.md` §1), plus [`view::render`]/[`view::parse`]/
+//!   [`view::parse_patch`] for a view's wire text.
 //! - [`scopes`] — [`scopes::Grants`] (a principal's effective access) and
-//!   [`scopes::parse_scopes`] (the datacenter document's `scopes` map),
-//!   implementing `docs/DESIGN.md` §2.
-//! - [`vmlist`] — parsing pmxcfs's own `/etc/pve/.vmlist`.
+//!   [`scopes::parse_scopes`]/[`scopes::scopes_for`] (the datacenter
+//!   document's `scopes` map, validated strictly on write and read
+//!   leniently), implementing `docs/DESIGN.md` §2.
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
 //!   alias) returned throughout this crate.
 //!
@@ -39,11 +45,11 @@
 //! use pve_meta_core::model;
 //!
 //! let doc = format::parse(Format::Yaml, "name: web01\ntags: [prod, web]\n").unwrap();
-//! assert_eq!(model::namespaces(&doc), vec!["name".to_string(), "tags".to_string()]);
+//! assert_eq!(model::top_level_keys(&doc), vec!["name".to_string(), "tags".to_string()]);
 //! ```
 
+pub mod api;
 pub mod digest;
-pub mod edit;
 pub mod error;
 pub mod format;
 pub mod model;
@@ -52,7 +58,6 @@ pub mod path;
 pub mod scopes;
 pub mod store;
 pub mod view;
-pub mod vmlist;
 
 pub use error::{Error, Result};
 pub use model::Value;

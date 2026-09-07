@@ -17,15 +17,18 @@ use base qw(PVE::RESTHandler);
 
 # `PVE::API2::Ext::Meta`: the native `/meta/...` API tree (`docs/DESIGN.md`
 # §3), a thin `PVE::RESTHandler` subclass whose methods call straight into
-# `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`). This module
-# does parameters, PVE ACL checks and `scopes` lookup ("grants"); everything
-# else -- view extraction, prefix stripping, merge/replace, touched-path
-# computation, YAML/JSON rendering and digesting -- happens in Rust.
+# `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`, implemented in
+# `pve_meta_core::api`). This module does parameters, PVE ACL checks, the
+# `scopes` lookup ("grants"), the vmlist and the per-document write lock;
+# everything else -- view extraction, prefix stripping, merge/replace,
+# write authorization, touched-path computation, YAML/JSON rendering and
+# digesting -- happens in Rust.
 #
 # No `proxyto`: the store lives under `/etc/pve/meta`, so it is cluster-wide
 # and any node can answer. Read methods are `protected => 0` (run in
 # pveproxy, which can read `/etc/pve/meta/*` as `www-data`); write methods
-# are `protected => 1` (run in pvedaemon, as root).
+# are `protected => 1` (run in pvedaemon, as root) and run inside
+# `PVE::Cluster::cfs_lock_domain` (see `_locked`).
 #
 # Loaded by `PVE::API2::Ext` (see `pve-ext/perl/PVE/API2/Ext.pm`), which
 # scans `/usr/share/perl5/PVE/API2/Ext/*.pm` and mounts each one at the path
@@ -58,6 +61,10 @@ sub _grants_json {
 # `PVE::RS::Meta::api_grants` (itself a JSON string -- see that function's
 # doc comment). The same list applies to every guest document
 # (`docs/DESIGN.md` §2).
+#
+# The lookup is lenient (`docs/DESIGN.md` §8): a malformed entry belonging to
+# a *different* principal is skipped with a warning on the Rust side, so one
+# admin typo can never take the whole guest API down for everybody.
 sub _scopes_for {
     my ($authuser) = @_;
     return decode_json(_call(\&PVE::RS::Meta::api_grants, $authuser));
@@ -76,9 +83,10 @@ sub _guest_grants_json {
 # and *no* scopes -- scopes apply "on every guest document"
 # (`docs/DESIGN.md` §2), not to the datacenter document itself. This is
 # also what makes "only Sys.Modify may edit scopes" (§2) hold automatically:
-# with no scope fallback, `Grants::check_write` requires `full_write` (i.e.
-# real `Sys.Modify`) for *every* touched path of a datacenter write,
-# `scopes` included.
+# with no scope fallback, the Rust side requires `full_write` (i.e. real
+# `Sys.Modify`) for the view *and* every touched path of a datacenter write,
+# `scopes` included. It is also why a caller without `Sys.Audit` gets a 403
+# from a datacenter GET rather than an empty document (§8).
 sub _datacenter_grants_json {
     my ($rpcenv, $authuser) = @_;
     my $full_read = $rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
@@ -89,8 +97,8 @@ sub _datacenter_grants_json {
 # -- helpers ------------------------------------------------------------
 
 # Calls a `PVE::RS::Meta::api_*` function, catching its "NNN: message" die
-# (the Rust->Perl error contract, `crates/pve-meta-perl/src/api.rs`) and
-# re-raising through `PVE::Exception` so clients get the right HTTP status.
+# (the Rust->Perl error contract, `pve_meta_core::api`) and re-raising
+# through `PVE::Exception` so clients get the right HTTP status.
 # Anything else (a die that isn't "NNN: ...", i.e. a genuine unexpected
 # failure) is re-thrown as-is.
 sub _call {
@@ -108,12 +116,62 @@ sub _call {
     return $res;
 }
 
+# Runs $code under the cluster-wide lock for one document
+# (`docs/DESIGN.md` §8): every API write is a read-modify-write of a file on
+# pmxcfs, which is shared by every node, and the writes are deliberately not
+# `proxyto`'d -- so without this two nodes can both read, both write, and
+# silently lose one update (observed live; review F12). The digest
+# precondition is re-checked *inside* the critical section, because the whole
+# Rust call happens in here and `cfs_lock_domain` runs `cfs_update()` before
+# invoking $code.
+#
+# `cfs_lock_domain` reports through `$@` rather than dying: a PVE::Exception
+# from our own code is re-raised verbatim (that is how the Rust layer's
+# 400/403/404/409 statuses survive), while a failure of the locking itself
+# becomes a clean 503.
+sub _locked {
+    my ($id, $code) = @_;
+
+    my $res = PVE::Cluster::cfs_lock_domain("pve-meta-$id", 10, $code);
+    if (my $err = $@) {
+        die $err if ref($err); # a PVE::Exception raised by _call
+        my $msg = "$err";
+        $msg =~ s/\s+$//;
+        raise("$msg\n", code => 503) if $msg =~ /^cfs-lock / || $msg =~ /no quorum/;
+        die "$msg\n";
+    }
+    return $res;
+}
+
+# The current vmlist, keyed by vmid.
+sub _vmlist_ids {
+    my $vmlist = PVE::Cluster::get_vmlist() || {};
+    return $vmlist->{ids} || {};
+}
+
+# `docs/DESIGN.md` §8: the API never creates documents for guests that do not
+# exist. Without this, "every guest document" is really "every u32": any
+# caller with one rw scope could create unbounded files under `/etc/pve/meta`
+# (replicated cluster-wide by pmxcfs, which has a hard size budget), invisible
+# to `GET /meta/guests`, and a guest later created at that vmid would silently
+# inherit the metadata (review F20).
+sub _assert_guest_exists {
+    my ($vmid) = @_;
+    return if _vmlist_ids()->{$vmid};
+    raise("guest '$vmid' does not exist\n", code => 404);
+}
+
 # Decodes an `api_get`/`api_put`/`api_delete` result's `data_json` (present
 # when `format=json`) into a real `data` key, in place; `text`
 # (`format=yaml`) needs no decoding. `JSON::PP`-backed `decode_json` (via
 # `use JSON;`) produces `JSON::PP::Boolean` objects for JSON `true`/`false`,
 # so a document's own booleans round-trip correctly when pveproxy
 # re-encodes the response.
+#
+# `data` is an *unordered* object once it is a Perl hash (`docs/DESIGN.md`
+# §8): Perl randomises hash order, so the document's own key order cannot
+# survive this. Clients that need the order read `keys` (an ordered array
+# the Rust side returns alongside) or ask for `format=yaml`.
 sub _inflate_view {
     my ($doc) = @_;
     if (defined(my $data_json = delete $doc->{data_json})) {
@@ -163,7 +221,8 @@ my $MODE_SCHEMA = {
     optional => 1,
     default => 'replace',
     description =>
-        "'replace' (default) replaces the view's subtree with the payload wholesale; "
+        "'replace' (default) replaces the view's subtree with the payload wholesale "
+        . "(an empty object stores an empty map; use DELETE to remove a view); "
         . "'merge' applies it as an RFC 7386-style merge patch relative to the view "
         . "(a JSON 'null' deletes a key).",
 };
@@ -180,14 +239,32 @@ my $TEXT_SCHEMA = {
     description => "The new view content, as YAML text. Exactly one of 'data'/'text' is required.",
 };
 
+my $SCOPES_RETURNS = {
+    type => 'array',
+    description => "The caller's datacenter-configured prefix scopes (docs/DESIGN.md §2).",
+    items => {
+        type => 'object',
+        properties => {
+            prefix => { type => 'string', description => "The key-path prefix the scope covers." },
+            mode => { type => 'string', enum => ['ro', 'rw'], description => "What it grants." },
+        },
+    },
+};
+
 my $VIEW_RETURNS = {
     type => 'object',
     properties => {
         id => { type => 'string' },
         view => { type => 'string' },
         digest => { type => 'string' },
-        data => { type => 'object', optional => 1, description => "Present when format=json." },
-        text => { type => 'string', optional => 1, description => "Present when format=yaml." },
+        keys => {
+            type => 'array',
+            items => { type => 'string' },
+            description => "The visible value's top-level keys, in document order. "
+                . "'data' is an unordered object; this is the order-preserving view of it.",
+        },
+        data => { type => 'object', optional => 1, description => "Present when format=json (unordered)." },
+        text => { type => 'string', optional => 1, description => "Present when format=yaml (ordered)." },
     },
 };
 
@@ -275,7 +352,13 @@ __PACKAGE__->register_method({
         additionalProperties => 0,
         properties => {},
     },
-    returns => { type => 'object', additionalProperties => 1 },
+    returns => {
+        type => 'object',
+        properties => {
+            token => { type => 'string', description => "Changes whenever any document's content changes." },
+            changed => { type => 'integer', description => "Newest document mtime, as a unix timestamp." },
+        },
+    },
     code => sub {
         return _call(\&PVE::RS::Meta::api_version);
     },
@@ -286,41 +369,57 @@ __PACKAGE__->register_method({
     path => 'access',
     method => 'GET',
     permissions => { user => 'all' },
-    description => "The caller's effective grants: 'full' is '*' (unrestricted, via "
-        . "Sys.Audit on /) or the list of vmids the caller has VM.Audit on; 'scopes' "
-        . "is their datacenter-configured prefix scopes (docs/DESIGN.md §2). Used by "
-        . "the editor UI's 'view as' selector.",
+    description => "The caller's effective grants for one document (docs/DESIGN.md §8): "
+        . "'read'/'write' are the ACL answers for that document (VM.Audit / "
+        . "VM.Config.Options with 'vmid'; Sys.Audit / Sys.Modify with 'dc'), and "
+        . "'scopes' lists the caller's datacenter-configured prefix scopes, which "
+        . "apply to every guest document but never to the datacenter document. "
+        . "With neither parameter, 'read'/'write' describe the datacenter document. "
+        . "Used by the editor UI to decide what to offer and whether to enable Apply.",
     parameters => {
         additionalProperties => 0,
-        properties => {},
+        properties => {
+            vmid => get_standard_option('pve-vmid', { optional => 1 }),
+            dc => {
+                type => 'boolean',
+                optional => 1,
+                description => "Ask about the datacenter document instead of a guest.",
+            },
+        },
     },
     returns => {
         type => 'object',
         properties => {
-            full => { description => "'*', or an array of vmids." },
-            scopes => { type => 'array' },
+            read => { type => 'boolean', description => "May read the whole document (ACL)." },
+            write => { type => 'boolean', description => "May write the whole document (ACL)." },
+            scopes => $SCOPES_RETURNS,
         },
     },
     code => sub {
+        my ($param) = @_;
+
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        my $scopes = _scopes_for($authuser);
+        raise_param_exc({ vmid => "'vmid' and 'dc' are mutually exclusive" })
+            if defined($param->{vmid}) && $param->{dc};
 
-        my $full;
-        if ($rpcenv->check($authuser, '/', ['Sys.Audit'], 1)) {
-            $full = '*';
-        } else {
-            my $vmlist = PVE::Cluster::get_vmlist() || {};
-            my $idlist = $vmlist->{ids} || {};
-            $full = [
-                sort { $a <=> $b }
-                grep { $rpcenv->check($authuser, "/vms/$_", ['VM.Audit'], 1) }
-                keys %$idlist
-            ];
+        if (defined(my $vmid = $param->{vmid})) {
+            _assert_guest_exists($vmid);
+            return {
+                read => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1) ? 1 : 0,
+                write => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options'], 1) ? 1 : 0,
+                scopes => _scopes_for($authuser),
+            };
         }
 
-        return { full => $full, scopes => $scopes };
+        # The datacenter document: scopes never apply to it, so an empty list
+        # is the honest answer rather than the caller's guest scopes.
+        my $dc = {
+            read => $rpcenv->check($authuser, '/', ['Sys.Audit'], 1) ? 1 : 0,
+            write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
+        };
+        return { %$dc, scopes => $param->{dc} ? [] : _scopes_for($authuser) };
     },
 });
 
@@ -333,7 +432,8 @@ __PACKAGE__->register_method({
     permissions => {
         description => "Anybody may call this; the list is filtered to guests the "
             . "caller can read anything of (full VM.Audit, or any datacenter-configured "
-            . "scope, which applies to every guest).",
+            . "scope, which applies to every guest). 'node' and 'name' are returned "
+            . "only for guests the caller has VM.Audit on.",
         user => 'all',
     },
     description => "Lists every guest in the vmlist the caller can read anything of.",
@@ -359,17 +459,31 @@ __PACKAGE__->register_method({
         my $authuser = $rpcenv->get_user();
         my $scopes = _scopes_for($authuser);
 
-        my $vmlist = PVE::Cluster::get_vmlist() || {};
-        my $idlist = $vmlist->{ids} || {};
+        my $idlist = _vmlist_ids();
 
-        my @entries;
-        for my $vmid (sort keys %$idlist) {
+        # One vmlist read, one display-name lookup, both here: Rust never
+        # opens `/etc/pve/.vmlist` or a guest config, so the two can no
+        # longer disagree and guest-config parsing is not re-implemented in
+        # a second language (review §5, api.rs:304). `hostname` is the LXC
+        # name field, `name` the qemu one.
+        my $names = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname)]) } || {};
+        warn "pve-meta: could not read guest names: $@" if $@;
+
+        my $guests = [];
+        for my $vmid (sort { $a <=> $b } keys %$idlist) {
+            my $info = $idlist->{$vmid};
+            my $props = $names->{$vmid} // {};
             my $full_read = $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1);
-            push @entries, qq("$vmid":) . _grants_json($full_read, 0, $scopes);
+            push @$guests, {
+                vmid => int($vmid),
+                node => $info->{node},
+                type => $info->{type},
+                name => $props->{name} // $props->{hostname},
+                grants => _grants_json($full_read, 0, $scopes),
+            };
         }
-        my $grants_map_json = '{' . join(',', @entries) . '}';
 
-        return _call(\&PVE::RS::Meta::api_list_guests, $grants_map_json, $param->{has});
+        return _call(\&PVE::RS::Meta::api_list_guests, encode_json($guests), $param->{has});
     },
 });
 
@@ -378,9 +492,9 @@ __PACKAGE__->register_method({
     path => 'guests/{vmid}',
     method => 'GET',
     permissions => {
-        description => "Anybody may call this; the response is filtered to what the "
-            . "caller may read (full VM.Audit, or a datacenter-configured scope). A "
-            . "'view' outside the caller's read access is refused with 403.",
+        description => "The response is filtered to what the caller may read (full "
+            . "VM.Audit, or a datacenter-configured scope). A caller with neither is "
+            . "refused with 403, as is a 'view' outside the caller's read access.",
         user => 'all',
     },
     description => "Gets a guest's metadata document (or a view/prefix of it).",
@@ -413,10 +527,11 @@ __PACKAGE__->register_method({
     method => 'PUT',
     protected => 1,
     permissions => {
-        description => "Anybody may call this; every touched path must be writable "
-            . "per the caller's grants (full VM.Config.Options, or a "
-            . "datacenter-configured rw scope) -- refused with 403 naming the first "
-            . "path that is not.",
+        description => "Anybody may call this; the caller must be able to write the "
+            . "named view (full VM.Config.Options, or a datacenter-configured rw "
+            . "scope covering it) and every path the write touches -- otherwise 403. "
+            . "Writing the whole document (no 'view') requires VM.Config.Options. "
+            . "Unknown vmids are 404, not created.",
         user => 'all',
     },
     description => "Writes a guest's metadata document (or a view/prefix of it).",
@@ -445,9 +560,12 @@ __PACKAGE__->register_method({
         my $authuser = $rpcenv->get_user();
         my $vmid = $param->{vmid};
 
-        my $grants_json =
-            _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
-        return $put_view->("$vmid", $param, $grants_json);
+        return _locked($vmid, sub {
+            _assert_guest_exists($vmid);
+            my $grants_json =
+                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
+            return $put_view->("$vmid", $param, $grants_json);
+        });
     },
 });
 
@@ -457,8 +575,9 @@ __PACKAGE__->register_method({
     method => 'DELETE',
     protected => 1,
     permissions => {
-        description => "Anybody may call this; every touched path must be writable "
-            . "per the caller's grants, same as PUT.",
+        description => "Anybody may call this; same write rules as PUT. Removes only "
+            . "the current document -- snapshot copies belong to the guest lifecycle "
+            . "and are never touched from here.",
         user => 'all',
     },
     description => "Removes a guest's document, or the subtree at 'view'.",
@@ -478,9 +597,12 @@ __PACKAGE__->register_method({
         my $authuser = $rpcenv->get_user();
         my $vmid = $param->{vmid};
 
-        my $grants_json =
-            _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
-        return $delete_view->("$vmid", $param, $grants_json);
+        return _locked($vmid, sub {
+            _assert_guest_exists($vmid);
+            my $grants_json =
+                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
+            return $delete_view->("$vmid", $param, $grants_json);
+        });
     },
 });
 
@@ -492,7 +614,7 @@ __PACKAGE__->register_method({
     method => 'GET',
     permissions => {
         description => "Requires Sys.Audit on / (docs/DESIGN.md §2 -- scopes do not "
-            . "apply to the datacenter document).",
+            . "apply to the datacenter document); anyone else is refused with 403.",
         user => 'all',
     },
     description => "Gets the datacenter metadata document (or a view/prefix of it).",
@@ -522,8 +644,9 @@ __PACKAGE__->register_method({
     method => 'PUT',
     protected => 1,
     permissions => {
-        description => "Requires Sys.Modify on / for every touched path, 'scopes' "
-            . "included (docs/DESIGN.md §2).",
+        description => "Requires Sys.Modify on / for the view and every touched path, "
+            . "'scopes' included (docs/DESIGN.md §2). A write that touches 'scopes' is "
+            . "additionally validated and refused with 400 naming a malformed entry.",
         user => 'all',
     },
     description => "Writes the datacenter metadata document (or a view/prefix of it).",
@@ -550,8 +673,10 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        my $grants_json = _datacenter_grants_json($rpcenv, $authuser);
-        return $put_view->('datacenter', $param, $grants_json);
+        return _locked('datacenter', sub {
+            my $grants_json = _datacenter_grants_json($rpcenv, $authuser);
+            return $put_view->('datacenter', $param, $grants_json);
+        });
     },
 });
 
@@ -561,7 +686,8 @@ __PACKAGE__->register_method({
     method => 'DELETE',
     protected => 1,
     permissions => {
-        description => "Requires Sys.Modify on / for every touched path, same as PUT.",
+        description => "Requires Sys.Modify on / for the view and every touched path, "
+            . "same as PUT.",
         user => 'all',
     },
     description => "Removes the datacenter document, or the subtree at 'view'.",
@@ -579,8 +705,10 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        my $grants_json = _datacenter_grants_json($rpcenv, $authuser);
-        return $delete_view->('datacenter', $param, $grants_json);
+        return _locked('datacenter', sub {
+            my $grants_json = _datacenter_grants_json($rpcenv, $authuser);
+            return $delete_view->('datacenter', $param, $grants_json);
+        });
     },
 });
 

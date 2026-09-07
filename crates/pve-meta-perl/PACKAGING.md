@@ -2,11 +2,11 @@
 
 This crate (`crates/pve-meta-perl`, Cargo package `pve-meta-rs`) ships as a **second
 Debian binary package**, `libpve-meta-rs-perl`, built from the same `pve-meta` source
-package as the main `pve-meta` binary. The root `Makefile` and `debian/control` already
-exist (owned by the coordinator/another agent), so this file documents exactly what was
-added there and what is still outstanding, rather than duplicating full file contents.
+package as the main `pve-meta` binary. The root `Makefile`, `debian/control` and
+`debian/rules` are owned elsewhere in the tree, so this file records what this crate
+needs from them rather than duplicating their contents.
 
-## What was already applied (minimal, additive edits)
+## What is wired up
 
 * **`debian/control`**:
   * Added `libperl-dev` to the source stanza's `Build-Depends` (needed by perlmod's
@@ -29,8 +29,9 @@ added there and what is still outstanding, rather than duplicating full file con
   * `build:` now also runs `$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release`
     (builds `PVE/RS/Meta.pm` + `Proxmox/Lib/PVEMeta.pm` via `genpackage.pl` and
     `cargo build --release -p pve-meta-rs`).
-  * `install:` now also runs `$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(DESTDIR)`,
-    which installs:
+* **`crates/pve-meta-perl`'s own `install:` target** (invoked by `debian/rules` with its
+  own `DESTDIR`, see below -- *not* from the root `Makefile`'s `install:`, which builds
+  only the `pve-meta` package's tree) installs:
     * `$(DESTDIR)$(PERL_INSTALLVENDORARCH)/auto/libpve_meta_rs.so`
     * `$(DESTDIR)$(PERL_INSTALLVENDORLIB)/PVE/RS/Meta.pm`
     * `$(DESTDIR)$(PERL_INSTALLVENDORLIB)/Proxmox/Lib/PVEMeta.pm`
@@ -38,9 +39,10 @@ added there and what is still outstanding, rather than duplicating full file con
     (`PERL_INSTALLVENDORARCH`/`PERL_INSTALLVENDORLIB` come from `perl -MConfig`, e.g.
     `/usr/lib/x86_64-linux-gnu/perl5/5.40/auto` and `/usr/share/perl5` on Debian 13.)
 
-## What is still outstanding (needs a coordinator decision)
+## Two binary packages from one source: how the split is done
 
-`debian/rules` currently builds a **single** binary package:
+`debian/rules` implements **option 1**, a per-package install override, and says so by
+name:
 
 ```make
 override_dh_auto_build:
@@ -48,41 +50,20 @@ override_dh_auto_build:
 
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-meta PREFIX=/usr
+	$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(CURDIR)/debian/libpve-meta-rs-perl
 ```
 
-With the `install:` edit above, this puts the perl-binding files inside
-`debian/pve-meta/...` too -- i.e. **still one package** on disk, even though
-`debian/control` now declares two. To actually split them into
-`debian/pve-meta/` vs. `debian/libpve-meta-rs-perl/`, pick one:
+The root `Makefile`'s own `install:` target deliberately does **not** invoke this crate's
+`install:`, so the perl-binding files land in `debian/libpve-meta-rs-perl/` only and never
+in the `pve-meta` package's tree as well. `override_dh_auto_build` runs `make build`,
+whose first line is `$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release`, so the cdylib and
+the generated `.pm` files exist before `dh_auto_install` runs.
 
-1. **Per-package install override** (smallest diff): keep `override_dh_auto_install`
-   installing the main package as-is, and add a second install call for the perl
-   binding with its own `DESTDIR`:
-
-   ```make
-   override_dh_auto_install:
-   	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-meta PREFIX=/usr
-   	$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(CURDIR)/debian/libpve-meta-rs-perl
-   ```
-
-   and then remove the `$(MAKE) -C crates/pve-meta-perl install ...` line from the root
-   Makefile's own `install:` target (added above) so it isn't installed into
-   `debian/pve-meta` *as well* -- or leave both and add `debian/pve-meta.install`
-   (see option 2) to explicitly exclude the perl-binding paths from the `pve-meta`
-   package's file list. Option 1 alone (without a `.install` file) is simplest and
-   sufficient as long as `debian/pve-meta`'s `install:` invocation no longer also
-   installs the perl bits into the same tree.
-
-2. **`debian/tmp` + per-package `.install` files** (more idiomatic dh, bigger diff):
-   change `override_dh_auto_install` to install everything once into
-   `$(CURDIR)/debian/tmp`, then add `debian/pve-meta.install` and
-   `debian/libpve-meta-rs-perl.install` files listing which paths under
-   `debian/tmp` go to which package. Standard debhelper multi-binary pattern, but
-   touches the main package's install path too.
-
-Either approach also needs `override_dh_auto_build` to actually build this crate
-before `dh_auto_install` runs (already covered if the root Makefile's `build:` target
-change above is kept, since `dh_auto_build` calls `$(MAKE) build ui`).
+The alternative that was *not* taken, recorded for whoever revisits this: install
+everything once into `$(CURDIR)/debian/tmp` and add `debian/pve-meta.install` /
+`debian/libpve-meta-rs-perl.install` files listing which paths go to which package. That
+is the more idiomatic debhelper multi-binary pattern, but it is a bigger diff and touches
+the main package's install path too.
 
 `override_dh_auto_test` in `debian/rules` explicitly skips Rust tests during the
 packaging build already (pre-existing comment: no guaranteed network access with
@@ -112,8 +93,7 @@ perlmod = { git = "https://git.proxmox.com/git/perlmod.git", rev = "d85d4ebdd13c
 
 If `libpve-meta-rs-perl` is ever built the "Debian way" (via `dh-cargo`/debcargo,
 `librust-*-dev` packages), this git dependency would need to become a path/vendored
-dependency instead -- not done here since the rest of this workspace's crates (see
-`crates/pve-meta-cli/Cargo.toml`, `crates/pve-meta-core/Cargo.toml`) are also built via
-a plain rustup + `cargo build`, not `dh-cargo`, and `debian/control`'s existing
-`Build-Depends` (just `debhelper-compat (= 13)`) confirms that's the project's chosen
+dependency instead -- not done here since the workspace's other crate
+(`crates/pve-meta-core/Cargo.toml`) is also built via a plain rustup + `cargo build`, not
+`dh-cargo`, and `debian/control`'s `Build-Depends` confirms that's the project's chosen
 build model.

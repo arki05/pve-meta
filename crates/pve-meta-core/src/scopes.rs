@@ -67,17 +67,56 @@ pub struct Grants {
     pub scopes: Vec<Scope>,
 }
 
+/// `true` if the scope prefix `prefix` covers `path`.
+///
+/// Beyond plain prefix containment, a scope on `p` also covers the sibling
+/// **comment key** `p__` — the human note *about* `p` (`docs/DESIGN.md` §1,
+/// §8: "comment keys follow their subject"). Without this a scoped principal
+/// could read the note through an unscoped read (where
+/// [`crate::view::filter`] brings comment keys along with their subject) but
+/// never write it, and no request could ever address it.
+///
+/// The aliasing is deliberately confined to the *final* segment at the
+/// scope's own depth: `p__` is a leaf string, so nothing can live under it,
+/// and `Path::is_prefix_of` stays a pure structural predicate (review F11).
+fn covers(prefix: &Path, path: &Path) -> bool {
+    if prefix.is_prefix_of(path) {
+        return true;
+    }
+    if path.segments().len() != prefix.segments().len() {
+        return false;
+    }
+    let Some(last) = path.last() else {
+        return false;
+    };
+    // The bare `__` map comment has no subject key, so it is not aliased.
+    let Some(base) = last
+        .strip_suffix(model::COMMENT_SUFFIX)
+        .filter(|b| !b.is_empty())
+    else {
+        return false;
+    };
+    let mut segments = path.segments().to_vec();
+    let last_idx = segments.len() - 1;
+    segments[last_idx] = base.to_string();
+    prefix.is_prefix_of(&Path::new(segments))
+}
+
 impl Grants {
     /// `true` if `path` is readable: full read access, or a scope (of
-    /// either mode) whose prefix covers it.
+    /// either mode) whose prefix covers it (see `covers`).
     pub fn can_read(&self, path: &Path) -> bool {
-        self.full_read || self.scopes.iter().any(|s| s.prefix.is_prefix_of(path))
+        self.full_read || self.scopes.iter().any(|s| covers(&s.prefix, path))
     }
 
     /// `true` if `path` is writable: full write access, or a read-write
-    /// scope whose prefix covers it.
+    /// scope whose prefix covers it (see `covers`).
     pub fn can_write(&self, path: &Path) -> bool {
-        self.full_write || self.scopes.iter().any(|s| s.mode == Mode::Rw && s.prefix.is_prefix_of(path))
+        self.full_write
+            || self
+                .scopes
+                .iter()
+                .any(|s| s.mode == Mode::Rw && covers(&s.prefix, path))
     }
 
     /// The prefixes to union for a "no view" read (see
@@ -118,6 +157,11 @@ impl Grants {
 /// A missing `scopes` key is an empty map, not an error. Comment keys at the
 /// top of `scopes` (a bare `__`, or `<authid>__`) are ignored.
 ///
+/// This is the **strict** parse, used at *write* time: a write that touches
+/// `scopes` is rejected with the offending entry named, so a malformed entry
+/// can never reach the disk (`docs/DESIGN.md` §8, review F7). Read paths use
+/// [`scopes_for`], which is lenient about *other* principals' entries.
+///
 /// # Errors
 /// [`Error::InvalidScopes`] if `scopes` (or one of its entries) does not
 /// have the shape above.
@@ -133,44 +177,80 @@ pub fn parse_scopes(dc: &Value) -> Result<HashMap<String, Vec<Scope>>> {
         if model::is_comment_key(authid) {
             continue;
         }
-        let arr = entries
-            .as_array()
-            .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid} must be a list")))?;
-        let mut scopes = Vec::with_capacity(arr.len());
-        for (i, entry) in arr.iter().enumerate() {
-            let prefix_str = entry
-                .get("prefix")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid}.{i}: missing 'prefix'")))?;
-            let prefix = Path::parse(prefix_str)
-                .map_err(|_| Error::InvalidScopes(format!("scopes.{authid}.{i}: invalid prefix '{prefix_str}'")))?;
-            let mode_str = entry
-                .get("mode")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid}.{i}: missing 'mode'")))?;
-            let mode = match mode_str {
-                "ro" => Mode::Ro,
-                "rw" => Mode::Rw,
-                other => {
-                    return Err(Error::InvalidScopes(format!(
-                        "scopes.{authid}.{i}: invalid mode '{other}' (expected 'ro' or 'rw')"
-                    )))
-                }
-            };
-            scopes.push(Scope { prefix, mode });
-        }
-        out.insert(authid.clone(), scopes);
+        out.insert(authid.clone(), parse_entry(authid, entries)?);
     }
     Ok(out)
 }
 
-/// Convenience: the scopes for one authid, or an empty list if it has none.
-/// Equivalent to `parse_scopes(dc)?.remove(authid).unwrap_or_default()`.
+/// Parses one `scopes.<authid>` entry.
+fn parse_entry(authid: &str, entries: &Value) -> Result<Vec<Scope>> {
+    let arr = entries
+        .as_array()
+        .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid} must be a list")))?;
+    let mut scopes = Vec::with_capacity(arr.len());
+    for (i, entry) in arr.iter().enumerate() {
+        let prefix_str = entry
+            .get("prefix")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid}.{i}: missing 'prefix'")))?;
+        let prefix = Path::parse(prefix_str).map_err(|_| {
+            Error::InvalidScopes(format!("scopes.{authid}.{i}: invalid prefix '{prefix_str}'"))
+        })?;
+        let mode_str = entry
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::InvalidScopes(format!("scopes.{authid}.{i}: missing 'mode'")))?;
+        let mode = match mode_str {
+            "ro" => Mode::Ro,
+            "rw" => Mode::Rw,
+            other => {
+                return Err(Error::InvalidScopes(format!(
+                    "scopes.{authid}.{i}: invalid mode '{other}' (expected 'ro' or 'rw')"
+                )))
+            }
+        };
+        scopes.push(Scope { prefix, mode });
+    }
+    Ok(scopes)
+}
+
+/// The scopes for one authid, or an empty list if it has none.
+///
+/// **Lenient by design** (`docs/DESIGN.md` §8, review F7): only the entry for
+/// `authid` is parsed. A malformed entry belonging to *another* principal is
+/// skipped with a `warn!` and can never deny service to anyone else — before
+/// this, one admin typo in the shipped editor made every guest read and write
+/// fail with a 400 for every caller, full-ACL administrators included, and
+/// the editor could no longer load to repair it.
+///
+/// A `scopes` key that is not a map at all, and a malformed entry for
+/// `authid` itself, are still errors: they are the caller's own problem and
+/// naming them is what makes the misconfiguration fixable.
 ///
 /// # Errors
-/// [`Error::InvalidScopes`], as [`parse_scopes`].
+/// [`Error::InvalidScopes`] if `scopes` is not a map, or if `authid`'s own
+/// entry is malformed.
 pub fn scopes_for(dc: &Value, authid: &str) -> Result<Vec<Scope>> {
-    Ok(parse_scopes(dc)?.remove(authid).unwrap_or_default())
+    let Some(scopes_val) = dc.get("scopes") else {
+        return Ok(Vec::new());
+    };
+    let Some(map) = scopes_val.as_object() else {
+        return Err(Error::InvalidScopes("'scopes' must be a map".to_string()));
+    };
+    // Warn about (and ignore) anything else that is broken, so an operator
+    // still learns about it from the logs.
+    for (other, entries) in map.iter() {
+        if other == authid || model::is_comment_key(other) {
+            continue;
+        }
+        if let Err(e) = parse_entry(other, entries) {
+            tracing::warn!(scopes_entry = %other, error = %e, "ignoring malformed scopes entry");
+        }
+    }
+    match map.get(authid) {
+        Some(entries) => parse_entry(authid, entries),
+        None => Ok(Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +371,11 @@ mod tests {
 
     #[test]
     fn check_write_empty_touched_is_always_ok() {
+        // Vacuously true, and therefore *not* a security boundary on its
+        // own: the API layer must independently require `can_write(view)`
+        // before it computes anything (`docs/DESIGN.md` §8, review F1), and
+        // `crate::view`'s operations must never change a document while
+        // reporting no touched paths (review F2).
         assert_eq!(Grants::default().check_write(&[]), Ok(()));
     }
 
@@ -414,5 +499,85 @@ mod tests {
         });
         assert_eq!(scopes_for(&dc, "svc@pve!x").unwrap(), vec![Scope { prefix: p("traefik"), mode: Mode::Rw }]);
         assert_eq!(scopes_for(&dc, "nobody@pve").unwrap(), Vec::<Scope>::new());
+    }
+
+    // -- lenient reads (review F7) ------------------------------------------
+
+    #[test]
+    fn scopes_for_skips_another_principals_malformed_entry() {
+        // The outage in review F7: one bad entry used to 400 every guest
+        // read and write, for every principal, cluster-wide.
+        let dc = json!({
+            "scopes": {
+                "broken@pve": "not a list",
+                "also-broken@pve": [{"prefix": "x", "mode": "readwrite"}],
+                "missing-mode@pve": [{"prefix": "x"}],
+                "good@pve!t": [{"prefix": "traefik", "mode": "rw"}],
+            },
+        });
+        assert_eq!(
+            scopes_for(&dc, "good@pve!t").unwrap(),
+            vec![Scope { prefix: p("traefik"), mode: Mode::Rw }]
+        );
+        // A full-ACL admin with no entry of their own is likewise unaffected.
+        assert_eq!(scopes_for(&dc, "root@pam").unwrap(), Vec::<Scope>::new());
+        // ... while the strict, write-time parse still rejects the document.
+        assert!(matches!(parse_scopes(&dc), Err(Error::InvalidScopes(_))));
+    }
+
+    #[test]
+    fn scopes_for_still_reports_the_callers_own_malformed_entry() {
+        let dc = json!({"scopes": {"me@pve": [{"prefix": "x", "mode": "nope"}]}});
+        let err = scopes_for(&dc, "me@pve").unwrap_err();
+        assert!(err.to_string().contains("me@pve"), "{err}");
+    }
+
+    #[test]
+    fn scopes_for_rejects_a_non_map_scopes_key() {
+        assert!(matches!(
+            scopes_for(&json!({"scopes": [1, 2]}), "me@pve"),
+            Err(Error::InvalidScopes(_))
+        ));
+    }
+
+    // -- comment keys follow their subject (review F11) ---------------------
+
+    #[test]
+    fn scope_covers_the_sibling_comment_key_of_its_own_prefix() {
+        let g = Grants {
+            scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
+            ..Default::default()
+        };
+        assert!(g.can_read(&p("traefik__")));
+        assert!(g.can_write(&p("traefik__")));
+        // Comment keys *inside* the subtree were always covered.
+        assert!(g.can_write(&p("traefik.spec__")));
+        assert!(g.can_write(&p("traefik.__")));
+    }
+
+    #[test]
+    fn comment_key_aliasing_does_not_leak_to_other_keys() {
+        let g = Grants {
+            scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
+            ..Default::default()
+        };
+        // Not the scope's own comment key.
+        assert!(!g.can_read(&p("netbird__")));
+        assert!(!g.can_read(&p("traefikx__")));
+        // The bare map comment at the document root has no subject key.
+        assert!(!g.can_read(&p("__")));
+        // A deeper path is not aliased up to the scope's depth.
+        assert!(!g.can_read(&p("other.traefik__")));
+    }
+
+    #[test]
+    fn nested_scope_covers_its_own_comment_key_at_the_same_depth() {
+        let g = Grants {
+            scopes: vec![Scope { prefix: p("a.b"), mode: Mode::Ro }],
+            ..Default::default()
+        };
+        assert!(g.can_read(&p("a.b__")));
+        assert!(!g.can_read(&p("a.c__")));
+        assert!(!g.can_read(&p("a__")));
     }
 }

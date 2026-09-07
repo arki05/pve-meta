@@ -1,5 +1,6 @@
 //! Integration tests for `pve_meta_core::format`: round trips, order
-//! preservation, and format-specific rejections.
+//! preservation, and format-specific rejections. YAML is the only on-disk
+//! format; JSON is a wire format only (`docs/DESIGN.md` §8).
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::error::Error;
@@ -111,43 +112,6 @@ fn yaml_rejects_null() {
         let err = parse(Format::Yaml, text).unwrap_err();
         assert!(matches!(err, Error::Lint(_)), "{text:?} -> {err:?}");
     }
-}
-
-#[test]
-fn toml_rejects_datetime_with_path_in_message() {
-    let err = parse(Format::Toml, "[a]\nwhen = 1979-05-27T07:32:00Z\n").unwrap_err();
-    match err {
-        Error::Parse { format, msg } => {
-            assert_eq!(format, Format::Toml);
-            assert!(msg.contains("a.when"), "message should mention path a.when: {msg}");
-        }
-        other => panic!("expected Parse, got {other:?}"),
-    }
-}
-
-#[test]
-fn toml_dump_uses_explicit_tables_and_array_of_tables() {
-    let doc = json!({
-        "top": 1,
-        "section": {"x": 1, "y": 2},
-        "items": [{"n": 1}, {"n": 2}],
-    });
-    let text = dump(Format::Toml, &doc);
-    assert!(text.contains("[section]"));
-    assert!(text.contains("[[items]]"));
-    assert!(!text.contains('{'), "should never use inline tables:\n{text}");
-    let back = parse(Format::Toml, &text).unwrap();
-    assert_eq!(back, doc);
-}
-
-#[test]
-fn toml_dump_key_order_matches_document_order() {
-    let doc = json!({"zebra": 1, "apple": 2, "mango": 3});
-    let text = dump(Format::Toml, &doc);
-    let zebra = text.find("zebra").unwrap();
-    let apple = text.find("apple").unwrap();
-    let mango = text.find("mango").unwrap();
-    assert!(zebra < apple && apple < mango, "order not preserved:\n{text}");
 }
 
 #[test]

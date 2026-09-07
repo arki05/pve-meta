@@ -1,7 +1,6 @@
-//! Merge-patch semantics (RFC 7386) with explicit delete, plus structural
-//! diff/patch construction.
-
-use serde_json::Map;
+//! Merge-patch semantics (RFC 7386) with explicit delete, plus the
+//! structural diff that turns a whole-document replace into the same
+//! leaf-granular `Touched` list.
 
 use crate::model::{self, Lint, Value};
 use crate::path::Path;
@@ -184,36 +183,6 @@ pub(crate) fn diff_at(old: &Value, new: &Value, path: &Path, out: &mut Vec<Touch
     }
 }
 
-/// Builds a merge patch (RFC 7386; removed keys become `null`) that
-/// transforms `old` into `new`: `apply_patch(&mut old.clone(), &make_patch(old, new))`
-/// yields a document equal to `new`, provided both are (or become) objects at
-/// every level where they differ.
-pub fn make_patch(old: &Value, new: &Value) -> Value {
-    match (old, new) {
-        (Value::Object(om), Value::Object(nm)) => {
-            let mut patch = Map::new();
-            for (k, nv) in nm.iter() {
-                match om.get(k) {
-                    Some(ov) if ov == nv => {}
-                    Some(ov) if ov.is_object() && nv.is_object() => {
-                        patch.insert(k.clone(), make_patch(ov, nv));
-                    }
-                    _ => {
-                        patch.insert(k.clone(), nv.clone());
-                    }
-                }
-            }
-            for k in om.keys() {
-                if !nm.contains_key(k) {
-                    patch.insert(k.clone(), Value::Null);
-                }
-            }
-            Value::Object(patch)
-        }
-        _ => new.clone(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,42 +281,6 @@ mod tests {
         let new = json!({"a": [1, 2, 3]});
         let touched = diff(&old, &new);
         assert_eq!(touched, vec![Touched{path: Path::parse("a").unwrap(), op: Op::Set}]);
-    }
-
-    fn assert_round_trip(old: Value, new: Value) {
-        let patch = make_patch(&old, &new);
-        let mut applied = old.clone();
-        apply_patch(&mut applied, &patch);
-        assert_eq!(applied, new, "old={old:?} new={new:?} patch={patch:?}");
-    }
-
-    #[test]
-    fn make_patch_round_trips_on_sample_documents() {
-        let samples: Vec<(Value, Value)> = vec![
-            (json!({}), json!({"a": 1})),
-            (json!({"a": 1}), json!({})),
-            (json!({"a": 1, "b": 2}), json!({"a": 1, "b": 2})),
-            (json!({"a": {"x": 1}}), json!({"a": {"x": 2, "y": 3}})),
-            (json!({"a": {"x": 1, "y": 2}}), json!({"a": {"x": 1}})),
-            (json!({"a": [1, 2]}), json!({"a": [1, 2, 3]})),
-            (json!({"a": 1}), json!({"a": {"b": 1}})),
-            (json!({"a": {"b": 1}}), json!({"a": 1})),
-            (
-                json!({"a": {"b": {"c": 1}}, "keep": true}),
-                json!({"a": {"b": {"c": 2, "d": 3}}, "keep": true, "new": "x"}),
-            ),
-        ];
-        for (old, new) in samples {
-            assert_round_trip(old, new);
-        }
-    }
-
-    #[test]
-    fn make_patch_uses_null_for_removed_keys() {
-        let old = json!({"a": 1, "b": 2});
-        let new = json!({"a": 1});
-        let patch = make_patch(&old, &new);
-        assert_eq!(patch, json!({"b": null}));
     }
 
     #[test]

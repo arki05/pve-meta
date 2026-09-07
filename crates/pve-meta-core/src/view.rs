@@ -6,21 +6,34 @@
 //! and [`merge`] write it back (whole-subtree replace vs. RFC 7386-style
 //! merge-patch, both scoped to the prefix); [`remove`] deletes it.
 //! [`filter`] builds the "no view" read: the union of several readable
-//! prefixes, unstripped and in the document's own order. [`render`]/[`parse`]
-//! convert a view's value to and from wire text (YAML/JSON/TOML),
-//! independent of the whole-document [`crate::format`] contract (a view's
-//! value need not itself be an object).
+//! prefixes, unstripped and in the document's own order.
+//! [`render`]/[`parse`]/[`parse_patch`] convert a view's value to and from
+//! wire text (YAML/JSON), independent of the whole-document
+//! [`crate::format`] contract (a view's value need not itself be an object;
+//! a *merge patch* may additionally contain `null` delete markers).
 //!
-//! The touched paths returned by [`replace`] and [`merge`] are always
-//! leaf-granular (see [`patch::diff`]/[`patch::apply_patch`]), even when a
-//! whole subtree is replaced or deleted: unlike [`patch::apply_patch`]'s
+//! The touched paths returned by [`replace`], [`merge`] and [`remove`] are
+//! reported *below* the view prefix rather than at it (see
+//! [`patch::diff`]/[`patch::apply_patch`]): unlike [`patch::apply_patch`]'s
 //! "replacing/deleting a whole subtree yields its root path" convention
 //! (which exists to keep a merge-patch's own change summary concise), this
 //! module's touched list feeds [`crate::scopes::Grants::check_write`], which
 //! must be able to reject a write that reaches outside the caller's scope
-//! *anywhere* inside a replaced or removed subtree.
+//! inside a replaced or removed subtree. Where a whole subtree disappears at
+//! once the report names that subtree's own path, not each leaf under it —
+//! which only makes the write check *stricter*, since every reported path is
+//! an ancestor of everything it stands for.
+//!
+//! **The touched list is complete** (`docs/DESIGN.md` §8, review F2): every
+//! one of these operations reports at least one touched path whenever it
+//! changes the document at all — including the corner cases where the
+//! leaf-granular diff of the *content* is empty because the content is an
+//! empty map (creating `a: {}` where `a` was absent, or removing an existing
+//! `a: {}`). A caller must never be able to create or destroy structure with
+//! a vacuous `touched: []`. Correspondingly, a [`merge`] that touches
+//! nothing does not mutate `doc` at all: it creates no containers.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Map;
 
@@ -93,18 +106,13 @@ pub fn extract(doc: &Value, prefix: &Path) -> Option<Value> {
     descend(doc, prefix).ok().flatten().cloned()
 }
 
-/// `true` for the sentinel "empty subtree" value that [`replace`] treats as
-/// a removal rather than a literal `{}`.
-fn is_removal_marker(subtree: &Value) -> bool {
-    matches!(subtree, Value::Object(m) if m.is_empty())
-}
-
 /// Replaces the subtree at `prefix` with `subtree` wholesale (not a merge),
 /// creating any missing intermediate maps along the way. An empty-object
-/// `subtree` removes the key instead of setting it to `{}` (see [`remove`],
-/// which is exactly `replace(doc, prefix, json!({}))`). Replacing at the
-/// root replaces the whole document (`subtree` must then itself satisfy the
-/// full document rules: an object, no nulls, valid keys).
+/// `subtree` stores an **empty map** — it does not remove the key
+/// (`docs/DESIGN.md` §8; deleting a view is [`remove`], i.e.
+/// `DELETE …?view=`). Replacing at the root replaces the whole document
+/// (`subtree` must then itself satisfy the full document rules: an object,
+/// no nulls, valid keys).
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
@@ -129,46 +137,44 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
     let parent_path = prefix.parent().expect("non-root path has a parent");
     let key = prefix.last().expect("non-root path has a last segment").to_string();
 
-    if is_removal_marker(&subtree) {
-        let Some(parent) = descend_mut(doc, &parent_path)? else {
-            return Ok(Vec::new());
-        };
-        let Some(map) = parent.as_object_mut() else {
-            return Err(blocked(prefix));
-        };
-        return match map.shift_remove(&key) {
-            Some(Value::Object(old_map)) => {
-                // Granular: a Delete entry per leaf that actually existed,
-                // so a write-scope check can catch removed content outside
-                // the caller's scope even when it is nested under `prefix`.
-                let mut touched = Vec::new();
-                patch::diff_at(&Value::Object(old_map), &Value::Object(Map::new()), prefix, &mut touched);
-                Ok(touched)
-            }
-            Some(_) => Ok(vec![Touched {
-                path: prefix.clone(),
-                op: Op::Delete,
-            }]),
-            None => Ok(Vec::new()),
-        };
-    }
-
+    // Refuse an impossible path (through an array/scalar) before touching
+    // anything, then materialise the parent chain.
     let parent = descend_creating(doc, &parent_path)?;
     let map = parent
         .as_object_mut()
         .expect("descend_creating always returns an object");
-    let old = map.get(&key).cloned().unwrap_or_else(|| Value::Object(Map::new()));
+    let old = map.get(&key).cloned();
     map.insert(key, subtree.clone());
+
     let mut touched = Vec::new();
-    patch::diff_at(&old, &subtree, prefix, &mut touched);
+    match &old {
+        Some(old) => patch::diff_at(old, &subtree, prefix, &mut touched),
+        None => {
+            patch::diff_at(&Value::Object(Map::new()), &subtree, prefix, &mut touched);
+            // Creating a key whose value is an empty map is a real change
+            // even though the content diff is empty: report it, so it can
+            // never slip past `Grants::check_write` (review F2).
+            if touched.is_empty() {
+                touched.push(Touched {
+                    path: prefix.clone(),
+                    op: Op::Set,
+                });
+            }
+        }
+    }
     Ok(touched)
 }
 
 /// Applies `patch` (RFC 7386 merge-patch semantics, see [`patch::apply_patch`])
-/// to the subtree at `prefix`, creating intermediate maps as needed. Merging
-/// away every key of a map leaves that map in place, empty: merge never
-/// prunes an emptied parent (the document model has no concept of "absent
-/// vs. empty map" beyond what is literally written).
+/// to the subtree at `prefix`. Merging away every key of a map leaves that
+/// map in place, empty: merge never prunes an emptied parent (the document
+/// model has no concept of "absent vs. empty map" beyond what is literally
+/// written).
+///
+/// A merge that changes nothing **mutates nothing**: intermediate maps are
+/// only materialised once the patch is known to write something
+/// (`docs/DESIGN.md` §8, review F2). A non-object value at `prefix` is
+/// merged over as if it were `{}`.
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
@@ -186,32 +192,95 @@ pub fn merge(doc: &mut Value, prefix: &Path, patch_value: &Value) -> Result<Vec<
     let parent_path = prefix.parent().expect("non-root path has a parent");
     let key = prefix.last().expect("non-root path has a last segment").to_string();
 
-    let parent = descend_creating(doc, &parent_path)?;
-    let map = parent
-        .as_object_mut()
-        .expect("descend_creating always returns an object");
-    // Ensure an object sits at `key` before delegating to `apply_obj`: that
-    // is what makes a merge into a not-yet-existing prefix apply as a merge
-    // against `{}` (dropping deletes of not-yet-existing fields, recursing
-    // as usual) rather than splicing the raw patch (which could contain
-    // literal `null`s) straight into the document.
-    map.entry(key.clone()).or_insert_with(|| Value::Object(Map::new()));
+    // Read-only descent first: this both rejects a prefix that runs through
+    // an array/scalar and tells us what is currently at `prefix`, without
+    // creating anything.
+    let existing = descend(doc, prefix)?;
+    let existing_is_object = matches!(existing, Some(Value::Object(_)));
+    let existed = existing.is_some();
+    // The scratch subtree the patch is applied to: the current object, or
+    // `{}` for an absent (or non-object) value. Merging against `{}` is what
+    // makes a delete of a not-yet-existing field a no-op instead of splicing
+    // a literal `null` into the document.
+    let mut scratch = match existing {
+        Some(Value::Object(m)) => Value::Object(m.clone()),
+        _ => Value::Object(Map::new()),
+    };
 
-    let mut synthetic = Map::new();
-    synthetic.insert(key, patch_value.clone());
     let mut touched = Vec::new();
-    patch::apply_obj(parent, &Value::Object(synthetic), &parent_path, &mut touched);
+    patch::apply_obj(&mut scratch, patch_value, prefix, &mut touched);
+
+    // Replacing a scalar/array at `prefix` with a map is itself a change,
+    // even when the patch body wrote no leaves.
+    if existed && !existing_is_object && touched.is_empty() {
+        touched.push(Touched {
+            path: prefix.clone(),
+            op: Op::Set,
+        });
+    }
+
+    if touched.is_empty() {
+        // Nothing to write: leave `doc` exactly as it was. In particular,
+        // create no containers along `prefix`.
+        return Ok(Vec::new());
+    }
+
+    let parent = descend_creating(doc, &parent_path)?;
+    parent
+        .as_object_mut()
+        .expect("descend_creating always returns an object")
+        .insert(key, scratch);
     Ok(touched)
 }
 
-/// Removes the subtree at `prefix` (the whole document, if `prefix` is
-/// root). A no-op (no touched paths) if nothing exists there. Exactly
-/// `replace(doc, prefix, Value::Object(Map::new()))`.
+/// Removes the subtree at `prefix` (empties the document, if `prefix` is
+/// root). A no-op (no touched paths) if nothing exists there.
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
 pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
-    replace(doc, prefix, Value::Object(Map::new()))
+    if prefix.is_root() {
+        let old = doc.clone();
+        *doc = Value::Object(Map::new());
+        return Ok(patch::diff(&old, doc));
+    }
+
+    let parent_path = prefix.parent().expect("non-root path has a parent");
+    let key = prefix.last().expect("non-root path has a last segment").to_string();
+
+    let Some(parent) = descend_mut(doc, &parent_path)? else {
+        return Ok(Vec::new());
+    };
+    let Some(map) = parent.as_object_mut() else {
+        return Err(blocked(prefix));
+    };
+    match map.shift_remove(&key) {
+        Some(Value::Object(old_map)) => {
+            // Report *below* `prefix`, so a write-scope check can catch
+            // removed content outside the caller's scope even when it is
+            // nested under `prefix`.
+            let mut touched = Vec::new();
+            patch::diff_at(
+                &Value::Object(old_map),
+                &Value::Object(Map::new()),
+                prefix,
+                &mut touched,
+            );
+            // Removing an existing (but empty) map is still a change.
+            if touched.is_empty() {
+                touched.push(Touched {
+                    path: prefix.clone(),
+                    op: Op::Delete,
+                });
+            }
+            Ok(touched)
+        }
+        Some(_) => Ok(vec![Touched {
+            path: prefix.clone(),
+            op: Op::Delete,
+        }]),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// Builds the "no view" read: the union of `readable_prefixes`, unstripped
@@ -260,7 +329,13 @@ fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<S
     // Second pass: build the result in the map's own order, bringing along
     // comment keys for included siblings (and the bare `__` map comment, if
     // anything in this map survived).
-    let any_included = !include.is_empty();
+    //
+    // The set of included base keys is snapshotted *before* the pass:
+    // `include` is drained as the pass consumes it, so testing it directly
+    // would drop `<key>__` whenever it follows its own key in document
+    // order — the natural authoring order (review F10).
+    let included_keys: HashSet<&str> = include.keys().copied().collect();
+    let any_included = !included_keys.is_empty();
     let mut out = Map::new();
     for (k, v) in map.iter() {
         if model::is_comment_key(k) {
@@ -270,7 +345,7 @@ fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<S
                 }
             } else {
                 let base = &k[..k.len() - model::COMMENT_SUFFIX.len()];
-                if include.contains_key(base) {
+                if included_keys.contains(base) {
                     out.insert(k.clone(), v.clone());
                 }
             }
@@ -283,18 +358,18 @@ fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<S
 
 /// Renders `value` (a view's extracted subtree, or a whole document) as
 /// `format`'s canonical text. Unlike a stored document, a view's value need
-/// not be an object at the top level (e.g. a view of an array-valued key);
-/// note that [`format::dump`]'s TOML backend still requires an object (TOML
-/// has no non-map top level), so rendering a non-object view as TOML panics
-/// -- moot in practice, since the native API only offers `format=json` or
-/// `format=yaml` for views (`docs/DESIGN.md` §3).
+/// not be an object at the top level (e.g. a view of an array-valued key).
 pub fn render(value: &Value, format: Format) -> String {
     format::dump(format, value)
 }
 
-/// Parses `text` as `format` into a view's value: like [`format::parse`],
-/// but does not require the top level to be an object (a view's payload can
-/// legitimately be an array or a scalar).
+/// Parses `text` as `format` into a `mode=replace` payload: like
+/// [`format::parse`], but does not require the top level to be an object (a
+/// view's payload can legitimately be an array or a scalar).
+///
+/// `null` is rejected here — a replace payload is document content, and
+/// documents have no nulls. A `mode=merge` payload goes through
+/// [`parse_patch`] instead.
 ///
 /// # Errors
 /// [`Error::Parse`] on a syntax error. [`Error::Lint`] if the parsed value
@@ -303,6 +378,28 @@ pub fn render(value: &Value, format: Format) -> String {
 pub fn parse(text: &str, format: Format) -> Result<Value> {
     let value = format::parse_raw(format, text)?;
     let lints = model::lint_relaxed(&value);
+    if !lints.is_empty() {
+        return Err(Error::Lint(lints));
+    }
+    Ok(value)
+}
+
+/// Parses `text` as `format` into a `mode=merge` payload: an RFC 7386 merge
+/// patch, validated with [`patch::lint_patch`], which permits `null`
+/// *anywhere* as the delete marker (`docs/DESIGN.md` §3, §8: "`merge` with
+/// `null` deletes").
+///
+/// This is what makes the documented delete reachable through the API: the
+/// replace-shaped [`parse`] rejects `null` outright, so routing a merge
+/// payload through it would make `null` unreachable (review F8).
+///
+/// # Errors
+/// [`Error::Parse`] on a syntax error. [`Error::Lint`] if the patch is not
+/// an object at the top level, has invalid keys, or gives a comment key a
+/// non-string, non-null value.
+pub fn parse_patch(text: &str, format: Format) -> Result<Value> {
+    let value = format::parse_raw(format, text)?;
+    let lints = patch::lint_patch(&value);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
     }
@@ -393,27 +490,49 @@ mod tests {
     }
 
     #[test]
-    fn replace_with_empty_object_removes_the_key() {
+    fn replace_with_empty_object_stores_an_empty_map() {
+        // docs/DESIGN.md §8: `replace` with `{}` stores an empty map;
+        // deleting a view is `DELETE ?view=` (review F9).
         let mut doc = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
         let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();
-        assert_eq!(doc, json!({"other": 1}));
+        assert_eq!(doc, json!({"traefik": {}, "other": 1}));
         assert_eq!(paths(&touched), vec!["traefik.spec".to_string()]);
     }
 
     #[test]
-    fn replace_with_empty_object_on_scalar_yields_single_delete() {
-        let mut doc = json!({"tags": "prod"});
-        let touched = replace(&mut doc, &p("tags"), json!({})).unwrap();
-        assert_eq!(doc, json!({}));
-        assert_eq!(touched, vec![Touched { path: p("tags"), op: Op::Delete }]);
+    fn replace_empty_object_round_trips_an_empty_namespace() {
+        // Opening a view whose value is legitimately `{}` and applying it
+        // unchanged must not delete the key.
+        let mut doc = json!({"traefik": {}, "other": 1});
+        let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();
+        assert_eq!(doc, json!({"traefik": {}, "other": 1}));
+        assert!(touched.is_empty());
     }
 
     #[test]
-    fn replace_with_empty_object_on_missing_key_is_noop() {
+    fn replace_with_empty_object_on_scalar_sets_an_empty_map() {
+        let mut doc = json!({"tags": "prod"});
+        let touched = replace(&mut doc, &p("tags"), json!({})).unwrap();
+        assert_eq!(doc, json!({"tags": {}}));
+        assert_eq!(touched, vec![Touched { path: p("tags"), op: Op::Set }]);
+    }
+
+    #[test]
+    fn replace_with_empty_object_on_missing_key_creates_it_and_reports_touched() {
+        // Creating structure must never report `touched: []` -- that is the
+        // authorization bypass of review F2.
         let mut doc = json!({"a": 1});
         let touched = replace(&mut doc, &p("missing"), json!({})).unwrap();
-        assert_eq!(doc, json!({"a": 1}));
-        assert!(touched.is_empty());
+        assert_eq!(doc, json!({"a": 1, "missing": {}}));
+        assert_eq!(touched, vec![Touched { path: p("missing"), op: Op::Set }]);
+    }
+
+    #[test]
+    fn replace_deep_empty_object_reports_touched_for_the_structure_it_creates() {
+        let mut doc = json!({});
+        let touched = replace(&mut doc, &p("zzz.deep"), json!({})).unwrap();
+        assert_eq!(doc, json!({"zzz": {"deep": {}}}));
+        assert_eq!(touched, vec![Touched { path: p("zzz.deep"), op: Op::Set }]);
     }
 
     #[test]
@@ -498,9 +617,48 @@ mod tests {
         let mut doc = json!({});
         let touched = merge(&mut doc, &p("a.b"), &json!({"gone": null})).unwrap();
         // "delete a key that never existed" is a no-op, same as apply_patch;
-        // critically this must not splice a literal `null` into the doc.
-        assert_eq!(doc, json!({"a": {"b": {}}}));
+        // critically this must not splice a literal `null` into the doc --
+        // and (review F2) it must not create `a.b` either.
+        assert_eq!(doc, json!({}));
         assert!(touched.is_empty());
+    }
+
+    #[test]
+    fn merge_with_empty_patch_never_mutates_the_document() {
+        // The live reproduction of review F2: an empty merge at an arbitrary
+        // deep prefix must create nothing and touch nothing, so that a
+        // vacuous `check_write([])` cannot be used to write structure.
+        for prefix in ["zzz_hacked", "zzz_hacked.deep", "traefik.spec.deeper"] {
+            let mut doc = json!({"traefik": {"spec": {"host": "x"}}});
+            let before = doc.clone();
+            let touched = merge(&mut doc, &p(prefix), &json!({})).unwrap();
+            assert!(touched.is_empty(), "{prefix}: expected no touched paths");
+            assert_eq!(doc, before, "{prefix}: merge mutated the document");
+        }
+    }
+
+    #[test]
+    fn merge_that_writes_nothing_leaves_an_existing_document_byte_identical() {
+        let mut doc = json!({"a": {"b": 1}});
+        let before = doc.clone();
+        // Same value: apply_obj reports nothing, so nothing is spliced.
+        let touched = merge(&mut doc, &p("a"), &json!({"b": 1})).unwrap();
+        assert!(touched.is_empty());
+        assert_eq!(doc, before);
+    }
+
+    #[test]
+    fn merge_over_a_scalar_replaces_it_with_a_map() {
+        let mut doc = json!({"a": "scalar"});
+        let touched = merge(&mut doc, &p("a"), &json!({"x": 1})).unwrap();
+        assert_eq!(doc, json!({"a": {"x": 1}}));
+        assert_eq!(paths(&touched), vec!["a.x".to_string()]);
+
+        // An *empty* patch over a scalar still empties it -- and says so.
+        let mut doc2 = json!({"a": "scalar"});
+        let touched2 = merge(&mut doc2, &p("a"), &json!({})).unwrap();
+        assert_eq!(doc2, json!({"a": {}}));
+        assert_eq!(touched2, vec![Touched { path: p("a"), op: Op::Set }]);
     }
 
     #[test]
@@ -519,13 +677,31 @@ mod tests {
     // -- remove ---------------------------------------------------------
 
     #[test]
-    fn remove_is_replace_with_empty_object() {
+    fn remove_deletes_the_key_unlike_replace_with_an_empty_object() {
         let mut a = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
-        let mut b = a.clone();
         let ta = remove(&mut a, &p("traefik")).unwrap();
-        let tb = replace(&mut b, &p("traefik"), json!({})).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(ta, tb);
+        assert_eq!(a, json!({"other": 1}));
+        assert_eq!(paths(&ta), vec!["traefik.spec".to_string()]);
+
+        let mut b = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
+        replace(&mut b, &p("traefik"), json!({})).unwrap();
+        assert_eq!(b, json!({"traefik": {}, "other": 1}));
+    }
+
+    #[test]
+    fn remove_of_an_existing_empty_map_reports_a_delete() {
+        let mut doc = json!({"a": {}, "b": 1});
+        let touched = remove(&mut doc, &p("a")).unwrap();
+        assert_eq!(doc, json!({"b": 1}));
+        assert_eq!(touched, vec![Touched { path: p("a"), op: Op::Delete }]);
+    }
+
+    #[test]
+    fn remove_of_a_scalar_reports_a_delete() {
+        let mut doc = json!({"tags": "prod"});
+        let touched = remove(&mut doc, &p("tags")).unwrap();
+        assert_eq!(doc, json!({}));
+        assert_eq!(touched, vec![Touched { path: p("tags"), op: Op::Delete }]);
     }
 
     #[test]
@@ -578,6 +754,24 @@ mod tests {
     fn filter_comment_keys_travel_with_included_sibling() {
         let doc = json!({"a__": "doc a", "a": {"x": 1}, "b": 2});
         assert_eq!(filter(&doc, &[p("a")]), json!({"a__": "doc a", "a": {"x": 1}}));
+    }
+
+    #[test]
+    fn filter_keeps_comment_key_that_follows_its_own_key() {
+        // Review F10: the natural authoring order (`a` then `a__`) used to
+        // drop the comment, because the first pass's map was drained as the
+        // second pass walked it.
+        let doc = json!({"a": 1, "a__": "about a", "b": 2});
+        assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1, "a__": "about a"}));
+    }
+
+    #[test]
+    fn filter_keeps_comment_keys_in_both_orders_for_nested_maps() {
+        let doc = json!({"ns": {"x": 1, "x__": "about x", "y__": "about y", "y": 2}});
+        assert_eq!(
+            filter(&doc, &[p("ns")]),
+            json!({"ns": {"x": 1, "x__": "about x", "y__": "about y", "y": 2}})
+        );
     }
 
     #[test]
@@ -643,5 +837,57 @@ mod tests {
             let text = render(&value, fmt);
             assert_eq!(parse(&text, fmt).unwrap(), value);
         }
+    }
+
+    // -- parse_patch --------------------------------------------------------
+
+    #[test]
+    fn parse_patch_accepts_null_where_parse_rejects_it() {
+        // Review F8: `merge` + `null` deletes must be reachable from the
+        // wire, in both JSON and YAML, top-level and nested.
+        for (text, fmt) in [
+            ("{\"host\": null}", Format::Json),
+            ("host: null\n", Format::Yaml),
+            ("host: ~\n", Format::Yaml),
+            ("{\"spec\": {\"host\": null}}", Format::Json),
+            ("spec:\n  host: null\n", Format::Yaml),
+        ] {
+            assert!(
+                parse(text, fmt).is_err(),
+                "replace payload must still reject null: {text:?}"
+            );
+            let patch = parse_patch(text, fmt)
+                .unwrap_or_else(|e| panic!("merge payload must accept null: {text:?}: {e}"));
+            assert!(patch.is_object());
+        }
+    }
+
+    #[test]
+    fn parse_patch_deletes_end_to_end_through_merge() {
+        let mut doc = json!({"traefik": {"spec": {"host": "x", "port": 1}}});
+        let patch = parse_patch("host: null\n", Format::Yaml).unwrap();
+        let touched = merge(&mut doc, &p("traefik.spec"), &patch).unwrap();
+        assert_eq!(doc, json!({"traefik": {"spec": {"port": 1}}}));
+        assert_eq!(touched, vec![Touched { path: p("traefik.spec.host"), op: Op::Delete }]);
+    }
+
+    #[test]
+    fn parse_patch_requires_an_object_and_checks_keys() {
+        assert!(matches!(parse_patch("[1, 2]", Format::Json), Err(Error::Lint(_))));
+        assert!(matches!(
+            parse_patch("{\"bad key\": 1}", Format::Json),
+            Err(Error::Lint(_))
+        ));
+        // A comment key may be deleted, but not set to a non-string.
+        assert!(parse_patch("{\"foo__\": null}", Format::Json).is_ok());
+        assert!(matches!(
+            parse_patch("{\"foo__\": 5}", Format::Json),
+            Err(Error::Lint(_))
+        ));
+    }
+
+    #[test]
+    fn parse_patch_rejects_bad_syntax() {
+        assert!(matches!(parse_patch("a: [", Format::Yaml), Err(Error::Parse { .. })));
     }
 }

@@ -132,8 +132,9 @@ light/dark state.
 ## 7. Repository layout after this revision
 
 ```
-crates/pve-meta-core     document model, YAML/JSON (TOML stays supported on disk), views, merge, digest, store
-crates/pve-meta-perl     PVE::RS::Meta: lifecycle + api_* functions used by the API module
+crates/pve-meta-core     document model, YAML on disk / JSON on the wire, views, merge, scopes, the
+                         authorization-checked api layer (pve_meta_core::api), digest, store
+crates/pve-meta-perl     PVE::RS::Meta: perlmod exports of the lifecycle hooks and the api layer
 perl/PVE/API2/Ext/Meta.pm
 ui/                      the editor page (pwt + Monaco)
 patches/lifecycle/       the Perl diffs + manifest

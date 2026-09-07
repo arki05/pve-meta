@@ -35,7 +35,7 @@ returns `'meta'`, so simply installing this file (above) is enough to reach it a
 `/api2/json/meta/...` after a `pvedaemon`/`pveproxy` restart — no patch, no
 `dpkg-divert`, no `pve-manager` diff, unlike the revision-3 design this superseded.
 
-## Verified manually (see this agent's own report for the full transcript)
+## Verified manually
 
 Installed by hand on the lab node (`pvemeta-node1`, PVE 9.2.11) as
 `cp perl/PVE/API2/Ext/Meta.pm /usr/share/perl5/PVE/API2/Ext/Meta.pm` (that directory,

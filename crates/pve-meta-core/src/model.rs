@@ -139,8 +139,10 @@ fn strip(v: &mut Value) {
     }
 }
 
-/// The document's top-level non-comment keys, in document order.
-pub fn namespaces(doc: &Value) -> Vec<String> {
+/// The document's top-level non-comment keys, in document order — the
+/// `keys` field of the wire API (`docs/DESIGN.md` §3). Deliberately *not*
+/// called "namespaces": DESIGN disclaims that word.
+pub fn top_level_keys(doc: &Value) -> Vec<String> {
     match doc {
         Value::Object(map) => map
             .keys()
@@ -235,14 +237,14 @@ mod tests {
     }
 
     #[test]
-    fn namespaces_lists_non_comment_top_keys_in_order() {
+    fn top_level_keys_lists_non_comment_top_keys_in_order() {
         let doc = json!({"__": "c", "zeta": 1, "alpha": 2, "alpha__": "cc"});
-        assert_eq!(namespaces(&doc), vec!["zeta".to_string(), "alpha".to_string()]);
+        assert_eq!(top_level_keys(&doc), vec!["zeta".to_string(), "alpha".to_string()]);
     }
 
     #[test]
-    fn namespaces_of_non_object_is_empty() {
-        assert!(namespaces(&json!([1, 2])).is_empty());
+    fn top_level_keys_of_non_object_is_empty() {
+        assert!(top_level_keys(&json!([1, 2])).is_empty());
     }
 
     #[test]

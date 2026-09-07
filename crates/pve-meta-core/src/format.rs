@@ -1,36 +1,36 @@
-//! The three supported serialization formats (YAML, TOML, JSON): canonical
+//! The two supported serialization formats (YAML, JSON): canonical
 //! parse/dump, with format-specific validation.
+//!
+//! YAML is the *only* on-disk format (`docs/DESIGN.md` §8); JSON exists
+//! solely as a wire format for a view's `data` (`docs/DESIGN.md` §3). There
+//! is no TOML support: it was removed together with the unreachable
+//! format-preserving edit engine.
 
 use std::fmt;
 use std::str::FromStr;
 
 use saphyr_parser::{Event, Parser};
-use serde_json::{Map, Number};
 
 use crate::error::Error;
 use crate::model::{self, Value};
-use crate::path::Path;
 
 /// A supported document serialization format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
-    /// YAML (block style on dump).
+    /// YAML (block style on dump). The only on-disk format.
     Yaml,
-    /// TOML.
-    Toml,
-    /// JSON (pretty-printed on dump).
+    /// JSON (pretty-printed on dump). A wire format only.
     Json,
 }
 
 impl Format {
     /// All supported formats, in a stable order.
-    pub const ALL: [Format; 3] = [Format::Yaml, Format::Toml, Format::Json];
+    pub const ALL: [Format; 2] = [Format::Yaml, Format::Json];
 
-    /// The canonical file extension (`yaml`, `toml`, `json`); never `yml`.
+    /// The canonical file extension (`yaml`, `json`); never `yml`.
     pub fn ext(&self) -> &'static str {
         match self {
             Format::Yaml => "yaml",
-            Format::Toml => "toml",
             Format::Json => "json",
         }
     }
@@ -40,7 +40,6 @@ impl Format {
     pub fn from_ext(ext: &str) -> Option<Format> {
         match ext.to_ascii_lowercase().as_str() {
             "yaml" | "yml" => Some(Format::Yaml),
-            "toml" => Some(Format::Toml),
             "json" => Some(Format::Json),
             _ => None,
         }
@@ -63,27 +62,28 @@ impl FromStr for Format {
 
 /// Parses `text` as `format` into a [`Value`], with no [`model::lint`]
 /// pass -- used directly by [`parse`] (which adds the full document lint)
-/// and by [`crate::view::parse`] (which adds [`model::lint_relaxed`]
-/// instead, since a view's value need not be an object at its own root).
+/// and by [`crate::view::parse`]/[`crate::view::parse_patch`] (which add
+/// [`model::lint_relaxed`]/[`crate::patch::lint_patch`] instead, since a
+/// view's value need not be an object at its own root, and a merge patch may
+/// contain `null` delete markers).
 ///
 /// # Errors
-/// [`Error::Parse`] on a syntax error (or a format-specific rejection: TOML
-/// datetimes; YAML anchors, aliases, explicit tags, or non-string keys).
+/// [`Error::Parse`] on a syntax error (or a format-specific rejection: YAML
+/// anchors, aliases, explicit tags, or non-string keys).
 pub(crate) fn parse_raw(format: Format, text: &str) -> Result<Value, Error> {
     match format {
         Format::Json => {
             serde_json::from_str(text).map_err(|e| Error::Parse { format, msg: e.to_string() })
         }
         Format::Yaml => parse_yaml(text),
-        Format::Toml => parse_toml(text),
     }
 }
 
 /// Parses `text` as `format`, then runs [`model::lint`] on the result.
 ///
 /// # Errors
-/// [`Error::Parse`] on a syntax error (or a format-specific rejection: TOML
-/// datetimes; YAML anchors, aliases, explicit tags, or non-string keys).
+/// [`Error::Parse`] on a syntax error (or a format-specific rejection: YAML
+/// anchors, aliases, explicit tags, or non-string keys).
 /// [`Error::Lint`] if the parsed value fails document-model validation.
 pub fn parse(format: Format, text: &str) -> Result<Value, Error> {
     let value = parse_raw(format, text)?;
@@ -97,11 +97,14 @@ pub fn parse(format: Format, text: &str) -> Result<Value, Error> {
 /// Dumps `doc` in canonical form for `format`. Always ends with a single
 /// trailing newline and preserves key order. `doc` is assumed to already
 /// satisfy [`model::lint`] (this function does not itself validate it).
+///
+/// Free-form comments in a document's previous text are *not* preserved: a
+/// document is always rewritten canonically from its value. Comment *keys*
+/// (`foo__`) are ordinary data and survive (`docs/DESIGN.md` §1).
 pub fn dump(format: Format, doc: &Value) -> String {
     let text = match format {
         Format::Json => serde_json::to_string_pretty(doc).expect("json dump of a valid document"),
         Format::Yaml => serde_yaml_ng::to_string(doc).expect("yaml dump of a valid document"),
-        Format::Toml => dump_toml(doc).expect("toml dump of a valid document"),
     };
     ensure_single_trailing_newline(text)
 }
@@ -211,155 +214,6 @@ fn scan_yaml_safety(text: &str) -> Result<(), Error> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// TOML
-// ---------------------------------------------------------------------
-
-fn toml_parse_err(e: impl fmt::Display) -> Error {
-    Error::Parse {
-        format: Format::Toml,
-        msg: e.to_string(),
-    }
-}
-
-fn parse_toml(text: &str) -> Result<Value, Error> {
-    let doc: toml_edit::DocumentMut = text.parse().map_err(toml_parse_err)?;
-    toml_table_to_json(doc.as_table(), &Path::root())
-}
-
-fn toml_table_to_json(t: &toml_edit::Table, path: &Path) -> Result<Value, Error> {
-    let mut map = Map::new();
-    for (k, item) in t.iter() {
-        let child_path = path.join(k.to_string());
-        map.insert(k.to_string(), toml_item_to_json(item, &child_path)?);
-    }
-    Ok(Value::Object(map))
-}
-
-fn toml_item_to_json(item: &toml_edit::Item, path: &Path) -> Result<Value, Error> {
-    match item {
-        toml_edit::Item::None => Ok(Value::Null),
-        toml_edit::Item::Value(v) => toml_value_to_json(v, path),
-        toml_edit::Item::Table(t) => toml_table_to_json(t, path),
-        toml_edit::Item::ArrayOfTables(aot) => {
-            let mut out = Vec::with_capacity(aot.len());
-            for (i, t) in aot.iter().enumerate() {
-                out.push(toml_table_to_json(t, &path.join(i.to_string()))?);
-            }
-            Ok(Value::Array(out))
-        }
-    }
-}
-
-fn toml_value_to_json(v: &toml_edit::Value, path: &Path) -> Result<Value, Error> {
-    match v {
-        toml_edit::Value::String(s) => Ok(Value::String(s.value().clone())),
-        toml_edit::Value::Integer(i) => Ok(Value::Number(Number::from(*i.value()))),
-        toml_edit::Value::Float(f) => Number::from_f64(*f.value())
-            .map(Value::Number)
-            .ok_or_else(|| toml_parse_err(format!("{path}: non-finite float"))),
-        toml_edit::Value::Boolean(b) => Ok(Value::Bool(*b.value())),
-        toml_edit::Value::Datetime(_) => Err(toml_parse_err(format!(
-            "{path}: datetime values are not supported"
-        ))),
-        toml_edit::Value::Array(arr) => {
-            let mut out = Vec::with_capacity(arr.len());
-            for (i, item) in arr.iter().enumerate() {
-                out.push(toml_value_to_json(item, &path.join(i.to_string()))?);
-            }
-            Ok(Value::Array(out))
-        }
-        toml_edit::Value::InlineTable(t) => {
-            let mut map = Map::new();
-            for (k, v) in t.iter() {
-                map.insert(
-                    k.to_string(),
-                    toml_value_to_json(v, &path.join(k.to_string()))?,
-                );
-            }
-            Ok(Value::Object(map))
-        }
-    }
-}
-
-/// Builds a fresh `toml_edit` document from `doc`: nested objects become
-/// explicit `[a.b]` tables (never inline tables, never dotted keys); arrays
-/// whose elements are all objects become `[[a.b]]` arrays of tables; every
-/// other value (scalars, arrays of scalars, or heterogeneous arrays whose
-/// object elements fall back to inline tables) is written as `key = value`.
-fn dump_toml(doc: &Value) -> Result<String, Error> {
-    let map = doc
-        .as_object()
-        .ok_or_else(|| toml_parse_err("document must be an object"))?;
-    let table = build_toml_table(map, &Path::root())?;
-    let doc_mut: toml_edit::DocumentMut = table.into();
-    Ok(doc_mut.to_string())
-}
-
-fn build_toml_table(
-    map: &Map<String, Value>,
-    path: &Path,
-) -> Result<toml_edit::Table, Error> {
-    let mut table = toml_edit::Table::new();
-    table.set_implicit(false);
-    for (k, v) in map.iter() {
-        let child_path = path.join(k.clone());
-        match v {
-            Value::Object(sub) => {
-                let sub_table = build_toml_table(sub, &child_path)?;
-                table.insert(k, toml_edit::Item::Table(sub_table));
-            }
-            Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_object) => {
-                let mut aot = toml_edit::ArrayOfTables::new();
-                for (i, item) in items.iter().enumerate() {
-                    let obj = item.as_object().expect("checked all-object above");
-                    aot.push(build_toml_table(obj, &child_path.join(i.to_string()))?);
-                }
-                table.insert(k, toml_edit::Item::ArrayOfTables(aot));
-            }
-            _ => {
-                let tv = json_to_toml_value(v, &child_path)?;
-                table.insert(k, toml_edit::Item::Value(tv));
-            }
-        }
-    }
-    Ok(table)
-}
-
-/// Converts a JSON value that is *not* directly a table-shaped object at the
-/// document/table level (scalars, arrays, and inline-table fallbacks for
-/// objects nested inside arrays) into a `toml_edit::Value`.
-pub(crate) fn json_to_toml_value(v: &Value, path: &Path) -> Result<toml_edit::Value, Error> {
-    match v {
-        Value::Null => Err(toml_parse_err(format!("{path}: null is not representable in TOML"))),
-        Value::Bool(b) => Ok((*b).into()),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(i.into())
-            } else if let Some(f) = n.as_f64() {
-                Ok(f.into())
-            } else {
-                Err(toml_parse_err(format!("{path}: number out of range for TOML")))
-            }
-        }
-        Value::String(s) => Ok(s.as_str().into()),
-        Value::Array(items) => {
-            let mut arr = toml_edit::Array::new();
-            for (i, item) in items.iter().enumerate() {
-                arr.push_formatted(json_to_toml_value(item, &path.join(i.to_string()))?);
-            }
-            Ok(toml_edit::Value::Array(arr))
-        }
-        Value::Object(obj) => {
-            let mut t = toml_edit::InlineTable::new();
-            for (k, val) in obj.iter() {
-                t.insert(k, json_to_toml_value(val, &path.join(k.clone()))?);
-            }
-            Ok(toml_edit::Value::InlineTable(t))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,16 +225,18 @@ mod tests {
         assert_eq!(Format::Yaml.ext(), "yaml");
         assert_eq!(Format::from_ext("yml"), Some(Format::Yaml));
         assert_eq!(Format::from_ext("YAML"), Some(Format::Yaml));
-        assert_eq!(Format::from_ext("toml"), Some(Format::Toml));
         assert_eq!(Format::from_ext("json"), Some(Format::Json));
         assert_eq!(Format::from_ext("ini"), None);
+        // TOML is gone entirely (docs/DESIGN.md §8: YAML only on disk).
+        assert_eq!(Format::from_ext("toml"), None);
     }
 
     #[test]
     fn format_display_and_from_str() {
-        assert_eq!(Format::Toml.to_string(), "toml");
-        assert_eq!("toml".parse::<Format>().unwrap(), Format::Toml);
+        assert_eq!(Format::Json.to_string(), "json");
+        assert_eq!("json".parse::<Format>().unwrap(), Format::Json);
         assert_eq!("yml".parse::<Format>().unwrap(), Format::Yaml);
+        assert!("toml".parse::<Format>().is_err());
         assert!("nope".parse::<Format>().is_err());
     }
 
@@ -448,35 +304,6 @@ mod tests {
     fn yaml_rejects_null_via_lint() {
         let err = parse(Format::Yaml, "a: ~\n").unwrap_err();
         assert!(matches!(err, Error::Lint(_)));
-    }
-
-    #[test]
-    fn toml_parse_and_dump_round_trip() {
-        let doc = json!({
-            "z": 1,
-            "a": {"y": 2, "x": [1, 2, 3]},
-            "items": [{"n": 1}, {"n": 2}],
-        });
-        let text = dump(Format::Toml, &doc);
-        assert!(text.ends_with('\n'));
-        assert!(!text.ends_with("\n\n"));
-        assert!(text.contains("[a]"));
-        assert!(text.contains("[[items]]"));
-        assert!(!text.contains("{"));
-        let back = parse(Format::Toml, &text).unwrap();
-        assert_eq!(back, doc);
-    }
-
-    #[test]
-    fn toml_rejects_datetime() {
-        let err = parse(Format::Toml, "d = 1979-05-27T07:32:00Z\n").unwrap_err();
-        match err {
-            Error::Parse { format, msg } => {
-                assert_eq!(format, Format::Toml);
-                assert!(msg.contains('d'), "message should name the path: {msg}");
-            }
-            other => panic!("expected Parse error, got {other:?}"),
-        }
     }
 
     #[test]

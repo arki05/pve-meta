@@ -1,7 +1,7 @@
 //! Integration tests for merge-patch semantics (`pve_meta_core::patch`).
 
 use pretty_assertions::assert_eq;
-use pve_meta_core::patch::{apply_patch, diff, make_patch, Op};
+use pve_meta_core::patch::{apply_patch, diff, Op};
 use pve_meta_core::path::Path;
 use serde_json::json;
 
@@ -113,29 +113,4 @@ fn diff_full_document_scenarios() {
             ("removed_top".to_string(), false),
         ]
     );
-}
-
-#[test]
-fn make_patch_and_apply_patch_round_trip_various_docs() {
-    let samples: Vec<(serde_json::Value, serde_json::Value)> = vec![
-        (json!({}), json!({})),
-        (json!({"a": 1}), json!({"a": 1})),
-        (json!({}), json!({"a": {"b": {"c": 1}}})),
-        (json!({"a": {"b": {"c": 1}}}), json!({})),
-        (
-            json!({"a": [1, 2], "b": {"x": 1, "y": 2}}),
-            json!({"a": [1, 2, 3], "b": {"x": 1, "z": 3}}),
-        ),
-        (
-            json!({"list": [{"n": 1}, {"n": 2}]}),
-            json!({"list": [{"n": 1}]}),
-        ),
-        (json!({"a__": "comment", "a": 1}), json!({"a__": "new comment", "a": 2})),
-    ];
-    for (old, new) in samples {
-        let patch = make_patch(&old, &new);
-        let mut applied = old.clone();
-        apply_patch(&mut applied, &patch);
-        assert_eq!(applied, new, "round trip failed for old={old} new={new} patch={patch}");
-    }
 }

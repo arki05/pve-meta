@@ -1,11 +1,8 @@
 //! Integration tests for `pve_meta_core::store::MetaStore`.
 
-use std::thread;
-use std::time::Duration;
-
 use pretty_assertions::assert_eq;
+use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
-use pve_meta_core::format::Format;
 use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome};
 use serde_json::json;
 use tempfile::tempdir;
@@ -24,78 +21,16 @@ fn read_missing_is_not_found() {
 }
 
 #[test]
-fn patch_creates_document_when_missing() {
-    let (_dir, store) = store();
-    let doc = store
-        .patch(DocId::Guest(100), &json!({"name": "web01"}), None)
-        .unwrap();
-    assert_eq!(doc.format, Format::Yaml);
-    assert_eq!(doc.value, json!({"name": "web01"}));
-    assert!(doc.path.exists());
-
-    let reread = store.read(DocId::Guest(100)).unwrap();
-    assert_eq!(reread.value, doc.value);
-    assert_eq!(reread.digest, doc.digest);
-}
-
-#[test]
-fn patch_create_with_top_level_delete_fails() {
-    let (_dir, store) = store();
-    let err = store
-        .patch(DocId::Guest(100), &json!({"name": null}), None)
-        .unwrap_err();
-    assert!(matches!(err, Error::NotFound(DocId::Guest(100))));
-}
-
-#[test]
-fn patch_invalid_patch_is_rejected() {
-    let (_dir, store) = store();
-    let err = store
-        .patch(DocId::Guest(100), &json!({"bad key": 1}), None)
-        .unwrap_err();
-    assert!(matches!(err, Error::Lint(_)));
-}
-
-#[test]
-fn patch_existing_document_merges() {
-    let (_dir, store) = store();
-    store
-        .patch(DocId::Guest(100), &json!({"a": 1, "b": 2}), None)
-        .unwrap();
-    let doc = store
-        .patch(DocId::Guest(100), &json!({"b": null, "c": 3}), None)
-        .unwrap();
-    assert_eq!(doc.value, json!({"a": 1, "c": 3}));
-}
-
-#[test]
-fn patch_digest_mismatch_is_rejected() {
-    let (_dir, store) = store();
-    let doc = store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    let err = store
-        .patch(DocId::Guest(100), &json!({"a": 2}), Some("deadbeef"))
-        .unwrap_err();
-    assert!(matches!(err, Error::DigestMismatch { .. }));
-    // correct digest succeeds
-    let doc2 = store
-        .patch(DocId::Guest(100), &json!({"a": 2}), Some(&doc.digest))
-        .unwrap();
-    assert_eq!(doc2.value, json!({"a": 2}));
-}
-
-#[test]
 fn put_raw_creates_and_replaces_and_diffs() {
     let (_dir, store) = store();
-    let result = store
-        .put_raw(DocId::Guest(100), "a: 1\nb: 2\n", None, None)
-        .unwrap();
-    assert_eq!(result.document.format, Format::Yaml);
+    let result = store.put_raw(DocId::Guest(100), "a: 1\nb: 2\n", None).unwrap();
     assert_eq!(result.document.value, json!({"a": 1, "b": 2}));
+    assert!(result.document.path.ends_with("100.yaml"));
     // diff against an empty starting document
     assert_eq!(result.touched.len(), 2);
 
     let result2 = store
-        .put_raw(DocId::Guest(100), "a: 10\nc: 3\n", None, Some(&result.document.digest))
+        .put_raw(DocId::Guest(100), "a: 10\nc: 3\n", Some(&result.document.digest))
         .unwrap();
     assert_eq!(result2.document.value, json!({"a": 10, "c": 3}));
     let mut touched: Vec<String> = result2.touched.iter().map(|t| t.path.to_string()).collect();
@@ -104,60 +39,83 @@ fn put_raw_creates_and_replaces_and_diffs() {
 }
 
 #[test]
-fn put_raw_can_switch_format_and_removes_old_file() {
-    let (_dir, store) = store();
-    let r1 = store.put_raw(DocId::Guest(100), "a: 1\n", None, None).unwrap();
-    let yaml_path = r1.document.path.clone();
-    assert!(yaml_path.exists());
-
-    let r2 = store
-        .put_raw(DocId::Guest(100), "a = 2\n", Some(Format::Toml), Some(&r1.document.digest))
-        .unwrap();
-    assert_eq!(r2.document.format, Format::Toml);
-    assert!(!yaml_path.exists());
-    assert!(r2.document.path.exists());
-    assert!(store.locate(DocId::Guest(100)).unwrap().is_some());
-}
-
-#[test]
 fn put_raw_digest_mismatch() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None, None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     let err = store
-        .put_raw(DocId::Guest(100), "a: 2\n", None, Some("nope"))
+        .put_raw(DocId::Guest(100), "a: 2\n", Some("nope"))
         .unwrap_err();
     assert!(matches!(err, Error::DigestMismatch { .. }));
 }
 
 #[test]
-fn convert_switches_format_and_preserves_value() {
+fn put_raw_empty_digest_matches_a_missing_document() {
+    // Review F13: `GET` reports digest "" for a non-existent document, so
+    // the documented GET-then-PUT-with-digest create flow must work.
     let (_dir, store) = store();
-    let doc = store
-        .patch(DocId::Guest(100), &json!({"a": 1, "b": {"c": 2}}), None)
-        .unwrap();
-    assert_eq!(doc.format, Format::Yaml);
-    let converted = store.convert(DocId::Guest(100), Format::Toml, Some(&doc.digest)).unwrap();
-    assert_eq!(converted.format, Format::Toml);
-    assert_eq!(converted.value, doc.value);
-    assert!(!doc.path.exists());
-    assert!(converted.path.exists());
+    let result = store.put_raw(DocId::Guest(100), "a: 1\n", Some("")).unwrap();
+    assert_eq!(result.document.value, json!({"a": 1}));
 
-    let reread = store.read(DocId::Guest(100)).unwrap();
-    assert_eq!(reread.format, Format::Toml);
-    assert_eq!(reread.value, doc.value);
+    // Once it exists, "" no longer matches.
+    let err = store
+        .put_raw(DocId::Guest(100), "a: 2\n", Some(""))
+        .unwrap_err();
+    match err {
+        Error::DigestMismatch { expected, actual } => {
+            assert_eq!(expected, "");
+            assert_eq!(actual, result.document.digest);
+        }
+        other => panic!("expected DigestMismatch, got {other:?}"),
+    }
 }
 
 #[test]
-fn convert_missing_is_not_found() {
+fn put_raw_non_empty_digest_against_a_missing_document_is_a_mismatch() {
     let (_dir, store) = store();
-    let err = store.convert(DocId::Guest(100), Format::Toml, None).unwrap_err();
-    assert!(matches!(err, Error::NotFound(_)));
+    let err = store
+        .put_raw(DocId::Guest(100), "a: 1\n", Some("deadbeef"))
+        .unwrap_err();
+    match err {
+        Error::DigestMismatch { expected, actual } => {
+            assert_eq!(expected, "deadbeef");
+            assert_eq!(actual, "");
+        }
+        other => panic!("expected DigestMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn put_raw_rejects_invalid_yaml_and_invalid_documents() {
+    let (_dir, store) = store();
+    assert!(matches!(
+        store.put_raw(DocId::Guest(100), "a: [\n", None),
+        Err(Error::Parse { .. })
+    ));
+    assert!(matches!(
+        store.put_raw(DocId::Guest(100), "a: ~\n", None),
+        Err(Error::Lint(_))
+    ));
+    assert!(matches!(
+        store.put_raw(DocId::Guest(100), "- 1\n- 2\n", None),
+        Err(Error::Lint(_))
+    ));
+    // Nothing was written.
+    assert!(store.locate(DocId::Guest(100)).unwrap().is_none());
+}
+
+#[test]
+fn put_raw_normalizes_the_trailing_newline_and_digest_matches_the_file() {
+    let (_dir, store) = store();
+    let r = store.put_raw(DocId::Guest(100), "a: 1", None).unwrap();
+    assert_eq!(r.document.raw, "a: 1\n");
+    let on_disk = std::fs::read(&r.document.path).unwrap();
+    assert_eq!(digest(&on_disk), r.document.digest);
 }
 
 #[test]
 fn delete_removes_document() {
     let (_dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     store.delete(DocId::Guest(100)).unwrap();
     assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
 }
@@ -169,48 +127,62 @@ fn delete_missing_is_not_found() {
 }
 
 #[test]
-fn delete_removes_snapshots_too() {
+fn delete_leaves_snapshots_alone() {
+    // Review F19: `DELETE /meta/guests/{vmid}` has no concept of snapshots,
+    // so `delete` must never cascade into them. Only `destroy` (the
+    // `on_destroy` lifecycle hook) does.
     let (dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    store.snapshot(100, "snap1").unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "snapA").unwrap();
     store.delete(DocId::Guest(100)).unwrap();
+    assert_eq!(store.list_snapshots(100).unwrap(), vec!["snapA".to_string()]);
+    assert!(dir.path().join("100.snapA.yaml").exists());
+}
+
+#[test]
+fn destroy_removes_the_document_and_every_snapshot() {
+    let (dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "snapA").unwrap();
+    store.snapshot(100, "snapB").unwrap();
+    store.destroy(100).unwrap();
+    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
     assert!(store.list_snapshots(100).unwrap().is_empty());
-    assert!(!dir.path().join("100.snap1.yaml").exists());
+    assert!(!dir.path().join("100.snapA.yaml").exists());
+    assert!(!dir.path().join("100.snapB.yaml").exists());
 }
 
 #[test]
-fn conflict_when_two_format_files_exist() {
-    let (dir, store) = store();
-    std::fs::write(dir.path().join("100.yaml"), "a: 1\n").unwrap();
-    std::fs::write(dir.path().join("100.toml"), "a = 1\n").unwrap();
-    let err = store.read(DocId::Guest(100)).unwrap_err();
-    assert!(matches!(err, Error::Conflict(_)));
-    let err2 = store.locate(DocId::Guest(100)).unwrap_err();
-    assert!(matches!(err2, Error::Conflict(_)));
-}
-
-#[test]
-fn list_guests_ignores_snapshots_datacenter_and_tmp_files() {
-    let (dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    store.patch(DocId::Guest(200), &json!({"a": 2}), None).unwrap();
-    store.patch(DocId::Datacenter, &json!({"settings": {}}), None).unwrap();
-    store.snapshot(100, "before").unwrap();
-    std::fs::write(dir.path().join(".100.tmp.12345"), "junk").unwrap();
-
-    let guests = store.list_guests().unwrap();
-    let vmids: Vec<u32> = guests.iter().map(|g| g.vmid).collect();
-    assert_eq!(vmids, vec![100, 200]);
-    for g in &guests {
-        assert_eq!(g.format, Format::Yaml);
-        assert!(g.size > 0);
-    }
-}
-
-#[test]
-fn list_guests_empty_store() {
+fn destroy_is_idempotent_and_cleans_orphaned_snapshots() {
     let (_dir, store) = store();
-    assert!(store.list_guests().unwrap().is_empty());
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "orphan").unwrap();
+    store.delete(DocId::Guest(100)).unwrap();
+    // No live document, but a snapshot survives the API delete.
+    store.destroy(100).unwrap();
+    assert!(store.list_snapshots(100).unwrap().is_empty());
+    store.destroy(100).unwrap();
+}
+
+#[test]
+fn api_delete_then_rollback_does_not_lose_snapshot_metadata() {
+    // The forward propagation of review F19: a plain DELETE used to eat the
+    // snapshot copies, after which `on_rollback` read "no snapshot" as
+    // "there was no metadata" and deleted the freshly rewritten document.
+    let (_dir, store) = store();
+    store.put_raw(DocId::Guest(100), "traefik:\n  host: a\n", None).unwrap();
+    store.snapshot(100, "snapA").unwrap();
+
+    // A user empties the document through the API...
+    store.delete(DocId::Guest(100)).unwrap();
+    // ... then writes new metadata ...
+    store.put_raw(DocId::Guest(100), "traefik:\n  host: b\n", None).unwrap();
+    // ... then rolls the guest back to snapA.
+    assert_eq!(store.rollback(100, "snapA").unwrap(), RollbackOutcome::Restored);
+    assert_eq!(
+        store.read(DocId::Guest(100)).unwrap().value,
+        json!({"traefik": {"host": "a"}})
+    );
 }
 
 #[test]
@@ -219,11 +191,12 @@ fn snapshot_rollback_delete_and_list() {
     // snapshot with no document is a no-op
     assert!(!store.snapshot(100, "none").unwrap());
 
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     assert!(store.snapshot(100, "v1").unwrap());
     assert_eq!(store.list_snapshots(100).unwrap(), vec!["v1".to_string()]);
 
-    store.patch(DocId::Guest(100), &json!({"a": 2}), None).unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     assert!(store.snapshot(100, "v2").unwrap());
     assert_eq!(
         store.list_snapshots(100).unwrap(),
@@ -243,9 +216,21 @@ fn snapshot_rollback_delete_and_list() {
 }
 
 #[test]
+fn snapshot_re_snapshot_overwrites() {
+    let (_dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "v1").unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    store.snapshot(100, "v1").unwrap();
+    store.rollback(100, "v1").unwrap();
+    assert_eq!(store.read(DocId::Guest(100)).unwrap().value, json!({"a": 2}));
+}
+
+#[test]
 fn rollback_without_snapshot_but_with_live_doc_removes_it() {
     let (_dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     let outcome = store.rollback(100, "never-existed").unwrap();
     assert_eq!(outcome, RollbackOutcome::RemovedNoSnapshot);
     assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
@@ -266,63 +251,31 @@ fn rollback_rejects_invalid_snapshot_name() {
 }
 
 #[test]
-fn snapshot_of_different_format_replaces_stale_extension() {
+fn list_snapshots_ignores_documents_temp_files_and_other_guests() {
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None, None).unwrap();
-    store.snapshot(100, "v1").unwrap();
-    assert!(dir.path().join("100.v1.yaml").exists());
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(DocId::Guest(1000), "a: 1\n", None).unwrap();
+    store.put_raw(DocId::Datacenter, "a: 1\n", None).unwrap();
+    store.snapshot(100, "before").unwrap();
+    std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
+    std::fs::write(dir.path().join("100.bad name.yaml"), "a: 1\n").unwrap();
 
-    store.convert(DocId::Guest(100), Format::Toml, None).unwrap();
-    store.snapshot(100, "v1").unwrap();
-    assert!(dir.path().join("100.v1.toml").exists());
-    assert!(!dir.path().join("100.v1.yaml").exists());
+    assert_eq!(store.list_snapshots(100).unwrap(), vec!["before".to_string()]);
+    assert!(store.list_snapshots(1000).unwrap().is_empty());
 }
 
 #[test]
-fn clone_copies_document_only() {
-    let (_dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    store.snapshot(100, "v1").unwrap();
-
-    let cloned = store.clone(100, 200).unwrap();
-    assert_eq!(cloned.value, json!({"a": 1}));
-    assert!(store.list_snapshots(200).unwrap().is_empty());
-}
-
-#[test]
-fn clone_fails_if_source_missing_or_target_exists() {
-    let (_dir, store) = store();
-    assert!(matches!(store.clone(100, 200).unwrap_err(), Error::NotFound(_)));
-
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    store.patch(DocId::Guest(200), &json!({"b": 2}), None).unwrap();
-    assert!(matches!(store.clone(100, 200).unwrap_err(), Error::Conflict(_)));
-}
-
-#[test]
-fn destroy_is_delete() {
-    let (_dir, store) = store();
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    store.destroy(100).unwrap();
-    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
-}
-
-#[test]
-fn default_format_falls_back_to_yaml_without_datacenter_doc() {
-    let (_dir, store) = store();
-    assert_eq!(store.default_format().unwrap(), Format::Yaml);
-}
-
-#[test]
-fn default_format_reads_from_datacenter_settings() {
-    let (_dir, store) = store();
-    store
-        .patch(DocId::Datacenter, &json!({"settings": {"default_format": "toml"}}), None)
-        .unwrap();
-    assert_eq!(store.default_format().unwrap(), Format::Toml);
-
-    let doc = store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
-    assert_eq!(doc.format, Format::Toml);
+fn write_atomic_leaves_no_temp_files_behind() {
+    let (dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
 }
 
 #[test]
@@ -330,7 +283,7 @@ fn version_token_changes_on_write_not_on_read() {
     let (_dir, store) = store();
     let v0 = store.version().unwrap();
 
-    store.patch(DocId::Guest(100), &json!({"a": 1}), None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
     assert_ne!(v0.token, v1.token);
 
@@ -340,45 +293,50 @@ fn version_token_changes_on_write_not_on_read() {
     assert_eq!(v1.token, v1_again.token);
 
     // another write changes it again
-    store.patch(DocId::Guest(100), &json!({"a": 2}), None).unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     let v2 = store.version().unwrap();
     assert_ne!(v1.token, v2.token);
 }
 
 #[test]
 fn version_distinguishes_same_length_same_second_writes() {
-    // Guards against relying on (mtime, len) alone, which has only
-    // one-second resolution on pmxcfs: two different byte-for-byte-different
-    // writes of equal length, issued back-to-back, must still produce
-    // different tokens because the content digest (not just mtime/len) is
-    // what feeds the token.
+    // Review F25: `(mtime, len)` cannot tell two same-length writes within
+    // one pmxcfs mtime tick apart, so the token is always computed from the
+    // files' actual content.
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None, None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
-    store
-        .put_raw(DocId::Guest(100), "a: 2\n", None, Some(&store.read(DocId::Guest(100)).unwrap().digest))
-        .unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     let v2 = store.version().unwrap();
     assert_ne!(v1.token, v2.token, "equal-length same-second writes must differ");
 }
 
 #[test]
-fn version_cache_still_correct_after_it_goes_stale() {
-    // Exercises the >2s-old cache-hit path: after the cache entry is old
-    // enough to be trusted, the token must still reflect the true content
-    // (unchanged here), and a subsequent real change must still be seen.
-    let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None, None).unwrap();
+fn version_reflects_a_change_made_behind_the_stores_back() {
+    // No cache means a second `MetaStore` over the same root, or an
+    // out-of-band write, is always seen.
+    let (dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
-    thread::sleep(Duration::from_millis(2100));
-    let v1_stale = store.version().unwrap();
-    assert_eq!(v1.token, v1_stale.token, "unchanged content must keep the same token");
+    std::fs::write(dir.path().join("100.yaml"), "a: 2\n").unwrap();
+    assert_ne!(v1.token, store.version().unwrap().token);
 
-    store
-        .put_raw(DocId::Guest(100), "a: 2\n", None, Some(&store.read(DocId::Guest(100)).unwrap().digest))
-        .unwrap();
-    let v2 = store.version().unwrap();
-    assert_ne!(v1_stale.token, v2.token, "a real change must still be detected");
+    let other = MetaStore::new(dir.path());
+    assert_eq!(other.version().unwrap().token, store.version().unwrap().token);
+}
+
+#[test]
+fn version_token_returns_to_an_earlier_value_when_content_does() {
+    let (_dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    let v1 = store.version().unwrap();
+    let d = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d2 = store.read(DocId::Guest(100)).unwrap().digest;
+    store.put_raw(DocId::Guest(100), "a: 1\n", Some(&d2)).unwrap();
+    assert_eq!(v1.token, store.version().unwrap().token);
 }
 
 #[test]
@@ -386,6 +344,6 @@ fn too_large_document_is_rejected() {
     let (_dir, store) = store();
     let big = "x".repeat(600 * 1024);
     let text = format!("a: \"{big}\"\n");
-    let err = store.put_raw(DocId::Guest(100), &text, None, None).unwrap_err();
+    let err = store.put_raw(DocId::Guest(100), &text, None).unwrap_err();
     assert!(matches!(err, Error::TooLarge { .. }));
 }

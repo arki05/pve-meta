@@ -1,7 +1,14 @@
-//! `pve-meta-rs`: the `PVE::RS::Meta` Perl bindings, exposing
-//! [`pve_meta_core::store::MetaStore`]'s guest lifecycle operations
-//! (snapshot/rollback/delsnap/clone/destroy, backup export/import) to PVE's
-//! Perl code via `perlmod`.
+//! `pve-meta-rs`: the `PVE::RS::Meta` Perl bindings.
+//!
+//! Two families of exports, both thin wrappers over [`pve_meta_core`]:
+//!
+//! * the **guest lifecycle hooks** (`on_snapshot`/`on_rollback`/`on_delsnap`/
+//!   `on_clone`/`on_destroy`, `export_for_backup`/`import_from_backup`,
+//!   `list_snapshots`/`has_document`), called from the patched PVE Perl code
+//!   (`patches/lifecycle/`, `docs/LIFECYCLE-PATCHES.md`), and
+//! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`
+//!   (`docs/DESIGN.md` §3), which are implemented in
+//!   [`pve_meta_core::api`] — this crate only supplies the store.
 //!
 //! Built as a `cdylib` (`libpve_meta_rs.so`); the `.pm` glue files
 //! (`PVE/RS/Meta.pm`, `Proxmox/Lib/PVEMeta.pm`) are generated separately by
@@ -14,10 +21,8 @@
 use std::path::PathBuf;
 
 use pve_meta_core::error::Error as CoreError;
-use pve_meta_core::format::Format;
-use pve_meta_core::store::{MetaStore, RollbackOutcome};
-
-mod api;
+use pve_meta_core::format::{self, Format};
+use pve_meta_core::store::{MetaStore, RollbackOutcome, DISK_FORMAT};
 
 /// Opens a fresh [`MetaStore`] rooted at `$PVE_META_ROOT`, or
 /// `/etc/pve/meta` if unset. Cheap: `MetaStore::new` does no I/O.
@@ -30,6 +35,11 @@ fn open_store() -> MetaStore {
 
 /// Splits an `export_for_backup` blob into its `#pve-meta-format: <ext>`
 /// header and the raw document text that follows it.
+///
+/// Documents are YAML on disk (`docs/DESIGN.md` §8), so the header this
+/// crate *writes* always says `yaml`; it is still parsed on import so a blob
+/// produced by an older build (which could say `json`) still restores — the
+/// content is re-dumped as YAML on the way in.
 fn split_backup_header(data: &str) -> anyhow::Result<(Format, &str)> {
     let (header, rest) = data
         .split_once('\n')
@@ -55,13 +65,15 @@ mod proxmox_lib_pve_meta {}
 mod pve_rs_meta {
     //! The `PVE::RS::Meta` package: guest metadata lifecycle hooks, called
     //! from PVE's guest lifecycle code (snapshot/rollback/clone/destroy) and
-    //! from vzdump backup/restore.
+    //! from vzdump backup/restore, plus the `api_*` functions used by
+    //! `PVE::API2::Ext::Meta`.
 
     use anyhow::Error;
 
+    use pve_meta_core::api;
     use pve_meta_core::store::DocId;
 
-    use super::{open_store, split_backup_header, RollbackOutcome};
+    use super::{format, open_store, split_backup_header, RollbackOutcome, DISK_FORMAT};
 
     /// Copies `$vmid`'s current document to its `$snapname` snapshot file.
     /// A no-op if the guest has no document.
@@ -117,52 +129,46 @@ mod pve_rs_meta {
         let src = match store.read(DocId::Guest(vmid)) {
             Ok(doc) => doc,
             Err(super::CoreError::NotFound(_)) => {
-                if let Some(stale) = store.locate(DocId::Guest(newid))? {
-                    std::fs::remove_file(&stale.path)?;
+                if store.locate(DocId::Guest(newid))?.is_some() {
+                    store.delete(DocId::Guest(newid))?;
                 }
                 return Ok(false);
             }
             Err(e) => return Err(e.into()),
         };
-        // `put_raw` with no expected digest always creates-or-overwrites (and
-        // switches the target's extension to match the source's format if it
-        // previously differed), so this never dies on an existing `$newid`
-        // document the way `MetaStore::clone` would.
-        store.put_raw(DocId::Guest(newid), &src.raw, Some(src.format), None)?;
+        // `put_raw` with no expected digest always creates-or-overwrites, so
+        // this never dies on an existing `$newid` document.
+        store.put_raw(DocId::Guest(newid), &src.raw, None)?;
         Ok(true)
     }
 
     /// Removes `$vmid`'s document and all of its snapshot copies. Idempotent.
     ///
+    /// This is the *only* caller of the cascading
+    /// [`pve_meta_core::store::MetaStore::destroy`]; the REST API's `DELETE`
+    /// removes the current document only (`docs/DESIGN.md` §8).
+    ///
     /// Returns the number of files removed.
     #[export]
     pub fn on_destroy(vmid: u32) -> Result<u32, Error> {
         let store = open_store();
-        let snapshots = store.list_snapshots(vmid)?;
+        let snapshots = store.list_snapshots(vmid)?.len() as u32;
         let had_document = store.locate(DocId::Guest(vmid))?.is_some();
-        if had_document {
-            // Removes the document and every snapshot copy in one go.
-            store.destroy(vmid)?;
-        } else {
-            // No live document: still clean up any orphaned snapshot files.
-            for name in &snapshots {
-                store.delete_snapshot(vmid, name)?;
-            }
-        }
-        Ok(snapshots.len() as u32 + u32::from(had_document))
+        store.destroy(vmid)?;
+        Ok(snapshots + u32::from(had_document))
     }
 
     /// Returns `undef` if `$vmid` has no document, else a string
-    /// `"#pve-meta-format: <ext>\n"` followed by the document's raw text.
-    /// The header records the format so `import_from_backup` can restore it
-    /// without re-guessing; it is stripped on import (and would otherwise
-    /// just be a harmless comment line in all three supported formats).
+    /// `"#pve-meta-format: yaml\n"` followed by the document's raw text.
+    /// The header records the format so `import_from_backup` can restore an
+    /// older blob without re-guessing; it is stripped on import (and would
+    /// otherwise just be a harmless comment line in YAML).
     #[export]
     pub fn export_for_backup(vmid: u32) -> Result<Option<String>, Error> {
         match open_store().read(DocId::Guest(vmid)) {
             Ok(doc) => Ok(Some(format!(
                 "#pve-meta-format: {}\n{}",
-                doc.format.ext(),
+                DISK_FORMAT.ext(),
                 doc.raw
             ))),
             Err(super::CoreError::NotFound(_)) => Ok(None),
@@ -175,11 +181,25 @@ mod pve_rs_meta {
     /// existing document for that vmid. The content is validated through the
     /// core parser/lint before being written; dies on invalid content.
     ///
+    /// Failure is safe for the caller: the restore path in
+    /// `PVE::API2::LXC`'s `create_vm` sets `$destroy_config_on_error = 1`
+    /// unconditionally before the hook runs, so a die here leaves no
+    /// half-restored guest behind.
+    ///
     /// Always returns `1`.
     #[export]
     pub fn import_from_backup(vmid: u32, data: &str) -> Result<bool, Error> {
-        let (format, text) = split_backup_header(data)?;
-        open_store().put_raw(DocId::Guest(vmid), text, Some(format), None)?;
+        let (blob_format, text) = split_backup_header(data)?;
+        let store = open_store();
+        if blob_format == DISK_FORMAT {
+            // Byte-for-byte restore (put_raw still parses and lints it).
+            store.put_raw(DocId::Guest(vmid), text, None)?;
+        } else {
+            // A blob from an older build may name another format; convert it
+            // to the one on-disk format instead of refusing the restore.
+            let value = format::parse(blob_format, text)?;
+            store.put_raw(DocId::Guest(vmid), &format::dump(DISK_FORMAT, &value), None)?;
+        }
         Ok(true)
     }
 
@@ -195,8 +215,9 @@ mod pve_rs_meta {
         Ok(open_store().locate(DocId::Guest(vmid))?.is_some())
     }
 
-    /// Returns this crate's version string (for the health endpoint /
-    /// `pve-meta health`).
+    /// Returns this crate's version string. Used by
+    /// `crates/pve-meta-perl/test/basic.pl` and available to operators for
+    /// checking which build a running pvedaemon/pveproxy has loaded.
     #[export]
     pub fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
@@ -204,15 +225,16 @@ mod pve_rs_meta {
 
     // -- API-shaped exports (`PVE::API2::Ext::Meta`, `docs/DESIGN.md` §3) --
     //
-    // Thin wrappers over `super::api` (see that module's docs for the wire
-    // contract). All of these die with a Rust `anyhow::Error` whose
-    // `Display` is `"NNN: message"` (an HTTP status prefix); the Perl layer
-    // parses that prefix and re-raises via `PVE::Exception::raise`.
+    // Thin wrappers over `pve_meta_core::api` (see that module's docs for the
+    // wire contract and the authorization rules). All of these die with a
+    // Rust `anyhow::Error` whose `Display` is `"NNN: message"` (an HTTP
+    // status prefix); the Perl layer parses that prefix and re-raises via
+    // `PVE::Exception::raise`.
 
     /// `GET /meta/version` -> `{ token, changed }`.
     #[export]
-    pub fn api_version() -> Result<super::api::ApiVersion, Error> {
-        super::api::version()
+    pub fn api_version() -> Result<api::ApiVersion, Error> {
+        api::version(&open_store())
     }
 
     /// The datacenter document's `scopes` entries for `$authid`, as a JSON
@@ -220,15 +242,19 @@ mod pve_rs_meta {
     /// the `grants_json` passed to the other `api_*` functions).
     #[export]
     pub fn api_grants(authid: &str) -> Result<String, Error> {
-        super::api::grants(authid)
+        api::grants(&open_store(), authid)
     }
 
-    /// `GET /meta/guests` -> every vmid the caller can read anything of,
-    /// with `keys` filtered to what they may see. `grants_json` maps each
-    /// vmid (decimal string) to that vmid's grants (see `super::api::list_guests`).
+    /// `GET /meta/guests`. `$guests_json` is the JSON array of vmlist rows
+    /// Perl already has -- `[{vmid, node, type, name, grants}]`, where
+    /// `grants` is that guest's grants as a JSON string. Rust never reads
+    /// `.vmlist` or a guest config itself.
     #[export]
-    pub fn api_list_guests(grants_json: &str, has: Option<&str>) -> Result<Vec<super::api::GuestListEntry>, Error> {
-        super::api::list_guests(grants_json, has)
+    pub fn api_list_guests(
+        guests_json: &str,
+        has: Option<&str>,
+    ) -> Result<Vec<api::GuestListEntry>, Error> {
+        api::list_guests(&open_store(), guests_json, has)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
@@ -240,11 +266,16 @@ mod pve_rs_meta {
         format: &str,
         comments: bool,
         grants_json: &str,
-    ) -> Result<super::api::ApiViewDocument, Error> {
-        super::api::get_document(id, view, format, comments, grants_json)
+    ) -> Result<api::ApiViewDocument, Error> {
+        api::get_document(&open_store(), id, view, format, comments, grants_json)
     }
 
     /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
+    ///
+    /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
+    /// `cfs_lock_domain` lock: the digest precondition is re-checked inside
+    /// this call, but only a lock makes the read-modify-write atomic across
+    /// nodes (`docs/DESIGN.md` §8).
     #[export]
     #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §3)
     pub fn api_put(
@@ -256,18 +287,29 @@ mod pve_rs_meta {
         digest: Option<&str>,
         dry_run: bool,
         grants_json: &str,
-    ) -> Result<super::api::ApiPutResult, Error> {
-        super::api::put_document(id, view, format, payload, mode, digest, dry_run, grants_json)
+    ) -> Result<api::ApiPutResult, Error> {
+        api::put_document(
+            &open_store(),
+            id,
+            view,
+            format,
+            payload,
+            mode,
+            digest,
+            dry_run,
+            grants_json,
+        )
     }
 
-    /// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`.
+    /// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`. Removes the
+    /// current document only -- never a snapshot copy.
     #[export]
     pub fn api_delete(
         id: &str,
         view: Option<&str>,
         digest: Option<&str>,
         grants_json: &str,
-    ) -> Result<super::api::ApiPutResult, Error> {
-        super::api::delete_document(id, view, digest, grants_json)
+    ) -> Result<api::ApiPutResult, Error> {
+        api::delete_document(&open_store(), id, view, digest, grants_json)
     }
 }
