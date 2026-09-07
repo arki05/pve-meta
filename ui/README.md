@@ -16,6 +16,7 @@ Query parameters, as substituted by `pve-ext-loader.js`:
 | File | Contents |
 |---|---|
 | `src/model.rs` | `DocId`, grants, views (key-path prefixes). Pure, unit-tested natively. |
+| `src/request.rs` | Request identity: what an async answer was asked for. Pure, unit-tested natively. |
 | `src/api.rs` | `/api2/json/meta/...` wrappers (`docs/DESIGN.md` §3). |
 | `src/auth.rs` | Ticket/CSRF bootstrap: parent-frame token when embedded, ticket renewal else. |
 | `src/theme.rs` | `PVEThemeCookie`/`?theme=` → pwt's `ThemeName`/`ThemeMode`. |
@@ -50,12 +51,13 @@ Checks:
 ```sh
 cargo clippy --target wasm32-unknown-unknown -- -D warnings
 cargo fmt --check
-cargo test --lib          # native: src/model.rs
+cargo test --lib          # native: src/model.rs, src/request.rs
 ```
 
-`model.rs` is the only module without `#[cfg(target_arch = "wasm32")]`, and everything
-browser-shaped is declared under `[target.'cfg(target_arch = "wasm32")'.dependencies]`,
-so a native `cargo test` never fetches or builds pwt, yew or web-sys.
+`model.rs` and `request.rs` are the only modules without `#[cfg(target_arch = "wasm32")]`,
+and everything browser-shaped is declared under
+`[target.'cfg(target_arch = "wasm32")'.dependencies]`, so a native `cargo test` never
+fetches or builds pwt, yew or web-sys.
 
 ## Install
 
@@ -72,16 +74,34 @@ answered with a 500 until pveproxy is restarted.
 
 * The theme is PVE's while embedded. `PVEThemeCookie` (`crisp` → light, `proxmox-dark` →
   dark, anything else → follow the OS) is mapped into pwt's `localStorage` keys before
-  the first render; the page has no theme switcher of its own.
+  the first render; the page has no theme switcher of its own. A theme change reaches
+  Monaco too (`pwt-theme-changed` → `monaco.editor.setTheme`, re-derived from the
+  `--pwt-*` variables once the new stylesheet has applied).
 * The pwt theme is **Crisp**, the one written to look like the Proxmox products.
 * Concurrency is the digest. `GET /meta/version` is polled every 5 s; when its token
   moves, the document's digest is re-read. A clean editor reloads silently, a dirty one
-  raises the "changed on the server" notice with a Reload button. Unapplied edits are
-  never thrown away.
-* Read-only views (an `ro` scope, or no write grant) disable both the editor and Apply.
+  raises the "changed on the server" notice with a Reload button.
+* **Unapplied edits are never thrown away without asking.** Reload (toolbar and banner)
+  and a "View as" switch raise the same confirmation the Discard button uses; declining
+  leaves the draft — and the selector — exactly where they were.
+* **Every async answer carries the identity it was asked for** — `(document, view,
+  generation)`, `src/request.rs`. `LoadableComponentMaster` respawns a load per
+  `Msg::Load` and cancels nothing, so a load, a write, the diff and the poll's digest
+  read are all dropped when the page has moved on since they went out; a Monaco instance
+  is disposed the moment the page stops showing what it was mounted for.
+* Read-only views disable both the editor and Apply. The grant comes from
+  `GET /meta/access?vmid=<id>` / `?dc=1`, whose `write` half is separate from `read`
+  (`docs/DESIGN.md` §8): an auditor gets a readable document, not an editable buffer and
+  a 403. If that call fails, the page stays read-only and says so, rather than not
+  loading at all.
+* The "View as" list comes from the document read's ordered `keys` array (the YAML text
+  is the fallback). `format=json`'s `data` object is unordered on the wire, so the page
+  never asks for it.
 
 ## Screenshots
 
 `docs/screenshots/`: `embedded-{light,dark}.png` (inside the PVE tab),
-`standalone-{light,dark}.png`, `diff-dialog.png`, `conflict-banner.png`,
-`view-traefik.png`, `read-only.png`.
+`standalone-{light,dark}.png`, `view-traefik.png`, `read-only.png`,
+`diff-dialog.png`, `after-apply.png`, `conflict-banner.png`, `stale-banner.png`,
+`after-conflict-reload.png`, and the two confirmations that guard a draft,
+`reload-confirm.png` and `switch-confirm.png`.

@@ -9,7 +9,7 @@
 //! (`cargo test --lib`) without a browser or any wasm-only dependency.
 
 use serde::Deserialize;
-use serde::de::{self, Deserializer};
+use serde::de::Deserializer;
 use serde_json::Value;
 
 /// Which document is loaded: one guest's, or the cluster-wide datacenter one.
@@ -56,114 +56,77 @@ pub struct Scope {
     pub mode: Mode,
 }
 
-/// Full (ACL-granted) access, as reported by `GET /meta/access`.
+/// The caller's effective grants **for one document** (`GET /meta/access?vmid=…` or
+/// `?dc=1`, `docs/DESIGN.md` §8).
 ///
-/// `docs/DESIGN.md` §3 documents this as `[vmids or "*"]`; PVE renders booleans as a
-/// plain `0`/`1` integer rather than a JSON `true`/`false` (the same wire quirk
-/// `proxmox_serde::perl::deserialize_bool` exists for), and an implementation may just
-/// as well answer `1`, `"*"` or a bare list. Accept all of those shapes rather than
-/// failing the whole response over the spelling of one field.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum FullAccess {
-    /// No document is fully accessible.
-    #[default]
-    None,
-    /// Every document is.
-    All,
-    /// Only these guest documents are (the datacenter document is never in this list).
-    Guests(Vec<u32>),
-}
-
-impl FullAccess {
-    /// True if `doc` is covered by this grant.
-    pub fn covers(&self, doc: DocId) -> bool {
-        match (self, doc) {
-            (FullAccess::None, _) => false,
-            (FullAccess::All, _) => true,
-            (FullAccess::Guests(ids), DocId::Guest(vmid)) => ids.contains(&vmid),
-            (FullAccess::Guests(_), DocId::Datacenter) => false,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for FullAccess {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        Ok(match value {
-            Value::Null => FullAccess::None,
-            Value::Bool(true) => FullAccess::All,
-            Value::Bool(false) => FullAccess::None,
-            Value::Number(n) => match n.as_i64() {
-                Some(0) | None => FullAccess::None,
-                Some(_) => FullAccess::All,
-            },
-            Value::String(s) => match s.as_str() {
-                "*" | "1" | "all" => FullAccess::All,
-                "" | "0" => FullAccess::None,
-                other => match other.parse() {
-                    Ok(vmid) => FullAccess::Guests(vec![vmid]),
-                    Err(_) => FullAccess::None,
-                },
-            },
-            Value::Array(items) => {
-                let mut ids = Vec::new();
-                for item in items {
-                    match item {
-                        Value::String(s) if s == "*" => return Ok(FullAccess::All),
-                        Value::String(s) => {
-                            if let Ok(vmid) = s.parse() {
-                                ids.push(vmid);
-                            }
-                        }
-                        Value::Number(n) => {
-                            if let Some(vmid) = n.as_u64() {
-                                ids.push(vmid as u32);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                FullAccess::Guests(ids)
-            }
-            other => {
-                return Err(de::Error::custom(format!(
-                    "unexpected 'full' value {other}"
-                )));
-            }
-        })
-    }
-}
-
-/// The caller's effective grants (`GET /meta/access`).
+/// `read`/`write` are the ACL half — `VM.Audit`/`VM.Config.Options` on that guest, or
+/// `Sys.Audit`/`Sys.Modify` on `/` for the datacenter document. They are deliberately two
+/// fields: the endpoint used to answer a single audit-derived `full`, which the editor then
+/// used as the *write* grant, so a `Sys.Audit`-only auditor got an editable buffer and an
+/// enabled Apply and learned otherwise from a 403 (`docs/REVIEW-2026-09-07.md` F22).
+///
+/// `scopes` is the prefix half, which applies to every document (§2).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Access {
-    #[serde(default)]
-    pub full: FullAccess,
+    /// May read the whole document.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    pub read: bool,
+    /// May write the whole document.
+    #[serde(default, deserialize_with = "deserialize_flag")]
+    pub write: bool,
+    /// Prefix scopes configured for this principal in the datacenter document.
     #[serde(default)]
     pub scopes: Vec<Scope>,
+}
+
+/// A PVE boolean, in every spelling the wire uses.
+///
+/// `PVE::RESTHandler` renders booleans as a plain `0`/`1` integer rather than a JSON
+/// `true`/`false` (the same quirk `proxmox_serde::perl::deserialize_bool` exists for), and
+/// an implementation may just as well answer `"1"` or `"*"`. Accept all of those rather
+/// than failing the whole response — and, crucially, resolve anything unrecognised to
+/// *false*: a grant the page cannot understand is not a grant.
+fn deserialize_flag<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Bool(flag) => flag,
+        Value::Number(n) => n.as_f64().is_some_and(|n| n != 0.0),
+        Value::String(s) => matches!(s.as_str(), "1" | "true" | "yes" | "*"),
+        _ => false,
+    })
 }
 
 impl Access {
     /// True if `prefix` covers `view` — the empty prefix covers everything, and
     /// `traefik` covers `traefik` and `traefik.spec` but not `traefikx`.
+    ///
+    /// A comment key follows its subject (`docs/DESIGN.md` §8): a scope on `traefik` also
+    /// covers `traefik__`, the note *about* `traefik`.
     pub fn covers(prefix: &str, view: &str) -> bool {
-        prefix.is_empty()
-            || view == prefix
-            || (view.len() > prefix.len()
-                && view.starts_with(prefix)
-                && view.as_bytes()[prefix.len()] == b'.')
+        covers_exactly(prefix, view) || covers_exactly(prefix, strip_comment_marker(view))
     }
 
-    /// True if the caller may write `view` of `doc`.
+    /// True if the caller may write `view` of this document.
     ///
     /// The server is the final arbiter (a refused write comes back as a 403 with its own
     /// message); this only decides whether the editor is writable up front.
-    pub fn may_write(&self, doc: DocId, view: &str) -> bool {
-        self.full.covers(doc)
+    pub fn may_write(&self, view: &str) -> bool {
+        self.write
             || self
                 .scopes
                 .iter()
                 .any(|s| s.mode == Mode::Rw && Self::covers(&s.prefix, view))
+    }
+
+    /// True if the caller may read anything of `view` of this document — either the whole
+    /// subtree (an ACL grant or a scope covering it) or a part of it (a scope *inside* it,
+    /// which a view-less read returns as the union of readable subtrees).
+    pub fn may_read(&self, view: &str) -> bool {
+        self.read
+            || self
+                .scopes
+                .iter()
+                .any(|s| Self::covers(&s.prefix, view) || Self::covers(view, &s.prefix))
     }
 
     /// The prefixes the "View as" selector offers, whole document (the empty prefix)
@@ -191,13 +154,104 @@ impl Access {
     }
 }
 
+/// `prefix` covers `view` as a plain key-path prefix, comment keys not considered.
+fn covers_exactly(prefix: &str, view: &str) -> bool {
+    prefix.is_empty()
+        || view == prefix
+        || (view.len() > prefix.len()
+            && view.starts_with(prefix)
+            && view.as_bytes()[prefix.len()] == b'.')
+}
+
+/// `traefik.host__` → `traefik.host`: the subject a comment key documents. A bare `__`
+/// (the note about the map itself) has no subject and is returned unchanged.
+fn strip_comment_marker(view: &str) -> &str {
+    let last = match view.rfind('.') {
+        Some(dot) => &view[dot + 1..],
+        None => view,
+    };
+    match last.len() > 2 && last.ends_with("__") {
+        true => &view[..view.len() - 2],
+        false => view,
+    }
+}
+
 /// The top-level keys of a document, in document order, comment keys included (they are
 /// ordinary data — `docs/DESIGN.md` §1).
-pub fn top_level_keys(data: &Value) -> Vec<String> {
-    match data {
-        Value::Object(map) => map.keys().cloned().collect(),
-        _ => Vec::new(),
+///
+/// Parsed out of `format=yaml` **text**, never out of `format=json` data: key order is
+/// guaranteed in the YAML rendering only, because the Perl API module round-trips the JSON
+/// through a plain hash (`docs/DESIGN.md` §8, `docs/REVIEW-2026-09-07.md` F23). The input
+/// is the store's own canonical dump — block style, two-space indent, one key per line —
+/// so this is a scan for unindented `key:` lines rather than a YAML parser:
+///
+/// * indented lines are nested data, and so is every line of a block scalar (its content
+///   must be indented deeper than the key that introduced it);
+/// * `#` comments, `---`/`...` document markers and `- ` sequence items are skipped;
+/// * a quoted key (`"a: b":`) is unquoted, with `\\`/`\"` unescaped.
+pub fn top_level_keys_from_yaml(text: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() || line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if line.starts_with('#') || line.starts_with("---") || line.starts_with("...") {
+            continue;
+        }
+        // A top-level sequence has no keys at all; `-` cannot start one.
+        if line.starts_with('-') {
+            continue;
+        }
+
+        if let Some(key) = parse_key(line) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
     }
+
+    keys
+}
+
+/// The mapping key `line` opens, if it opens one.
+fn parse_key(line: &str) -> Option<String> {
+    let mut chars = line.char_indices();
+    let (_, first) = chars.next()?;
+
+    if first == '"' || first == '\'' {
+        let mut key = String::new();
+        let mut escaped = false;
+        for (index, c) in chars {
+            if escaped {
+                key.push(c);
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' if first == '"' => escaped = true,
+                c if c == first => {
+                    // Only a quoted scalar that is followed by `:` is a key.
+                    return line[index + 1..]
+                        .trim_start()
+                        .starts_with(':')
+                        .then_some(key);
+                }
+                c => key.push(c),
+            }
+        }
+        return None;
+    }
+
+    // A plain key ends at the first `:` that is followed by a space or the end of line —
+    // `a:b` is the scalar `a:b`, not a key (YAML 1.2 §7.3.3).
+    let bytes = line.as_bytes();
+    let end = (0..bytes.len()).find(|&i| {
+        bytes[i] == b':' && bytes.get(i + 1).is_none_or(|c| *c == b' ' || *c == b'\t')
+    })?;
+    let key = line[..end].trim_end();
+    (!key.is_empty()).then(|| key.to_string())
 }
 
 #[cfg(test)]
@@ -222,53 +276,78 @@ mod tests {
     }
 
     #[test]
-    fn full_access_accepts_every_wire_spelling() {
-        let all: Access = serde_json::from_value(json!({"full": "*"})).unwrap();
-        assert!(all.full.covers(DocId::Datacenter));
+    fn a_scope_covers_the_comment_key_of_its_subject() {
+        // docs/DESIGN.md §8: comment keys follow their subject.
+        assert!(Access::covers("traefik", "traefik__"));
+        assert!(Access::covers("traefik", "traefik.spec__"));
+        assert!(Access::covers("traefik.spec", "traefik.spec__"));
+        // A bare `__` documents the map itself, not the subtree of a scope.
+        assert!(!Access::covers("traefik", "__"));
+        assert!(!Access::covers("traefik", "netbird__"));
+    }
 
-        let one: Access = serde_json::from_value(json!({"full": [200, "201"]})).unwrap();
-        assert!(one.full.covers(DocId::Guest(200)));
-        assert!(one.full.covers(DocId::Guest(201)));
-        assert!(!one.full.covers(DocId::Guest(202)));
-        assert!(!one.full.covers(DocId::Datacenter));
+    #[test]
+    fn read_and_write_are_separate_grants() {
+        // F22: an auditor gets a readable, not an editable, document.
+        let auditor: Access = serde_json::from_value(json!({"read": 1, "write": 0})).unwrap();
+        assert!(auditor.may_read(""));
+        assert!(!auditor.may_write(""));
 
-        let perl_bool: Access = serde_json::from_value(json!({"full": 1})).unwrap();
-        assert!(perl_bool.full.covers(DocId::Guest(200)));
+        let admin: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
+        assert!(admin.may_write(""));
+        assert!(admin.may_write("scopes"));
+    }
 
-        let none: Access = serde_json::from_value(json!({"full": 0})).unwrap();
-        assert!(!none.full.covers(DocId::Guest(200)));
+    #[test]
+    fn access_flags_accept_every_wire_spelling() {
+        let perl_bool: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
+        assert!(perl_bool.write);
 
-        let missing: Access = serde_json::from_value(json!({})).unwrap();
-        assert_eq!(missing, Access::default());
+        let json_bool: Access =
+            serde_json::from_value(json!({"read": true, "write": false})).unwrap();
+        assert!(json_bool.read);
+        assert!(!json_bool.write);
+
+        let strings: Access = serde_json::from_value(json!({"read": "*", "write": "0"})).unwrap();
+        assert!(strings.read);
+        assert!(!strings.write);
+
+        // Anything unrecognised — including the old audit-only `full` field, which is not
+        // a write grant — resolves to no grant at all.
+        let unknown: Access = serde_json::from_value(json!({"full": "*"})).unwrap();
+        assert_eq!(unknown, Access::default());
+        assert!(!unknown.may_write(""));
+
+        let null: Access = serde_json::from_value(json!({"read": null, "write": null})).unwrap();
+        assert_eq!(null, Access::default());
     }
 
     #[test]
     fn write_permission_follows_scopes() {
         let access: Access = serde_json::from_value(json!({
-            "full": [],
+            "read": 0,
+            "write": 0,
             "scopes": [{"prefix": "traefik", "mode": "rw"}, {"prefix": "netbird", "mode": "ro"}],
         }))
         .unwrap();
 
-        assert!(access.may_write(DocId::Guest(200), "traefik"));
-        assert!(access.may_write(DocId::Guest(200), "traefik.spec"));
-        assert!(!access.may_write(DocId::Guest(200), "netbird"));
+        assert!(access.may_write("traefik"));
+        assert!(access.may_write("traefik.spec"));
+        assert!(access.may_write("traefik__"));
+        assert!(!access.may_write("netbird"));
         // The whole document is readable (the union of the readable subtrees) but never
         // writable through a scope alone.
-        assert!(!access.may_write(DocId::Guest(200), ""));
-    }
-
-    #[test]
-    fn full_access_writes_everything() {
-        let access: Access = serde_json::from_value(json!({"full": "*"})).unwrap();
-        assert!(access.may_write(DocId::Guest(200), ""));
-        assert!(access.may_write(DocId::Datacenter, "scopes"));
+        assert!(!access.may_write(""));
+        assert!(access.may_read(""));
+        assert!(access.may_read("netbird"));
+        assert!(!access.may_read("other"));
     }
 
     #[test]
     fn view_options_start_with_the_whole_document() {
         let access: Access = serde_json::from_value(json!({
-            "full": "*",
+            "read": 1,
+            "write": 1,
             "scopes": [{"prefix": "netbird", "mode": "ro"}, {"prefix": "traefik", "mode": "rw"}],
         }))
         .unwrap();
@@ -282,7 +361,60 @@ mod tests {
 
     #[test]
     fn top_level_keys_keep_document_order() {
-        let data = json!({"traefik": {}, "__": "note", "notes": ""});
-        assert_eq!(top_level_keys(&data), vec!["traefik", "__", "notes"]);
+        let text = "traefik:\n  spec:\n    host: ct200.example\n__: a note\nnotes: ''\n";
+        assert_eq!(
+            top_level_keys_from_yaml(text),
+            vec!["traefik", "__", "notes"],
+        );
+    }
+
+    #[test]
+    fn top_level_keys_ignore_nesting_and_noise() {
+        let text = "\
+# a comment
+---
+traefik:
+  # an indented comment
+  spec:
+    host: ct200.example
+  ports:
+    - 80
+    - 443
+netbird:
+  groups: [lan]
+";
+        assert_eq!(top_level_keys_from_yaml(text), vec!["traefik", "netbird"]);
+    }
+
+    #[test]
+    fn top_level_keys_ignore_block_scalar_content() {
+        // The body of a block scalar is indented deeper than its key, so `readme:` is the
+        // only key here — `not: a key` inside the text must not be picked up.
+        let text = "readme: |\n  not: a key\n  host: nope\nnetbird: {}\n";
+        assert_eq!(top_level_keys_from_yaml(text), vec!["readme", "netbird"]);
+    }
+
+    #[test]
+    fn top_level_keys_unquote_quoted_keys() {
+        let text = "\"a: b\": 1\n'plain': 2\n\"with \\\"quotes\\\"\": 3\n";
+        assert_eq!(
+            top_level_keys_from_yaml(text),
+            vec!["a: b", "plain", "with \"quotes\""],
+        );
+    }
+
+    #[test]
+    fn top_level_keys_of_an_empty_or_scalar_document() {
+        assert!(top_level_keys_from_yaml("").is_empty());
+        assert!(top_level_keys_from_yaml("--- {}\n").is_empty());
+        assert!(top_level_keys_from_yaml("- one\n- two\n").is_empty());
+        // A plain scalar line is not a mapping key.
+        assert!(top_level_keys_from_yaml("just text\n").is_empty());
+    }
+
+    #[test]
+    fn top_level_keys_are_reported_once() {
+        let text = "traefik:\n  a: 1\ntraefik:\n  b: 2\n";
+        assert_eq!(top_level_keys_from_yaml(text), vec!["traefik"]);
     }
 }

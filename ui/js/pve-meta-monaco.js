@@ -221,14 +221,6 @@
         return id;
     }
 
-    function getValue(id) {
-        var entry = editors[id];
-        if (!entry) {
-            return '';
-        }
-        return entry.editor ? entry.editor.getValue() : entry.value;
-    }
-
     function setValue(id, text) {
         var entry = editors[id];
         if (!entry) {
@@ -260,18 +252,42 @@
         }
     }
 
+    // monaco.editor.setTheme() is global: it repaints every editor on the page, the diff
+    // editor in the dialog included. The colors themselves are read from the --pwt-*
+    // custom properties, which only carry their new values once pwt's ThemeLoader has
+    // swapped the stylesheet - and it does that asynchronously, after the
+    // 'pwt-theme-changed' event that brought us here. So apply the theme now (instant
+    // feedback for a pure prefers-color-scheme flip, where no stylesheet moves) and again
+    // once the next frames and a short settle window have passed; a token makes sure only
+    // the newest switch keeps repainting.
+    var themeToken = 0;
+
     function setTheme(name) {
-        var dark = isDark(name);
         if (!monacoPromise) {
             return;
         }
-        monacoPromise
-            .then(function (monaco) {
-                monaco.editor.setTheme(defineTheme(monaco, anyElement(), dark));
-            })
-            .catch(function (err) {
-                log('theme update failed', err);
-            });
+        var token = ++themeToken;
+        var apply = function () {
+            if (token !== themeToken) {
+                return;
+            }
+            monacoPromise
+                .then(function (monaco) {
+                    if (token !== themeToken) {
+                        return;
+                    }
+                    monaco.editor.setTheme(defineTheme(monaco, anyElement(), isDark(name)));
+                })
+                .catch(function (err) {
+                    log('theme update failed', err);
+                });
+        };
+
+        apply();
+        window.requestAnimationFrame(function () {
+            window.requestAnimationFrame(apply);
+        });
+        window.setTimeout(apply, 250);
     }
 
     function dispose(id) {
@@ -283,6 +299,11 @@
         delete editors[id];
         if (entry.diff) {
             var model = entry.diff.getModel();
+            // Detach first: monaco's standalone diff editor keeps its {original,
+            // modified} pair (and stays in monaco.editor.getDiffEditors()) after
+            // dispose(), so a disposed widget would otherwise still hold two disposed
+            // models alive.
+            entry.diff.setModel(null);
             entry.diff.dispose();
             if (model) {
                 model.original.dispose();
@@ -301,7 +322,6 @@
     window.pveMetaMonaco = {
         mount: mount,
         mountDiff: mountDiff,
-        getValue: getValue,
         setValue: setValue,
         setReadOnly: setReadOnly,
         setTheme: setTheme,

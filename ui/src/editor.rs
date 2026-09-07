@@ -3,13 +3,22 @@
 //! One `LoadableComponent` for one document (`docs/DESIGN.md` §6), structured exactly
 //! like `proxmox_yew_comp::NotesView`: `load()` fetches a text document and its digest,
 //! `toolbar()` returns the standard three-class `Toolbar`, `main_view()` fills the
-//! remaining height, and `dialog_view()` returns the one modal. Everything else — the
+//! remaining height, and `dialog_view()` returns the modals. Everything else — the
 //! outer column, the load-error strip, dialog stacking, off-screen refresh suspension —
 //! comes from `LoadableComponentMaster`.
 //!
 //! The one deviation from the pwt stack is the editor itself: Monaco, mounted into a
 //! plain `Container` from `rendered()` through the glue in `js/pve-meta-monaco.js`
 //! (`crate::monaco`).
+//!
+//! Two disciplines run through this file, both from `docs/REVIEW-2026-09-07.md`:
+//!
+//! * **Every async result carries the identity it was requested for** (`crate::request`).
+//!   `LoadableComponentMaster` respawns a load per `Msg::Load` and cancels nothing, so an
+//!   answer for the view the user just left must be dropped, not applied — otherwise the
+//!   page shows (and Apply then writes) one view's text under another view's path (F4).
+//! * **Unapplied edits are never discarded without asking.** Reload and a view switch go
+//!   through the same confirmation the Discard button uses (F5).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,7 +34,9 @@ use pwt::css::{AlignItems, ColorScheme, FlexFit, FontStyle, JustifyContent};
 use pwt::prelude::*;
 use pwt::state::ThemeObserver;
 use pwt::widget::form::Combobox;
-use pwt::widget::{Button, Column, Container, Dialog, Fa, Row, Toolbar, error_message};
+use pwt::widget::{
+    Button, Column, ConfirmDialog, Container, Dialog, Fa, Row, Toolbar, error_message,
+};
 use pwt_macros::builder;
 
 use proxmox_yew_comp::{
@@ -34,8 +45,9 @@ use proxmox_yew_comp::{
 };
 
 use crate::api::{self, GuestEntry, WriteResult};
-use crate::model::{Access, DocId};
+use crate::model::{Access, DocId, top_level_keys_from_yaml};
 use crate::monaco;
+use crate::request::{Channel, RequestId, RequestTracker};
 
 /// `GET /meta/version` is polled this often. Its token covers the whole store, so a
 /// change only triggers a digest check of this one document.
@@ -46,14 +58,19 @@ const VERSION_POLL_MS: u32 = 5_000;
 /// `ViewSelector` uses for its `__dashboard__` entry.
 const WHOLE_DOCUMENT: &str = "__document__";
 
-/// Everything one load produces.
+/// Everything one load produces, plus the identity it was loaded for.
 pub struct Loaded {
-    /// Only on the first load — the grants do not change under us.
+    /// Which document, which view, which generation this answers.
+    id: RequestId,
+    /// Only when the grants for this document have not been fetched yet.
     access: Option<Access>,
+    /// Set instead of `access` when the grants could not be fetched at all.
+    access_error: Option<String>,
     /// Only on the first load — the guest's name and node, for the identity line.
     guest: Option<GuestEntry>,
-    /// Top-level keys of the whole document, for the "View as" selector.
-    keys: Vec<String>,
+    /// Top-level keys of the whole document, for the "View as" selector; `None` when the
+    /// whole-document read failed, in which case the known list is kept.
+    keys: Option<Vec<String>>,
     digest: String,
     text: String,
 }
@@ -61,20 +78,25 @@ pub struct Loaded {
 /// Modal states of the page.
 #[derive(PartialEq)]
 pub enum ViewState {
+    /// The Apply confirmation: a diff of the loaded text against the edited one.
     ConfirmApply,
+    /// "Discard all unapplied changes?" before leaving the edited view.
+    ConfirmSwitchView,
 }
 
 pub enum Msg {
     Loaded(Box<Loaded>),
     SelectView(String),
+    ConfirmSwitchView,
     EditorInput(String),
     ShowDiff,
     CloseDialog,
     Apply,
-    Applied(Result<WriteResult, Error>),
+    Applied(RequestId, Result<WriteResult, Error>),
     Discard,
+    Reload,
     VersionToken(String),
-    ServerDigest(String),
+    ServerDigest(RequestId, String),
     ThemeChanged(bool),
 }
 
@@ -103,19 +125,38 @@ impl MetaEditor {
     }
 }
 
+/// A live Monaco instance, and the identity of the buffer it is showing.
+struct MountedEditor {
+    id: String,
+    doc: DocId,
+    view: String,
+    /// The load/discard generation whose text is in the buffer.
+    generation: u64,
+}
+
 #[doc(hidden)]
 pub struct PveMetaEditor {
     state: LoadableComponentState<ViewState>,
-    /// The caller's effective grants.
+    /// What the page is asking for, and what an answer must match to be applied.
+    requests: RequestTracker,
+    /// The caller's effective grants for this document.
     access: Access,
-    /// Set once the grants have been fetched.
-    access_loaded: bool,
+    /// The document the grants were fetched for; `None` while they are unknown.
+    access_for: Option<DocId>,
+    /// Why the grants are unknown, if the endpoint refused to answer.
+    access_error: Option<String>,
     /// Guest name and node, for the identity line.
     guest: Option<GuestEntry>,
-    /// The selected view: a key-path prefix, empty for the whole document.
-    view: String,
+    /// Top-level keys of the whole document, as parsed from its YAML text.
+    keys: Vec<String>,
     /// The prefixes the "View as" selector offers.
     views: Rc<Vec<AttrValue>>,
+    /// Bumped when a view selection is cancelled, to make the `Combobox` re-read the
+    /// value prop it is not otherwise controlled by (`PWT/src/widget/form/selector.rs`
+    /// only force-feeds the value when the prop itself changed).
+    view_revision: u64,
+    /// The view a pending confirmation would switch to.
+    pending_view: Option<String>,
     /// Text and digest as loaded.
     loaded: String,
     digest: String,
@@ -123,7 +164,6 @@ pub struct PveMetaEditor {
     draft: Option<String>,
     /// Bumped by every load, so `rendered()` knows when to push new text into Monaco.
     generation: u64,
-    mounted_generation: Option<u64>,
     /// The last message of a failed write, shown verbatim under the editor.
     write_error: Option<String>,
     /// A poll found this document's digest changed while there were unapplied edits,
@@ -131,9 +171,11 @@ pub struct PveMetaEditor {
     stale: bool,
     version_token: Option<String>,
     editor_ref: NodeRef,
-    editor_id: Option<String>,
+    editor: Option<MountedEditor>,
     diff_ref: NodeRef,
     diff_id: Option<String>,
+    /// The identity the open diff was built for.
+    diff_request: Option<RequestId>,
     dialog_open: bool,
     /// Kept alive for as long as the editor exists.
     on_change: Option<Closure<dyn Fn(String)>>,
@@ -146,13 +188,46 @@ pwt::impl_deref_mut_property!(PveMetaEditor, state, LoadableComponentState<ViewS
 
 impl PveMetaEditor {
     /// True if the caller may edit the selected view.
-    fn writable(&self, ctx: &LoadableComponentContext<Self>) -> bool {
-        self.access.may_write(ctx.props().doc, &self.view)
+    fn writable(&self, _ctx: &LoadableComponentContext<Self>) -> bool {
+        self.access.may_write(&self.requests.view())
     }
 
     /// The text the editor currently shows.
     fn current_text(&self) -> &str {
         self.draft.as_deref().unwrap_or(&self.loaded)
+    }
+
+    /// True while the editor holds changes that are not on the server.
+    fn dirty(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    /// Show `view` from now on: strand everything in flight, empty the buffer (the text
+    /// in it belongs to the view being left) and load the new one.
+    fn switch_view(&mut self, ctx: &LoadableComponentContext<Self>, view: String) {
+        if !self.requests.set_view(view) {
+            return;
+        }
+        self.draft = None;
+        self.loaded.clear();
+        self.digest.clear();
+        self.stale = false;
+        self.write_error = None;
+        self.generation += 1;
+        self.close_dialog(ctx);
+        ctx.link().send_reload();
+    }
+
+    /// Close whichever modal is open, dropping the diff editor with it.
+    fn close_dialog(&mut self, ctx: &LoadableComponentContext<Self>) {
+        if self.pending_view.take().is_some() {
+            // The selector already shows the view the user picked; make it re-read the
+            // one that is actually loaded.
+            self.view_revision += 1;
+        }
+        self.dialog_open = false;
+        self.dispose_diff();
+        ctx.link().change_view(None);
     }
 
     /// The document identity line, e.g. `200 traefik` + `(lxc, node1)`.
@@ -200,22 +275,56 @@ impl PveMetaEditor {
             }))
     }
 
-    /// The non-modal "changed on the server" notice.
-    fn stale_banner(&self, ctx: &LoadableComponentContext<Self>) -> Row {
+    /// The Reload button. With unapplied edits it asks first — a reload throws them away
+    /// just as the Discard button next to it does, so it uses the same confirmation.
+    fn reload_button(&self, ctx: &LoadableComponentContext<Self>) -> Html {
         let link = ctx.link().clone();
-        Row::new()
+        let loading = self.loading();
+
+        if !self.dirty() {
+            return Button::refresh(loading)
+                .on_activate(move |_| link.send_reload())
+                .into();
+        }
+
+        let icon_class = match loading {
+            true => "fa fa-fw fa-refresh fa-spin",
+            false => "fa fa-fw fa-refresh",
+        };
+
+        ConfirmButton::new_icon(icon_class)
+            .aria_label(tr!("Refresh"))
+            .dangerous(true)
+            .disabled(loading)
+            .confirm_message(tr!("Discard all unapplied changes?"))
+            .on_activate(link.callback(|_| Msg::Reload))
+            .into()
+    }
+
+    /// The non-modal "changed on the server" notice.
+    fn stale_banner(&self, ctx: &LoadableComponentContext<Self>) -> Column {
+        Column::new()
             .padding(2)
-            .gap(2)
-            .class(AlignItems::Center)
+            .gap(1)
             .class(ColorScheme::WarningContainer)
             .class("pwt-default-colors")
             .class("pwt-border-bottom")
-            .with_child(Fa::new("exclamation-triangle"))
-            .with_child(tr!(
-                "This document was changed on the server since it was loaded."
-            ))
-            .with_flex_spacer()
-            .with_child(Button::new(tr!("Reload")).on_activate(move |_| link.send_reload()))
+            .with_child(
+                Row::new()
+                    .gap(2)
+                    .class(AlignItems::Center)
+                    .with_child(Fa::new("exclamation-triangle"))
+                    .with_child(tr!(
+                        "This document was changed on the server since it was loaded."
+                    ))
+                    .with_flex_spacer()
+                    .with_child(self.reload_button(ctx)),
+            )
+            .with_optional_child(self.dirty().then(|| {
+                Container::from_tag("span").with_child(tr!(
+                    "Your unapplied changes are kept until you reload or discard them."
+                ))
+            }))
     }
 
     /// The Apply confirmation: a Monaco diff of the loaded text against the edited one.
@@ -250,19 +359,37 @@ impl PveMetaEditor {
             .into()
     }
 
+    /// The same confirmation the Discard button raises, before a view switch drops the
+    /// edits made in the view being left.
+    fn switch_view_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link();
+        ConfirmDialog::new(tr!("Confirm"), tr!("Discard all unapplied changes?"))
+            .dangerous(true)
+            .on_confirm(link.callback(|_| Msg::ConfirmSwitchView))
+            .on_close(link.callback(|_| Msg::CloseDialog))
+            .into()
+    }
+
     fn dispose_diff(&mut self) {
+        self.diff_request = None;
         if let Some(id) = self.diff_id.take() {
             monaco::dispose(&id);
         }
+    }
+
+    /// Drop the mounted editor, its model and its change listener.
+    fn dispose_editor(&mut self) {
+        if let Some(editor) = self.editor.take() {
+            monaco::dispose(&editor.id);
+        }
+        self.on_change = None;
     }
 }
 
 impl Drop for PveMetaEditor {
     fn drop(&mut self) {
         // Monaco leaks a ResizeObserver and a model otherwise.
-        if let Some(id) = self.editor_id.take() {
-            monaco::dispose(&id);
-        }
+        self.dispose_editor();
         self.dispose_diff();
     }
 }
@@ -278,7 +405,8 @@ impl LoadableComponent for PveMetaEditor {
         let dark_mode = theme_observer.dark_mode();
 
         // The store's content hash, polled on an interval — the native module answers
-        // `GET /meta/version` immediately, there is no long poll.
+        // `GET /meta/version` immediately, there is no long poll. The future runs in the
+        // component's `AsyncPool`, which aborts it when the component goes away.
         let link = ctx.link().clone();
         ctx.link().spawn(async move {
             loop {
@@ -292,23 +420,27 @@ impl LoadableComponent for PveMetaEditor {
 
         Self {
             state: LoadableComponentState::new(),
+            requests: RequestTracker::new(ctx.props().doc),
             access: Access::default(),
-            access_loaded: false,
+            access_for: None,
+            access_error: None,
             guest: None,
-            view: String::new(),
+            keys: Vec::new(),
             views: Rc::new(vec![AttrValue::from(WHOLE_DOCUMENT)]),
+            view_revision: 0,
+            pending_view: None,
             loaded: String::new(),
             digest: String::new(),
             draft: None,
             generation: 0,
-            mounted_generation: None,
             write_error: None,
             stale: false,
             version_token: None,
             editor_ref: NodeRef::default(),
-            editor_id: None,
+            editor: None,
             diff_ref: NodeRef::default(),
             diff_id: None,
+            diff_request: None,
             dialog_open: false,
             on_change: None,
             _theme_observer: theme_observer,
@@ -316,20 +448,51 @@ impl LoadableComponent for PveMetaEditor {
         }
     }
 
+    fn changed(&mut self, ctx: &LoadableComponentContext<Self>, _old: &Self::Properties) -> bool {
+        // A different document is a different page: nothing loaded for the old one — its
+        // text, its digest, its grants, its keys — may survive into it.
+        if self.requests.set_doc(ctx.props().doc) {
+            self.access = Access::default();
+            self.access_for = None;
+            self.access_error = None;
+            self.guest = None;
+            self.keys.clear();
+            self.draft = None;
+            self.loaded.clear();
+            self.digest.clear();
+            self.stale = false;
+            self.write_error = None;
+            self.generation += 1;
+            self.close_dialog(ctx);
+            ctx.link().send_reload();
+        }
+        true
+    }
+
     fn load(
         &self,
         ctx: &LoadableComponentContext<Self>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Error>>>> {
-        let doc = ctx.props().doc;
-        let view = self.view.clone();
-        let need_access = !self.access_loaded;
+        let tracker = self.requests.clone();
+        let id = tracker.issue(Channel::Load);
+        let doc = id.doc;
+        let view = id.view.clone();
+        let need_access = self.access_for != Some(doc);
         let need_guest = matches!(doc, DocId::Guest(_)) && self.guest.is_none();
         let link = ctx.link().clone();
 
         Box::pin(async move {
-            let access = match need_access {
-                true => Some(api::access().await?),
-                false => None,
+            let (access, access_error) = match need_access {
+                true => match api::access(doc).await {
+                    Ok(access) => (Some(access), None),
+                    // A page that cannot ask for its grants stays usable and read-only
+                    // rather than failing outright: `/meta/access` parses the whole
+                    // `scopes` map, so one malformed entry can 400 it for everyone
+                    // (`docs/REVIEW-2026-09-07.md` F7) — and this document may be exactly
+                    // the one that has to be edited to fix that.
+                    Err(err) => (None, Some(err.to_string())),
+                },
+                false => (None, None),
             };
 
             // The identity line wants the guest's name; a failure here is not worth
@@ -347,11 +510,45 @@ impl LoadableComponent for PveMetaEditor {
             };
 
             // The whole document, for the top-level keys the "View as" selector offers.
-            let keys = crate::model::top_level_keys(&api::get_data(doc).await?.data);
-            let document = api::get_text(doc, &view).await?;
+            // A view's own answer only carries the keys *inside* that view, so a selected
+            // view needs the document read as well. Never `format=json`: its `data` object
+            // is unordered on the wire (`docs/DESIGN.md` §8), and the selector is a list
+            // in document order.
+            let whole = match view.is_empty() {
+                true => None,
+                false => api::get_text(doc, "")
+                    .await
+                    .map_err(|err| {
+                        log::warn!("pve-meta-ui: failed to read the whole document: {err}")
+                    })
+                    .ok(),
+            };
+
+            let document = api::get_text(doc, &view).await;
+
+            // Nothing past this point may touch the page unless it still wants this
+            // answer: the user may have switched view or document while this was in
+            // flight, and `LoadableComponentMaster` cancels nothing (F4).
+            if !tracker.accepts(&id) {
+                log::debug!(
+                    "pve-meta-ui: dropping a stale load of {}, view '{}'",
+                    doc.label(),
+                    view,
+                );
+                return Ok(());
+            }
+
+            let document = document?;
+
+            let keys = match &whole {
+                Some(whole) => Some(document_keys(whole)),
+                None => view.is_empty().then(|| document_keys(&document)),
+            };
 
             link.send_message(Msg::Loaded(Box::new(Loaded {
+                id,
                 access,
+                access_error,
                 guest,
                 keys,
                 digest: document.digest,
@@ -366,35 +563,58 @@ impl LoadableComponent for PveMetaEditor {
         match msg {
             Msg::Loaded(loaded) => {
                 let Loaded {
+                    id,
                     access,
+                    access_error,
                     guest,
                     keys,
                     digest,
                     text,
                 } = *loaded;
 
+                // The future checked this before sending; check it again here, where the
+                // state it would overwrite actually lives.
+                if !self.requests.accepts(&id) {
+                    return false;
+                }
+
                 if let Some(access) = access {
                     self.access = access;
-                    self.access_loaded = true;
+                    self.access_for = Some(id.doc);
+                    self.access_error = None;
+                }
+                if let Some(err) = access_error {
+                    // No grants until the endpoint answers: the page stays read-only and
+                    // says why. `access_for` stays unset, so a Reload retries.
+                    self.access = Access::default();
+                    self.access_for = None;
+                    self.access_error = Some(err);
                 }
                 if guest.is_some() {
                     self.guest = guest;
                 }
-
-                let options = self.access.view_options(&keys);
-                // Fall back to the whole document when the selected prefix is gone.
-                if !options.contains(&self.view) {
-                    self.view = String::new();
+                if let Some(keys) = keys {
+                    self.keys = keys;
                 }
+
+                let options = self.access.view_options(&self.keys);
                 self.views = Rc::new(
                     options
-                        .into_iter()
+                        .iter()
                         .map(|option| match option.is_empty() {
                             true => AttrValue::from(WHOLE_DOCUMENT),
-                            false => AttrValue::from(option),
+                            false => AttrValue::from(option.clone()),
                         })
                         .collect(),
                 );
+
+                // The selected prefix is gone (deleted, or no longer granted). Fall back
+                // to the whole document — and load *it*: the text in hand is the answer
+                // for a view that no longer exists, not for the one now selected.
+                if !options.contains(&id.view) {
+                    self.switch_view(ctx, String::new());
+                    return true;
+                }
 
                 self.loaded = text;
                 self.digest = digest;
@@ -402,63 +622,100 @@ impl LoadableComponent for PveMetaEditor {
                 self.stale = false;
                 self.write_error = None;
                 self.generation += 1;
+                // Whatever the diff dialog was showing was a picture of the text that
+                // just moved.
+                self.close_dialog(ctx);
             }
             Msg::SelectView(view) => {
                 let view = match view.as_str() {
                     WHOLE_DOCUMENT => String::new(),
                     other => other.to_string(),
                 };
-                if view == self.view {
+                if view == self.requests.view() {
                     return false;
                 }
-                self.view = view;
-                self.draft = None;
-                self.write_error = None;
-                ctx.link().send_reload();
+                // Leaving an edited view throws the edits away, so ask first — the same
+                // question, in the same dialog, as the Discard button (F5).
+                if self.dirty() {
+                    self.pending_view = Some(view);
+                    ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
+                    return true;
+                }
+                self.switch_view(ctx, view);
+            }
+            Msg::ConfirmSwitchView => {
+                let Some(view) = self.pending_view.take() else {
+                    return false;
+                };
+                ctx.link().change_view(None);
+                self.switch_view(ctx, view);
             }
             Msg::EditorInput(text) => {
                 self.draft = (text != self.loaded).then_some(text);
             }
             Msg::ShowDiff => {
                 self.dialog_open = true;
+                self.diff_request = Some(self.requests.issue(Channel::Diff));
                 ctx.link().change_view(Some(ViewState::ConfirmApply));
             }
             Msg::CloseDialog => {
-                self.dialog_open = false;
-                self.dispose_diff();
-                ctx.link().change_view(None);
+                self.close_dialog(ctx);
             }
             Msg::Apply => {
-                self.dialog_open = false;
-                self.dispose_diff();
-                ctx.link().change_view(None);
+                self.close_dialog(ctx);
 
-                let doc = ctx.props().doc;
-                let view = self.view.clone();
+                let id = self.requests.issue(Channel::Apply);
+                let doc = id.doc;
+                let view = id.view.clone();
                 let text = self.current_text().to_string();
                 let digest = self.digest.clone();
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
                     let result = api::put_text(doc, &view, text, &digest).await;
-                    link.send_message(Msg::Applied(result));
+                    link.send_message(Msg::Applied(id, result));
                 });
             }
-            Msg::Applied(Ok(_)) => {
-                self.write_error = None;
-                ctx.link().send_reload();
-            }
-            Msg::Applied(Err(err)) => {
-                // A 409 is not an error the user can act on by reading it — it means the
-                // document moved underneath, so show the notice that offers a reload.
-                self.stale = api::is_conflict(&err);
-                // Everything else is the server's own message, shown verbatim.
-                self.write_error = Some(err.to_string());
+            Msg::Applied(id, result) => {
+                // The write went out for one view of one document. If the page has moved
+                // on, its outcome says nothing about what is on screen now — the version
+                // poll will pick the change up.
+                if !self.requests.accepts(&id) {
+                    log::warn!(
+                        "pve-meta-ui: dropping the result of a write to {}, view '{}': \
+                         the page moved on",
+                        id.doc.label(),
+                        id.view,
+                    );
+                    return false;
+                }
+                match result {
+                    Ok(_) => {
+                        self.write_error = None;
+                        ctx.link().send_reload();
+                    }
+                    Err(err) => {
+                        // A 409 is not an error the user can act on by reading it — it
+                        // means the document moved underneath, so show the notice that
+                        // offers a reload.
+                        self.stale = api::is_conflict(&err);
+                        // Everything else is the server's own message, shown verbatim.
+                        self.write_error = Some(err.to_string());
+                    }
+                }
             }
             Msg::Discard => {
                 self.draft = None;
                 self.write_error = None;
                 // Force `rendered()` to put the loaded text back into the editor.
                 self.generation += 1;
+            }
+            Msg::Reload => {
+                // Confirmed by the caller (the toolbar's and the banner's Reload both ask
+                // when there is something to lose).
+                self.draft = None;
+                self.write_error = None;
+                self.generation += 1;
+                ctx.link().send_reload();
             }
             Msg::VersionToken(token) => {
                 if self.version_token.as_deref() == Some(token.as_str()) {
@@ -467,23 +724,26 @@ impl LoadableComponent for PveMetaEditor {
                 self.version_token = Some(token);
                 // The store token covers every document, so it only says "something,
                 // somewhere, moved". Ask this one whether it was this document.
-                let doc = ctx.props().doc;
-                let view = self.view.clone();
+                let id = self.requests.issue(Channel::Digest);
+                let doc = id.doc;
+                let view = id.view.clone();
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
                     match api::get_text(doc, &view).await {
-                        Ok(document) => link.send_message(Msg::ServerDigest(document.digest)),
+                        Ok(document) => link.send_message(Msg::ServerDigest(id, document.digest)),
                         Err(err) => log::warn!("pve-meta-ui: digest check failed: {err}"),
                     }
                 });
                 return false;
             }
-            Msg::ServerDigest(digest) => {
-                if digest == self.digest {
+            Msg::ServerDigest(id, digest) => {
+                // A digest read for a view the page has left says nothing about the one
+                // it now shows.
+                if !self.requests.accepts(&id) || digest == self.digest {
                     return false;
                 }
                 // Never throw away unapplied edits: say so and offer the reload instead.
-                if self.draft.is_some() {
+                if self.dirty() {
                     self.stale = true;
                 } else {
                     ctx.link().send_reload();
@@ -501,15 +761,20 @@ impl LoadableComponent for PveMetaEditor {
 
     fn toolbar(&self, ctx: &LoadableComponentContext<Self>) -> Option<Html> {
         let link = ctx.link();
-        let dirty = self.draft.is_some();
+        let dirty = self.dirty();
         let writable = self.writable(ctx);
+        let view = self.requests.view();
 
-        let selected = match self.view.is_empty() {
+        let selected = match view.is_empty() {
             true => AttrValue::from(WHOLE_DOCUMENT),
-            false => AttrValue::from(self.view.clone()),
+            false => AttrValue::from(view.clone()),
         };
 
         let view_as = Combobox::new()
+            // A cancelled switch maps the selection back to the value the field already
+            // had, which a `Selector` does not re-assert on its own; a changed key makes
+            // it start over from the `value` prop.
+            .key(format!("view-as:{}:{}", self.view_revision, view))
             .aria_label(tr!("View as"))
             // Not clearable: an empty value has no meaning here, and `required` is what
             // suppresses the field's clear trigger (`PWT/src/widget/form/selector.rs`).
@@ -548,10 +813,7 @@ impl LoadableComponent for PveMetaEditor {
                         .class("pwt-color-on-neutral-alt")
                         .with_child(tr!("Read-only"))
                 }))
-                .with_child(Button::refresh(self.loading()).on_activate({
-                    let link = link.clone();
-                    move |_| link.send_reload()
-                }))
+                .with_child(self.reload_button(ctx))
                 .into(),
         )
     }
@@ -571,6 +833,15 @@ impl LoadableComponent for PveMetaEditor {
                     .class("pve-meta-monaco-host")
                     .into_html_with_ref(self.editor_ref.clone()),
             )
+            .with_optional_child(self.access_error.as_deref().map(|err| {
+                error_message(&tr!(
+                    "Could not determine your access to this document; it is shown \
+                     read-only. {0}",
+                    err
+                ))
+                .key("access-error")
+                .class("pwt-border-top")
+            }))
             .with_optional_child(self.write_error.as_deref().map(|err| {
                 error_message(err)
                     .key("write-error")
@@ -586,13 +857,27 @@ impl LoadableComponent for PveMetaEditor {
     ) -> Option<Html> {
         match view_state {
             ViewState::ConfirmApply => Some(self.diff_dialog(ctx)),
+            ViewState::ConfirmSwitchView => Some(self.switch_view_dialog(ctx)),
         }
     }
 
     fn rendered(&mut self, ctx: &LoadableComponentContext<Self>, _first_render: bool) {
+        let doc = ctx.props().doc;
+        let view = self.requests.view();
         let read_only = !self.writable(ctx);
+        let generation = self.generation;
 
-        match &self.editor_id {
+        // An editor belongs to the buffer it was mounted for: its model, its undo stack
+        // and its change listener are all that view's. Never carry one across.
+        let stale_editor = self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.doc != doc || editor.view != view);
+        if stale_editor {
+            self.dispose_editor();
+        }
+
+        match &mut self.editor {
             None => {
                 if let Some(el) = self.editor_ref.cast::<Element>() {
                     let id = monaco::mount(
@@ -608,26 +893,50 @@ impl LoadableComponent for PveMetaEditor {
                     self.on_change = Some(monaco::on_change(&id, move |text| {
                         link.send_message(Msg::EditorInput(text))
                     }));
-                    self.mounted_generation = Some(self.generation);
-                    self.editor_id = Some(id);
+                    self.editor = Some(MountedEditor {
+                        id,
+                        doc,
+                        view,
+                        generation,
+                    });
                 }
             }
-            Some(id) => {
+            Some(editor) => {
                 // Never write over the buffer the user is typing in: only a load, a
                 // discard or a view switch bumps the generation.
-                if self.mounted_generation != Some(self.generation) {
-                    monaco::set_value(id, &self.loaded);
-                    self.mounted_generation = Some(self.generation);
+                if editor.generation != generation {
+                    monaco::set_value(&editor.id, &self.loaded);
+                    editor.generation = generation;
                 }
-                monaco::set_read_only(id, read_only);
+                monaco::set_read_only(&editor.id, read_only);
             }
         }
 
         if self.dialog_open && self.diff_id.is_none() {
-            if let Some(el) = self.diff_ref.cast::<Element>() {
-                self.diff_id = Some(monaco::mount_diff(&el, &self.loaded, self.current_text()));
+            // The diff pictures one document, one view, one loaded text. If any of those
+            // moved since the dialog opened, it is on its way out — do not fill it.
+            let current = self
+                .diff_request
+                .as_ref()
+                .is_some_and(|id| self.requests.accepts(id));
+            if current {
+                if let Some(el) = self.diff_ref.cast::<Element>() {
+                    self.diff_id = Some(monaco::mount_diff(&el, &self.loaded, self.current_text()));
+                }
             }
         }
+    }
+}
+
+/// The top-level keys of a whole-document read, in document order.
+///
+/// The server sends them as an ordered `keys` array; the YAML text is the fallback for a
+/// server that does not (the same text, parsed — never `format=json`, whose object arrives
+/// reordered, `docs/DESIGN.md` §8).
+fn document_keys(document: &api::DocText) -> Vec<String> {
+    match document.keys.is_empty() {
+        true => top_level_keys_from_yaml(&document.text),
+        false => document.keys.clone(),
     }
 }
 

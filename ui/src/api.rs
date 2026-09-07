@@ -46,15 +46,10 @@ pub struct DocText {
     pub digest: String,
     #[serde(default)]
     pub text: String,
-}
-
-/// A document view as data (`format=json`).
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct DocData {
+    /// The view's top-level keys, in document order — the one ordered key list on the
+    /// wire (`docs/DESIGN.md` §8: `format=json`'s `data` object is not one).
     #[serde(default)]
-    pub digest: String,
-    #[serde(default)]
-    pub data: Value,
+    pub keys: Vec<String>,
 }
 
 /// The result of a write.
@@ -76,9 +71,17 @@ pub struct VersionInfo {
     pub token: String,
 }
 
-/// The caller's effective grants (`GET /meta/access`).
-pub async fn access() -> Result<Access, Error> {
-    get_json("/meta/access", None).await
+/// The caller's effective grants **for one document** (`GET /meta/access?vmid=…`, or
+/// `?dc=1` for the datacenter document — `docs/DESIGN.md` §8).
+///
+/// Asking per document is what lets the page separate read from write: the answer's `read`
+/// and `write` are that document's ACL grants, not one audit-derived `full` flag.
+pub async fn access(doc: DocId) -> Result<Access, Error> {
+    let query = match doc {
+        DocId::Guest(vmid) => json!({ "vmid": vmid }),
+        DocId::Datacenter => json!({ "dc": 1 }),
+    };
+    get_json("/meta/access", Some(query)).await
 }
 
 /// Every guest in the vmlist, with the top-level keys visible to the caller.
@@ -87,6 +90,10 @@ pub async fn guests() -> Result<Vec<GuestEntry>, Error> {
 }
 
 /// A view of a document as YAML text. An empty `view` is the whole document.
+///
+/// The page never asks for `format=json`: key order is guaranteed in the YAML rendering
+/// only (`docs/DESIGN.md` §8), so even the "View as" selector's key list is parsed out of
+/// this text (`crate::model::top_level_keys_from_yaml`).
 pub async fn get_text(doc: DocId, view: &str) -> Result<DocText, Error> {
     let mut query = Map::new();
     query.insert("format".into(), json!("yaml"));
@@ -94,11 +101,6 @@ pub async fn get_text(doc: DocId, view: &str) -> Result<DocText, Error> {
         query.insert("view".into(), json!(view));
     }
     get_json(&doc.api_path(), Some(Value::Object(query))).await
-}
-
-/// The whole document as data — the "View as" selector needs its top-level keys.
-pub async fn get_data(doc: DocId) -> Result<DocData, Error> {
-    get_json(&doc.api_path(), Some(json!({ "format": "json" }))).await
 }
 
 /// Replace `view` of `doc` with `text`. `digest` pins optimistic concurrency: a 409

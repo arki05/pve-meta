@@ -6,8 +6,10 @@
 //! (`docs/design/PDM-DESIGN-LANGUAGE.md` §11.3).
 //!
 //! Mounting happens from `Component::rendered`, the pattern pwt itself uses for raw DOM
-//! work (§11.2). The editor is disposed when the component is dropped; Monaco leaks a
-//! `ResizeObserver` and a model otherwise.
+//! work (§11.2). Every instance is disposed the moment the page stops showing what it was
+//! mounted for — the component is dropped, the view or document switches, the diff dialog
+//! closes; Monaco leaks a `ResizeObserver` and a model otherwise, and a buffer left over
+//! from another view is a buffer that can be applied to the wrong path.
 
 use js_sys::{Object, Reflect};
 use wasm_bindgen::prelude::*;
@@ -20,9 +22,6 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = mountDiff)]
     fn js_mount_diff(el: &Element, original: &str, modified: &str) -> String;
-
-    #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = getValue)]
-    fn js_get_value(id: &str) -> String;
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setValue)]
     fn js_set_value(id: &str, text: &str);
@@ -65,11 +64,6 @@ pub fn mount(el: &Element, options: &MountOptions) -> String {
 /// Create a read-only side-by-side diff editor inside `el` and return its id.
 pub fn mount_diff(el: &Element, original: &str, modified: &str) -> String {
     js_mount_diff(el, original, modified)
-}
-
-/// The editor's current text.
-pub fn get_value(id: &str) -> String {
-    js_get_value(id)
 }
 
 /// Replace the editor's text (a no-op when it already matches).
