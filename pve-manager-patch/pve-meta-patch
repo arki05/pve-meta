@@ -1,0 +1,334 @@
+#!/bin/bash
+#
+# pve-meta-patch - apply/remove/verify/status for the pve-meta "Metadata"
+# tab injection into the Proxmox VE web UI.
+#
+# Mechanism (see README.md for details):
+#   1. dpkg-divert index.html.tpl away from pve-manager, so the on-disk
+#      "real" name is ours to write, while the pristine file pve-manager
+#      ships (now and on future upgrades) always lands at the diverted
+#      path.
+#   2. Regenerate the "real" index.html.tpl as: pristine original, plus one
+#      <script> tag right after the pvemanagerlib.js tag, loading our
+#      loader script.
+#   3. Copy pve-meta-loader.js into /usr/share/pve-manager/js/, which
+#      pveproxy already serves at /pve2/js/ (see add_dirs() in
+#      PVE::Service::pveproxy) - no pveproxy.pm changes required.
+#
+# This script is intended to be installed as /usr/sbin/pve-meta-patch and
+# invoked from the pve-meta package's postinst / triggers, but it can also
+# be run ad hoc (e.g. straight from a checkout) for testing.
+#
+set -u
+
+PKG="pve-meta"
+
+MANAGER_DIR="/usr/share/pve-manager"
+MANAGER_JS_DIR="${MANAGER_DIR}/js"
+TPL="${MANAGER_DIR}/index.html.tpl"
+ORIG="${TPL}.pve-meta-orig"
+
+LOADER_NAME="pve-meta-loader.js"
+LOADER_DST="${MANAGER_JS_DIR}/${LOADER_NAME}"
+
+# Anchor: the pvemanagerlib.js <script> tag in index.html.tpl. Our line is
+# inserted immediately after the line matching this pattern. Kept as a
+# literal (non-regex) needle since we use grep -F / string ops on it.
+PVEMANAGERLIB_TAG_NEEDLE='src="/pve2/js/pvemanagerlib.js'
+INSERT_LINE='<script type="text/javascript" src="/pve2/js/pve-meta-loader.js"></script>'
+
+# ExtJS class anchors this patch's loader depends on.
+ANCHOR_CLASSES=(
+    "Ext.define('PVE.panel.Config'"
+    "Ext.define('PVE.lxc.Config'"
+    "Ext.define('PVE.qemu.Config'"
+    "Ext.define('PVE.dc.Config'"
+)
+
+log()  { echo "pve-meta-patch: $*"; }
+err()  { echo "pve-meta-patch: ERROR: $*" >&2; }
+die()  { err "$*"; exit 1; }
+
+script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd
+}
+
+# Find the pve-meta-loader.js payload to install: prefer the canonical
+# packaged location, fall back to a copy sitting next to this script (the
+# checkout / ad-hoc testing case).
+find_loader_src() {
+    local candidates=(
+        "/usr/share/${PKG}/${LOADER_NAME}"
+        "$(script_dir)/${LOADER_NAME}"
+    )
+    local c
+    for c in "${candidates[@]}"; do
+        if [ -f "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found"
+}
+
+# Is index.html.tpl currently diverted to $ORIG (by any package)?
+is_diverted() {
+    dpkg-divert --truename "$TPL" 2>/dev/null | grep -qx "$ORIG"
+}
+
+# Does dpkg know about a diversion for $TPL owned by our package?
+diversion_owned_by_us() {
+    dpkg-divert --listpackage "$TPL" 2>/dev/null | grep -qx "$PKG"
+}
+
+anchors_present_in() {
+    # $1 = file to check, remaining args = literal needles (grep -F)
+    local file="$1"
+    shift
+    local needle
+    for needle in "$@"; do
+        if ! grep -qF -- "$needle" "$file" 2>/dev/null; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+cmd_verify() {
+    # Usage: verify [pvemanagerlib.js] [index.html.tpl]
+    local lib_js="${1:-${MANAGER_JS_DIR}/pvemanagerlib.js}"
+    local tpl
+    if [ -n "${2:-}" ]; then
+        tpl="$2"
+    elif is_diverted && [ -f "$ORIG" ]; then
+        tpl="$ORIG"
+    else
+        tpl="$TPL"
+    fi
+
+    local ok=1
+
+    if [ ! -f "$lib_js" ]; then
+        err "pvemanagerlib.js not found at: $lib_js"
+        ok=0
+    else
+        local cls
+        for cls in "${ANCHOR_CLASSES[@]}"; do
+            if grep -qF -- "$cls" "$lib_js"; then
+                log "OK  anchor present in $(basename "$lib_js"): $cls"
+            else
+                err "MISSING anchor in $(basename "$lib_js"): $cls"
+                ok=0
+            fi
+        done
+    fi
+
+    if [ ! -f "$tpl" ]; then
+        err "index.html.tpl not found at: $tpl"
+        ok=0
+    else
+        if grep -qF -- "$PVEMANAGERLIB_TAG_NEEDLE" "$tpl"; then
+            log "OK  pvemanagerlib.js script tag present in $(basename "$tpl")"
+        else
+            err "MISSING pvemanagerlib.js script tag in $tpl"
+            ok=0
+        fi
+    fi
+
+    if [ "$ok" -eq 1 ]; then
+        log "verify: all anchors present - loader is expected to apply cleanly."
+        return 0
+    else
+        err "verify: one or more anchors missing - pve-manager may have changed; do NOT trust apply() without investigating."
+        return 1
+    fi
+}
+
+# Build the patched template content on stdout from a pristine template on
+# stdin/$1, inserting INSERT_LINE right after the pvemanagerlib.js tag.
+render_patched_template() {
+    local src="$1"
+    awk -v needle="$PVEMANAGERLIB_TAG_NEEDLE" -v insert="$INSERT_LINE" '
+        { print }
+        index($0, needle) > 0 { print insert }
+    ' "$src"
+}
+
+validate_rendered_template() {
+    # $1 = rendered file to sanity check
+    local out="$1"
+    local count
+    count=$(grep -cF -- "$INSERT_LINE" "$out")
+    if [ "$count" -ne 1 ]; then
+        err "validation failed: loader script tag appears $count time(s) in rendered template (expected 1)"
+        return 1
+    fi
+    if ! grep -qF -- "</body>" "$out"; then
+        err "validation failed: rendered template has no </body> - looks malformed"
+        return 1
+    fi
+    if ! grep -qF -- "$PVEMANAGERLIB_TAG_NEEDLE" "$out"; then
+        err "validation failed: pvemanagerlib.js tag missing from rendered template"
+        return 1
+    fi
+    return 0
+}
+
+cmd_apply() {
+    require_cmd dpkg-divert
+
+    [ "$(id -u)" -eq 0 ] || die "apply must be run as root"
+
+    if ! anchors_present_in "${MANAGER_JS_DIR}/pvemanagerlib.js" "${ANCHOR_CLASSES[@]}"; then
+        die "refusing to apply: pvemanagerlib.js anchors missing (run 'pve-meta-patch verify' for details)"
+    fi
+
+    local loader_src
+    loader_src="$(find_loader_src)" || die "could not find ${LOADER_NAME} to install (looked next to this script and in /usr/share/${PKG}/)"
+
+    if is_diverted; then
+        if ! diversion_owned_by_us; then
+            die "index.html.tpl is diverted by another package - refusing to touch it"
+        fi
+        log "diversion already in place (owned by ${PKG}); reusing pristine copy at ${ORIG}"
+    else
+        [ -f "$TPL" ] || die "expected pve-manager template not found: $TPL"
+        log "diverting ${TPL} -> ${ORIG} (package: ${PKG})"
+        dpkg-divert --package "$PKG" --add --rename --divert "$ORIG" "$TPL" \
+            || die "dpkg-divert --add failed"
+    fi
+
+    [ -f "$ORIG" ] || die "pristine template not found at $ORIG after diversion - aborting"
+
+    if ! grep -qF -- "$PVEMANAGERLIB_TAG_NEEDLE" "$ORIG"; then
+        die "pristine template ${ORIG} does not contain the expected pvemanagerlib.js tag - refusing to patch"
+    fi
+
+    local tmp_out
+    tmp_out="$(mktemp "${TPL}.pve-meta-new.XXXXXX")" || die "mktemp failed"
+
+    render_patched_template "$ORIG" > "$tmp_out"
+
+    if ! validate_rendered_template "$tmp_out"; then
+        rm -f "$tmp_out"
+        die "validation of newly rendered template failed - leaving existing ${TPL} untouched"
+    fi
+
+    if ! install -m 0644 "$tmp_out" "$TPL"; then
+        rm -f "$tmp_out"
+        die "failed to install patched template to $TPL"
+    fi
+    rm -f "$tmp_out"
+    log "wrote patched template: $TPL"
+
+    install -d -m 0755 "$MANAGER_JS_DIR"
+    install -m 0644 "$loader_src" "$LOADER_DST" || die "failed to install loader to $LOADER_DST"
+    log "installed loader: $LOADER_DST (from $loader_src)"
+
+    log "apply: success."
+    cmd_status
+}
+
+cmd_remove() {
+    require_cmd dpkg-divert
+    [ "$(id -u)" -eq 0 ] || die "remove must be run as root"
+
+    if [ -f "$LOADER_DST" ]; then
+        rm -f "$LOADER_DST" && log "removed loader: $LOADER_DST"
+    fi
+
+    if is_diverted; then
+        if ! diversion_owned_by_us; then
+            die "index.html.tpl is diverted by another package - refusing to remove"
+        fi
+        log "restoring original template and removing diversion"
+        # dpkg-divert --remove --rename moves $ORIG back onto $TPL, but it
+        # refuses to do so ("destination file already exists") since $TPL
+        # currently holds our patched content. Remove our file first so the
+        # rename-back has a clear destination; $ORIG (the pristine content)
+        # is only ever removed by dpkg-divert itself once the rename
+        # succeeds, so no data is lost even if something goes wrong here.
+        rm -f "$TPL"
+        if ! dpkg-divert --package "$PKG" --remove --rename --divert "$ORIG" "$TPL"; then
+            err "dpkg-divert --remove failed"
+            if [ -f "$ORIG" ] && [ ! -f "$TPL" ]; then
+                err "recovering: restoring $TPL from $ORIG manually"
+                cp -a "$ORIG" "$TPL"
+            fi
+            die "remove failed - see above"
+        fi
+    else
+        log "no diversion in place for $TPL - nothing to restore"
+    fi
+
+    log "remove: success."
+    cmd_status || true
+    return 0
+}
+
+cmd_status() {
+    echo "pve-meta-patch status:"
+    if is_diverted; then
+        if diversion_owned_by_us; then
+            echo "  diversion:       APPLIED (owned by ${PKG})"
+        else
+            echo "  diversion:       APPLIED (owned by a DIFFERENT package - unexpected!)"
+        fi
+        echo "  pristine backup: $([ -f "$ORIG" ] && echo "present ($ORIG)" || echo "MISSING")"
+    else
+        echo "  diversion:       not applied"
+    fi
+
+    if [ -f "$TPL" ] && grep -qF -- "$INSERT_LINE" "$TPL"; then
+        echo "  loader tag:      present in $TPL"
+    else
+        echo "  loader tag:      absent from $TPL"
+    fi
+
+    if [ -f "$LOADER_DST" ]; then
+        echo "  loader file:     present ($LOADER_DST)"
+    else
+        echo "  loader file:     absent ($LOADER_DST)"
+    fi
+
+    if is_diverted && diversion_owned_by_us && [ -f "$LOADER_DST" ] && [ -f "$TPL" ] && grep -qF -- "$INSERT_LINE" "$TPL"; then
+        echo "  overall:         APPLIED"
+        return 0
+    else
+        echo "  overall:         NOT APPLIED"
+        return 1
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <apply|remove|verify|status> [args]
+
+  apply                Divert index.html.tpl (if not already) and (re)write
+                        the patched template + install the loader script.
+  remove               Restore the original index.html.tpl and remove the
+                        loader script.
+  verify [libjs] [tpl]  Check that the ExtJS class / script-tag anchors this
+                        patch depends on are present in the given (or
+                        installed) pvemanagerlib.js / index.html.tpl.
+  status               Report whether the patch is currently applied.
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in
+        apply)  cmd_apply "$@" ;;
+        remove) cmd_remove "$@" ;;
+        verify) cmd_verify "$@" ;;
+        status) cmd_status "$@" ;;
+        *) usage; exit 2 ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,46 @@
+#!/bin/sh
+# postinst snippet for the pve-meta package.
+#
+# Applies (or re-applies) the index.html.tpl / pvemanagerlib.js patch on
+# initial configure, and again whenever dpkg triggers us because
+# pve-manager shipped a new index.html.tpl or pvemanagerlib.js (see
+# debian/pve-meta.triggers). Re-running `pve-meta-patch apply` is safe and
+# idempotent: it reuses the existing dpkg-divert diversion, re-derives the
+# patched template from the (possibly-updated) pristine original, and
+# re-installs the loader script.
+set -e
+
+PVE_META_PATCH=/usr/sbin/pve-meta-patch
+
+apply_patch() {
+    if [ -x "$PVE_META_PATCH" ]; then
+        # Never let a failure here break the pve-manager/pve-meta install;
+        # the loader itself is designed to no-op harmlessly if anchors are
+        # missing, and pve-meta-patch verify/status can be used afterwards
+        # to diagnose.
+        "$PVE_META_PATCH" apply || {
+            echo "pve-meta: warning: pve-meta-patch apply failed, see above." >&2
+        }
+    else
+        echo "pve-meta: warning: $PVE_META_PATCH not found or not executable." >&2
+    fi
+}
+
+case "$1" in
+    configure)
+        apply_patch
+        ;;
+    triggered)
+        # $2 is the whitespace-separated list of trigger names that fired;
+        # for either of our two triggers, just re-apply.
+        apply_patch
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0
