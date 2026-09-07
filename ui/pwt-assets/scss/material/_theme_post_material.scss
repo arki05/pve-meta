@@ -1,0 +1,88 @@
+/// ### Fine Tuning
+///
+
+/// `pwt-panel-header`, `pwt-menubar`
+/// : use `neutral` color scheme (instead of `surface`)
+///
+.pwt-panel-header,
+ul.pwt-menubar {
+    @include color-scheme-vars("neutral");
+}
+
+/// `pwt-nav-menu`
+/// : add padding
+///
+.pwt-nav-menu {
+    padding: var(--pwt-spacer-1);
+}
+.pwt-nav-link {
+    padding: var(--pwt-spacer-1) 1rem;
+}
+
+.pwt-nav-menu {
+    .pwt-nav-section {
+        font-size: map-get($font-size, "title-medium");
+        padding: var(--pwt-spacer-2);
+    }
+}
+
+/// `pwt-tab-material`
+/// : add padding
+///
+.pwt-tab-material {
+    .pwt-nav-link {
+        padding: var(--pwt-spacer-1) var(--pwt-spacer-3);
+
+        span {
+            display: flex;
+            align-items: center;
+        }
+    }
+
+    &.primary {
+        .pwt-nav-link {
+            span {
+                gap: 0;
+                flex-direction: column;
+
+                &:before {
+                    font-size: map-get($font-size, "headline-small");
+                }
+            }
+        }
+    }
+    &.secondary {
+        span {
+            flex-direction: row;
+        }
+    }
+}
+
+/// `pwt-datatable-content tr`
+/// : make horizontal table borders invisible
+///
+.pwt-datatable-content {
+    &:not(.table-borderless) tr {
+        border-color: var(--pwt-elevated-background-color);
+    }
+}
+
+/// `pwt-content-spacer`
+/// : overwrite content spacer layout
+///
+/// - use elevated box with box-shadow
+///
+.pwt-content-spacer {
+    & > *:not(:only-child) {
+        border: 0px !important;
+        border-top: 1px solid var(--pwt-color-surface) !important;
+        @include elevation-box-shadow(1);
+    }
+}
+
+/// `pwt-side-dialog-bottom`
+/// : overwrite corner radius
+.pwt-side-dialog-bottom {
+        border-top-left-radius: var(--pwt-shape-corner-large);
+        border-top-right-radius: var(--pwt-shape-corner-large);
+}

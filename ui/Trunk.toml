@@ -1,0 +1,13 @@
+[build]
+release = true
+public_url = "/ui/"
+
+[[hooks]]
+stage = "build"
+command = "grass"
+command_arguments = ["css/desktop-yew-style.scss", "dist/.stage/desktop-yew-style.css"]
+
+[[hooks]]
+stage = "build"
+command = "grass"
+command_arguments = ["css/crisp-yew-style.scss", "dist/.stage/crisp-yew-style.css"]

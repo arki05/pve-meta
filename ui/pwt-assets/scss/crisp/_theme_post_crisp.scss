@@ -1,0 +1,13 @@
+/// ### Fine Tuning
+///
+
+/// `pwt-content-spacer`
+/// : use neutral color scheme instead of surface.
+///
+.pwt-content-spacer {
+    @include color-scheme-vars("neutral");
+}
+
+.pwt-content-spacer-colors {
+    @include color-scheme-vars("neutral");
+}

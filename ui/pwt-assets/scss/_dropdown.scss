@@ -1,0 +1,17 @@
+.pwt-dropdown {
+    display: none;
+    background-color: var(--pwt-color-neutral);
+    color: var(--pwt-color-on-neutral);
+    z-index: $zindex-dropdown;
+
+    @include elevation-box-shadow(1);
+
+    max-height: 100dvh;
+    max-width: 100dvw;
+    /* make e.g. the header menu overflow visible */
+    overflow: visible;
+}
+
+.pwt-dropdown[data-show] {
+    display: flex;
+}

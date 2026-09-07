@@ -1,0 +1,190 @@
+/* pve-meta UI overrides */
+
+.pve-meta-source {
+    font-family: monospace;
+    white-space: pre;
+}
+
+.pve-meta-app {
+    height: 100%;
+}
+
+.pve-meta-header {
+    flex: none;
+}
+
+.pve-meta-current-label {
+    opacity: 0.85;
+    font-size: 0.9em;
+}
+
+.pve-meta-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.pve-meta-guest-list {
+    flex: none;
+    width: 240px;
+    overflow-y: auto;
+    border-right: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-guest-row {
+    cursor: pointer;
+    border-bottom: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-guest-row:hover {
+    background-color: var(--pwt-color-surface-container);
+}
+
+.pve-meta-guest-row-selected {
+    background-color: var(--pwt-color-surface-tint);
+    color: var(--pwt-color-on-primary);
+}
+
+.pve-meta-guest-marker {
+    width: 0.8em;
+    display: inline-block;
+    color: transparent;
+}
+
+.pve-meta-guest-marker-active {
+    color: var(--pwt-color-success, green);
+}
+
+.pve-meta-guest-meta {
+    opacity: 0.7;
+    font-size: 0.9em;
+}
+
+.pve-meta-placeholder,
+.pve-meta-loading,
+.pve-meta-error-panel {
+    padding: 2em;
+}
+
+.pve-meta-editor {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+.pve-meta-toolbar {
+    flex: none;
+    border-bottom: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-form-root {
+    flex: 1 1 auto;
+}
+
+.pve-meta-namespace-panel {
+    border: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-panel-title {
+    cursor: pointer;
+    user-select: none;
+}
+
+.pve-meta-owner-label {
+    font-size: 0.85em;
+}
+
+.pve-meta-namespace-body {
+    border-top: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-section {
+    border-left: 2px solid var(--pwt-color-border);
+    padding-left: 0.75em;
+}
+
+.pve-meta-section-title {
+    cursor: pointer;
+    user-select: none;
+    font-weight: 500;
+}
+
+.pve-meta-section-body {
+    padding-left: 0.5em;
+}
+
+.pve-meta-value-row {
+    border-bottom: 1px solid var(--pwt-color-border);
+}
+
+.pve-meta-row-label {
+    min-width: 12em;
+    flex: none;
+}
+
+.pve-meta-row-widget {
+    flex: 1 1 auto;
+    min-width: 12em;
+}
+
+.pve-meta-required {
+    color: var(--pwt-color-error, crimson);
+}
+
+.pve-meta-comment-text {
+    font-style: italic;
+    font-size: 0.9em;
+}
+
+.pve-meta-comment-field {
+    max-width: 16em;
+}
+
+.pve-meta-readonly-array pre {
+    max-height: 12em;
+    overflow: auto;
+    background-color: var(--pwt-color-surface-container);
+    padding: 0.5em;
+}
+
+.pve-meta-pending-bar {
+    flex: none;
+    border-top: 1px solid var(--pwt-color-border);
+    background-color: var(--pwt-color-surface-container);
+}
+
+.pve-meta-error-banner {
+    flex: none;
+}
+
+.pve-meta-source-view {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+.pve-meta-source-view .pve-meta-source {
+    flex: 1 1 auto;
+    min-height: 20em;
+    width: 100%;
+}
+
+.pve-meta-diff {
+    max-height: 24em;
+    overflow: auto;
+}
+
+.pve-meta-touched-list {
+    max-height: 12em;
+    overflow: auto;
+}
+
+.pve-meta-dialog-message {
+    max-width: 32em;
+}
+
+.pve-meta-not-logged-in {
+    max-width: 32em;
+    margin: 2em auto;
+}
