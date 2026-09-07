@@ -20,8 +20,17 @@ One of:
   is parsed for identity but **not** verified (trusted lab). Identity is recorded in
   the log line of every write.
 
-No per-path authorization in v1. The touched-path set of every write is computed and
-logged, which is the seam where claims enforcement slots in later.
+No per-path *claims* authorization in v1 (i.e. nothing yet stops an authorized caller
+from writing to a namespace/prefix another operator claims) — the touched-path set of
+every write is computed and returned in the response, which is the seam where claims
+enforcement slots in later. Ordinary PVE object permissions **are** enforced by the
+native `PVE::API2::Meta` module, though: guest endpoints require the caller's usual
+`VM.Audit` (read) / `VM.Config.Options` (write; `clone` additionally requires
+`VM.Clone`) on `/vms/{vmid}`, and datacenter/registry/inventory endpoints require
+`Sys.Audit` (read) / `Sys.Modify` (write) on `/` — see `docs/NATIVE-API-SPEC.md`'s
+endpoint table for the exact mapping. The standalone `pve-metad` daemon, in contrast,
+has no ACL layer at all (any caller who can authenticate at all may read or write
+anything) — that daemon is the one this whole "trusted-lab" framing was written for.
 
 ## Documents
 
@@ -50,7 +59,7 @@ cluster-wide. Representation on the wire:
 | GET | `/meta/guests` | List guest documents: `[{ "vmid", "node", "type", "format", "digest", "mtime", "size", "namespaces": ["traefik", ...] }]`. Filter with `has=<namespace>` (top-level key or dotted prefix present). |
 | GET | `/meta/guests/{vmid}` | The document (above). `comments=1` keeps comment keys. `raw=1` adds `"raw": "<file text>"`. |
 | GET | `/meta/guests/{vmid}/subtree?path=traefik.spec` | Subtree at a dotted path (the router cannot match variable-depth paths, so the path is a query parameter) → `{ "data": {...}, "digest": "..." }`. 404 if absent. |
-| PUT | `/meta/guests/{vmid}` | **Patch.** Body `{ "patch": { ... }, "digest": "<optional expected>", "dry_run": false }`. Merge-patch semantics, `null` deletes. Creates the document (in the default format) if it does not exist. Returns the new document plus `"touched": [{"path": "traefik.spec.host", "op": "set"}]`. With `dry_run=1` nothing is written and the would-be result (document text + touched) is returned. 409 on digest mismatch, 400 on lint/parse errors. |
+| PUT | `/meta/guests/{vmid}` | **Patch.** Body `{ "patch": { ... }, "digest": "<optional expected>", "dry_run": false }`. Merge-patch semantics, `null` deletes. Creates the document (in the default format) if it does not exist. Returns the new document plus `"touched": [{"path": "traefik.spec.host", "op": "set"}]`. With `dry_run=1` nothing is written and the would-be result (document text + touched) is returned; a patch that would fail against a real write (digest mismatch, lint/parse error, or a top-level delete against a document that does not exist) fails identically under `dry_run` rather than silently reporting a fabricated empty result. 409 on digest mismatch, 400 on lint/parse errors, 404 if a top-level key is deleted from a document that does not exist. |
 | PUT | `/meta/guests/{vmid}/raw` | **Full text replace.** Body `{ "content": "<text>", "format": "<optional, switches extension>", "digest": "<optional>", "dry_run": false }`. Returns document + `touched` (derived by diffing old and new). `dry_run=1` validates and diffs without writing. |
 | POST | `/meta/guests/{vmid}/convert` | Body `{ "format": "toml", "digest": "<optional>" }`. Re-dumps in the new format (file comments lost, comment keys kept). |
 | DELETE | `/meta/guests/{vmid}` | Remove the document and its snapshot copies. |

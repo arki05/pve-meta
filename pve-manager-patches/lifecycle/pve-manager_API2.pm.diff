@@ -1,0 +1,25 @@
+--- a/PVE/API2.pm
++++ b/PVE/API2.pm
+@@ -17,6 +17,7 @@
+ use PVE::API2::Pool;
+ use PVE::API2::AccessControl;
+ use PVE::API2::Storage::Config;
++use PVE::API2::Meta;
+ 
+ __PACKAGE__->register_method({
+     subclass => "PVE::API2::Cluster",
+@@ -43,6 +44,14 @@
+     path => 'pools',
+ });
+ 
++# pve-meta: native metadata store API (see docs/NATIVE-API-SPEC.md). Applied
++# out-of-tree via dpkg-divert + patch by pve-meta-lifecycle-patch, not part
++# of stock pve-manager.
++__PACKAGE__->register_method({
++    subclass => "PVE::API2::Meta",
++    path => 'meta',
++});
++
+ __PACKAGE__->register_method({
+     name => 'index',
+     path => '',

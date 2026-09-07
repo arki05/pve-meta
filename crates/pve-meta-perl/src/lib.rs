@@ -17,6 +17,8 @@ use pve_meta_core::error::Error as CoreError;
 use pve_meta_core::format::Format;
 use pve_meta_core::store::{MetaStore, RollbackOutcome};
 
+mod api;
+
 /// Opens a fresh [`MetaStore`] rooted at `$PVE_META_ROOT`, or
 /// `/etc/pve/meta` if unset. Cheap: `MetaStore::new` does no I/O.
 fn open_store() -> MetaStore {
@@ -198,5 +200,127 @@ mod pve_rs_meta {
     #[export]
     pub fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    // -- API-shaped exports (`PVE::API2::Meta`, `docs/NATIVE-API-SPEC.md`) --
+    //
+    // Thin wrappers over `super::api` (see that module's docs for the wire
+    // contract). All of these die with a Rust `anyhow::Error` whose
+    // `Display` is `"NNN: message"` (an HTTP status prefix); the Perl layer
+    // parses that prefix and re-raises via `PVE::Exception::raise`.
+
+    /// `GET /meta/version` -> `{ token, changed }`.
+    #[export]
+    pub fn api_version() -> Result<super::api::ApiVersion, Error> {
+        super::api::version()
+    }
+
+    /// `GET /meta/health` -> `{ store: {root, files, bytes}, version, hooks: {} }`.
+    #[export]
+    pub fn api_health() -> Result<super::api::ApiHealth, Error> {
+        super::api::health()
+    }
+
+    /// `GET /meta/inventory` -> guests from `.vmlist`, enriched with their
+    /// display name.
+    #[export]
+    pub fn api_inventory() -> Result<Vec<super::api::InventoryEntry>, Error> {
+        super::api::inventory()
+    }
+
+    /// `GET /meta/guests` -> guest documents, optionally filtered by `has`
+    /// (a dotted path that must be present).
+    #[export]
+    pub fn api_list_guests(has: Option<&str>) -> Result<Vec<super::api::GuestListEntry>, Error> {
+        super::api::list_guests(has)
+    }
+
+    /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
+    /// or `"datacenter"`).
+    #[export]
+    pub fn api_get(id: &str, comments: bool, raw: bool) -> Result<super::api::ApiDocument, Error> {
+        super::api::get_document(id, comments, raw)
+    }
+
+    /// `GET .../subtree?path=...` -> `{ data_json, digest }`. 404s if
+    /// nothing exists at `path`.
+    #[export]
+    pub fn api_subtree(id: &str, path: &str) -> Result<super::api::ApiSubtree, Error> {
+        super::api::get_subtree(id, path)
+    }
+
+    /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`: merge-patch.
+    /// `patch_json` is a JSON-encoded string (avoids Perl number/string
+    /// ambiguity); creates the document if it does not exist.
+    #[export]
+    pub fn api_patch(id: &str, patch_json: &str, digest: Option<&str>, dry_run: bool) -> Result<super::api::ApiDocument, Error> {
+        super::api::patch_document(id, patch_json, digest, dry_run)
+    }
+
+    /// `PUT .../raw`: full-text replace.
+    #[export]
+    pub fn api_put_raw(
+        id: &str,
+        content: &str,
+        format: Option<&str>,
+        digest: Option<&str>,
+        dry_run: bool,
+    ) -> Result<super::api::ApiDocument, Error> {
+        super::api::put_raw_document(id, content, format, digest, dry_run)
+    }
+
+    /// `POST .../convert`: re-dumps the document in another format.
+    #[export]
+    pub fn api_convert(id: &str, format: &str, digest: Option<&str>) -> Result<super::api::ApiDocument, Error> {
+        super::api::convert_document(id, format, digest)
+    }
+
+    /// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`.
+    #[export]
+    pub fn api_delete(id: &str) -> Result<bool, Error> {
+        super::api::delete_document(id)
+    }
+
+    /// `GET /meta/guests/{vmid}/snapshots` -> snapshot names.
+    #[export]
+    pub fn api_snapshots(vmid: u32) -> Result<Vec<String>, Error> {
+        super::api::list_guest_snapshots(vmid)
+    }
+
+    /// `POST /meta/guests/{vmid}/snapshot` -> `{ created }`.
+    #[export]
+    pub fn api_snapshot(vmid: u32, name: &str) -> Result<super::api::ApiCreated, Error> {
+        super::api::snapshot_guest(vmid, name)
+    }
+
+    /// `POST /meta/guests/{vmid}/rollback` -> `{ outcome }`.
+    #[export]
+    pub fn api_rollback(vmid: u32, name: &str) -> Result<super::api::ApiOutcome, Error> {
+        super::api::rollback_guest(vmid, name)
+    }
+
+    /// `DELETE /meta/guests/{vmid}/snapshots/{name}`.
+    #[export]
+    pub fn api_delete_snapshot(vmid: u32, name: &str) -> Result<bool, Error> {
+        super::api::delete_guest_snapshot(vmid, name)
+    }
+
+    /// `POST /meta/guests/{vmid}/clone` -> the new guest's document.
+    #[export]
+    pub fn api_clone(vmid: u32, newid: u32) -> Result<super::api::ApiDocument, Error> {
+        super::api::clone_document(vmid, newid)
+    }
+
+    /// `GET /meta/registry` -> a view of `datacenter.operators`.
+    #[export]
+    pub fn api_registry() -> Result<Vec<super::api::ApiRegistryEntry>, Error> {
+        super::api::registry()
+    }
+
+    /// `GET /meta/schemas/{vmid}` -> the JSON schemas applicable to a
+    /// guest's document, as a JSON object string keyed by namespace prefix.
+    #[export]
+    pub fn api_schemas(vmid: u32) -> Result<String, Error> {
+        super::api::schemas_for_guest(vmid)
     }
 }
