@@ -11,6 +11,7 @@ Package: pve-meta
 Architecture: any
 Depends: pve-manager (>= 9.0),
          libpve-meta-rs-perl (= ${binary:Version}),
+         patch,
          ${shlibs:Depends}, ${misc:Depends}
 Description: Structured, versioned metadata store for Proxmox VE
  pve-meta adds a structured (YAML/TOML/JSON) metadata document per guest and
