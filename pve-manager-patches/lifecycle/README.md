@@ -1,11 +1,13 @@
 # pve-meta-lifecycle-patch: wiring `PVE::RS::Meta` into stock PVE Perl
 
-Applies the seven unified diffs derived in `docs/LIFECYCLE-PATCHES.md` (section 10 in
+Applies the eight unified diffs derived in `docs/LIFECYCLE-PATCHES.md` (section 10 in
 particular documents this tool's design) so that snapshot/rollback/delsnap/clone/destroy
 and vzdump backup/restore call into `PVE::RS::Meta`'s `on_snapshot`, `on_rollback`,
 `on_delsnap`, `on_clone`, `on_destroy`, `export_for_backup`, and `import_from_backup`
-hooks. Every call site uses the soft `eval { ... }; warn "pve-meta: ..." if $@;` form —
-a metadata read/write hiccup never blocks the underlying guest operation.
+hooks, and so that the native `PVE::API2::Meta` module (see `docs/NATIVE-API-SPEC.md`)
+is registered into `PVE::API2` and reachable at `/api2/json/meta`. Every lifecycle-hook
+call site uses the soft `eval { ... }; warn "pve-meta: ..." if $@;` form — a metadata
+read/write hiccup never blocks the underlying guest operation.
 
 This tool is the "lifecycle" sibling of `pve-manager-patch/pve-meta-patch` (the web-UI
 tab injector) and deliberately reuses its mechanism and CLI shape — read that tool's
@@ -20,16 +22,17 @@ Tested against **pve-manager 9.2.11** / `pve-container 6.1.14` / `qemu-server 9.
 - `pve-meta-lifecycle-patch` — bash script, installed as
   `/usr/sbin/pve-meta-lifecycle-patch`. Subcommands: `apply`, `remove`, `verify`,
   `status`.
-- `*.diff` (seven files) — unified diffs, one per patched Perl file, generated in
-  `docs/LIFECYCLE-PATCHES.md` §7 from real installed source. Shipped verbatim; the tool
-  applies them with `patch -p1`, never re-implements the insertions as shell logic.
+- `*.diff` (eight files) — unified diffs, one per patched Perl file, generated in
+  `docs/LIFECYCLE-PATCHES.md` §7 from real installed source (the eighth, `PVE/API2.pm`,
+  registers `PVE::API2::Meta`; see `docs/NATIVE-API-SPEC.md`). Shipped verbatim; the
+  tool applies them with `patch -p1`, never re-implements the insertions as shell logic.
 - `debian/pve-meta.triggers.lifecycle`, `debian/postinst.lifecycle`,
   `debian/postrm.lifecycle` — packaging-glue snippets to fold into the real
   `pve-meta` package's `debian/pve-meta.triggers` / `debian/postinst` / `debian/postrm`
   (which already carry the UI-patch tool's own triggers/apply/remove calls) — these are
   fragments to merge in, not standalone maintainer scripts.
 
-## The seven patched files
+## The eight patched files
 
 | Key | Real path (under the diverted-file's own dir) | Diff file | Package |
 |---|---|---|---|
@@ -40,11 +43,15 @@ Tested against **pve-manager 9.2.11** / `pve-container 6.1.14` / `qemu-server 9.
 | `API2-Qemu` | `/usr/share/perl5/PVE/API2/Qemu.pm` | `qemu-server_API2-Qemu.pm.diff` | qemu-server |
 | `QemuServer` | `/usr/share/perl5/PVE/QemuServer.pm` | `qemu-server_QemuServer.pm.diff` | qemu-server |
 | `VZDump-QemuServer` | `/usr/share/perl5/PVE/VZDump/QemuServer.pm` | `qemu-server_VZDump-QemuServer.pm.diff` | qemu-server |
+| `API2` | `/usr/share/perl5/PVE/API2.pm` | `pve-manager_API2.pm.diff` | pve-manager |
 
 Each real path is diverted to `<real path>.pve-meta-orig` (the full path, suffixed —
 not a flattened basename registry: `API2/LXC.pm` and `API2/Qemu.pm`, and `VZDump/LXC.pm`
 and `VZDump/QemuServer.pm`, would otherwise collide), all owned by the diversion package
-name `pve-meta`, exactly like the UI-patch tool's single `index.html.tpl` diversion.
+name `pve-meta`, exactly like the UI-patch tool's single `index.html.tpl` diversion —
+the `API2` entry's real file is patched by a different upstream package (pve-manager,
+rather than pve-container/qemu-server/libpve-guest-common-perl) but the diversion owner
+is still `pve-meta` throughout.
 
 ## Mechanism
 
@@ -82,7 +89,7 @@ pve-meta-lifecycle-patch [--root <dir>] verify [file...]
 pve-meta-lifecycle-patch [--root <dir>] status [file...]
 ```
 
-`file...` is optional (default: all seven) and each may be given as the short key
+`file...` is optional (default: all eight) and each may be given as the short key
 (`AbstractConfig`), the diff's basename, the path relative to `/usr/share/perl5`, the
 absolute path, or the bare basename (ambiguous for `LXC.pm`/`QemuServer.pm`, which
 exist under two different directories each — an ambiguous basename selects *all*
@@ -96,7 +103,7 @@ copy of the pristine backup → `patch -p1 --dry-run` → `patch -p1` for real �
 file is left alone (or, if `apply` diverted it moments ago in this same run, the
 diversion is rolled back so no half-applied state lingers) and the tool moves on to the
 next file — one file's anchors moving on some future point release must not block
-patching the other six. Exit status is non-zero if *any* file failed, after all
+patching the other seven. Exit status is non-zero if *any* file failed, after all
 requested files were attempted. Re-running `apply` is idempotent: it always regenerates
 from the pristine backup + diff, never from the (possibly already-patched) live file, so
 re-applying never double-inserts.
@@ -108,7 +115,7 @@ then `dpkg-divert --remove --rename` to rename the pristine backup back onto the
 path (clearing the live file first, since `dpkg-divert` refuses to rename onto an
 existing destination); falls back to `cp -a` from the pristine backup if `dpkg-divert`
 itself fails, so the host is never left without the file. Verified end-to-end on the lab
-node: `md5sum` of all seven files after `apply` → `remove` is identical to their
+node: `md5sum` of all eight files after `apply` → `remove` is identical to their
 pre-`apply` (pristine) `md5sum`.
 
 ### `verify`
@@ -123,12 +130,14 @@ and the intended CI check via `--root` (see below).
 
 Per file: whether it's diverted (and by which package — a diversion owned by anyone
 other than `pve-meta` is flagged as unexpected and left alone by every other
-subcommand), whether the pristine backup is present, whether the live file carries the
-`use PVE::RS::Meta;` marker, and whether the live file is byte-for-byte what the shipped
-diff would produce from the current pristine (checked via a `patch -p1 -R --dry-run`
-reverse-application probe) — a stronger claim than the marker grep alone, since a file
-patched by an *older* version of a diff would still carry the marker but fail this
-check.
+subcommand), whether the pristine backup is present, whether the live file carries that
+file's marker (the fourth `|`-separated field in `LIFECYCLE_FILES`: `use PVE::RS::Meta;`
+for seven of the eight files, `subclass => "PVE::API2::Meta"` for `API2`, since
+`PVE/API2.pm`'s diff never adds a `use PVE::RS::Meta;` line itself), and whether the
+live file is byte-for-byte what the shipped diff would produce from the current
+pristine (checked via a `patch -p1 -R --dry-run` reverse-application probe) — a stronger
+claim than the marker grep alone, since a file patched by an *older* version of a diff
+would still carry the marker but fail this check.
 
 ### `--root <dir>`
 
@@ -168,7 +177,7 @@ disk-having-VM backup gap from `docs/LIFECYCLE-PATCHES.md` §4.2).
   selects both `API2-LXC` and `VZDump-LXC` (and `QemuServer.pm` selects both
   `QemuServer` and `VZDump-QemuServer`). This is intentional — a stricter "ambiguous,
   please disambiguate" error would be more surprising for the common case of running the
-  tool with no file arguments at all (all seven) — but worth knowing if you intend to
+  tool with no file arguments at all (all eight) — but worth knowing if you intend to
   target exactly one of a same-basename pair; use the key or the path relative to
   `/usr/share/perl5` instead.
 - **`on_clone`'s die-on-conflict is swallowed by the soft eval, same as every other

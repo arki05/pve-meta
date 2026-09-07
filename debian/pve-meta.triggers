@@ -16,7 +16,4 @@ interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm
 interest-noawait /usr/share/perl5/PVE/API2/Qemu.pm
 interest-noawait /usr/share/perl5/PVE/QemuServer.pm
 interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm
-# Native API module registration (docs/NATIVE-API-SPEC.md); the corresponding
-# pve-manager-patches/lifecycle/pve-manager_API2.pm.diff did not exist yet as of this
-# writing -- this line is forward-compatible (harmless no-op trigger) until it does.
 interest-noawait /usr/share/perl5/PVE/API2.pm

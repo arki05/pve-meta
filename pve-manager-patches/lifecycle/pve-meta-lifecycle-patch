@@ -1,12 +1,13 @@
 #!/bin/bash
 #
-# pve-meta-lifecycle-patch - apply/remove/verify/status for the seven
+# pve-meta-lifecycle-patch - apply/remove/verify/status for the eight
 # lifecycle-hook patches that wire PVE::RS::Meta into stock PVE 9.x Perl
-# (snapshot/rollback/delsnap/clone/destroy/backup/restore). See
-# docs/LIFECYCLE-PATCHES.md section 10 for the design this implements.
+# (snapshot/rollback/delsnap/clone/destroy/backup/restore) and register the
+# native PVE::API2::Meta module in PVE::API2. See docs/LIFECYCLE-PATCHES.md
+# section 10 for the design this implements.
 #
 # Mechanism (same shape as pve-manager-patch/pve-meta-patch, generalized to
-# seven files across three packages with multiple insertion points each):
+# eight files across four packages with multiple insertion points each):
 #   1. dpkg-divert each real file away, so the pristine file each package
 #      ships (now and on future upgrades) always lands next to the real
 #      path, suffixed ".pve-meta-orig", and the "real" name is ours to
@@ -30,25 +31,31 @@ set -u
 PKG="pve-meta"
 BASE_PERL5="/usr/share/perl5"
 
-# key|relative-path-under-BASE_PERL5|diff-file-basename
+# key|relative-path-under-BASE_PERL5|diff-file-basename|patch-marker
 #
-# All seven files live under the same vendor perl5 tree, so the diff's
+# All eight files live under the same vendor perl5 tree, so the diff's
 # "a/<relpath>" / "b/<relpath>" headers apply directly with `patch -p1`
 # from a scratch dir containing just that one relative path.
+#
+# The fourth field is a per-file marker string - a cheap, reliable "is this
+# file patched at all" needle used by verify/status, mirroring the existing
+# tool's single-string INSERT_LINE grep idiom. Seven of the eight files gain
+# `use PVE::RS::Meta;` directly (see each diff's "use" hunk); PVE/API2.pm's
+# diff only adds `use PVE::API2::Meta;` plus a `register_method` block (it
+# calls into PVE::RS::Meta only indirectly, through PVE::API2::Meta itself),
+# so it needs its own marker: the `subclass => "PVE::API2::Meta"` text
+# present verbatim in that diff's added block, and not a substring any of
+# the other seven files would already contain.
 LIFECYCLE_FILES=(
-    "AbstractConfig|PVE/AbstractConfig.pm|libpve-guest-common-perl_AbstractConfig.pm.diff"
-    "API2-LXC|PVE/API2/LXC.pm|pve-container_API2-LXC.pm.diff"
-    "LXC-Create|PVE/LXC/Create.pm|pve-container_LXC-Create.pm.diff"
-    "VZDump-LXC|PVE/VZDump/LXC.pm|pve-container_VZDump-LXC.pm.diff"
-    "API2-Qemu|PVE/API2/Qemu.pm|qemu-server_API2-Qemu.pm.diff"
-    "QemuServer|PVE/QemuServer.pm|qemu-server_QemuServer.pm.diff"
-    "VZDump-QemuServer|PVE/VZDump/QemuServer.pm|qemu-server_VZDump-QemuServer.pm.diff"
+    "AbstractConfig|PVE/AbstractConfig.pm|libpve-guest-common-perl_AbstractConfig.pm.diff|use PVE::RS::Meta;"
+    "API2-LXC|PVE/API2/LXC.pm|pve-container_API2-LXC.pm.diff|use PVE::RS::Meta;"
+    "LXC-Create|PVE/LXC/Create.pm|pve-container_LXC-Create.pm.diff|use PVE::RS::Meta;"
+    "VZDump-LXC|PVE/VZDump/LXC.pm|pve-container_VZDump-LXC.pm.diff|use PVE::RS::Meta;"
+    "API2-Qemu|PVE/API2/Qemu.pm|qemu-server_API2-Qemu.pm.diff|use PVE::RS::Meta;"
+    "QemuServer|PVE/QemuServer.pm|qemu-server_QemuServer.pm.diff|use PVE::RS::Meta;"
+    "VZDump-QemuServer|PVE/VZDump/QemuServer.pm|qemu-server_VZDump-QemuServer.pm.diff|use PVE::RS::Meta;"
+    "API2|PVE/API2.pm|pve-manager_API2.pm.diff|subclass => \"PVE::API2::Meta\""
 )
-
-# Marker inserted into every one of the seven files (see the diffs' "use"
-# hunks) - a cheap, reliable "is this file patched at all" needle, mirroring
-# the existing tool's single-string INSERT_LINE grep idiom.
-PATCH_MARKER='use PVE::RS::Meta;'
 
 ROOT_DIR=""
 DIFF_DIR=""
@@ -66,7 +73,7 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found"
 }
 
-# Find the directory holding the seven *.diff payloads: prefer the
+# Find the directory holding the eight *.diff payloads: prefer the
 # canonical packaged location, fall back to a copy sitting next to this
 # script (the checkout / ad-hoc testing case).
 find_diff_dir() {
@@ -152,18 +159,18 @@ entry_matches() {
 
 # Populates the global array SELECTED with the entries (from
 # LIFECYCLE_FILES) matching the given patterns; with no patterns, selects
-# all seven. Dies if a pattern matches nothing.
+# all eight. Dies if a pattern matches nothing.
 select_entries() {
     SELECTED=()
     if [ "$#" -eq 0 ]; then
         SELECTED=("${LIFECYCLE_FILES[@]}")
         return 0
     fi
-    local pattern entry key relpath difffile found
+    local pattern entry key relpath difffile marker found
     for pattern in "$@"; do
         found=0
         for entry in "${LIFECYCLE_FILES[@]}"; do
-            IFS='|' read -r key relpath difffile <<<"$entry"
+            IFS='|' read -r key relpath difffile marker <<<"$entry"
             if entry_matches "$key" "$relpath" "$difffile" "$pattern"; then
                 SELECTED+=("$entry")
                 found=1
@@ -300,9 +307,9 @@ cmd_apply() {
     SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
     trap cleanup_scratch EXIT
 
-    local entry key relpath difffile rc=0
+    local entry key relpath difffile marker rc=0
     for entry in "${SELECTED[@]}"; do
-        IFS='|' read -r key relpath difffile <<<"$entry"
+        IFS='|' read -r key relpath difffile marker <<<"$entry"
         apply_one "$key" "$relpath" "$difffile" || rc=1
     done
 
@@ -355,9 +362,9 @@ cmd_remove() {
     require_cmd dpkg-divert
     [ "$(id -u)" -eq 0 ] || [ -n "$ROOT_DIR" ] || die "remove must be run as root (or with --root for a non-live tree)"
 
-    local entry key relpath difffile rc=0
+    local entry key relpath difffile marker rc=0
     for entry in "${SELECTED[@]}"; do
-        IFS='|' read -r key relpath difffile <<<"$entry"
+        IFS='|' read -r key relpath difffile marker <<<"$entry"
         remove_one "$key" "$relpath" || rc=1
     done
 
@@ -433,9 +440,9 @@ cmd_verify() {
     SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
     trap cleanup_scratch EXIT
 
-    local entry key relpath difffile rc=0
+    local entry key relpath difffile marker rc=0
     for entry in "${SELECTED[@]}"; do
-        IFS='|' read -r key relpath difffile <<<"$entry"
+        IFS='|' read -r key relpath difffile marker <<<"$entry"
         verify_one "$key" "$relpath" "$difffile" || rc=1
     done
 
@@ -450,7 +457,7 @@ cmd_verify() {
 # --- status ---------------------------------------------------------
 
 status_one() {
-    local key="$1" relpath="$2" difffile="$3"
+    local key="$1" relpath="$2" difffile="$3" marker="$4"
     local real diverted diff_path
     real="$(real_path_for "$relpath")"
     diverted="$(diverted_path_for "$relpath")"
@@ -463,7 +470,7 @@ status_one() {
         diversion_owned_by_us "$real" && owned_flag=1
         [ -f "$diverted" ] && pristine_flag=1
     fi
-    [ -f "$real" ] && grep -qF -- "$PATCH_MARKER" "$real" && patched_flag=1
+    [ -f "$real" ] && grep -qF -- "$marker" "$real" && patched_flag=1
 
     if [ -f "$real" ] && [ -f "$diff_path" ] && [ -n "$SCRATCH_ROOT" ]; then
         local work="${SCRATCH_ROOT}/${key}.status"
@@ -516,10 +523,10 @@ cmd_status() {
     fi
 
     echo "pve-meta-lifecycle-patch status:"
-    local entry key relpath difffile rc=0
+    local entry key relpath difffile marker rc=0
     for entry in "${SELECTED[@]}"; do
-        IFS='|' read -r key relpath difffile <<<"$entry"
-        status_one "$key" "$relpath" "$difffile" || rc=1
+        IFS='|' read -r key relpath difffile marker <<<"$entry"
+        status_one "$key" "$relpath" "$difffile" "$marker" || rc=1
     done
     return "$rc"
 }
@@ -534,7 +541,7 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [file...]
                     a scratch copy, gate on 'patch --dry-run' then 'perl -c'
                     reporting syntax OK as the LAST line, then install.
                     Best-effort per file: one file's anchors moving does
-                    not block applying the other six.
+                    not block applying the other seven.
   remove [file...]  Restore the pristine file and remove its diversion.
   verify [file...]  'patch --dry-run' each file's diff against its pristine
                     copy (the diverted backup if applied, else the live
@@ -548,13 +555,13 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [file...]
                     package tree in CI, without touching a live system;
                     apply/remove also honor it for the same reason.
 
-file arguments (optional; default: all seven) may be given as the short
+file arguments (optional; default: all eight) may be given as the short
 key, the diff's basename, the path relative to ${BASE_PERL5}, the
 absolute path, or the bare basename. Known files:
 EOF
-    local entry key relpath difffile
+    local entry key relpath difffile marker
     for entry in "${LIFECYCLE_FILES[@]}"; do
-        IFS='|' read -r key relpath difffile <<<"$entry"
+        IFS='|' read -r key relpath difffile marker <<<"$entry"
         printf '  %-18s %s  (%s)\n' "$key" "$relpath" "$difffile"
     done
 }
