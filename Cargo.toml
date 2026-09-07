@@ -5,6 +5,19 @@ members = [
     "crates/pve-meta-api",
     "crates/pve-metad",
     "crates/pve-meta-cli",
+    "crates/pve-meta-perl",
+]
+# pve-meta-perl (PVE::RS::Meta perlmod bindings) needs `libperl-dev` headers
+# and only builds on the Linux build host; it is a workspace member (so
+# `cargo build -p pve-meta-rs` / `cargo test -p pve-meta-rs` work there) but
+# left out of `default-members` so a bare `cargo build`/`cargo test` at the
+# workspace root (e.g. on macOS) does not try to build it. An explicit
+# `cargo build --workspace` still targets every member, pve-meta-rs included.
+default-members = [
+    "crates/pve-meta-core",
+    "crates/pve-meta-api",
+    "crates/pve-metad",
+    "crates/pve-meta-cli",
 ]
 exclude = ["ui"]
 
@@ -24,6 +37,7 @@ indexmap = { version = "2", features = ["serde"] }
 toml_edit = "0.25"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 regex = "1"
 tracing = "0.1"

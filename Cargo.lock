@@ -1239,6 +1239,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "perlmod"
+version = "0.14.2"
+source = "git+https://git.proxmox.com/git/perlmod.git?rev=d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e#d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e"
+dependencies = [
+ "bitflags 2.13.1",
+ "cc",
+ "libc",
+ "perlmod-macro",
+ "serde",
+]
+
+[[package]]
+name = "perlmod-macro"
+version = "0.10.2"
+source = "git+https://git.proxmox.com/git/perlmod.git?rev=d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e#d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e"
+dependencies = [
+ "proc-macro2 1.0.107",
+ "quote 1.0.47",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1622,6 +1644,7 @@ dependencies = [
  "pve-meta-api",
  "pve-meta-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -1644,6 +1667,17 @@ dependencies = [
  "thiserror",
  "toml_edit",
  "tracing",
+]
+
+[[package]]
+name = "pve-meta-rs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "perlmod",
+ "pve-meta-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

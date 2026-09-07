@@ -1,0 +1,30 @@
+[package]
+name = "pve-meta-rs"
+description = "PVE::RS::Meta -- pve-meta guest lifecycle hooks, exposed to Perl via perlmod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# Only builds on a Linux host with `libperl-dev` (and a `perl` interpreter)
+# installed -- perlmod's build.rs compiles against Perl's `CORE` headers. Not
+# part of the workspace's `default-members`; see the root Cargo.toml.
+exclude = ["genpackage.pl", "test", "Makefile", "PACKAGING.md"]
+
+[lib]
+crate-type = ["cdylib"]
+# No explicit `name` -> Cargo derives `libpve_meta_rs.so` from the package
+# name, matching `--lib=pve_meta_rs` passed to genpackage.pl in the Makefile.
+
+[dependencies]
+pve-meta-core = { path = "../pve-meta-core" }
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Not on crates.io (checked 2026-09-07: `perlmod` returns 404 there) --
+# pinned to the same commit used by upstream `pve-rs` 0.15.3, per
+# docs/PERL-BINDINGS-SPEC.md.
+perlmod = { git = "https://git.proxmox.com/git/perlmod.git", rev = "d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e", features = ["exporter"] }
