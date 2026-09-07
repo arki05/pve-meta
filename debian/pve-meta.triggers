@@ -1,14 +1,11 @@
-# Web UI "Metadata" tab injection (see pve-manager-patch/README.md): re-run
-# pve-meta-patch whenever pve-manager reships either of these files, so the
-# patch survives pve-manager upgrades.
-interest-noawait /usr/share/pve-manager/index.html.tpl
-interest-noawait /usr/share/pve-manager/js/pvemanagerlib.js
-
-# Guest-lifecycle-hook + native PVE::API2::Meta registration patching
-# (pve-meta-lifecycle-patch, see pve-manager-patches/lifecycle/ and
-# docs/NATIVE-API-SPEC.md): re-run whenever any of these packages reship the
-# files it patches, so the patches survive their upgrades. postinst/postrm
-# call the tool tolerantly (no-op if it or a target file is absent).
+# Guest-lifecycle-hook managed patch (see patches/lifecycle.toml,
+# patches/lifecycle/, applied via pve-ext-patch): re-run whenever any of
+# these packages reship the files it patches, so the patch survives their
+# upgrades. postinst calls pve-ext-patch tolerantly (no-op if it, or a
+# target file, is absent).
+#
+# Note: index.html.tpl and PVE/API2.pm are no longer this package's
+# concern -- pve-ext owns those triggers now (see pve-ext/debian/triggers).
 interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm
 interest-noawait /usr/share/perl5/PVE/API2/LXC.pm
 interest-noawait /usr/share/perl5/PVE/LXC/Create.pm
@@ -16,4 +13,3 @@ interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm
 interest-noawait /usr/share/perl5/PVE/API2/Qemu.pm
 interest-noawait /usr/share/perl5/PVE/QemuServer.pm
 interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm
-interest-noawait /usr/share/perl5/PVE/API2.pm

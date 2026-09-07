@@ -1,0 +1,398 @@
+/*
+ * pve-ext-loader.js
+ *
+ * The generic half of the pve-ext UI-page seam (see pve-ext/README.md).
+ * Fetches GET /api2/json/ext/pages (served by PVE::API2::Ext from
+ * /usr/share/pve-ext/pages/*.json) and, for each manifest, adds one tab -
+ * a same-origin iframe, layout: 'fit' - to every matching target config
+ * panel (PVE.lxc.Config / PVE.qemu.Config / PVE.node.Config / PVE.dc.Config).
+ *
+ * This is a direct generalization of pve-manager-patch/pve-meta-loader.js
+ * (which now goes through this loader instead, via pve-meta's own page
+ * manifest): same script-tag injection point (right after pvemanagerlib.js
+ * in index.html.tpl), same feature-detection posture, and - this is the
+ * part that must never be "simplified" back - the *exact* same
+ * PVE.panel.Config.prototype.initComponent patch technique. See that
+ * file's history / pve-manager-patch/README.md ("The ExtJS override") for
+ * the long story: an earlier version used the global Ext.override(cls,
+ * {...}) shim with this.callParent(arguments) inside the replacement, and
+ * that combination throws in real ExtJS 7 classic (as shipped by PVE),
+ * silently killing the *whole* config panel for every guest. The fix -
+ * capture the original prototype method in a closure and invoke it with a
+ * plain Function.prototype.apply(), no Ext class-system machinery involved
+ * at all - is proven in a real browser against real pve-manager and must
+ * not be changed without re-doing that verification.
+ *
+ * Design goal: NEVER break the PVE UI. Every seam this script depends on
+ * (Ext/PVE class shapes, the /ext/pages API, one page manifest's shape) is
+ * individually try/catch-guarded; a failure anywhere logs to the console
+ * (prefixed "[pve-ext]") and degrades to "that one thing doesn't happen",
+ * never to a broken page.
+ *
+ * Plain ES2017, no build step, no external dependencies.
+ */
+(function () {
+    'use strict';
+
+    if (window.PveExtLoaded) {
+        return;
+    }
+
+    var LOG_PREFIX = '[pve-ext]';
+    var PAGES_URL = '/api2/json/ext/pages';
+
+    // PVE.<target>.Config class name -> the loader's own target keyword,
+    // and the Ext.state.Manager.get('GuiCap') top-level key that carries
+    // the privileges relevant to that target (see checkRequires() below).
+    var TARGETS = {
+        'PVE.lxc.Config': { target: 'lxc', capKey: 'vms' },
+        'PVE.qemu.Config': { target: 'qemu', capKey: 'vms' },
+        'PVE.node.Config': { target: 'node', capKey: 'nodes' },
+        'PVE.dc.Config': { target: 'dc', capKey: 'dc' },
+    };
+
+    function warn(msg, err) {
+        try {
+            if (err) {
+                // eslint-disable-next-line no-console
+                console.warn(LOG_PREFIX + ' ' + msg, err);
+            } else {
+                // eslint-disable-next-line no-console
+                console.warn(LOG_PREFIX + ' ' + msg);
+            }
+        } catch (e) {
+            /* console unavailable, nothing we can do */
+        }
+    }
+
+    function info(msg) {
+        try {
+            // eslint-disable-next-line no-console
+            console.info(LOG_PREFIX + ' ' + msg);
+        } catch (e) {
+            /* ignore */
+        }
+    }
+
+    // --- Feature detection ---------------------------------------------
+
+    if (typeof Ext === 'undefined') {
+        warn('Ext JS not found - skipping extension tab injection.');
+        return;
+    }
+
+    if (
+        typeof PVE === 'undefined' ||
+        typeof PVE.panel === 'undefined' ||
+        typeof PVE.panel.Config === 'undefined' ||
+        typeof PVE.panel.Config.prototype === 'undefined' ||
+        typeof PVE.panel.Config.prototype.initComponent !== 'function'
+    ) {
+        warn('PVE.panel.Config (or its initComponent) not found - pvemanagerlib.js may have changed. Skipping.');
+        return;
+    }
+
+    // --- Theme detection (same logic as pve-meta-loader.js) -------------
+    //
+    // Mirrors PVE's own color-theme picker (Proxmox.window.ThemeEditWindow
+    // in proxmoxlib.js), which stores the choice in the PVEThemeCookie
+    // cookie: 'crisp' -> light, 'proxmox-dark' -> dark, anything else
+    // (unset/'__default__'/a future theme) -> follow the OS/browser
+    // preference, same as PVE's own charts/gauges (checkThemeColors()).
+    function getPveTheme() {
+        var cookieVal = '';
+        try {
+            if (typeof Ext !== 'undefined' && Ext.util && Ext.util.Cookies && typeof Ext.util.Cookies.get === 'function') {
+                cookieVal = Ext.util.Cookies.get('PVEThemeCookie') || '';
+            } else {
+                var match = document.cookie.match(/(?:^|;\s*)PVEThemeCookie=([^;]*)/);
+                cookieVal = match ? decodeURIComponent(match[1]) : '';
+            }
+        } catch (e) {
+            warn('failed to read PVEThemeCookie, falling back to OS preference', e);
+        }
+
+        if (cookieVal === 'proxmox-dark') {
+            return 'dark';
+        }
+        if (cookieVal === 'crisp') {
+            return 'light';
+        }
+
+        try {
+            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                return 'dark';
+            }
+        } catch (e) {
+            /* matchMedia unsupported - default to light below */
+        }
+        return 'light';
+    }
+
+    // --- Capability check (client-side filter only; each page's own API
+    //     is the actual server-side enforcement - see README.md) --------
+    //
+    // manifest.requires is e.g. { vms: ["VM.Audit"], dc: ["Sys.Audit"] }:
+    // per-capability-category lists of privileges, all of which must be
+    // present for the *category relevant to this target* (see TARGETS
+    // above) for the tab to be added. A category the manifest doesn't
+    // mention at all imposes no restriction for that target.
+    function hasRequiredCaps(manifest, capKey) {
+        var requires = manifest && manifest.requires;
+        if (!requires || typeof requires !== 'object') {
+            return true;
+        }
+        var need = requires[capKey];
+        if (!need) {
+            return true;
+        }
+        if (!Ext.isArray(need)) {
+            warn('page "' + manifest.id + '": requires.' + capKey + ' is not an array, ignoring it (failing open)');
+            return true;
+        }
+
+        var caps;
+        try {
+            caps = Ext.state.Manager.get('GuiCap');
+        } catch (e) {
+            warn('could not read GuiCap capabilities - skipping page "' + (manifest && manifest.id) + '"', e);
+            return false;
+        }
+        var bucket = caps && caps[capKey];
+        if (!bucket) {
+            return need.length === 0;
+        }
+        for (var i = 0; i < need.length; i++) {
+            if (!bucket[need[i]]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // --- GET /ext/pages, fetched once and cached ------------------------
+    //
+    // Deliberately lazy (fetched on first use, not at script-load time)
+    // and deliberately synchronous: at script-load time (this file is
+    // loaded on every index.html.tpl render, including the pre-login
+    // screen) there is no authenticated session yet and the request would
+    // just 401. By the time any PVE.lxc.Config / PVE.qemu.Config /
+    // PVE.node.Config / PVE.dc.Config panel is actually *constructed*,
+    // the user must already be logged in (the resource tree these panels
+    // come from only exists post-login) - so deferring the fetch to that
+    // point means it succeeds, and doing it synchronously means the tab
+    // list is available in time for that very first panel's
+    // initComponent, with no async/race complexity. This is a same-origin
+    // call to pveproxy itself (typically sub-10ms); the one-time
+    // synchronous-XHR cost is judged worth avoiding an entire
+    // fetch-then-retroactively-patch-the-already-rendered-treelist design.
+    // Cached after the first attempt (success or failure) - never retried
+    // for the lifetime of the page, matching the "computed once" posture
+    // pve-meta-loader.js already documents for its iframe src.
+    var pagesCache = null;
+
+    function fetchPagesOnce() {
+        if (pagesCache !== null) {
+            return pagesCache;
+        }
+        pagesCache = [];
+        try {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', PAGES_URL, false);
+            xhr.setRequestHeader('Accept', 'application/json');
+            xhr.send(null);
+            if (xhr.status >= 200 && xhr.status < 300) {
+                var body = JSON.parse(xhr.responseText);
+                if (body && Ext.isArray(body.data)) {
+                    pagesCache = body.data;
+                } else {
+                    warn('unexpected ' + PAGES_URL + ' response shape, ignoring it');
+                }
+            } else {
+                warn(PAGES_URL + ' returned HTTP ' + xhr.status + ' - no extension tabs will be added this session');
+            }
+        } catch (e) {
+            warn('failed to fetch ' + PAGES_URL + ' - no extension tabs will be added this session', e);
+        }
+        return pagesCache;
+    }
+
+    // --- Placeholder substitution ----------------------------------------
+
+    // {query} is deliberately NOT handled here (see expandQueryPlaceholder,
+    // below): it substitutes to an already-encoded query string, not a
+    // single value, and must never be run through encodeURIComponent().
+    function expandUrl(template, vars) {
+        return String(template).replace(/\{(vmid|node|type|theme)\}/g, function (whole, name) {
+            var v = vars[name];
+            return v === undefined || v === null ? '' : encodeURIComponent(v);
+        });
+    }
+
+    // {query} is itself an already-encoded query string, not a single
+    // value - substitute it separately (raw, not re-encoded) after the
+    // single-value placeholders are done.
+    function expandQueryPlaceholder(template, query) {
+        return String(template).replace(/\{query\}/g, query);
+    }
+
+    function buildQuery(target, vars) {
+        var theme = encodeURIComponent(vars.theme);
+        if (target === 'dc') {
+            return 'dc=1&theme=' + theme;
+        }
+        if (target === 'node') {
+            return 'node=' + encodeURIComponent(vars.node) + '&theme=' + theme;
+        }
+        // lxc / qemu
+        return (
+            'vmid=' +
+            encodeURIComponent(vars.vmid) +
+            '&type=' +
+            encodeURIComponent(vars.type) +
+            '&node=' +
+            encodeURIComponent(vars.node) +
+            '&theme=' +
+            theme
+        );
+    }
+
+    function buildTabItem(manifest, src) {
+        return {
+            xtype: 'panel',
+            itemId: 'pve-ext-' + manifest.id,
+            title: manifest.title,
+            iconCls: manifest.iconCls || 'fa fa-puzzle-piece',
+            layout: 'fit',
+            border: 0,
+            items: [
+                {
+                    xtype: 'component',
+                    autoEl: {
+                        tag: 'iframe',
+                        src: src,
+                        style: 'border:0;width:100%;height:100%',
+                    },
+                },
+            ],
+        };
+    }
+
+    // Builds the list of tab item configs to add to a given PVE.panel.Config
+    // instance, or [] if this instance's class isn't one of our targets, or
+    // no manifest applies to it.
+    function tabsFor(me) {
+        var className = '';
+        try {
+            if (me && typeof me.$className === 'string' && me.$className) {
+                className = me.$className;
+            } else if (me && me.self && typeof me.self.getName === 'function') {
+                className = me.self.getName();
+            } else if (typeof Ext.getClassName === 'function') {
+                className = Ext.getClassName(me) || '';
+            }
+        } catch (e) {
+            warn('failed to determine component class name', e);
+            return [];
+        }
+
+        var targetInfo = TARGETS[className];
+        if (!targetInfo) {
+            return []; // not a panel we care about (pool/storage/sdn/... config)
+        }
+        var target = targetInfo.target;
+
+        var vars = { theme: getPveTheme() };
+        if (target === 'lxc' || target === 'qemu') {
+            var selData = me.pveSelNode && me.pveSelNode.data;
+            vars.vmid = selData && selData.vmid;
+            vars.node = selData && selData.node;
+            vars.type = target;
+            if (!vars.vmid || !vars.node) {
+                warn('could not determine vmid/node for ' + className + ' - skipping all extension tabs for this panel.');
+                return [];
+            }
+        } else if (target === 'node') {
+            vars.node = me.pveSelNode && me.pveSelNode.data && me.pveSelNode.data.node;
+            vars.type = 'node';
+            if (!vars.node) {
+                warn('could not determine node name for ' + className + ' - skipping all extension tabs for this panel.');
+                return [];
+            }
+        } else {
+            // dc
+            vars.type = 'dc';
+        }
+
+        var query = buildQuery(target, vars);
+
+        var pages = fetchPagesOnce();
+        var items = [];
+        for (var i = 0; i < pages.length; i++) {
+            var manifest = pages[i];
+            try {
+                if (!manifest || !manifest.id || !manifest.title || !manifest.url || !Ext.isArray(manifest.targets)) {
+                    warn('ignoring malformed page manifest (missing id/title/url/targets): ' + JSON.stringify(manifest));
+                    continue;
+                }
+                if (manifest.targets.indexOf(target) === -1) {
+                    continue;
+                }
+                if (!hasRequiredCaps(manifest, targetInfo.capKey)) {
+                    continue; // user lacks a listed privilege - never add the tab
+                }
+                var src = expandUrl(manifest.url, vars);
+                src = expandQueryPlaceholder(src, query);
+                items.push(buildTabItem(manifest, src));
+            } catch (e) {
+                warn('failed to build tab for page manifest "' + (manifest && manifest.id) + '", skipping it', e);
+            }
+        }
+        return items;
+    }
+
+    // --- The actual patch -------------------------------------------------
+    //
+    // See the file header comment: patch PVE.panel.Config.prototype.
+    // initComponent directly (capture the original, invoke it via a plain
+    // .apply(), no Ext.override()/callParent() involved) - this is the one
+    // part of pve-meta-loader.js this file must keep byte-for-byte
+    // equivalent in spirit, proven against real ExtJS 7 classic.
+    try {
+        var configProto = PVE.panel.Config.prototype;
+        var origInitComponent = configProto && configProto.initComponent;
+
+        if (typeof origInitComponent !== 'function') {
+            warn('PVE.panel.Config.prototype.initComponent is not a function - skipping.');
+            return;
+        }
+
+        configProto.initComponent = function () {
+            var me = this;
+            try {
+                var tabs = tabsFor(me);
+                if (tabs.length) {
+                    me.items = me.items || [];
+                    for (var i = 0; i < tabs.length; i++) {
+                        var tabItem = tabs[i];
+                        if (!me.items.some(function (it) { return it && it.itemId === tabItem.itemId; })) {
+                            me.items.push(tabItem);
+                        }
+                    }
+                }
+            } catch (e) {
+                warn('failed to inject extension tab(s) for this panel, continuing without them', e);
+            }
+            // Always call the real, original initComponent - our logic
+            // above must never be able to prevent the actual PVE config
+            // panel from being built.
+            return origInitComponent.apply(me, arguments);
+        };
+    } catch (e) {
+        warn('failed to patch PVE.panel.Config.prototype.initComponent - extension tabs will not be available.', e);
+        return;
+    }
+
+    window.PveExtLoaded = true;
+    info('extension tab injection active.');
+})();

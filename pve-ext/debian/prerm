@@ -1,0 +1,37 @@
+#!/bin/sh
+# prerm for the pve-ext package.
+#
+# Reverses pve-ext's own pve-manager patch *before* dpkg removes this
+# package's own files -- per Debian policy, `prerm remove` runs before the
+# package's files are deleted, while `postrm remove` runs after, by which
+# point /usr/sbin/pve-ext-patch would already be gone and unable to run
+# its own `dpkg-divert --remove` cleanup.
+#
+# IMPORTANT for anything that depends on pve-ext and diverts files of its
+# own via `pve-ext-patch` (e.g. pve-meta's lifecycle manifest): those
+# packages' own prerm must run its `pve-ext-patch remove <manifest>`
+# *before* this one, i.e. before pve-ext itself is removed -- dpkg
+# guarantees this automatically via the `Depends: pve-ext` relationship
+# (dependents are removed before their dependencies), so no extra
+# ordering is needed as long as that Depends is declared.
+#
+# On `upgrade` we deliberately do nothing: the new version's postinst
+# re-applies (idempotently) once it's configured, so there is no need
+# (and no benefit) to unpatch in between.
+set -e
+
+case "$1" in
+    remove)
+        if [ -x /usr/sbin/pve-ext-patch ]; then
+            /usr/sbin/pve-ext-patch remove pve-manager || {
+                echo "pve-ext: warning: pve-ext-patch remove failed, its patch may still be active." >&2
+            }
+        fi
+        ;;
+    upgrade | deconfigure | failed-upgrade) ;;
+    *) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

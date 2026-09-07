@@ -1,0 +1,14 @@
+--- a/usr/share/perl5/PVE/API2.pm
++++ b/usr/share/perl5/PVE/API2.pm
+@@ -43,6 +43,11 @@
+     path => 'pools',
+ });
+ 
++# pve-ext: generic API-module extension loader (see pve-ext/README.md).
++# Applied out-of-tree via dpkg-divert + patch by pve-ext-patch, not part
++# of stock pve-manager.
++use PVE::API2::Ext;
++
+ __PACKAGE__->register_method({
+     name => 'index',
+     path => '',

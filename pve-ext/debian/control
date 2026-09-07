@@ -1,0 +1,34 @@
+Source: pve-ext
+Section: admin
+Priority: optional
+Maintainer: Julius Arkenberg <julius@rkenberg.de>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/arki05/pve-meta
+
+Package: pve-ext
+Architecture: all
+Depends: pve-manager (>= 9.0),
+         dpkg (>= 1.15.7.2),
+         patch,
+         ${misc:Depends},
+         ${perl:Depends}
+Description: Generic extension layer for the Proxmox VE web UI and API
+ pve-ext provides three small, reusable seams so that adding an API module
+ or a UI page to Proxmox VE never needs another one-off patch:
+ .
+  * API modules: PVE::API2::Ext scans /usr/share/perl5/PVE/API2/Ext/*.pm,
+    requires each one and mounts it into the API root at the path it
+    declares.
+  * UI pages: pve-ext-loader.js fetches GET /api2/json/ext/pages and adds
+    one tab per manifest (found under /usr/share/pve-ext/pages/*.json) to
+    the matching LXC/QEMU/node/Datacenter config panel, as a same-origin
+    iframe.
+  * Managed patches: pve-ext-patch applies, verifies, removes and reports
+    on a set of dpkg-diverted file patches described by TOML manifests
+    under /usr/share/pve-ext/patches/*.toml.
+ .
+ pve-ext ships its own two-file manifest (the one-line hooks into
+ index.html.tpl and PVE/API2.pm this whole layer depends on); other
+ packages (e.g. pve-meta) depend on pve-ext and ship their own page
+ manifests, API modules and/or patch manifests.

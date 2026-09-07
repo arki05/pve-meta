@@ -1,0 +1,249 @@
+# pve-ext: a generic extension layer for Proxmox VE
+
+pve-ext is the thing that used to be one-off, per-project patches
+(`pve-manager-patch/`, `pve-manager-patches/lifecycle/` in this repo's own
+history) turned into a small, reusable, package-agnostic seam. Any package
+that needs to add an API endpoint or a UI tab to stock Proxmox VE, or patch
+a stock PVE file some other way, depends on `pve-ext` and drops a
+declarative artifact into one of three places, instead of writing (and
+re-verifying) its own dpkg-divert/ExtJS-override/ `perl -c`-gate machinery.
+
+This document covers all three seams and how a consumer package uses each
+one. `pve-meta` (the sibling project in this repository) is the first real
+consumer; see its own `debian/` for a worked example of each.
+
+## 1. API modules — `PVE::API2::Ext`
+
+Ship a plain `PVE::RESTHandler` subclass at
+`/usr/share/perl5/PVE/API2/Ext/<Name>.pm` that declares an `ext_path`
+class method:
+
+```perl
+package PVE::API2::Ext::Meta;
+
+use base qw(PVE::RESTHandler);
+
+sub ext_path { return 'meta'; }
+
+__PACKAGE__->register_method({ ... your own paths, e.g. 'guests', 'guests/{vmid}', ... ... });
+
+1;
+```
+
+`PVE::API2::Ext` (installed by pve-ext, `require`d by one `use
+PVE::API2::Ext;` line dpkg-diverted into stock `PVE/API2.pm`) scans
+`/usr/share/perl5/PVE/API2/Ext/*.pm` once, at load time (i.e. once per
+pvedaemon/pveproxy worker startup), `require`s each file it finds, and — if
+the resulting class implements `ext_path` — mounts it directly into the API
+root at the path it returns:
+
+```perl
+PVE::API2->register_method({ subclass => $class, path => $path });
+```
+
+So `PVE::API2::Ext::Meta`'s `ext_path` of `'meta'` ends up reachable at
+`/api2/json/meta/...`, exactly like any other native `PVE::API2` subclass —
+`pve-ext` itself never appears in the URL. A module with no `ext_path`, or
+that fails to `require`, or whose registration itself dies, is skipped with
+a `warn` to the log; **one broken extension module never takes
+pvedaemon/pveproxy down with it.**
+
+`PVE::API2::Ext` also mounts itself at `/api2/json/ext`, with three
+endpoints of its own:
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/ext` | `[{subdir: "modules"}, {subdir: "pages"}]` |
+| GET | `/ext/modules` | The extension API modules that loaded successfully: `[{module, path}, ...]` |
+| GET | `/ext/pages` | The validated page manifests (see below) |
+
+You do not need to install anything to get a package listed at
+`/api2/json/`: `PVE::API2`'s own `index` method iterates its
+`method_attributes()`, which plain `register_method({ subclass => ...
+})` calls already populate — nothing pve-ext-specific is required there.
+
+A new extension module needs a pvedaemon/pveproxy restart to be picked up
+(the scan runs once, at process start) — same as adding any other native
+`PVE::API2` module.
+
+## 2. UI pages — `js/pve-ext-loader.js`
+
+Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
+
+```json
+{
+  "id": "pve-meta",
+  "title": "Metadata",
+  "iconCls": "fa fa-tags",
+  "targets": ["lxc", "qemu", "dc"],
+  "url": "/pve2/js/pve-meta-ui/index.html?{query}",
+  "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | Unique id; also used as the tab's `itemId` (`pve-ext-<id>`) and as the JSON filename by convention. |
+| `title` | yes | Tab title. |
+| `iconCls` | no | An ExtJS/FontAwesome icon class (default: `fa fa-puzzle-piece`). |
+| `targets` | yes | Any of `lxc`, `qemu`, `node`, `dc` — which config panel(s) get the tab. |
+| `url` | yes | Iframe `src`, with placeholders substituted (below). Same-origin (relative, no scheme/host/port) is strongly recommended — see "Serving your page's files", below. |
+| `requires` | no | Per-capability-category privilege lists (see "Privilege check", below). Omit to show the tab to every logged-in user. |
+
+`GET /api2/json/ext/pages` (served by `PVE::API2::Ext`, `permissions => {
+user => 'all' }`) re-reads this directory **on every call** — no daemon
+restart needed to pick up a new/changed manifest — and validates each
+file's shape (the fields above; `targets` entries must be one of the four
+known values; `requires`, if present, must map to arrays). A malformed
+manifest is skipped with a `warn`, never breaks the endpoint for every
+other manifest.
+
+`pve-ext-loader.js` (installed by pve-ext, loaded via one `<script>` line
+dpkg-diverted into stock `index.html.tpl`, right after `pvemanagerlib.js`)
+fetches that endpoint once (lazily, on first use — see the file's own
+header comment for why) and, for every manifest whose `targets` includes
+the panel currently being built, adds one tab: a `layout: 'fit'` panel
+containing a same-origin `<iframe>`, sized to fill it. This goes through
+the *exact* `PVE.panel.Config.prototype.initComponent` patch technique
+`pve-manager-patch/pve-meta-loader.js` established and proved in a real
+browser — see that file's own long comment, and
+`pve-manager-patch/README.md`'s "The ExtJS override" section, for why it
+must **never** be done via the global `Ext.override(cls, {...})` shim with
+`this.callParent(...)` inside the replacement (it throws in real ExtJS 7
+classic and silently kills the whole config panel). Every seam this script
+touches is individually `try`/`catch`-guarded; a failure anywhere logs to
+the console (prefixed `[pve-ext]`) and degrades to "that one thing doesn't
+happen" — **it must never be possible for a broken manifest, or a broken
+`/ext/pages` response, to break the PVE UI itself.**
+
+### Placeholders
+
+| Placeholder | Guest (`lxc`/`qemu`) | `node` | `dc` |
+|---|---|---|---|
+| `{vmid}` | the guest's vmid | — | — |
+| `{node}` | the guest's node | the node's name | — |
+| `{type}` | `lxc` or `qemu` | `node` | `dc` |
+| `{theme}` | `light` or `dark`, mirroring the admin's current PVE color theme | same | same |
+| `{query}` | `vmid=<id>&type=<type>&node=<node>&theme=<theme>` | `node=<node>&theme=<theme>` | `dc=1&theme=<theme>` |
+
+`{query}` is the one most manifests want (it's a ready-to-use query
+string); the individual placeholders exist for a URL that needs one value
+somewhere other than the query string.
+
+### Privilege check (client-side; not the enforcement)
+
+`requires` is checked against `Ext.state.Manager.get('GuiCap')` — the same
+capability map the rest of the PVE UI already uses to show/hide its own
+buttons and tabs (`caps.vms['VM.Audit']`, `caps.dc['Sys.Audit']`, etc.). For
+a guest target the `vms` bucket is checked, for `node` the `nodes` bucket,
+for `dc` the `dc` bucket; every privilege listed for the relevant bucket
+must be present, or the tab is not added at all. **This is a UX
+convenience only** — it means a user simply never sees a tab they have no
+access to — **it is not the access control.** Your page's own backend API
+must enforce the real permission check server-side regardless of whether
+the tab was shown; never rely on `requires` for security.
+
+### Serving your page's files
+
+pveproxy already maps `/pve2/js/` to `/usr/share/pve-manager/js/` (see
+`add_dirs()` in `PVE::Service::pveproxy`) — that's how
+`pve-ext-loader.js` itself gets served. Ship your page's own static files
+(e.g. `pve-meta`'s Monaco-based editor) under
+`/usr/share/pve-manager/js/<your-app>/` and point `url` at
+`/pve2/js/<your-app>/index.html?{query}` — a same-origin, host/port-relative
+path, so there is no cross-origin/mixed-content concern, exactly like the
+main PVE UI's own assets.
+
+## 3. Managed patches — `pve-ext-patch`
+
+For anything that isn't "add an API module" or "add a UI tab" — most
+commonly, hooking a few lines into stock PVE Perl at points where there is
+no plugin seam at all (pve-ext's own `index.html.tpl`/`PVE/API2.pm` hooks
+are exactly this) — ship a TOML manifest at
+`/usr/share/pve-ext/patches/<name>.toml`:
+
+```toml
+[[file]]
+path = "/usr/share/perl5/PVE/API2.pm"
+package = "pve-manager"
+diff = "pve-manager_API2.pm.diff"        # relative to the manifest's own directory
+marker = "use PVE::API2::Ext;"
+check = "perl"                            # perl -c gate; or "template" for an HTML template
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `path` | yes | Absolute path of the file to patch. |
+| `package` | no | The upstream package that ships `path` — informational, shown in `status` output. |
+| `diff` | yes | A unified diff (`a/`/`b/` headers using `path` with its leading `/` stripped), applied with `patch -p1`, relative to the manifest's own directory. |
+| `marker` | yes | A literal string used both by `status`/`verify` (a quick "is this patched" grep) and, for `check = "template"`, as the exact tag that must appear **exactly once** in the patched output. |
+| `check` | no (default `perl`) | `perl` gates on `perl -c` reporting `syntax OK` as the *last* line of its output; `template` gates on `marker` appearing exactly once and `</body>` still being present. |
+
+`pve-ext-patch apply|remove|verify|status [--root DIR] [manifest...]`
+(installed as `/usr/sbin/pve-ext-patch`) keeps every mechanic the two
+tools this generalizes proved out:
+
+- `dpkg-divert --package pve-ext --add --rename --divert <path>.pve-ext-orig <path>`
+  per file, the first time it's touched — the diversion is always owned by
+  `pve-ext` itself (never by whatever a manifest's `package` field names),
+  so `<path>.pve-ext-orig` always holds the pristine upstream content
+  (including across that package's future upgrades — dpkg keeps routing
+  its writes there) and `<path>` is pve-ext's to (re)write.
+- The patched file is always regenerated from that pristine backup + the
+  diff, in a scratch copy, **never in place** and never touching the
+  pristine backup itself except to read it — so re-running `apply` is
+  idempotent and never double-applies.
+- `patch -p1 --dry-run` gates the real `patch -p1`; the resulting file is
+  only `install`ed over the real path after it *also* passes its `check`.
+- Best-effort per file, across every file in every selected manifest: one
+  file's anchors moving on some future PVE point release must never block
+  patching the others.
+- `remove` restores every entry's pristine file and removes its diversion
+  (mirroring `apply`'s rollback logic exactly, including the
+  divert-then-clear-before-rename-back dance `dpkg-divert --remove
+  --rename` needs).
+
+With no manifest named, `apply`/`remove`/`verify`/`status` act on every
+`*.toml` found under `/usr/share/pve-ext/patches/` (or, in a checkout,
+`../patches` next to the script) — so pve-ext's own manifest and every
+consumer's manifest are all covered by e.g. a bare `pve-ext-patch status`
+with no arguments.
+
+### Using it from your own package
+
+1. Ship your diffs and manifest under `/usr/share/pve-ext/patches/`
+   (`Depends: pve-ext`).
+2. Your `postinst`, on `configure` and `triggered`, runs
+   `pve-ext-patch apply <your-manifest-name>` — best-effort, never fails
+   your package's install.
+3. Your `prerm`, on `remove`, runs
+   `pve-ext-patch remove <your-manifest-name>` — **before** dpkg deletes
+   your package's files, mirroring pve-ext's own `prerm` (see there for
+   why `prerm`, not `postrm`). This runs correctly before pve-ext is
+   itself removed as long as your package declares `Depends: pve-ext` (dpkg
+   always removes dependents before their dependencies).
+4. Your `debian/triggers` declares `interest-noawait` on every path your
+   manifest patches, so the patch survives upgrades of whatever package
+   ships those files.
+
+`pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
+project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
+is a worked example of all four steps for eight files across four upstream
+packages.
+
+## Summary: what pve-ext ships
+
+```
+perl/PVE/API2/Ext.pm             -> /usr/share/perl5/PVE/API2/Ext.pm
+(empty dir, for consumers)       -> /usr/share/perl5/PVE/API2/Ext/
+js/pve-ext-loader.js             -> /usr/share/pve-manager/js/pve-ext-loader.js  (served as /pve2/js/pve-ext-loader.js)
+bin/pve-ext-patch                -> /usr/sbin/pve-ext-patch
+patches/pve-manager.toml + diffs -> /usr/share/pve-ext/patches/
+(empty dir, for consumers)       -> /usr/share/pve-ext/pages/
+```
+
+pve-ext's own `debian/postinst`/`debian/prerm` apply/remove exactly its own
+`pve-manager.toml` manifest (the `index.html.tpl`/`PVE/API2.pm` hooks
+everything else in this document depends on); every other manifest, page
+and API module comes from whatever package depends on `pve-ext` and drops
+it in.

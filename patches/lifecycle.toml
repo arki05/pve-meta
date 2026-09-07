@@ -1,0 +1,67 @@
+# pve-meta's own pve-ext managed-patch manifest: the seven guest-lifecycle
+# hooks that wire PVE::RS::Meta into stock pve-container/qemu-server/
+# libpve-guest-common-perl (see docs/DESIGN.md section 4 and, for the
+# design each diff implements, docs/LIFECYCLE-PATCHES.md).
+#
+# Installed to /usr/share/pve-ext/patches/pve-meta-lifecycle.toml; the
+# diffs it references live alongside it, under a "lifecycle/" subdirectory
+# (both here in the source tree and once installed), which is why every
+# `diff` value below is "lifecycle/<file>.diff" rather than a bare
+# filename.
+#
+# Note there is no eighth entry for PVE/API2.pm here (unlike this
+# manifest's predecessor, pve-manager-patches/lifecycle/pve-meta-lifecycle-patch):
+# registering the native metadata API into the API root is pve-ext's own
+# generic job now (PVE::API2::Ext scans /usr/share/perl5/PVE/API2/Ext/*.pm
+# and mounts whatever it finds via that module's own `ext_path` - see
+# pve-ext/README.md) - PVE::API2::Ext::Meta just needs to exist there, no
+# registration diff required.
+
+[[file]]
+path = "/usr/share/perl5/PVE/AbstractConfig.pm"
+package = "libpve-guest-common-perl"
+diff = "lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/API2/LXC.pm"
+package = "pve-container"
+diff = "lifecycle/pve-container_API2-LXC.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/LXC/Create.pm"
+package = "pve-container"
+diff = "lifecycle/pve-container_LXC-Create.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/VZDump/LXC.pm"
+package = "pve-container"
+diff = "lifecycle/pve-container_VZDump-LXC.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/API2/Qemu.pm"
+package = "qemu-server"
+diff = "lifecycle/qemu-server_API2-Qemu.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/QemuServer.pm"
+package = "qemu-server"
+diff = "lifecycle/qemu-server_QemuServer.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/VZDump/QemuServer.pm"
+package = "qemu-server"
+diff = "lifecycle/qemu-server_VZDump-QemuServer.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"

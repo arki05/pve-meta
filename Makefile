@@ -41,37 +41,37 @@ ui:
 		printf '<!doctype html><html><head><title>pve-meta</title></head><body><p>pve-meta UI not built (trunk unavailable at package build time).</p></body></html>' > $(UI_DIST)/index.html; \
 	fi
 
-# Per docs/NATIVE-API-SPEC.md the API is served natively by pveproxy/pvedaemon
-# (PVE::API2::Meta). Two binary packages come from this source (see debian/control):
+# Per docs/DESIGN.md section 5, pve-meta is a consumer of pve-ext's three generic
+# seams (see pve-ext/README.md), not a package that patches PVE itself:
+#   - API module:    perl/PVE/API2/Ext/Meta.pm, discovered by PVE::API2::Ext at
+#                     pvedaemon/pveproxy startup -- no registration diff needed.
+#   - UI page:       pages/pve-meta.json, discovered by pve-ext-loader.js.
+#   - Managed patch: patches/lifecycle.toml + patches/lifecycle/*.diff, applied by
+#                     `pve-ext-patch apply pve-meta-lifecycle` from debian/pve-meta.postinst.
+# Two binary packages come from this source (see debian/control):
 #   - `pve-meta`:            install (below)
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own `install` target, invoked with
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
 #
-# Everything in the `pve-meta` package: the native PVE::API2::Meta module (if it's
-# been generated yet -- see docs/NATIVE-API-SPEC.md, written alongside this by
+# Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module (if
+# it's been generated yet -- see docs/NATIVE-API-SPEC.md, written alongside this by
 # another part of the project), the wasm editor UI (served by pveproxy), and the
-# web UI / guest-lifecycle integration patch tools.
+# pve-ext page/patch manifests.
 install:
-	if [ -f perl/PVE/API2/Meta.pm ]; then \
-		install -D -m 0644 perl/PVE/API2/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Meta.pm; \
+	if [ -f perl/PVE/API2/Ext/Meta.pm ]; then \
+		install -D -m 0644 perl/PVE/API2/Ext/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext/Meta.pm; \
 	else \
-		echo "warning: perl/PVE/API2/Meta.pm not present yet, skipping" >&2; \
+		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui
 	if [ -d $(UI_DIST) ]; then cp -a $(UI_DIST)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui/; fi
-	# pve-manager web UI "Metadata" tab injection (see pve-manager-patch/).
-	install -D -m 0755 pve-manager-patch/pve-meta-patch $(DESTDIR)$(PREFIX)/sbin/pve-meta-patch
-	install -D -m 0644 pve-manager-patch/pve-meta-loader.js $(DESTDIR)$(PREFIX)/share/pve-meta/pve-meta-loader.js
-	# Guest lifecycle hook + native-API-registration patch (see
-	# pve-manager-patches/lifecycle/): the *.diff files always ship;
-	# pve-meta-lifecycle-patch itself is tolerant of not (yet) existing.
-	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/lifecycle
-	cp pve-manager-patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-meta/lifecycle/ 2>/dev/null || true
-	if [ -f pve-manager-patches/lifecycle/pve-meta-lifecycle-patch ]; then \
-		install -D -m 0755 pve-manager-patches/lifecycle/pve-meta-lifecycle-patch $(DESTDIR)$(PREFIX)/sbin/pve-meta-lifecycle-patch; \
-	else \
-		echo "warning: pve-manager-patches/lifecycle/pve-meta-lifecycle-patch not present yet, skipping" >&2; \
-	fi
+	# pve-ext UI-page manifest (see pages/pve-meta.json, pve-ext/README.md).
+	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
+	# pve-ext managed-patch manifest for the seven guest-lifecycle hooks
+	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md).
+	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/pve-meta-lifecycle.toml
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
+	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
 
 deb:
 	dpkg-buildpackage -b -us -uc -d

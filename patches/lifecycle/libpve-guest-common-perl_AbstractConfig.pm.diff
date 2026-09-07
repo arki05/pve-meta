@@ -1,0 +1,40 @@
+--- a/usr/share/perl5/PVE/AbstractConfig.pm
++++ b/usr/share/perl5/PVE/AbstractConfig.pm
+@@ -12,6 +12,7 @@
+ use PVE::GuestHelpers qw(typesafe_ne);
+ use PVE::ReplicationConfig;
+ use PVE::Replication;
++use PVE::RS::Meta;
+ 
+ my $nodename = PVE::INotify::nodename();
+ 
+@@ -876,6 +877,9 @@
+     }
+ 
+     $class->__snapshot_commit($vmid, $snapname);
++
++    eval { PVE::RS::Meta::on_snapshot($vmid, $snapname) };
++    warn "pve-meta: on_snapshot($vmid, $snapname) failed: $@" if $@;
+ }
+ 
+ # Check if the snapshot might still be needed by a replication job.
+@@ -1052,6 +1056,9 @@
+             $class->write_config($vmid, $conf);
+         },
+     );
++
++    eval { PVE::RS::Meta::on_delsnap($vmid, $snapname) };
++    warn "pve-meta: on_delsnap($vmid, $snapname) failed: $@" if $@;
+ }
+ 
+ # Remove replication snapshots to make a rollback possible.
+@@ -1214,6 +1221,9 @@
+ 
+     $prepare = 0;
+     $class->lock_config($vmid, $updatefn);
++
++    eval { PVE::RS::Meta::on_rollback($vmid, $snapname) };
++    warn "pve-meta: on_rollback($vmid, $snapname) failed: $@" if $@;
+ }
+ 
+ # Calculate a derived property from a configuration. Derived properties are:

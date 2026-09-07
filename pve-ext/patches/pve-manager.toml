@@ -1,0 +1,19 @@
+# pve-ext's own managed-patch manifest: the two generic seams into stock
+# pve-manager (see pve-ext/README.md, "Managed patches").
+#
+# Installed to /usr/share/pve-ext/patches/pve-manager.toml; the diffs it
+# references live alongside it in the same directory.
+
+[[file]]
+path = "/usr/share/pve-manager/index.html.tpl"
+package = "pve-manager"
+diff = "pve-manager_index.html.tpl.diff"
+marker = '<script type="text/javascript" src="/pve2/js/pve-ext-loader.js"></script>'
+check = "template"
+
+[[file]]
+path = "/usr/share/perl5/PVE/API2.pm"
+package = "pve-manager"
+diff = "pve-manager_API2.pm.diff"
+marker = "use PVE::API2::Ext;"
+check = "perl"

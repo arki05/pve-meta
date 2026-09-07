@@ -1,0 +1,751 @@
+#!/bin/bash
+#
+# pve-ext-patch - apply/remove/verify/status for pve-ext's generic
+# managed-patch seam (see pve-ext/README.md, "Managed patches").
+#
+# This is the generalized, TOML-manifest-driven successor to the two
+# proven, single-purpose tools this project shipped first:
+#   - pve-manager-patch/pve-meta-patch (one file, awk-anchor insertion)
+#   - pve-manager-patches/lifecycle/pve-meta-lifecycle-patch (eight files,
+#     patch(1)-based, perl -c gated)
+# Every mechanic that made those two safe is kept, generalized to an
+# arbitrary number of files across an arbitrary number of packages,
+# described declaratively instead of hardcoded per tool:
+#   1. dpkg-divert each file away (suffix ".pve-ext-orig", owned by the
+#      package "pve-ext" - never by whatever package a manifest names in
+#      its `package` field, which is informational/for status output
+#      only), so the pristine file its real owning package ships (now and
+#      on future upgrades) always lands at the diverted path, and the
+#      "real" path is ours to (re)write.
+#   2. Regenerate the "real" file as: pristine original + the manifest
+#      entry's unified diff, applied with `patch -p1` into a scratch
+#      copy - never in place, and never touching the diverted pristine
+#      backup itself (only ever read).
+#   3. Gate installation on the entry's `check`:
+#        - "perl":     `perl -c` reporting "syntax OK" as the LAST line
+#                       of its output (a pre-existing "Subroutine ...
+#                       redefined" warning is expected noise, never the
+#                       verdict, which perl always prints last).
+#        - "template": the entry's `marker` string (normally the exact
+#                       inserted tag) must appear in the rendered file
+#                       EXACTLY once, and `</body>` must still be present
+#                       - the same "did this render into garbage" check
+#                       pve-meta-patch used for index.html.tpl.
+#   4. `install -m 0644` the scratch file over the real path, only after
+#      both the dry-run and the check gate pass. Best-effort per file:
+#      one file's anchors moving must never block the others in the same
+#      (or a different) manifest.
+#
+# Manifests are TOML files, normally at /usr/share/pve-ext/patches/<name>.toml
+# (installed by whichever package owns that patch - pve-ext ships its own
+# two-file manifest, pve-meta ships its eight-file lifecycle manifest, and
+# so on for any future package that needs to patch stock PVE):
+#
+#   [[file]]
+#   path = "/usr/share/perl5/PVE/API2.pm"
+#   package = "pve-manager"
+#   diff = "pve-manager_API2.pm.diff"    # relative to the manifest's own directory
+#   marker = "use PVE::API2::Ext;"
+#   check = "perl"                        # "perl" (default) or "template"
+#
+# Parsed by a small awk reader below - no TOML library, no Perl TOML
+# module (none ship with PVE) - just dpkg-divert, patch and perl, exactly
+# like the two tools this generalizes. It understands exactly the subset
+# of TOML these manifests use: repeated [[file]] array-of-tables blocks,
+# each holding a handful of `key = "value"` (or `key = 'value'`) string
+# assignments, blank lines, and '#' comments running to end-of-line
+# (assumed to never appear as literal text inside a manifest's own string
+# values - true for every manifest this project ships).
+#
+# Intended to be installed as /usr/sbin/pve-ext-patch and invoked from
+# postinst/triggers (both pve-ext's own and every consumer package's -
+# see pve-ext/README.md), but also runs fine ad hoc from a checkout.
+#
+set -u
+
+PKG="pve-ext"
+CANON_MANIFEST_DIR="/usr/share/pve-ext/patches"
+
+ROOT_DIR=""
+SCRATCH_ROOT=""
+
+log() { echo "pve-ext-patch: $*"; }
+err() { echo "pve-ext-patch: ERROR: $*" >&2; }
+die() {
+    err "$*"
+    exit 1
+}
+
+script_dir() {
+    cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found"
+}
+
+cleanup_scratch() {
+    [ -n "$SCRATCH_ROOT" ] && [ -d "$SCRATCH_ROOT" ] && rm -rf -- "$SCRATCH_ROOT"
+}
+
+# --- manifest directory / resolution -----------------------------------
+
+# Where manifests (and, by convention, the diffs they reference) live:
+# prefer the canonical packaged location (under --root, if given), fall
+# back to ../patches next to this script (the checkout / ad-hoc case,
+# where this script sits at pve-ext/bin/pve-ext-patch and manifests at
+# pve-ext/patches/*.toml).
+manifest_dir() {
+    local canon="${ROOT_DIR}${CANON_MANIFEST_DIR}"
+    if [ -d "$canon" ]; then
+        echo "$canon"
+        return 0
+    fi
+    local checkout
+    checkout="$(script_dir)/../patches"
+    if [ -d "$checkout" ]; then
+        echo "$checkout"
+        return 0
+    fi
+    return 1
+}
+
+# Resolves one manifest argument (a bare name, or a path to a .toml file)
+# to an absolute manifest file path. Echoes it, or returns non-zero.
+resolve_manifest() {
+    local arg="$1" dir
+    case "$arg" in
+        */* | *.toml)
+            if [ -f "$arg" ]; then
+                echo "$arg"
+                return 0
+            fi
+            return 1
+            ;;
+        *)
+            dir="$(manifest_dir)" || return 1
+            if [ -f "${dir}/${arg}.toml" ]; then
+                echo "${dir}/${arg}.toml"
+                return 0
+            fi
+            return 1
+            ;;
+    esac
+}
+
+# Populates the global array MANIFESTS with resolved manifest file paths:
+# either the given names/paths, or (with none given) every *.toml in the
+# manifest directory.
+select_manifests() {
+    MANIFESTS=()
+    if [ "$#" -eq 0 ]; then
+        local dir manifest
+        dir="$(manifest_dir)" || die "no manifest directory found (looked for ${ROOT_DIR}${CANON_MANIFEST_DIR} and next to this script) and no manifest named on the command line"
+        for manifest in "$dir"/*.toml; do
+            [ -f "$manifest" ] && MANIFESTS+=("$manifest")
+        done
+        [ "${#MANIFESTS[@]}" -gt 0 ] || die "no *.toml manifests found in $dir"
+        return 0
+    fi
+    local arg resolved
+    for arg in "$@"; do
+        resolved="$(resolve_manifest "$arg")" || die "no such manifest: '$arg' (looked for it as a path, and as <name>.toml under the manifest directory)"
+        MANIFESTS+=("$resolved")
+    done
+}
+
+# --- tiny TOML reader ---------------------------------------------------
+#
+# Emits one line per [[file]] table found in $1, fields separated by
+# 0x1f (ASCII unit separator, never legal in a TOML bare/basic string we
+# care about here): path\x1fpackage\x1fdiff\x1fmarker\x1fcheck
+# `check` defaults to "perl" when the table doesn't set it.
+parse_manifest() {
+    awk '
+        function trim(s) {
+            sub(/^[ \t]+/, "", s)
+            sub(/[ \t]+$/, "", s)
+            return s
+        }
+        function unquote(s,    n, c) {
+            s = trim(s)
+            n = length(s)
+            if (n >= 2) {
+                c = substr(s, 1, 1)
+                if ((c == "\"" || c == "'\''") && substr(s, n, 1) == c) {
+                    s = substr(s, 2, n - 2)
+                }
+            }
+            return s
+        }
+        function emit() {
+            if (path != "") {
+                if (check == "") check = "perl"
+                printf "%s\x1f%s\x1f%s\x1f%s\x1f%s\n", path, pkg, diff, marker, check
+            }
+            path = ""; pkg = ""; diff = ""; marker = ""; check = ""
+        }
+        BEGIN { path = ""; pkg = ""; diff = ""; marker = ""; check = "" }
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            t = trim(line)
+            if (t == "") next
+            if (t == "[[file]]") { emit(); next }
+            if (match(t, /^path[ \t]*=/))    { path   = unquote(substr(t, RSTART + RLENGTH)); next }
+            if (match(t, /^package[ \t]*=/)) { pkg    = unquote(substr(t, RSTART + RLENGTH)); next }
+            if (match(t, /^diff[ \t]*=/))    { diff   = unquote(substr(t, RSTART + RLENGTH)); next }
+            if (match(t, /^marker[ \t]*=/))  { marker = unquote(substr(t, RSTART + RLENGTH)); next }
+            if (match(t, /^check[ \t]*=/))   { check  = unquote(substr(t, RSTART + RLENGTH)); next }
+        }
+        END { emit() }
+    ' "$1"
+}
+
+# --- dpkg-divert helpers (honor --root) --------------------------------
+
+set_dpkg_root_args() {
+    DPKG_ROOT_ARGS=()
+    if [ -n "$ROOT_DIR" ]; then
+        DPKG_ROOT_ARGS=(--root "$ROOT_DIR")
+    fi
+}
+
+is_diverted() {
+    # $1 = real path, $2 = diverted path
+    local -a DPKG_ROOT_ARGS=()
+    set_dpkg_root_args
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --truename "$1" 2>/dev/null | grep -qx "$2"
+}
+
+diversion_owned_by_us() {
+    local -a DPKG_ROOT_ARGS=()
+    set_dpkg_root_args
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --listpackage "$1" 2>/dev/null | grep -qx "$PKG"
+}
+
+dpkg_divert_add() {
+    # $1 = real path, $2 = diverted path
+    local -a DPKG_ROOT_ARGS=()
+    set_dpkg_root_args
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --add --rename --divert "$2" "$1"
+}
+
+dpkg_divert_remove() {
+    # $1 = real path, $2 = diverted path
+    local -a DPKG_ROOT_ARGS=()
+    set_dpkg_root_args
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --remove --rename --divert "$2" "$1"
+}
+
+real_path_for() { echo "${ROOT_DIR}$1"; }
+diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
+# The path used inside the scratch dir and inside each diff's a/ b/
+# headers: the real path with its leading '/' stripped, so `patch -p1`
+# (which strips exactly one leading path component) reconstructs it
+# regardless of where under / the file actually lives.
+relpath_for() { echo "${1#/}"; }
+
+# --- perl -c gate --------------------------------------------------------
+
+perl_check_ok() {
+    local file="$1"
+    local out last
+    out="$(perl -I "${ROOT_DIR}/usr/share/perl5" -c "$file" 2>&1)"
+    last="$(printf '%s\n' "$out" | tail -n1)"
+    LAST_PERL_CHECK_OUTPUT="$out"
+    LAST_PERL_CHECK_VERDICT="$last"
+    printf '%s' "$last" | grep -Eq 'syntax OK$'
+}
+
+# --- template gate ---------------------------------------------------
+
+template_check_ok() {
+    # $1 = file, $2 = marker (the exact tag expected exactly once)
+    local file="$1" marker="$2" count
+    count=$(grep -cF -- "$marker" "$file")
+    if [ "$count" -ne 1 ]; then
+        LAST_TEMPLATE_CHECK_VERDICT="marker appears $count time(s) (expected 1)"
+        return 1
+    fi
+    if ! grep -qF -- '</body>' "$file"; then
+        LAST_TEMPLATE_CHECK_VERDICT="</body> missing - rendered file looks malformed"
+        return 1
+    fi
+    LAST_TEMPLATE_CHECK_VERDICT="marker present exactly once, </body> present"
+    return 0
+}
+
+run_check() {
+    # $1 = check type, $2 = file, $3 = marker
+    case "$1" in
+        perl)
+            perl_check_ok "$2"
+            ;;
+        template)
+            template_check_ok "$2" "$3"
+            ;;
+        *)
+            err "unknown check type '$1' (must be 'perl' or 'template')"
+            return 1
+            ;;
+    esac
+}
+
+check_verdict() {
+    case "$1" in
+        perl) echo "$LAST_PERL_CHECK_VERDICT" ;;
+        template) echo "$LAST_TEMPLATE_CHECK_VERDICT" ;;
+        *) echo "n/a" ;;
+    esac
+}
+
+# --- apply --------------------------------------------------------------
+
+apply_one() {
+    # $1 = manifest dir (diffs are relative to this), $2 = path, $3 = package,
+    # $4 = diff basename, $5 = marker, $6 = check
+    local mdir="$1" mpath="$2" mpkg="$3" mdiff="$4" marker="$5" check="$6"
+    local real diverted diff_path work rel created_divert=0
+
+    real="$(real_path_for "$mpath")"
+    diverted="$(diverted_path_for "$mpath")"
+    diff_path="${mdir}/${mdiff}"
+    rel="$(relpath_for "$mpath")"
+    work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_')"
+
+    [ -f "$diff_path" ] || {
+        err "$mpath: diff not found: $diff_path"
+        return 1
+    }
+
+    if is_diverted "$real" "$diverted"; then
+        if ! diversion_owned_by_us "$real"; then
+            err "$mpath: diverted by a DIFFERENT package - refusing to touch it"
+            return 1
+        fi
+        log "$mpath: diversion already in place (owned by ${PKG}); reusing pristine copy at $diverted"
+    else
+        [ -f "$real" ] || {
+            err "$mpath: expected file not found: $real (owning package: ${mpkg:-unknown})"
+            return 1
+        }
+        log "$mpath: diverting $real -> $diverted"
+        if ! dpkg_divert_add "$real" "$diverted"; then
+            err "$mpath: dpkg-divert --add failed"
+            return 1
+        fi
+        created_divert=1
+    fi
+
+    if [ ! -f "$diverted" ]; then
+        err "$mpath: pristine backup not found at $diverted after diversion - aborting this file"
+        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        return 1
+    fi
+
+    # A fresh divert physically moves $real away; some patched files are
+    # transitively `require`d by unrelated code while we're mid-way
+    # through applying a *different* file in the same run (seen in
+    # practice with the lifecycle patches - see pve-meta-lifecycle-patch),
+    # so leaving $real briefly missing can cause spurious failures
+    # elsewhere. Restore the pristine placeholder for the duration of the
+    # check; `install` below replaces it with the real patched content
+    # once validated.
+    if [ ! -f "$real" ]; then
+        if ! cp "$diverted" "$real"; then
+            err "$mpath: failed to restore pristine placeholder at $real for the duration of the check"
+            [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+            return 1
+        fi
+    fi
+
+    mkdir -p "$(dirname "${work}/${rel}")" || {
+        err "$mpath: mkdir scratch dir failed"
+        return 1
+    }
+    if ! cp "$diverted" "${work}/${rel}"; then
+        err "$mpath: failed to copy pristine into scratch area"
+        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        return 1
+    fi
+
+    local dry_out
+    if ! dry_out="$(cd "$work" && patch -p1 --dry-run <"$diff_path" 2>&1)"; then
+        err "$mpath: patch --dry-run failed - anchors may have moved upstream; leaving this file untouched"
+        printf '%s\n' "$dry_out" >&2
+        if [ "$created_divert" -eq 1 ]; then
+            log "$mpath: rolling back diversion created moments ago"
+            dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        fi
+        return 1
+    fi
+
+    local apply_out
+    if ! apply_out="$(cd "$work" && patch -p1 <"$diff_path" 2>&1)"; then
+        err "$mpath: real patch application failed after a clean dry-run (unexpected)"
+        printf '%s\n' "$apply_out" >&2
+        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        return 1
+    fi
+
+    if ! run_check "$check" "${work}/${rel}" "$marker"; then
+        err "$mpath: '$check' check failed: $(check_verdict "$check")"
+        [ "$check" = "perl" ] && printf '%s\n' "$LAST_PERL_CHECK_OUTPUT" >&2
+        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        return 1
+    fi
+    log "$mpath: $check check OK ($(check_verdict "$check"))"
+
+    if ! install -m 0644 "${work}/${rel}" "$real"; then
+        err "$mpath: failed to install patched file to $real"
+        return 1
+    fi
+    log "$mpath: patched and installed."
+    return 0
+}
+
+cmd_apply() {
+    require_cmd dpkg-divert patch perl
+    [ "$(id -u)" -eq 0 ] || [ -n "$ROOT_DIR" ] || die "apply must be run as root (or with --root for a non-live tree)"
+
+    SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
+    trap cleanup_scratch EXIT
+
+    local manifest mdir rc=0 count=0
+    for manifest in "${MANIFESTS[@]}"; do
+        mdir="$(dirname "$manifest")"
+        log "manifest: $manifest"
+        while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
+            [ -n "$mpath" ] || continue
+            count=$((count + 1))
+            apply_one "$mdir" "$mpath" "$mpkg" "$mdiff" "$marker" "$check" || rc=1
+        done < <(parse_manifest "$manifest")
+    done
+
+    [ "$count" -gt 0 ] || die "no [[file]] entries found in the selected manifest(s)"
+
+    echo
+    cmd_status_quiet
+    if [ "$rc" -eq 0 ]; then
+        log "apply: success (${count} file(s), ${#MANIFESTS[@]} manifest(s))."
+    else
+        err "apply: one or more files failed - see above. Files that failed were left untouched (or reverted if just diverted); files that succeeded are installed."
+    fi
+    return "$rc"
+}
+
+# --- remove ---------------------------------------------------------
+
+remove_one() {
+    # $1 = path
+    local mpath="$1"
+    local real diverted
+    real="$(real_path_for "$mpath")"
+    diverted="$(diverted_path_for "$mpath")"
+
+    if is_diverted "$real" "$diverted"; then
+        if ! diversion_owned_by_us "$real"; then
+            err "$mpath: diverted by a DIFFERENT package - refusing to remove"
+            return 1
+        fi
+        log "$mpath: restoring pristine file and removing diversion"
+        # dpkg-divert --remove --rename refuses to rename the pristine
+        # backup onto the real path while the real path already holds
+        # something (our patched file always does) - clear it first.
+        rm -f "$real"
+        if ! dpkg_divert_remove "$real" "$diverted"; then
+            err "$mpath: dpkg-divert --remove failed"
+            if [ -f "$diverted" ] && [ ! -f "$real" ]; then
+                err "$mpath: recovering: restoring from $diverted manually"
+                cp -a "$diverted" "$real"
+            fi
+            return 1
+        fi
+    else
+        log "$mpath: no diversion in place - nothing to restore"
+    fi
+    return 0
+}
+
+cmd_remove() {
+    require_cmd dpkg-divert
+    [ "$(id -u)" -eq 0 ] || [ -n "$ROOT_DIR" ] || die "remove must be run as root (or with --root for a non-live tree)"
+
+    local manifest rc=0 count=0
+    for manifest in "${MANIFESTS[@]}"; do
+        log "manifest: $manifest"
+        while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
+            [ -n "$mpath" ] || continue
+            count=$((count + 1))
+            remove_one "$mpath" || rc=1
+        done < <(parse_manifest "$manifest")
+    done
+
+    echo
+    cmd_status_quiet || true
+    if [ "$rc" -eq 0 ]; then
+        log "remove: success (${count} file(s), ${#MANIFESTS[@]} manifest(s))."
+    else
+        err "remove: one or more files failed - see above."
+    fi
+    return "$rc"
+}
+
+# --- verify ---------------------------------------------------------
+
+verify_one() {
+    # $1 = manifest dir, $2 = path, $3 = diff basename
+    local mdir="$1" mpath="$2" mdiff="$3"
+    local real diverted diff_path work rel pristine source_desc
+
+    real="$(real_path_for "$mpath")"
+    diverted="$(diverted_path_for "$mpath")"
+    diff_path="${mdir}/${mdiff}"
+    rel="$(relpath_for "$mpath")"
+    work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_').verify"
+
+    [ -f "$diff_path" ] || {
+        err "$mpath: diff not found: $diff_path"
+        return 1
+    }
+
+    if is_diverted "$real" "$diverted" && [ -f "$diverted" ]; then
+        pristine="$diverted"
+        source_desc="diverted pristine backup"
+    else
+        pristine="$real"
+        source_desc="live file (assumed pristine/unpatched)"
+    fi
+    [ -f "$pristine" ] || {
+        err "$mpath: no pristine source found at $pristine"
+        return 1
+    }
+
+    mkdir -p "$(dirname "${work}/${rel}")" || {
+        err "$mpath: mkdir scratch dir failed"
+        return 1
+    }
+    cp "$pristine" "${work}/${rel}" || {
+        err "$mpath: failed to copy $pristine into scratch area"
+        return 1
+    }
+
+    local dry_out rc total_hunks fail_hunks ok_hunks
+    dry_out="$(cd "$work" && patch -p1 --dry-run <"$diff_path" 2>&1)"
+    rc=$?
+    total_hunks=$(grep -c '^@@ ' "$diff_path")
+    fail_hunks=$(printf '%s\n' "$dry_out" | grep -c 'FAILED')
+    if [ "$rc" -eq 0 ]; then
+        ok_hunks="$total_hunks"
+    else
+        ok_hunks=$((total_hunks - fail_hunks))
+    fi
+
+    if [ "$rc" -eq 0 ]; then
+        log "$mpath: OK - ${ok_hunks}/${total_hunks} hunks would apply cleanly against ${source_desc}"
+        return 0
+    else
+        err "$mpath: FAIL - ${ok_hunks}/${total_hunks} hunks would apply, ${fail_hunks} failed, against ${source_desc}"
+        printf '%s\n' "$dry_out" >&2
+        return 1
+    fi
+}
+
+cmd_verify() {
+    require_cmd patch dpkg-divert
+
+    SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
+    trap cleanup_scratch EXIT
+
+    local manifest mdir rc=0 count=0
+    for manifest in "${MANIFESTS[@]}"; do
+        mdir="$(dirname "$manifest")"
+        log "manifest: $manifest"
+        while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
+            [ -n "$mpath" ] || continue
+            count=$((count + 1))
+            verify_one "$mdir" "$mpath" "$mdiff" || rc=1
+        done < <(parse_manifest "$manifest")
+    done
+
+    if [ "$rc" -eq 0 ]; then
+        log "verify: all selected files (${count}) would apply cleanly."
+    else
+        err "verify: one or more files would NOT apply cleanly - do not trust apply() without investigating."
+    fi
+    return "$rc"
+}
+
+# --- status ---------------------------------------------------------
+
+status_one() {
+    # $1 = path, $2 = manifest dir, $3 = diff basename, $4 = marker, $5 = check, $6 = package
+    local mpath="$1" mdir="$2" mdiff="$3" marker="$4" check="$5" mpkg="$6"
+    local real diverted diff_path
+    real="$(real_path_for "$mpath")"
+    diverted="$(diverted_path_for "$mpath")"
+    diff_path="${mdir}/${mdiff}"
+
+    local diverted_flag=0 owned_flag=0 pristine_flag=0 patched_flag=0 insync_flag=0 insync_checked=0
+
+    is_diverted "$real" "$diverted" && diverted_flag=1
+    if [ "$diverted_flag" -eq 1 ]; then
+        diversion_owned_by_us "$real" && owned_flag=1
+        [ -f "$diverted" ] && pristine_flag=1
+    fi
+    [ -f "$real" ] && grep -qF -- "$marker" "$real" && patched_flag=1
+
+    if [ -f "$real" ] && [ -f "$diff_path" ] && [ -n "$SCRATCH_ROOT" ]; then
+        local rel work
+        rel="$(relpath_for "$mpath")"
+        work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_').status"
+        mkdir -p "$(dirname "${work}/${rel}")" 2>/dev/null
+        if cp "$real" "${work}/${rel}" 2>/dev/null; then
+            insync_checked=1
+            if (cd "$work" && patch -p1 -R --dry-run <"$diff_path") >/dev/null 2>&1; then
+                insync_flag=1
+            fi
+        fi
+    fi
+
+    echo "  ${mpath} (package: ${mpkg:-unknown}, check: ${check}):"
+    if [ "$diverted_flag" -eq 1 ]; then
+        if [ "$owned_flag" -eq 1 ]; then
+            echo "    diversion:       APPLIED (owned by ${PKG})"
+        else
+            echo "    diversion:       APPLIED (owned by a DIFFERENT package - unexpected!)"
+        fi
+        echo "    pristine backup: $([ "$pristine_flag" -eq 1 ] && echo "present ($diverted)" || echo "MISSING")"
+    else
+        echo "    diversion:       not applied"
+    fi
+    echo "    patched:         $([ "$patched_flag" -eq 1 ] && echo "yes (marker present in $real)" || echo "no")"
+    if [ "$insync_checked" -eq 1 ]; then
+        echo "    in sync w/ diff: $([ "$insync_flag" -eq 1 ] && echo "yes" || echo "no (live file does not exactly match diff's expected output)")"
+    fi
+
+    if [ "$diverted_flag" -eq 1 ] && [ "$owned_flag" -eq 1 ] && [ "$pristine_flag" -eq 1 ] && [ "$patched_flag" -eq 1 ]; then
+        echo "    overall:         APPLIED"
+        return 0
+    else
+        echo "    overall:         NOT APPLIED"
+        return 1
+    fi
+}
+
+cmd_status_quiet() { cmd_status; }
+
+cmd_status() {
+    require_cmd dpkg-divert
+    if [ -z "$SCRATCH_ROOT" ]; then
+        SCRATCH_ROOT="$(mktemp -d)" || SCRATCH_ROOT=""
+        [ -n "$SCRATCH_ROOT" ] && trap cleanup_scratch EXIT
+    fi
+
+    echo "pve-ext-patch status:"
+    local manifest mdir rc=0
+    for manifest in "${MANIFESTS[@]}"; do
+        echo " manifest: $manifest"
+        mdir="$(dirname "$manifest")"
+        while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
+            [ -n "$mpath" ] || continue
+            status_one "$mpath" "$mdir" "$mdiff" "$marker" "$check" "$mpkg" || rc=1
+        done < <(parse_manifest "$manifest")
+    done
+    return "$rc"
+}
+
+# --- usage / main -----------------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...]
+
+  apply [manifest...]   Divert each entry's file (if not already), apply its
+                        diff into a scratch copy, gate on 'patch --dry-run'
+                        then the entry's check ('perl' -c, or 'template':
+                        marker present exactly once + </body> present), then
+                        install. Best-effort per file: one file's anchors
+                        moving does not block the others.
+  remove [manifest...]  Restore each entry's pristine file and remove its
+                        diversion.
+  verify [manifest...]  'patch --dry-run' each entry's diff against its
+                        pristine copy (the diverted backup if applied, else
+                        the live file) and report hunks-would-apply vs.
+                        hunks-failed. Makes no changes.
+  status [manifest...]  Report per-file diversion/patched/in-sync state.
+
+  --root <dir>          Resolve every path this tool touches under <dir>
+                        instead of /, and pass --root <dir> through to
+                        dpkg-divert. Intended for running 'verify' (and
+                        'status') against an extracted package tree in CI,
+                        without touching a live system; apply/remove also
+                        honor it for the same reason.
+
+manifest arguments (optional; default: every *.toml under the manifest
+directory) may be a bare name (resolved to <name>.toml under
+/usr/share/pve-ext/patches, or next to this script in a checkout) or a
+path to a manifest file directly.
+EOF
+}
+
+main() {
+    local -a positional=()
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --root)
+                [ "$#" -ge 2 ] || die "--root requires an argument"
+                ROOT_DIR="${2%/}"
+                shift 2
+                ;;
+            --root=*)
+                ROOT_DIR="${1#--root=}"
+                ROOT_DIR="${ROOT_DIR%/}"
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                while [ "$#" -gt 0 ]; do
+                    positional+=("$1")
+                    shift
+                done
+                ;;
+            -*)
+                die "unknown option: $1 (see --help)"
+                ;;
+            *)
+                positional+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [ "${#positional[@]}" -eq 0 ]; then
+        usage
+        exit 2
+    fi
+
+    local cmd="${positional[0]}"
+    local -a manifest_args=("${positional[@]:1}")
+
+    local -a MANIFESTS=()
+    select_manifests "${manifest_args[@]}"
+
+    case "$cmd" in
+        apply) cmd_apply ;;
+        remove) cmd_remove ;;
+        verify) cmd_verify ;;
+        status) cmd_status ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

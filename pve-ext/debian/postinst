@@ -1,0 +1,60 @@
+#!/bin/sh
+# postinst for the pve-ext package.
+#
+# Applies (or re-applies) pve-ext's own two-line pve-manager patch
+# (index.html.tpl / PVE/API2.pm - see patches/pve-manager.toml) on initial
+# configure, and again whenever dpkg triggers us because pve-manager
+# shipped a new copy of either file (see debian/triggers). Re-running
+# `pve-ext-patch apply` is safe and idempotent: it reuses the existing
+# dpkg-divert diversions and re-derives each patched file from the
+# (possibly-updated) pristine original.
+#
+# Never fails the package install/configure if the patch application
+# itself fails -- pve-ext-loader.js and PVE::API2::Ext are themselves
+# designed to no-op harmlessly if their anchors are missing, and
+# `pve-ext-patch verify`/`status` exist to diagnose problems afterwards.
+set -e
+
+PVE_EXT_PATCH=/usr/sbin/pve-ext-patch
+
+apply_patch() {
+    if [ -x "$PVE_EXT_PATCH" ]; then
+        "$PVE_EXT_PATCH" apply pve-manager || {
+            echo "pve-ext: warning: pve-ext-patch apply failed, see above." >&2
+        }
+    else
+        echo "pve-ext: warning: $PVE_EXT_PATCH not found or not executable." >&2
+    fi
+}
+
+# Both patched files are loaded into pvedaemon's/pveproxy's memory at
+# startup (index.html.tpl is re-read per request, but PVE/API2.pm's
+# `use PVE::API2::Ext;` only ever runs once, at process start), so restart
+# both to pick the change up. Best-effort only: never fails the package
+# install/configure, and is a harmless no-op off a systemd host.
+restart_pve_services() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart pvedaemon pveproxy 2>/dev/null || {
+            echo "pve-ext: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-ext patches." >&2
+        }
+    fi
+}
+
+case "$1" in
+    configure)
+        apply_patch
+        restart_pve_services
+        ;;
+    triggered)
+        # $2 is the whitespace-separated list of trigger names that fired
+        # (see debian/triggers); re-applying is enough either way.
+        apply_patch
+        restart_pve_services
+        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

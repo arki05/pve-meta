@@ -1,0 +1,41 @@
+#!/bin/sh
+# preinst for the pve-meta package.
+#
+# Handles the one-time transition away from pve-meta owning its own
+# dpkg-diversions (pre pve-ext): older pve-meta versions (< 0.2.0) diverted
+# index.html.tpl and all eight lifecycle-hook files themselves, via
+# pve-meta-patch/pve-meta-lifecycle-patch, under the diversion package name
+# "pve-meta". This version depends on pve-ext instead, whose own
+# pve-ext-patch diverts the *same* paths under the diversion package name
+# "pve-ext" -- and refuses to touch a path already diverted by a different
+# package (see pve-ext/README.md). So on upgrade, before dpkg replaces (or
+# removes) the old pve-meta-patch/pve-meta-lifecycle-patch binaries that
+# are the only things that can undo those old diversions, undo them now.
+#
+# This must run in preinst, not postinst: by the time this package's own
+# postinst runs `pve-ext-patch apply pve-meta-lifecycle`, dpkg has already
+# unpacked this version's files, which no longer include
+# pve-meta-patch/pve-meta-lifecycle-patch -- if the old diversions were
+# still in place at that point, nothing could remove them any more.
+set -e
+
+case "$1" in
+    upgrade)
+        if [ -x /usr/sbin/pve-meta-patch ]; then
+            /usr/sbin/pve-meta-patch remove || {
+                echo "pve-meta: warning: pve-meta-patch remove (pre-pve-ext transition) failed, see above." >&2
+            }
+        fi
+        if [ -x /usr/sbin/pve-meta-lifecycle-patch ]; then
+            /usr/sbin/pve-meta-lifecycle-patch remove || {
+                echo "pve-meta: warning: pve-meta-lifecycle-patch remove (pre-pve-ext transition) failed, see above." >&2
+            }
+        fi
+        ;;
+    install | abort-upgrade) ;;
+    *) ;;
+esac
+
+#DEBHELPER#
+
+exit 0

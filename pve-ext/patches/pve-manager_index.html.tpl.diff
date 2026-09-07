@@ -1,0 +1,10 @@
+--- a/usr/share/pve-manager/index.html.tpl
++++ b/usr/share/pve-manager/index.html.tpl
+@@ -53,6 +53,7 @@
+     </script>
+     <script type="text/javascript" src="/proxmoxlib.js?ver=[% wtversion %]"></script>
+     <script type="text/javascript" src="/pve2/js/pvemanagerlib.js?ver=[% version %]"></script>
++    <script type="text/javascript" src="/pve2/js/pve-ext-loader.js"></script>
+     <script type="text/javascript" src="/pve2/ext6/locale/locale-[% lang %].js?ver=7.0.0"></script>
+ 
+     <script type="text/javascript">

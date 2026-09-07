@@ -1,0 +1,17 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build
+
+override_dh_auto_install:
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-ext PREFIX=/usr
+
+override_dh_auto_test:
+	# `make check` (shellcheck + perl -c) is for local/CI use; perl -c
+	# needs the PVE perl modules installed, which a plain package build
+	# environment does not guarantee -- see Makefile.

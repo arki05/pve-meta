@@ -1,0 +1,14 @@
+#!/bin/sh
+# postrm for the pve-ext package.
+#
+# The actual patch reversal (dpkg-divert --remove, restoring pve-manager's
+# pristine index.html.tpl/PVE/API2.pm) happens in debian/prerm's `remove`
+# case, *before* this package's own files (including pve-ext-patch itself)
+# are deleted -- by the time postrm runs, those tools are already gone.
+# This script exists for documentation and to host debhelper's own
+# generated snippet below.
+set -e
+
+#DEBHELPER#
+
+exit 0

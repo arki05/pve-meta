@@ -1,33 +1,28 @@
 #!/bin/sh
 # prerm for the pve-meta package.
 #
-# Reverses both local patches *before* dpkg removes this package's own
-# files -- per Debian policy, `prerm remove` runs before the package's
-# files are deleted, while `postrm remove` runs after, by which point
-# /usr/sbin/pve-meta-patch (etc.) would already be gone and unable to run
-# its own `dpkg-divert --remove` cleanup. On `upgrade` we deliberately do
-# nothing: the new version's postinst re-applies (idempotently) once it's
-# configured, so there is no need (and no benefit) to unpatch in between.
+# Reverses pve-meta's lifecycle managed-patch *before* dpkg removes this
+# package's own files -- per Debian policy, `prerm remove` runs before the
+# package's files are deleted, while `postrm remove` runs after. This runs
+# correctly before pve-ext itself is removed as long as `Depends: pve-ext`
+# holds (dpkg always removes dependents before their dependencies) -- see
+# pve-ext/debian/prerm for the matching note on its side.
+#
+# On `upgrade` we deliberately do nothing: the new version's postinst
+# re-applies (idempotently) once it's configured, so there is no need
+# (and no benefit) to unpatch in between.
 set -e
-
-remove_patch() {
-    tool="$1"
-    if [ -x "$tool" ]; then
-        "$tool" remove || {
-            echo "pve-meta: warning: $tool remove failed, its patch may still be active." >&2
-        }
-    fi
-}
 
 case "$1" in
     remove)
-        remove_patch /usr/sbin/pve-meta-patch
-        remove_patch /usr/sbin/pve-meta-lifecycle-patch
+        if [ -x /usr/sbin/pve-ext-patch ]; then
+            /usr/sbin/pve-ext-patch remove pve-meta-lifecycle || {
+                echo "pve-meta: warning: pve-ext-patch remove pve-meta-lifecycle failed, its patch may still be active." >&2
+            }
+        fi
         ;;
-    upgrade|deconfigure|failed-upgrade)
-        ;;
-    *)
-        ;;
+    upgrade | deconfigure | failed-upgrade) ;;
+    *) ;;
 esac
 
 #DEBHELPER#

@@ -1,0 +1,5 @@
+# pve-ext's own two-file pve-manager patch (see patches/pve-manager.toml):
+# re-run pve-ext-patch whenever pve-manager reships either patched file,
+# so the patch survives pve-manager upgrades.
+interest-noawait /usr/share/pve-manager/index.html.tpl
+interest-noawait /usr/share/perl5/PVE/API2.pm

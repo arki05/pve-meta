@@ -1,0 +1,7 @@
+pve-ext (0.1.0-1) unstable; urgency=medium
+
+  * Initial release: PVE::API2::Ext (API-module discovery), pve-ext-loader.js
+    (UI-page discovery) and pve-ext-patch (generic managed-patch tool),
+    plus pve-ext's own two-file pve-manager patch manifest.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Mon, 07 Sep 2026 12:00:00 -0000

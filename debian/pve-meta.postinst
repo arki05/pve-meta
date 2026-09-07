@@ -1,60 +1,61 @@
 #!/bin/sh
 # postinst for the pve-meta package.
 #
-# Applies (or re-applies) two local patches to the surrounding PVE install:
-#   1. pve-meta-patch: injects the "Metadata" tab into pve-manager's web UI
-#      (index.html.tpl / pvemanagerlib.js) -- see pve-manager-patch/README.md.
-#   2. pve-meta-lifecycle-patch: wires snapshot/rollback/clone/destroy and
-#      vzdump export/import hooks into pve-container/qemu-server (see
-#      pve-manager-patches/lifecycle/). This tool may not be installed yet
-#      (it ships once crates/pve-meta-perl's Perl bindings are wired up), so
-#      this step is a tolerant no-op until it exists.
+# pve-meta is a consumer of pve-ext's generic extension layer (see
+# docs/DESIGN.md section 5, pve-ext/README.md): its UI tab is a page
+# manifest (pages/pve-meta.json) pve-ext-loader.js discovers on its own,
+# and its API module (perl/PVE/API2/Ext/Meta.pm) is discovered by
+# PVE::API2::Ext at pvedaemon/pveproxy startup -- neither needs anything
+# from this script. The one thing this package still applies itself is
+# its guest-lifecycle managed-patch manifest (see patches/lifecycle.toml),
+# via pve-ext's own `pve-ext-patch` tool.
 #
-# Re-running either `apply` is safe and idempotent. Neither is allowed to
-# fail the package install/configure -- both patch tools are themselves
-# designed to no-op harmlessly if their anchors are missing, and `verify`/
-# `status` subcommands exist to diagnose problems afterwards.
+# See debian/pve-meta.preinst for the one-time transition off this
+# package's own (pre-pve-ext) diversions, which must happen first on
+# upgrade.
+#
+# Re-running `pve-ext-patch apply` is safe and idempotent. Never allowed
+# to fail the package install/configure -- `pve-ext-patch verify`/`status`
+# exist to diagnose problems afterwards.
 set -e
 
-apply_patch() {
-    tool="$1"
-    if [ -x "$tool" ]; then
-        "$tool" apply || {
-            echo "pve-meta: warning: $tool apply failed, see above." >&2
+PVE_EXT_PATCH=/usr/sbin/pve-ext-patch
+
+apply_lifecycle_patch() {
+    if [ -x "$PVE_EXT_PATCH" ]; then
+        "$PVE_EXT_PATCH" apply pve-meta-lifecycle || {
+            echo "pve-meta: warning: pve-ext-patch apply pve-meta-lifecycle failed, see above." >&2
         }
+    else
+        echo "pve-meta: warning: $PVE_EXT_PATCH not found or not executable (is pve-ext installed?)." >&2
     fi
 }
 
-# Both patch tools change files pvedaemon/pveproxy have already loaded into memory
-# (pve-meta-lifecycle-patch's PVE/API2.pm change registers PVE::API2::Meta; see
-# docs/NATIVE-API-SPEC.md), so restart both to pick the changes up. Best-effort only:
-# never fails the package install/configure, and is a harmless no-op off a systemd host
-# (e.g. inside some build/test environments).
+# The lifecycle patch changes files pvedaemon has already loaded into
+# memory, so restart both PVE daemons to pick the change up. Best-effort
+# only: never fails the package install/configure, and is a harmless
+# no-op off a systemd host (e.g. inside some build/test environments).
 restart_pve_services() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl restart pvedaemon pveproxy 2>/dev/null || {
-            echo "pve-meta: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-meta patches." >&2
+            echo "pve-meta: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-meta lifecycle patch." >&2
         }
     fi
 }
 
 case "$1" in
     configure)
-        apply_patch /usr/sbin/pve-meta-patch
-        apply_patch /usr/sbin/pve-meta-lifecycle-patch
+        apply_lifecycle_patch
         restart_pve_services
         ;;
     triggered)
         # $2 is the whitespace-separated list of trigger names that fired
         # (see debian/pve-meta.triggers); re-applying is enough either way.
-        apply_patch /usr/sbin/pve-meta-patch
-        apply_patch /usr/sbin/pve-meta-lifecycle-patch
+        apply_lifecycle_patch
         restart_pve_services
         ;;
-    abort-upgrade|abort-remove|abort-deconfigure)
-        ;;
-    *)
-        ;;
+    abort-upgrade | abort-remove | abort-deconfigure) ;;
+    *) ;;
 esac
 
 #DEBHELPER#
