@@ -7,21 +7,20 @@
  * a same-origin iframe, layout: 'fit' - to every matching target config
  * panel (PVE.lxc.Config / PVE.qemu.Config / PVE.node.Config / PVE.dc.Config).
  *
- * This is a direct generalization of pve-manager-patch/pve-meta-loader.js
- * (which now goes through this loader instead, via pve-meta's own page
- * manifest): same script-tag injection point (right after pvemanagerlib.js
- * in index.html.tpl), same feature-detection posture, and - this is the
- * part that must never be "simplified" back - the *exact* same
- * PVE.panel.Config.prototype.initComponent patch technique. See that
- * file's history / pve-manager-patch/README.md ("The ExtJS override") for
- * the long story: an earlier version used the global Ext.override(cls,
- * {...}) shim with this.callParent(arguments) inside the replacement, and
+ * This generalizes an early, single-purpose prototype (see
+ * docs/LIFECYCLE-PATCHES.md, superseded): same script-tag injection point
+ * (right after pvemanagerlib.js in index.html.tpl), same
+ * feature-detection posture, and - this is the part that must never be
+ * "simplified" back - the *exact* same
+ * PVE.panel.Config.prototype.initComponent patch technique: capture the
+ * original prototype method in a closure and invoke it with a plain
+ * Function.prototype.apply(), no Ext class-system machinery involved at
+ * all. An earlier version used the global Ext.override(cls, {...}) shim
+ * with this.callParent(arguments) inside the replacement instead, and
  * that combination throws in real ExtJS 7 classic (as shipped by PVE),
- * silently killing the *whole* config panel for every guest. The fix -
- * capture the original prototype method in a closure and invoke it with a
- * plain Function.prototype.apply(), no Ext class-system machinery involved
- * at all - is proven in a real browser against real pve-manager and must
- * not be changed without re-doing that verification.
+ * silently killing the *whole* config panel for every guest. The
+ * capture-and-apply fix is proven in a real browser against real
+ * pve-manager and must not be changed without re-doing that verification.
  *
  * Design goal: NEVER break the PVE UI. Every seam this script depends on
  * (Ext/PVE class shapes, the /ext/pages API, one page manifest's shape) is
@@ -257,12 +256,35 @@
         );
     }
 
+    // ExtJS renders a panel's `title` as markup (Ext.panel.Title does not
+    // HTML-encode it), so a manifest's title must be escaped before it
+    // reaches buildTabItem below - manifests are root-owned today (see
+    // pve-ext/README.md), but a page manifest is still attacker-adjacent
+    // enough (any package that depends on pve-ext can drop one) to be
+    // worth not trusting blindly.
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return (
+                { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+            );
+        });
+    }
+
+    // iconCls ends up as a CSS class list, not text content, so HTML
+    // escaping isn't the relevant defense - restrict it to characters
+    // that are actually legal in a class-list attribute value instead,
+    // falling back to the default icon for anything else.
+    function sanitizeIconCls(cls) {
+        var s = String(cls || '');
+        return /^[A-Za-z0-9 _-]+$/.test(s) ? s : '';
+    }
+
     function buildTabItem(manifest, src) {
         return {
             xtype: 'panel',
             itemId: 'pve-ext-' + manifest.id,
-            title: manifest.title,
-            iconCls: manifest.iconCls || 'fa fa-puzzle-piece',
+            title: escapeHtml(manifest.title),
+            iconCls: sanitizeIconCls(manifest.iconCls) || 'fa fa-puzzle-piece',
             layout: 'fit',
             border: 0,
             items: [

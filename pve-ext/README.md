@@ -1,8 +1,8 @@
 # pve-ext: a generic extension layer for Proxmox VE
 
-pve-ext is the thing that used to be one-off, per-project patches
-(`pve-manager-patch/`, `pve-manager-patches/lifecycle/` in this repo's own
-history) turned into a small, reusable, package-agnostic seam. Any package
+pve-ext is the thing that started as one-off, per-project research into
+patching stock pve-manager (see `docs/LIFECYCLE-PATCHES.md`, superseded by
+this package) turned into a small, reusable, package-agnostic seam. Any package
 that needs to add an API endpoint or a UI tab to stock Proxmox VE, or patch
 a stock PVE file some other way, depends on `pve-ext` and drops a
 declarative artifact into one of three places, instead of writing (and
@@ -30,8 +30,10 @@ __PACKAGE__->register_method({ ... your own paths, e.g. 'guests', 'guests/{vmid}
 1;
 ```
 
-`PVE::API2::Ext` (installed by pve-ext, `require`d by one `use
-PVE::API2::Ext;` line dpkg-diverted into stock `PVE/API2.pm`) scans
+`PVE::API2::Ext` (installed by pve-ext, `require`d and then explicitly
+driven by one `PVE::API2::Ext->register_all();` call, both dpkg-diverted
+into stock `PVE/API2.pm` at the very end of that file — i.e. *after* every
+one of `PVE::API2`'s own core `register_method` calls) scans
 `/usr/share/perl5/PVE/API2/Ext/*.pm` once, at load time (i.e. once per
 pvedaemon/pveproxy worker startup), `require`s each file it finds, and — if
 the resulting class implements `ext_path` — mounts it directly into the API
@@ -43,10 +45,17 @@ PVE::API2->register_method({ subclass => $class, path => $path });
 
 So `PVE::API2::Ext::Meta`'s `ext_path` of `'meta'` ends up reachable at
 `/api2/json/meta/...`, exactly like any other native `PVE::API2` subclass —
-`pve-ext` itself never appears in the URL. A module with no `ext_path`, or
-that fails to `require`, or whose registration itself dies, is skipped with
-a `warn` to the log; **one broken extension module never takes
-pvedaemon/pveproxy down with it.**
+`pve-ext` itself never appears in the URL (except at its own `/ext`
+mount point, below). A module with no `ext_path`, that fails to `require`,
+or whose `ext_path` collides with a path something else already
+registered — a core `PVE::API2` path, another extension module scanned
+earlier, or the reserved name `ext` itself — is skipped with a `warn` to
+the log, never a `die`; **one broken or colliding extension module never
+takes pvedaemon/pveproxy down with it.** Running `register_all()` only
+after every core registration has already happened is what makes the
+"core always wins a collision" direction hold: an extension's own
+`register_method` call is the one that fails (and is caught) when it
+collides with something core already claimed, never the reverse.
 
 `PVE::API2::Ext` also mounts itself at `/api2/json/ext`, with three
 endpoints of its own:
@@ -103,14 +112,13 @@ dpkg-diverted into stock `index.html.tpl`, right after `pvemanagerlib.js`)
 fetches that endpoint once (lazily, on first use — see the file's own
 header comment for why) and, for every manifest whose `targets` includes
 the panel currently being built, adds one tab: a `layout: 'fit'` panel
-containing a same-origin `<iframe>`, sized to fill it. This goes through
-the *exact* `PVE.panel.Config.prototype.initComponent` patch technique
-`pve-manager-patch/pve-meta-loader.js` established and proved in a real
-browser — see that file's own long comment, and
-`pve-manager-patch/README.md`'s "The ExtJS override" section, for why it
-must **never** be done via the global `Ext.override(cls, {...})` shim with
-`this.callParent(...)` inside the replacement (it throws in real ExtJS 7
-classic and silently kills the whole config panel). Every seam this script
+containing a same-origin `<iframe>`, sized to fill it. This works by
+patching `PVE.panel.Config.prototype.initComponent` directly (replacing
+the function, calling the original it captured first, then adding the
+extra tabs) — proved out in a real browser against ExtJS 7 classic. It
+must **never** be done via the global `Ext.override(cls, {...})` shim
+with `this.callParent(...)` inside the replacement: that form throws in
+real ExtJS 7 classic and silently kills the whole config panel. Every seam this script
 touches is individually `try`/`catch`-guarded; a failure anywhere logs to
 the console (prefixed `[pve-ext]`) and degrades to "that one thing doesn't
 happen" — **it must never be possible for a broken manifest, or a broken
@@ -167,7 +175,7 @@ are exactly this) — ship a TOML manifest at
 path = "/usr/share/perl5/PVE/API2.pm"
 package = "pve-manager"
 diff = "pve-manager_API2.pm.diff"        # relative to the manifest's own directory
-marker = "use PVE::API2::Ext;"
+marker = "PVE::API2::Ext->register_all();"
 check = "perl"                            # perl -c gate; or "template" for an HTML template
 ```
 
@@ -193,8 +201,20 @@ tools this generalizes proved out:
   diff, in a scratch copy, **never in place** and never touching the
   pristine backup itself except to read it — so re-running `apply` is
   idempotent and never double-applies.
-- `patch -p1 --dry-run` gates the real `patch -p1`; the resulting file is
-  only `install`ed over the real path after it *also* passes its `check`.
+- `patch -p1 --fuzz=0 --dry-run` gates the real `patch -p1 --fuzz=0`; the
+  resulting file is only `install`ed over the real path after it *also*
+  passes its `check`. `--fuzz=0` is deliberate, not an oversight: GNU
+  patch's default fuzz (2) will slide a hunk onto the wrong one of
+  several near-identical anchors in the same file and report success —
+  several of pve-meta's own lifecycle-patch targets have exactly that
+  shape (see `docs/LIFECYCLE-PATCHES.md`) — and a hunk that silently lands
+  in the wrong place is worse than one that fails loudly. On any failure
+  after a diversion that already existed (i.e. a re-apply after an
+  upstream package upgrade replaced the diverted pristine with a newer
+  one), `apply` restores the *current* pristine over the real path rather
+  than leaving it holding content patched against the old one, and
+  records the failure to syslog and to `/run/pve-ext-patch/failed` (never
+  only stderr, which a postinst commonly swallows).
 - Best-effort per file, across every file in every selected manifest: one
   file's anchors moving on some future PVE point release must never block
   patching the others.
@@ -208,6 +228,31 @@ With no manifest named, `apply`/`remove`/`verify`/`status` act on every
 `../patches` next to the script) — so pve-ext's own manifest and every
 consumer's manifest are all covered by e.g. a bare `pve-ext-patch status`
 with no arguments.
+
+### Limitation: no two manifests may patch the same file
+
+A diversion is owned by the `pve-ext` dpkg-divert package name regardless
+of which manifest created it, so `dpkg-divert` alone cannot tell two
+manifests apart. `pve-ext-patch` tracks, in a small marker file next to
+each diversion (`<path>.pve-ext-orig.claimed-by`, never touched by dpkg),
+which manifest currently claims that path, and:
+
+- `apply` refuses — with a clear error, not a silent merge or overwrite —
+  to patch a path a *different* manifest has already diverted. Two
+  manifests can never stack their diffs onto the same file today; if your
+  package needs to change a file another manifest already patches, either
+  fold your change into that manifest's own diff (coordinate with its
+  owner) or patch a different file.
+- `remove` refuses to undivert a path a different manifest still claims,
+  so removing one package's manifest can never yank the pristine file out
+  from under another package's patch.
+
+This is a known, intentional limitation of the current design, not a bug:
+composing two independent diffs on one file safely (in an order-
+independent way, surviving either manifest's removal) is real work this
+tool does not attempt. Today's only two manifests (pve-ext's own
+`pve-manager.toml` and pve-meta's `pve-meta-lifecycle.toml`) are disjoint
+by construction — they simply never name the same file.
 
 ### Using it from your own package
 
@@ -228,8 +273,8 @@ with no arguments.
 
 `pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
 project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
-is a worked example of all four steps for eight files across four upstream
-packages.
+is a worked example of all four steps for seven files across three
+upstream packages.
 
 ## Summary: what pve-ext ships
 

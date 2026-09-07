@@ -4,10 +4,11 @@
 # managed-patch seam (see pve-ext/README.md, "Managed patches").
 #
 # This is the generalized, TOML-manifest-driven successor to the two
-# proven, single-purpose tools this project shipped first:
-#   - pve-manager-patch/pve-meta-patch (one file, awk-anchor insertion)
-#   - pve-manager-patches/lifecycle/pve-meta-lifecycle-patch (eight files,
-#     patch(1)-based, perl -c gated)
+# proven, single-purpose tools this project prototyped first as research
+# (see docs/LIFECYCLE-PATCHES.md, superseded): a one-file awk-anchor
+# insertion tool for the UI template, and a seven-file, patch(1)-based,
+# perl -c gated tool for the guest-lifecycle hooks (now pve-meta's own
+# `patches/lifecycle.toml` manifest, applied through this tool instead).
 # Every mechanic that made those two safe is kept, generalized to an
 # arbitrary number of files across an arbitrary number of packages,
 # described declaratively instead of hardcoded per tool:
@@ -18,9 +19,18 @@
 #      on future upgrades) always lands at the diverted path, and the
 #      "real" path is ours to (re)write.
 #   2. Regenerate the "real" file as: pristine original + the manifest
-#      entry's unified diff, applied with `patch -p1` into a scratch
-#      copy - never in place, and never touching the diverted pristine
-#      backup itself (only ever read).
+#      entry's unified diff, applied with `patch -p1 --fuzz=0` into a
+#      scratch copy - never in place, and never touching the diverted
+#      pristine backup itself (only ever read). `--fuzz=0` is deliberate:
+#      GNU patch's default fuzz=2 will happily slide a hunk onto the
+#      wrong one of several near-identical anchors (several of the
+#      lifecycle-patch targets have exactly this shape) and report
+#      success - a corruption that "works" is worse than a hunk that
+#      fails loudly. No manifest may claim a path another manifest has
+#      already diverted (checked via a small per-path claim marker next
+#      to the diversion) - stacking two manifests on one file is refused
+#      with a clear error, not attempted (documented limitation, see
+#      pve-ext/README.md).
 #   3. Gate installation on the entry's `check`:
 #        - "perl":     `perl -c` reporting "syntax OK" as the LAST line
 #                       of its output (a pre-existing "Subroutine ...
@@ -29,8 +39,8 @@
 #        - "template": the entry's `marker` string (normally the exact
 #                       inserted tag) must appear in the rendered file
 #                       EXACTLY once, and `</body>` must still be present
-#                       - the same "did this render into garbage" check
-#                       pve-meta-patch used for index.html.tpl.
+#                       - a "did this render into garbage" check, used for
+#                       HTML templates like index.html.tpl.
 #   4. `install -m 0644` the scratch file over the real path, only after
 #      both the dry-run and the check gate pass. Best-effort per file:
 #      one file's anchors moving must never block the others in the same
@@ -38,14 +48,14 @@
 #
 # Manifests are TOML files, normally at /usr/share/pve-ext/patches/<name>.toml
 # (installed by whichever package owns that patch - pve-ext ships its own
-# two-file manifest, pve-meta ships its eight-file lifecycle manifest, and
+# two-file manifest, pve-meta ships its seven-file lifecycle manifest, and
 # so on for any future package that needs to patch stock PVE):
 #
 #   [[file]]
 #   path = "/usr/share/perl5/PVE/API2.pm"
 #   package = "pve-manager"
 #   diff = "pve-manager_API2.pm.diff"    # relative to the manifest's own directory
-#   marker = "use PVE::API2::Ext;"
+#   marker = "PVE::API2::Ext->register_all();"
 #   check = "perl"                        # "perl" (default) or "template"
 #
 # Parsed by a small awk reader below - no TOML library, no Perl TOML
@@ -211,32 +221,56 @@ set_dpkg_root_args() {
     fi
 }
 
+# All four of these take $1 = the manifest's own path (e.g.
+# "/usr/share/perl5/PVE/API2.pm"), NEVER a --root-prefixed one:
+# dpkg-divert's own --root already prepends ROOT_DIR to every path it
+# operates on (both for its diversions-database bookkeeping and for the
+# actual rename it performs), so passing an *already*-prefixed path here
+# too (e.g. what real_path_for()/diverted_path_for() return, meant for
+# this script's own plain `cp`/`[ -f ]`/etc., which know nothing about
+# --root) would double the prefix for the on-disk rename dpkg-divert
+# performs -- registering a diversion that "succeeds" (no error) but
+# never actually moves the real file, silently no-op'ing `apply`/`remove`
+# under --root while `status`/`verify`'s read-only lookups still appear
+# consistent (they double the same prefix on both sides).
+divert_arg_diverted() { echo "$1.pve-ext-orig"; }
+
 is_diverted() {
-    # $1 = real path, $2 = diverted path
+    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
-    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --truename "$1" 2>/dev/null | grep -qx "$2"
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --truename "$1" 2>/dev/null | grep -qx "$(divert_arg_diverted "$1")"
 }
 
 diversion_owned_by_us() {
+    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
     dpkg-divert "${DPKG_ROOT_ARGS[@]}" --listpackage "$1" 2>/dev/null | grep -qx "$PKG"
 }
 
 dpkg_divert_add() {
-    # $1 = real path, $2 = diverted path
+    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
-    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --add --rename --divert "$2" "$1"
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --add --rename --divert "$(divert_arg_diverted "$1")" "$1"
 }
 
 dpkg_divert_remove() {
-    # $1 = real path, $2 = diverted path
+    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
-    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --remove --rename --divert "$2" "$1"
+    dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --remove --rename --divert "$(divert_arg_diverted "$1")" "$1"
 }
+
+# Canonicalizes a directory to an absolute path. apply_one/verify_one/
+# status_one all `cd` into a scratch directory before reading a diff via
+# `<"$diff_path"`, so a manifest directory that was relative to the
+# caller's original cwd (possible when a manifest is named as an explicit
+# relative path/argument, rather than resolved via manifest_dir()) would
+# silently stop resolving the instant the subshell `cd`s elsewhere. Every
+# `mdir` this tool computes from a manifest path goes through this first.
+abs_dir() { (cd "$1" 2>/dev/null && pwd) || echo "$1"; }
 
 real_path_for() { echo "${ROOT_DIR}$1"; }
 diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
@@ -245,6 +279,77 @@ diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
 # (which strips exactly one leading path component) reconstructs it
 # regardless of where under / the file actually lives.
 relpath_for() { echo "${1#/}"; }
+
+# --- per-manifest claims (no stacking two manifests on one file) -------
+#
+# A diversion is owned by the "pve-ext" dpkg-divert package regardless of
+# which manifest created it (see the header comment), so dpkg-divert
+# itself cannot tell two manifests apart. This tiny marker file, living
+# next to the diversion (never touched by dpkg, so it survives package
+# upgrades untouched), records which manifest currently claims the path -
+# apply refuses to re-purpose a path for a different manifest, and remove
+# refuses to undivert a path a different manifest still claims.
+
+claim_file_for() { echo "$(diverted_path_for "$1").claimed-by"; }
+
+read_claim() {
+    # $1 = claim file
+    [ -f "$1" ] && cat "$1" 2>/dev/null
+}
+
+write_claim() {
+    # $1 = claim file, $2 = manifest name
+    printf '%s\n' "$2" >"$1" 2>/dev/null
+}
+
+# --- failure reporting ---------------------------------------------------
+#
+# apply_one's failure branches always print to stderr (visible when run
+# interactively or from a postinst that doesn't redirect it), but a
+# postinst failure is deliberately swallowed (never fails install/
+# configure - see pve-ext/README.md) so it can otherwise go completely
+# unnoticed. Leave a durable trail in two places a human or monitoring
+# actually looks: syslog, and a marker file `status`/an admin can check
+# for without having captured the original postinst output.
+FAILURE_MARKER_DIR="${ROOT_DIR}/run/pve-ext-patch"
+
+record_failure() {
+    # $1 = mpath, $2 = message
+    mkdir -p "$FAILURE_MARKER_DIR" 2>/dev/null
+    printf '%s %s: %s\n' "$(date -Is 2>/dev/null || date)" "$1" "$2" \
+        >>"${FAILURE_MARKER_DIR}/failed" 2>/dev/null
+    if command -v logger >/dev/null 2>&1; then
+        logger -t pve-ext-patch -p user.err -- "$1: $2" 2>/dev/null || true
+    fi
+}
+
+# On any apply_one failure: if this run just created the diversion, undo
+# it (restores the file exactly as it was before this invocation - "leave
+# it untouched" for a brand-new apply). If the diversion pre-existed
+# (a re-apply after an upstream package upgrade replaced the diverted
+# pristine with a newer one), $real may still hold content patched
+# against the *old* pristine while the rest of the package was already
+# upgraded - restore the *current* pristine over it instead, so the node
+# runs a consistent, unpatched-but-current file rather than a silently
+# stale one. Best-effort: if even that copy fails, $real is left alone
+# and the failure is still recorded via record_failure by the caller.
+restore_on_failure() {
+    # $1 = mpath, $2 = real, $3 = diverted, $4 = created_divert (0|1)
+    local mpath="$1" real="$2" diverted="$3" created_divert="$4"
+    if [ "$created_divert" -eq 1 ]; then
+        log "$mpath: rolling back diversion created moments ago"
+        dpkg_divert_remove "$mpath" >/dev/null 2>&1
+        rm -f "$(claim_file_for "$mpath")" 2>/dev/null
+        return
+    fi
+    if [ -f "$diverted" ]; then
+        if cp -a "$diverted" "$real" 2>/dev/null; then
+            err "$mpath: restored current pristine (unpatched) content to $real so the node stays consistent"
+        else
+            err "$mpath: FAILED to restore pristine to $real - it may still hold stale patched content from before this failure!"
+        fi
+    fi
+}
 
 # --- perl -c gate --------------------------------------------------------
 
@@ -304,58 +409,67 @@ check_verdict() {
 
 apply_one() {
     # $1 = manifest dir (diffs are relative to this), $2 = path, $3 = package,
-    # $4 = diff basename, $5 = marker, $6 = check
-    local mdir="$1" mpath="$2" mpkg="$3" mdiff="$4" marker="$5" check="$6"
-    local real diverted diff_path work rel created_divert=0
+    # $4 = diff basename, $5 = marker, $6 = check, $7 = manifest name (claim owner)
+    local mdir="$1" mpath="$2" mpkg="$3" mdiff="$4" marker="$5" check="$6" mname="$7"
+    local real diverted diff_path work rel claim existing_claim created_divert=0
 
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
     diff_path="${mdir}/${mdiff}"
     rel="$(relpath_for "$mpath")"
     work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_')"
+    claim="$(claim_file_for "$mpath")"
 
     [ -f "$diff_path" ] || {
         err "$mpath: diff not found: $diff_path"
         return 1
     }
 
-    if is_diverted "$real" "$diverted"; then
-        if ! diversion_owned_by_us "$real"; then
+    if is_diverted "$mpath"; then
+        if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to touch it"
             return 1
         fi
-        log "$mpath: diversion already in place (owned by ${PKG}); reusing pristine copy at $diverted"
+        existing_claim="$(read_claim "$claim")"
+        if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
+            err "$mpath: already diverted for manifest '$existing_claim' - pve-ext-patch does not support two manifests patching the same file (documented limitation, see pve-ext/README.md); refusing to touch it for manifest '$mname'"
+            return 1
+        fi
+        log "$mpath: diversion already in place (owned by ${PKG}, manifest ${existing_claim:-$mname}); reusing pristine copy at $diverted"
+        write_claim "$claim" "$mname"
     else
         [ -f "$real" ] || {
             err "$mpath: expected file not found: $real (owning package: ${mpkg:-unknown})"
             return 1
         }
         log "$mpath: diverting $real -> $diverted"
-        if ! dpkg_divert_add "$real" "$diverted"; then
+        if ! dpkg_divert_add "$mpath"; then
             err "$mpath: dpkg-divert --add failed"
             return 1
         fi
         created_divert=1
+        write_claim "$claim" "$mname"
     fi
 
     if [ ! -f "$diverted" ]; then
         err "$mpath: pristine backup not found at $diverted after diversion - aborting this file"
-        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+        record_failure "$mpath" "pristine backup missing after diversion"
         return 1
     fi
 
     # A fresh divert physically moves $real away; some patched files are
     # transitively `require`d by unrelated code while we're mid-way
     # through applying a *different* file in the same run (seen in
-    # practice with the lifecycle patches - see pve-meta-lifecycle-patch),
-    # so leaving $real briefly missing can cause spurious failures
-    # elsewhere. Restore the pristine placeholder for the duration of the
-    # check; `install` below replaces it with the real patched content
-    # once validated.
+    # practice with the lifecycle patches), so leaving $real briefly
+    # missing can cause spurious failures elsewhere. Restore the pristine
+    # placeholder for the duration of the check; `install` below replaces
+    # it with the real patched content once validated.
     if [ ! -f "$real" ]; then
         if ! cp "$diverted" "$real"; then
             err "$mpath: failed to restore pristine placeholder at $real for the duration of the check"
-            [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+            restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+            record_failure "$mpath" "failed to restore pristine placeholder"
             return 1
         fi
     fi
@@ -366,39 +480,41 @@ apply_one() {
     }
     if ! cp "$diverted" "${work}/${rel}"; then
         err "$mpath: failed to copy pristine into scratch area"
-        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+        record_failure "$mpath" "failed to copy pristine into scratch area"
         return 1
     fi
 
     local dry_out
-    if ! dry_out="$(cd "$work" && patch -p1 --dry-run <"$diff_path" 2>&1)"; then
-        err "$mpath: patch --dry-run failed - anchors may have moved upstream; leaving this file untouched"
+    if ! dry_out="$(cd "$work" && patch -p1 --fuzz=0 --dry-run <"$diff_path" 2>&1)"; then
+        err "$mpath: patch --dry-run failed - anchors may have moved upstream"
         printf '%s\n' "$dry_out" >&2
-        if [ "$created_divert" -eq 1 ]; then
-            log "$mpath: rolling back diversion created moments ago"
-            dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
-        fi
+        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+        record_failure "$mpath" "patch --dry-run failed (anchors may have moved upstream)"
         return 1
     fi
 
     local apply_out
-    if ! apply_out="$(cd "$work" && patch -p1 <"$diff_path" 2>&1)"; then
+    if ! apply_out="$(cd "$work" && patch -p1 --fuzz=0 <"$diff_path" 2>&1)"; then
         err "$mpath: real patch application failed after a clean dry-run (unexpected)"
         printf '%s\n' "$apply_out" >&2
-        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+        record_failure "$mpath" "patch apply failed after a clean dry-run"
         return 1
     fi
 
     if ! run_check "$check" "${work}/${rel}" "$marker"; then
         err "$mpath: '$check' check failed: $(check_verdict "$check")"
         [ "$check" = "perl" ] && printf '%s\n' "$LAST_PERL_CHECK_OUTPUT" >&2
-        [ "$created_divert" -eq 1 ] && dpkg_divert_remove "$real" "$diverted" >/dev/null 2>&1
+        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
+        record_failure "$mpath" "'$check' check failed: $(check_verdict "$check")"
         return 1
     fi
     log "$mpath: $check check OK ($(check_verdict "$check"))"
 
     if ! install -m 0644 "${work}/${rel}" "$real"; then
         err "$mpath: failed to install patched file to $real"
+        record_failure "$mpath" "install of patched file failed"
         return 1
     fi
     log "$mpath: patched and installed."
@@ -412,14 +528,15 @@ cmd_apply() {
     SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
     trap cleanup_scratch EXIT
 
-    local manifest mdir rc=0 count=0
+    local manifest mdir mname rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
-        mdir="$(dirname "$manifest")"
+        mdir="$(abs_dir "$(dirname "$manifest")")"
+        mname="$(basename "$manifest" .toml)"
         log "manifest: $manifest"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))
-            apply_one "$mdir" "$mpath" "$mpkg" "$mdiff" "$marker" "$check" || rc=1
+            apply_one "$mdir" "$mpath" "$mpkg" "$mdiff" "$marker" "$check" "$mname" || rc=1
         done < <(parse_manifest "$manifest")
     done
 
@@ -438,15 +555,21 @@ cmd_apply() {
 # --- remove ---------------------------------------------------------
 
 remove_one() {
-    # $1 = path
-    local mpath="$1"
-    local real diverted
+    # $1 = path, $2 = manifest name (claim owner)
+    local mpath="$1" mname="$2"
+    local real diverted claim existing_claim
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
+    claim="$(claim_file_for "$mpath")"
 
-    if is_diverted "$real" "$diverted"; then
-        if ! diversion_owned_by_us "$real"; then
+    if is_diverted "$mpath"; then
+        if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to remove"
+            return 1
+        fi
+        existing_claim="$(read_claim "$claim")"
+        if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
+            err "$mpath: diverted for a different manifest ('$existing_claim') - refusing to remove (documented limitation: no stacking support, see pve-ext/README.md)"
             return 1
         fi
         log "$mpath: restoring pristine file and removing diversion"
@@ -454,7 +577,7 @@ remove_one() {
         # backup onto the real path while the real path already holds
         # something (our patched file always does) - clear it first.
         rm -f "$real"
-        if ! dpkg_divert_remove "$real" "$diverted"; then
+        if ! dpkg_divert_remove "$mpath"; then
             err "$mpath: dpkg-divert --remove failed"
             if [ -f "$diverted" ] && [ ! -f "$real" ]; then
                 err "$mpath: recovering: restoring from $diverted manually"
@@ -462,6 +585,7 @@ remove_one() {
             fi
             return 1
         fi
+        rm -f "$claim"
     else
         log "$mpath: no diversion in place - nothing to restore"
     fi
@@ -472,13 +596,14 @@ cmd_remove() {
     require_cmd dpkg-divert
     [ "$(id -u)" -eq 0 ] || [ -n "$ROOT_DIR" ] || die "remove must be run as root (or with --root for a non-live tree)"
 
-    local manifest rc=0 count=0
+    local manifest mname rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
+        mname="$(basename "$manifest" .toml)"
         log "manifest: $manifest"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))
-            remove_one "$mpath" || rc=1
+            remove_one "$mpath" "$mname" || rc=1
         done < <(parse_manifest "$manifest")
     done
 
@@ -510,7 +635,7 @@ verify_one() {
         return 1
     }
 
-    if is_diverted "$real" "$diverted" && [ -f "$diverted" ]; then
+    if is_diverted "$mpath" && [ -f "$diverted" ]; then
         pristine="$diverted"
         source_desc="diverted pristine backup"
     else
@@ -532,7 +657,7 @@ verify_one() {
     }
 
     local dry_out rc total_hunks fail_hunks ok_hunks
-    dry_out="$(cd "$work" && patch -p1 --dry-run <"$diff_path" 2>&1)"
+    dry_out="$(cd "$work" && patch -p1 --fuzz=0 --dry-run <"$diff_path" 2>&1)"
     rc=$?
     total_hunks=$(grep -c '^@@ ' "$diff_path")
     fail_hunks=$(printf '%s\n' "$dry_out" | grep -c 'FAILED')
@@ -560,7 +685,7 @@ cmd_verify() {
 
     local manifest mdir rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
-        mdir="$(dirname "$manifest")"
+        mdir="$(abs_dir "$(dirname "$manifest")")"
         log "manifest: $manifest"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
@@ -582,29 +707,45 @@ cmd_verify() {
 status_one() {
     # $1 = path, $2 = manifest dir, $3 = diff basename, $4 = marker, $5 = check, $6 = package
     local mpath="$1" mdir="$2" mdiff="$3" marker="$4" check="$5" mpkg="$6"
-    local real diverted diff_path
+    local real diverted diff_path claim claimed_by
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
     diff_path="${mdir}/${mdiff}"
+    claim="$(claim_file_for "$mpath")"
+    claimed_by="$(read_claim "$claim")"
 
     local diverted_flag=0 owned_flag=0 pristine_flag=0 patched_flag=0 insync_flag=0 insync_checked=0
 
-    is_diverted "$real" "$diverted" && diverted_flag=1
+    is_diverted "$mpath" && diverted_flag=1
     if [ "$diverted_flag" -eq 1 ]; then
-        diversion_owned_by_us "$real" && owned_flag=1
+        diversion_owned_by_us "$mpath" && owned_flag=1
         [ -f "$diverted" ] && pristine_flag=1
     fi
     [ -f "$real" ] && grep -qF -- "$marker" "$real" && patched_flag=1
 
-    if [ -f "$real" ] && [ -f "$diff_path" ] && [ -n "$SCRATCH_ROOT" ]; then
+    # "In sync" means: applying the diff to the *current* pristine backup
+    # reproduces $real byte-for-byte. Deliberately forward (pristine + diff
+    # -> candidate, then cmp against $real), not a reverse-apply of the
+    # diff against $real itself: a reverse dry-run only proves the diff's
+    # hunks *could* un-apply somewhere in $real - it says nothing about
+    # whether $real still matches the *current* pristine (e.g. after an
+    # unrelated package upgrade replaced the diverted pristine with a
+    # newer one while $real still holds content patched against the old
+    # one), so it can report "in sync: yes" against a file that is
+    # actually stale. A forward-rebuild-and-compare cannot make that
+    # mistake, and it also catches the marker being missing from a
+    # supposedly-applied file, since a missing/altered marker line means
+    # the candidate cannot match $real either.
+    if [ "$diverted_flag" -eq 1 ] && [ "$pristine_flag" -eq 1 ] && [ -f "$real" ] \
+        && [ -f "$diff_path" ] && [ -n "$SCRATCH_ROOT" ]; then
         local rel work
         rel="$(relpath_for "$mpath")"
         work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_').status"
         mkdir -p "$(dirname "${work}/${rel}")" 2>/dev/null
-        if cp "$real" "${work}/${rel}" 2>/dev/null; then
-            insync_checked=1
-            if (cd "$work" && patch -p1 -R --dry-run <"$diff_path") >/dev/null 2>&1; then
-                insync_flag=1
+        if cp "$diverted" "${work}/${rel}" 2>/dev/null; then
+            if (cd "$work" && patch -p1 --fuzz=0 <"$diff_path") >/dev/null 2>&1; then
+                insync_checked=1
+                cmp -s "${work}/${rel}" "$real" && insync_flag=1
             fi
         fi
     fi
@@ -617,6 +758,7 @@ status_one() {
             echo "    diversion:       APPLIED (owned by a DIFFERENT package - unexpected!)"
         fi
         echo "    pristine backup: $([ "$pristine_flag" -eq 1 ] && echo "present ($diverted)" || echo "MISSING")"
+        echo "    claimed by:      ${claimed_by:-<none recorded>}"
     else
         echo "    diversion:       not applied"
     fi
@@ -647,7 +789,7 @@ cmd_status() {
     local manifest mdir rc=0
     for manifest in "${MANIFESTS[@]}"; do
         echo " manifest: $manifest"
-        mdir="$(dirname "$manifest")"
+        mdir="$(abs_dir "$(dirname "$manifest")")"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             status_one "$mpath" "$mdir" "$mdiff" "$marker" "$check" "$mpkg" || rc=1
@@ -663,11 +805,14 @@ usage() {
 Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...]
 
   apply [manifest...]   Divert each entry's file (if not already), apply its
-                        diff into a scratch copy, gate on 'patch --dry-run'
-                        then the entry's check ('perl' -c, or 'template':
-                        marker present exactly once + </body> present), then
-                        install. Best-effort per file: one file's anchors
-                        moving does not block the others.
+                        diff (patch -p1 --fuzz=0) into a scratch copy, gate
+                        on a clean dry-run then the entry's check ('perl'
+                        -c, or 'template': marker present exactly once +
+                        </body> present), then install. Best-effort per
+                        file: one file's anchors moving does not block the
+                        others. Refuses (with a clear error) to patch a
+                        file already diverted for a different manifest -
+                        two manifests can never stack on one file.
   remove [manifest...]  Restore each entry's pristine file and remove its
                         diversion.
   verify [manifest...]  'patch --dry-run' each entry's diff against its

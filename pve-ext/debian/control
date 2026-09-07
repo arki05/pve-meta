@@ -11,6 +11,7 @@ Architecture: all
 Depends: pve-manager (>= 9.0),
          dpkg (>= 1.15.7.2),
          patch,
+         init-system-helpers (>= 1.54~),
          ${misc:Depends},
          ${perl:Depends}
 Description: Generic extension layer for the Proxmox VE web UI and API

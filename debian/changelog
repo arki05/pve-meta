@@ -1,6 +1,6 @@
 pve-meta (0.1.0-1) unstable; urgency=medium
 
-  * Initial release: native PVE::API2::Meta module, perlmod lifecycle
+  * Initial release: native PVE::API2::Ext::Meta module, perlmod lifecycle
     bindings, and the editor UI.
 
  -- Julius Arkenberg <julius@rkenberg.de>  Mon, 07 Sep 2026 12:00:00 -0000

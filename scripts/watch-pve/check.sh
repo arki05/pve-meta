@@ -7,16 +7,20 @@
 # root. For each package with a newer upstream version:
 #
 #   1. downloads the .deb and extracts it with `dpkg-deb -x`;
-#   2. for pve-manager: runs `pve-manager-patch/pve-meta-patch verify` against
-#      the extracted pvemanagerlib.js / index.html.tpl;
-#   3. for every package: `patch --dry-run -p1` of every
-#      pve-manager-patches/lifecycle/<pkg>_*.diff registered for it.
+#   2. for pve-manager: runs `pve-ext-patch --root <extracted> verify` against
+#      pve-ext's own manifest (pve-ext/patches/pve-manager.toml), covering
+#      index.html.tpl and PVE/API2.pm;
+#   3. for pve-container / qemu-server / libpve-guest-common-perl: the same
+#      `pve-ext-patch --root <extracted> verify`, against a copy of
+#      patches/lifecycle.toml filtered down to that package's own entries
+#      (a single package's extracted tree never has the *other* two
+#      packages' files, so verifying the whole manifest at once against it
+#      would wrongly report "no pristine source found" for those).
 #
-# A package with a clean dry-run on every applicable check gets its ceiling
+# A package with a clean verify on every applicable check gets its ceiling
 # bumped and rolled into one PR. A package with any failure gets rolled into
-# one issue (label: pve-upgrade) carrying the patch/verify output, with a
-# TODO block marking the hand-off to the (not yet built) LLM-assisted fix
-# flow described in docs/VISION.typ ("Upgrade gating").
+# one issue (label: pve-upgrade) carrying the verify output, with a TODO
+# block marking the hand-off to a not-yet-built LLM-assisted fix flow.
 #
 # Local dry run (no GitHub side effects, just prints what would happen):
 #   PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
@@ -28,8 +32,10 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CEILINGS="$REPO_ROOT/ceilings.toml"
-LIFECYCLE_DIR="$REPO_ROOT/pve-manager-patches/lifecycle"
-UI_PATCH_TOOL="$REPO_ROOT/pve-manager-patch/pve-meta-patch"
+PVE_EXT_PATCH="$REPO_ROOT/pve-ext/bin/pve-ext-patch"
+PVE_MANAGER_MANIFEST="$REPO_ROOT/pve-ext/patches/pve-manager.toml"
+LIFECYCLE_MANIFEST="$REPO_ROOT/patches/lifecycle.toml"
+LIFECYCLE_DIFF_DIR="$REPO_ROOT/patches"
 
 PVE_REPO_BASE="http://download.proxmox.com/debian/pve"
 PVE_SUITE="trixie"
@@ -52,9 +58,15 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "required command '$1' no
 require_cmd curl
 require_cmd dpkg-deb
 require_cmd dpkg
+require_cmd dpkg-divert
 require_cmd patch
+require_cmd perl
 require_cmd awk
 require_cmd git
+
+[ -x "$PVE_EXT_PATCH" ] || die "pve-ext-patch not found or not executable: $PVE_EXT_PATCH"
+[ -f "$PVE_MANAGER_MANIFEST" ] || die "pve-ext's own manifest not found: $PVE_MANAGER_MANIFEST"
+[ -f "$LIFECYCLE_MANIFEST" ] || die "pve-meta lifecycle manifest not found: $LIFECYCLE_MANIFEST"
 
 [ -f "$CEILINGS" ] || die "ceilings.toml not found at $CEILINGS"
 
@@ -127,41 +139,51 @@ if [ ${#NEWER_PKGS[@]} -eq 0 ]; then
     exit 0
 fi
 
-# --- per-package dry run -----------------------------------------------------
+# --- per-package verify -------------------------------------------------
 
 check_pve_manager() {
-    # UI patch tool's own `verify` already takes explicit file paths, so no
-    # --root/wiring changes to pve-manager-patch are needed here; see
-    # docs/DISTRIBUTION.md ("Ceiling watcher") for the --root convenience
-    # flag proposed for that tool anyway.
+    # check_pve_manager <extracted>
+    #
+    # pve-ext's own manifest (index.html.tpl + PVE/API2.pm) against a
+    # freshly extracted pve-manager tree. `--root` makes every path
+    # pve-ext-patch touches (including its dpkg-divert calls) resolve
+    # under <extracted> instead of the live filesystem; a bare
+    # dpkg-deb -x tree has no diversions recorded, so `verify` falls back
+    # to treating the live (extracted) file itself as pristine - exactly
+    # right for a never-patched upstream package.
     local extracted="$1"
-    local lib_js="$extracted/usr/share/pve-manager/js/pvemanagerlib.js"
-    local tpl="$extracted/usr/share/pve-manager/index.html.tpl"
-    bash "$UI_PATCH_TOOL" verify "$lib_js" "$tpl"
+    "$PVE_EXT_PATCH" --root "$extracted" verify "$PVE_MANAGER_MANIFEST"
 }
 
-check_lifecycle_diffs() {
-    # check_lifecycle_diffs <pkg> <extracted>
-    local pkg="$1" extracted="$2" perl_root status=0
-    perl_root="$extracted/usr/share/perl5"
+check_lifecycle_manifest() {
+    # check_lifecycle_manifest <pkg> <extracted>
+    #
+    # patches/lifecycle.toml covers three different upstream packages
+    # (see the file itself); a single package's extracted tree only ever
+    # has *that* package's files, so verifying the whole manifest against
+    # it would wrongly report "no pristine source found" for every entry
+    # belonging to the other two. Filter the manifest down to $pkg's own
+    # [[file]] blocks first, into a scratch manifest that sits next to a
+    # symlink back to the real patches/lifecycle/ diff directory (each
+    # entry's `diff` path is relative to the manifest's own directory).
+    local pkg="$1" extracted="$2"
+    local tmp_dir="$WORKDIR/lifecycle-manifest.$pkg"
+    local tmp_manifest="$tmp_dir/pve-meta-lifecycle.toml"
 
-    shopt -s nullglob
-    local diffs=("$LIFECYCLE_DIR/${pkg}_"*.diff)
-    shopt -u nullglob
+    mkdir -p "$tmp_dir"
+    ln -sfn "$LIFECYCLE_DIFF_DIR/lifecycle" "$tmp_dir/lifecycle"
 
-    if [ ${#diffs[@]} -eq 0 ]; then
-        echo "no lifecycle diffs registered for $pkg, nothing to dry-run"
+    awk -v pkg="$pkg" '
+        BEGIN { RS = ""; FS = "\n" }
+        $0 ~ ("package[ \t]*=[ \t]*\"" pkg "\"") { print $0 "\n" }
+    ' "$LIFECYCLE_MANIFEST" >"$tmp_manifest"
+
+    if [ ! -s "$tmp_manifest" ]; then
+        echo "no lifecycle manifest entries registered for $pkg, nothing to verify"
         return 0
     fi
 
-    local diff
-    for diff in "${diffs[@]}"; do
-        echo "--- patch --dry-run -p1 < $(basename "$diff") ---"
-        if ! patch --dry-run -p1 -d "$perl_root" < "$diff"; then
-            status=1
-        fi
-    done
-    return "$status"
+    "$PVE_EXT_PATCH" --root "$extracted" verify "$tmp_manifest"
 }
 
 declare -A RESULT=()
@@ -201,7 +223,7 @@ $(cat "$WORKDIR/$pkg.extract.log")"
         fi
     fi
 
-    if lc_out="$(check_lifecycle_diffs "$pkg" "$extracted" 2>&1)"; then
+    if lc_out="$(check_lifecycle_manifest "$pkg" "$extracted" 2>&1)"; then
         combined+="$lc_out"$'\n'
     else
         ok=0
@@ -260,7 +282,7 @@ open_ceiling_pr() {
     fi
 
     local body pkg old new
-    body="Automated bump after a clean \`patch --dry-run\`/\`pve-meta-patch verify\` against the newly released package(s) (see \`scripts/watch-pve/check.sh\`)."$'\n\n'
+    body="Automated bump after a clean \`pve-ext-patch verify\` against the newly released package(s) (see \`scripts/watch-pve/check.sh\`)."$'\n\n'
     for pkg in "${pkgs[@]}"; do
         old="$(get_ceiling "$pkg")"
         new="${NEW_VERSION[$pkg]}"
@@ -292,7 +314,7 @@ open_failure_issue() {
     [ ${#pkgs[@]} -gt 0 ] || return 0
 
     local title
-    title="pve-upgrade: patch dry-run failed for $(IFS=,; echo "${pkgs[*]}")"
+    title="pve-upgrade: pve-ext-patch verify failed for $(IFS=,; echo "${pkgs[*]}")"
 
     if [ "$DRY_RUN" = "1" ] || ! command -v gh >/dev/null 2>&1; then
         log "[dry-run] would open issue '$title'"
@@ -313,7 +335,7 @@ open_failure_issue() {
     local pkg
     {
         echo "The scheduled Proxmox ceiling watcher found upstream release(s) our"
-        echo "patches no longer dry-run cleanly against."
+        echo "patches no longer verify cleanly against."
         echo
         for pkg in "${pkgs[@]}"; do
             echo "## $pkg: $(get_ceiling "$pkg") -> ${NEW_VERSION[$pkg]}"
@@ -324,16 +346,16 @@ open_failure_issue() {
             echo
         done
         echo "---"
-        echo "<!-- TODO(llm-fix): hand-off point for the planned LLM-assisted"
-        echo "     fix flow (docs/VISION.typ, \"Upgrade gating\": a"
+        echo "<!-- TODO(llm-fix): hand-off point for a planned LLM-assisted fix"
+        echo "     flow (see docs/DISTRIBUTION.md, \"Ceiling watcher\": a"
         echo "     claude-code-action run that regenerates the failing hunks"
         echo "     against the new upstream source and opens a draft PR for"
         echo "     human review). Not implemented yet -- for now, a human"
-        echo "     fixes the patch(es) under pve-manager-patches/lifecycle/"
-        echo "     (or pve-manager-patch/ for the UI anchors), re-runs"
-        echo "     'PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh' locally to"
-        echo "     confirm, and bumps ceilings.toml by hand (the escape"
-        echo "     hatch -- see docs/DISTRIBUTION.md). -->"
+        echo "     fixes the diff(s) under pve-ext/patches/ (pve-manager's own"
+        echo "     hooks) or patches/lifecycle/ (the guest-lifecycle hooks),"
+        echo "     re-runs 'PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh'"
+        echo "     locally to confirm, and bumps ceilings.toml by hand (the"
+        echo "     escape hatch -- see docs/DISTRIBUTION.md). -->"
     } | gh issue create --title "$title" --label pve-upgrade --body-file -
 }
 

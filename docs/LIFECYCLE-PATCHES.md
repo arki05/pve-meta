@@ -1,16 +1,23 @@
 # Lifecycle patch plan: wiring `PVE::RS::Meta` into PVE 9.2
 
-Research-only deliverable. **No Rust was implemented and nothing was installed on any
-system.** All quoted lines and line numbers come from the actual installed Perl on a
+**Status: §1-9 below are accurate research** — where each hook goes, why, and the full
+diffs — and are implemented, live, and shipped: the seven diffs in §7 are, verbatim,
+`patches/lifecycle/*.diff` in this repo, described by the manifest
+`patches/lifecycle.toml`, applied by `pve-ext-patch apply pve-meta-lifecycle` from
+`debian/pve-meta.postinst` (see `docs/DESIGN.md` §5 and §7, and `pve-ext/README.md`
+for the tool). **§10 is SUPERSEDED** — it designs a bespoke `pve-meta-lifecycle-patch`
+tool under a `pve-manager-patches/lifecycle/` layout that was never built; that need is
+met instead by pve-ext's generic `pve-ext-patch` (see `pve-ext/README.md`, "Managed
+patches"), left in place below only as a record of the design work that led there.
+
+All quoted lines and line numbers below come from the actual installed Perl on a
 disposable PVE 9.2.11 lab node (`pvemeta-node1`, reached as `root@10.10.10.154` via the
-`arkantos` jump host), fetched read-only and diffed locally. The patched copies and raw
-`diff -u` output live under
-`/private/tmp/claude-501/-Users-arki-Documents-proxmox/afff609e-fb1e-4d06-8a92-09f2b57a5c90/scratchpad/pve-perl/`
-(`orig/`, `patched/`, `diffs/`); the same `.diff` files are copied into
-`pve-manager-patches/lifecycle/` in this repo (see the end of this document).
+`arkantos` jump host), fetched read-only and diffed locally, at the time this research
+was done.
 
 Every insertion was validated with `perl -I<stub> -I/usr/share/perl5 -c <file>` on the
-lab node against a throwaway stub `PVE::RS::Meta` (the real functions don't exist yet).
+lab node against a throwaway stub `PVE::RS::Meta` (the real functions did not exist
+yet at the time this research was done — they do now, see `crates/pve-meta-perl`).
 All seven patched files report `syntax OK`; the only warnings seen (`Subroutine ... 
 redefined`) are pre-existing and reproduce identically against the *unpatched* originals
 (harmless `use base` / classic-Perl-plugin artifacts of running `perl -c` on a file
@@ -883,12 +890,11 @@ least-surprising possible hunk.
 ## 7. Full unified diffs
 
 Generated with `diff -u <orig> <patched> --label a/<path> --label b/<path>` from copies
-fetched read-only from the lab node into
-`.../scratchpad/pve-perl/orig/` and hand-edited (then `perl -c`-validated on the node
-against a throwaway stub `PVE::RS::Meta`) into `.../scratchpad/pve-perl/patched/`. The
-same seven files are copied into this repo at `pve-manager-patches/lifecycle/`:
+fetched read-only from the lab node, hand-edited, and `perl -c`-validated on the node
+against a throwaway stub `PVE::RS::Meta`. The same seven files are shipped in this repo
+at `patches/lifecycle/`, described by `patches/lifecycle.toml`:
 
-| Diff file (in `pve-manager-patches/lifecycle/`) | Target | Package |
+| Diff file (in `patches/lifecycle/`) | Target | Package |
 |---|---|---|
 | `libpve-guest-common-perl_AbstractConfig.pm.diff` | `PVE/AbstractConfig.pm` | libpve-guest-common-perl |
 | `pve-container_API2-LXC.pm.diff` | `PVE/API2/LXC.pm` | pve-container |
@@ -1408,10 +1414,21 @@ shape of module — a Rust cdylib exposed to Perl via `perlmod`, namespaced unde
 folded into `libpve-rs-perl`, per `docs/PERL-BINDINGS-SPEC.md`) is a new sibling in this
 already-established family, not a novel pattern for PVE to accept.
 
-## 10. `pve-meta-patch` (lifecycle variant) tool design
+## 10. `pve-meta-patch` (lifecycle variant) tool design — SUPERSEDED
 
-`pve-manager-patch/pve-meta-patch` (already in this repo) establishes the pattern this
-tool should reuse for the seven Perl files above: **`dpkg-divert` the original away, so
+**This section is a historical record of the design work, kept for context; it was
+never built as its own tool.** The need it identifies — apply the seven diffs from §7,
+`dpkg-divert`-based, `perl -c`-gated, with `apply`/`remove`/`verify`/`status` — is met
+instead by pve-ext's generic `pve-ext-patch`, applying `patches/lifecycle.toml` (see
+`docs/DESIGN.md` §5 and `pve-ext/README.md`, "Managed patches"). Several of the
+specific mechanics this section calls for (a per-path `dpkg-divert`, `patch -p1
+--dry-run` before a real `patch -p1`, `perl -c` reporting `syntax OK`) are exactly what
+`pve-ext-patch` does — generalized to an arbitrary manifest of files across an
+arbitrary number of packages, not hardcoded to these seven.
+
+`pve-manager-patch/pve-meta-patch` (an early, single-purpose prototype for the UI
+template patch, since folded into pve-ext's `pve-manager.toml` manifest) established
+the pattern this section proposed reusing for the seven Perl files above: **`dpkg-divert` the original away, so
 the pristine file is always recoverable and automatically stays in sync with future
 package upgrades; regenerate the "real" filename from the pristine copy plus our
 insertions; validate before installing; provide `apply`/`remove`/`verify`/`status`.**
@@ -1424,7 +1441,8 @@ The lifecycle variant differs in three ways the existing tool doesn't need to ha
    not "insert exactly one line after one anchor" — the existing tool's
    `render_patched_template`/`validate_rendered_template` `awk`-based single-anchor
    approach doesn't generalize cleanly. Recommended mechanism: ship the `.diff` files
-   from §7 verbatim (already produced, already in `pve-manager-patches/lifecycle/`) and
+   from §7 verbatim (already produced, already in `patches/lifecycle/` — see the
+   note at the top of this section) and
    apply them with **`patch`** (context-based, so it tolerates unrelated nearby changes
    in a point release and *fails loudly* — non-zero exit, no `.rej` silently left behind
    uninspected — if an anchor genuinely moved), rather than re-implementing each
@@ -1437,7 +1455,8 @@ The lifecycle variant differs in three ways the existing tool doesn't need to ha
    grep-only, appropriate for HTML/JS but not for Perl where a misapplied hunk can
    produce a file that "greps fine" but doesn't compile).
 
-### Files & layout (proposed, mirrors `pve-manager-patch/`)
+### Files & layout (as proposed here; see the note at the top of this section for
+### what was actually built)
 
 ```
 pve-manager-patches/lifecycle/
@@ -1448,6 +1467,11 @@ pve-manager-patches/lifecycle/
     postinst.lifecycle              # appended into the real postinst
     postrm.lifecycle                # appended into the real postrm
 ```
+
+(What was actually built: `patches/lifecycle/*.diff` + `patches/lifecycle.toml`,
+applied by the generic `pve-ext-patch`, triggered via `debian/pve-meta.triggers` and
+called from `debian/pve-meta.postinst`/`prerm` — no bespoke tool or per-manifest
+`debian/*.lifecycle` fragments needed.)
 
 ### Per-file table the tool operates over
 

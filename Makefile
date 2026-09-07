@@ -65,6 +65,13 @@ install:
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
+	# Note: dist/ itself contains a "js" subdirectory (ui/index.html's
+	# `data-target-path="js"` link for js/pve-meta-monaco.js), so this
+	# lands at .../pve-manager/js/pve-meta-ui/js/pve-meta-monaco.js -- a
+	# visually doubled "js" segment, but not a bug: index.html's own
+	# `<script src="js/pve-meta-monaco.js">` is relative to itself, and
+	# both files move together. Not worth reshaping (would mean changing
+	# ui/index.html's copy-file target path) for a cosmetic doubling.
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui
 	if [ -d $(UI_DIST) ]; then cp -a $(UI_DIST)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui/; fi
 	# pve-ext UI-page manifest (see pages/pve-meta.json, pve-ext/README.md).
@@ -88,7 +95,12 @@ deb:
 	dpkg-buildpackage -b -us -uc -d
 
 check:
-	$(CARGO) clippy --workspace --exclude pve-meta-ui -- -D warnings
+	# `ui/` is its own separate Cargo workspace (see the root Cargo.toml's
+	# `exclude = ["ui"]`), never a member of this one -- `--exclude
+	# pve-meta-ui` used to name a package that can never match anything
+	# here (cargo only warns and ignores it), so there is nothing to
+	# exclude; run `cargo clippy` from inside ui/ separately to lint it.
+	$(CARGO) clippy --workspace -- -D warnings
 
 test:
 	$(CARGO) test -p pve-meta-core

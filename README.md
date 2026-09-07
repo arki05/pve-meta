@@ -176,7 +176,7 @@ incantation and the safe way to replace the installed `.so` on a live node.
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, YAML/TOML/JSON formats, merge-patch engine, file store — pure Rust |
+| `crates/pve-meta-core` | Document model, YAML on-disk format, merge-patch engine, file store — pure Rust |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks and the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `ui/` | The editor page (pwt + Monaco, compiled to wasm) |
@@ -191,8 +191,10 @@ incantation and the safe way to replace the installed `.so` on a live node.
 
 ## License
 
-AGPL-3.0-or-later (see `debian/copyright`; every crate inherits `license.workspace =
-true` from the root `Cargo.toml`).
+AGPL-3.0-or-later for this project's own code (every crate inherits
+`license.workspace = true` from the root `Cargo.toml`); a handful of vendored editor
+assets (pwt's stylesheets, Font Awesome, Monaco) carry their own upstream MIT/
+Apache-2.0/OFL-1.1 licenses — see `debian/copyright` for the full, per-file breakdown.
 
 ---
 

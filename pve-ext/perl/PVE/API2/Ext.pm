@@ -12,9 +12,12 @@ use PVE::Tools qw(file_get_contents);
 use base qw(PVE::RESTHandler);
 
 # `PVE::API2::Ext`: the generic Proxmox VE extension layer (see
-# `pve-ext/README.md`). Loaded by a single `use PVE::API2::Ext;` line
-# dpkg-diverted into stock `PVE/API2.pm` (see `patches/pve-manager.toml`).
-# Two things happen, once, as a side effect of that `use`:
+# `pve-ext/README.md`). `require`d, then explicitly driven by one
+# `PVE::API2::Ext->register_all();` call, from the very end of stock
+# `PVE/API2.pm` -- i.e. *after* every one of PVE::API2's own runtime
+# `register_method` calls have already run (see `patches/pve-manager.toml`
+# and the comment on `register_all()` below for why order matters here).
+# Two things happen, once, inside that explicit `register_all()` call:
 #
 #   1. This module registers itself into the API root at `ext`
 #      (`/api2/json/ext/...`), exposing three read-only endpoints of its
@@ -28,23 +31,36 @@ use base qw(PVE::RESTHandler);
 #      `sub ext_path { 'meta' }` ends up reachable at `/api2/json/meta`,
 #      exactly like any other native PVE::API2 subclass).
 #
-# A module that fails to `require`, or that has no `ext_path`, is skipped
-# with a `warn` -- pvedaemon/pveproxy load `PVE::API2` once at startup, so
-# one broken extension must never take either daemon down. Nothing here
-# is refreshed at runtime: the scan happens exactly once, when this file
-# is first `require`d (i.e. once per pvedaemon/pveproxy worker startup);
-# installing a new extension module (or page manifest -- see `GET
-# /ext/pages` below, which *does* re-read its directory on every request)
-# needs a service restart to be picked up, same as any other PVE::API2
-# module.
+# A module that fails to `require`, that has no `ext_path`, or whose
+# `ext_path` collides with a path some other module (core or extension)
+# already holds -- including `ext` itself, always reserved for this
+# module -- is skipped with a `warn`, never a `die`: pvedaemon/pveproxy
+# load `PVE::API2` once at startup, so one broken or colliding extension
+# must never take either daemon down with it. Nothing here is refreshed
+# at runtime: the scan happens exactly once, when `register_all()` runs
+# (i.e. once per pvedaemon/pveproxy worker startup); installing a new
+# extension module (or page manifest -- see `GET /ext/pages` below, which
+# *does* re-read its directory on every request) needs a service restart
+# to be picked up, same as any other PVE::API2 module.
 
 my $EXT_MODULE_DIR = '/usr/share/perl5/PVE/API2/Ext';
 my $EXT_PAGE_DIR = '/usr/share/pve-ext/pages';
 
 my $VALID_TARGETS = { lxc => 1, qemu => 1, node => 1, dc => 1 };
 
-# Populated once by _scan_and_register(), at the bottom of this file;
-# `GET /ext/modules` reports exactly this list, it never re-scans.
+# Path names no extension module may ever claim, regardless of whether
+# anything has registered them yet: `ext` is this module's own mount
+# point (registered by register_all() itself, guarded the same way as
+# any other module below), so a third-party module racing to claim it
+# first must never be allowed to win.
+my $RESERVED_EXT_PATHS = { ext => 1 };
+
+# Set once register_all() has run, so a second call (there should never
+# be one -- see the comment there) is a no-op instead of double-scanning.
+my $registered = 0;
+
+# Populated once by register_all(), below; `GET /ext/modules` reports
+# exactly this list, it never re-scans.
 my $loaded_modules = [];
 
 # /usr/share/perl5/PVE/API2/Ext/Foo/Bar.pm -> "PVE::API2::Ext::Foo::Bar".
@@ -59,6 +75,44 @@ sub _class_from_file {
 
     $rel =~ s{/}{::}g;
     return $rel;
+}
+
+# Registers $class (a subclass, e.g. an extension module) at $path,
+# refusing anything in $RESERVED_EXT_PATHS (the reserved list is for
+# *other* modules -- pve-ext's own self-registration goes through
+# _register_unchecked below instead, which skips this check by
+# construction) and anything already taken by anything else in the API
+# root's method table
+# (core PVE::API2 registrations, or an earlier extension module in this
+# same scan). Returns true on success; on any failure it warns (using
+# $what to describe what was being registered) and returns false -- never
+# dies, so the caller can keep going.
+sub _register_guarded {
+    my ($class, $path, $what) = @_;
+
+    if ($RESERVED_EXT_PATHS->{$path}) {
+        warn "pve-ext: skipping $what: ext_path '$path' is reserved\n";
+        return 0;
+    }
+
+    return _register_unchecked($class, $path, $what);
+}
+
+# The actual register_method call, with only the "already taken" guard --
+# no reserved-path check, since the one caller allowed to bypass it
+# (pve-ext registering itself at 'ext', the path the reserved list exists
+# to protect) needs exactly this. Not called directly for extension
+# modules; they always go through _register_guarded above.
+sub _register_unchecked {
+    my ($class, $path, $what) = @_;
+
+    my $ok = eval { PVE::API2->register_method({ subclass => $class, path => $path }); 1 };
+    if (!$ok) {
+        warn "pve-ext: skipping $what: path '$path' is already registered: $@";
+        return 0;
+    }
+
+    return 1;
 }
 
 sub _scan_and_register {
@@ -103,14 +157,52 @@ sub _scan_and_register {
             next;
         }
 
-        eval { PVE::API2->register_method({ subclass => $class, path => $path }); };
-        if ($@) {
-            warn "pve-ext: skipping extension module '$class' ($file): register_method('$path') failed: $@";
-            next;
-        }
+        next if !_register_guarded($class, $path, "extension module '$class' ($file)");
 
         push @$loaded_modules, { module => $class, path => $path, file => $file };
     }
+
+    return;
+}
+
+# The single entry point stock PVE/API2.pm calls, once, from its own very
+# end -- i.e. after all of PVE::API2's own runtime `register_method` calls
+# have already populated the API root's method table (see
+# `patches/pve-manager.toml`'s pve-manager_API2.pm.diff). This is what
+# makes collisions safe in the direction that matters: an extension's
+# ext_path colliding with a *core* path always loses (core registered
+# first, so _register_guarded's eval-wrapped register_method call for the
+# extension fails and is warned-and-skipped) instead of the reverse.
+#
+# Previously this module registered itself and ran its scan as top-level
+# statements, executed the moment `use PVE::API2::Ext;` compiled this file
+# in -- which happens at BEGIN time, i.e. before *any* of PVE/API2.pm's
+# own runtime register_method calls, regardless of where in that file the
+# `use` line sits. That made every extension win every collision against
+# core, which is exactly backwards. `require` (not `use`) plus this
+# explicit call, placed at the true end of PVE/API2.pm, fixes the
+# ordering; folding the two side effects that used to run at `use` time
+# into this one guarded call is what makes a colliding ext_path (`ext`
+# itself included) a `warn`, never a fatal `die` that takes pvedaemon and
+# pveproxy down with it.
+sub register_all {
+    my ($class) = @_;
+
+    if ($registered) {
+        warn "pve-ext: register_all() called more than once, ignoring\n";
+        return;
+    }
+    $registered = 1;
+
+    # Mount ourselves first, at the one path the reserved list exists to
+    # keep everyone else off of -- so this goes through
+    # _register_unchecked (skip the reserved-path check, which would
+    # otherwise refuse 'ext' to pve-ext itself), still guarded against an
+    # actual collision with a core path literally named 'ext' (not
+    # expected, but must never be fatal either).
+    _register_unchecked(__PACKAGE__, 'ext', "pve-ext's own API ('ext')");
+
+    _scan_and_register();
 
     return;
 }
@@ -277,11 +369,9 @@ __PACKAGE__->register_method({
     },
 });
 
-# -- mount ourselves at 'ext', then discover & mount every other
-#    extension module at the path it declares -----------------------------
-
-PVE::API2->register_method({ subclass => __PACKAGE__, path => 'ext' });
-
-_scan_and_register();
+# -- mounting ourselves at 'ext' and discovering/mounting every other
+#    extension module happens in register_all(), above, called explicitly
+#    from the very end of stock PVE/API2.pm -- nothing runs as a side
+#    effect of `require`ing this file. ------------------------------------
 
 1;

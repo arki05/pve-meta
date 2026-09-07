@@ -12,9 +12,10 @@ Architecture: any
 Depends: pve-manager (>= 9.0),
          pve-ext (>= 0.1.0),
          libpve-meta-rs-perl (= ${binary:Version}),
-         ${shlibs:Depends}, ${misc:Depends}
+         init-system-helpers (>= 1.54~),
+         ${misc:Depends}, ${perl:Depends}
 Description: Structured, versioned metadata store for Proxmox VE
- pve-meta adds a structured (YAML/TOML/JSON) metadata document per guest and
+ pve-meta adds a structured YAML metadata document per guest and
  for the datacenter, stored under /etc/pve/meta and replicated by pmxcfs like
  any other cluster file. The API is served natively by pveproxy/pvedaemon
  (PVE::API2::Ext::Meta, discovered by pve-ext, see docs/DESIGN.md) under

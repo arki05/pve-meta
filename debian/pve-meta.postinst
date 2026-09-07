@@ -10,10 +10,6 @@
 # its guest-lifecycle managed-patch manifest (see patches/lifecycle.toml),
 # via pve-ext's own `pve-ext-patch` tool.
 #
-# See debian/pve-meta.preinst for the one-time transition off this
-# package's own (pre-pve-ext) diversions, which must happen first on
-# upgrade.
-#
 # Re-running `pve-ext-patch apply` is safe and idempotent. Never allowed
 # to fail the package install/configure -- `pve-ext-patch verify`/`status`
 # exist to diagnose problems afterwards.
@@ -32,12 +28,18 @@ apply_lifecycle_patch() {
 }
 
 # The lifecycle patch changes files pvedaemon has already loaded into
-# memory, so restart both PVE daemons to pick the change up. Best-effort
-# only: never fails the package install/configure, and is a harmless
-# no-op off a systemd host (e.g. inside some build/test environments).
+# memory, so restart both PVE daemons to pick the change up.
+# `deb-systemd-invoke reload-or-try-restart` (not a raw `systemctl
+# restart`) goes through each unit's own `ExecReload` when it has one --
+# pveproxy's is `/usr/bin/pveproxy restart`, PVE's own graceful in-place
+# respawn that does not drop in-flight connections the way a hard
+# stop/start does -- and also respects policy-rc.d (chroots/containers
+# that disable service management). Best-effort only: never fails the
+# package install/configure, and is a harmless no-op off a systemd host
+# (e.g. inside some build/test environments).
 restart_pve_services() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart pvedaemon pveproxy 2>/dev/null || {
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke reload-or-try-restart pvedaemon.service pveproxy.service || {
             echo "pve-meta: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-meta lifecycle patch." >&2
         }
     fi

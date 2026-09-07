@@ -1,14 +1,19 @@
 --- a/usr/share/perl5/PVE/API2.pm
 +++ b/usr/share/perl5/PVE/API2.pm
-@@ -43,6 +43,11 @@
-     path => 'pools',
+@@ -135,4 +135,16 @@
+         return $res;
+     },
  });
- 
++
 +# pve-ext: generic API-module extension loader (see pve-ext/README.md).
 +# Applied out-of-tree via dpkg-divert + patch by pve-ext-patch, not part
-+# of stock pve-manager.
-+use PVE::API2::Ext;
++# of stock pve-manager. `require`d and driven by an explicit
++# `register_all()` call placed here, at the very end of this file --
++# i.e. after every one of the register_method calls above -- so that a
++# colliding ext_path can never prevent (or be prevented by) any of this
++# file's own core registrations; see PVE::API2::Ext::register_all's own
++# comment for why the ordering matters.
++require PVE::API2::Ext;
++PVE::API2::Ext->register_all();
 +
- __PACKAGE__->register_method({
-     name => 'index',
-     path => '',
+ 1;

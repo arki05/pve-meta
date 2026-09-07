@@ -29,12 +29,18 @@ apply_patch() {
 
 # Both patched files are loaded into pvedaemon's/pveproxy's memory at
 # startup (index.html.tpl is re-read per request, but PVE/API2.pm's
-# `use PVE::API2::Ext;` only ever runs once, at process start), so restart
-# both to pick the change up. Best-effort only: never fails the package
-# install/configure, and is a harmless no-op off a systemd host.
+# `require PVE::API2::Ext;` + `PVE::API2::Ext->register_all();` only ever
+# run once, at process start), so restart both to pick the change up.
+# `deb-systemd-invoke reload-or-try-restart` (not a raw `systemctl
+# restart`) goes through each unit's own `ExecReload` when it has one --
+# pveproxy's is `/usr/bin/pveproxy restart`, PVE's own graceful in-place
+# respawn that does not drop in-flight connections the way a hard
+# stop/start does -- and also respects policy-rc.d. Best-effort only:
+# never fails the package install/configure, and is a harmless no-op off
+# a systemd host.
 restart_pve_services() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart pvedaemon pveproxy 2>/dev/null || {
+    if command -v deb-systemd-invoke >/dev/null 2>&1; then
+        deb-systemd-invoke reload-or-try-restart pvedaemon.service pveproxy.service || {
             echo "pve-ext: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-ext patches." >&2
         }
     fi

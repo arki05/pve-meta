@@ -3,9 +3,19 @@
 This document covers everything under `.github/workflows/`, `scripts/apt-repo/`,
 `scripts/watch-pve/`, and `ceilings.toml` at the repo root: how packages get from a
 `make deb` build to a host running `apt update`, and how the "tested ceiling" for the
-patched upstream Proxmox packages stays current. See `docs/VISION.typ` ("Packaging &
-distribution") for the design rationale, and `docs/LIFECYCLE-PATCHES.md` §10 /
-`pve-manager-patch/README.md` for what the patch tools this document drives actually do.
+patched upstream Proxmox packages stays current.
+
+The design rationale in one paragraph: pve-meta patches stock Proxmox VE files it does
+not control the release cadence of (see `docs/DESIGN.md` §5, "Managed patches"). A
+signed, static apt repo (§1-§5 below) is the simplest way to distribute the resulting
+`.deb`s without asking every install to build from source; a scheduled "ceiling
+watcher" (§6) is the cheapest way to find out *before* a user's `apt dist-upgrade` that
+a new upstream point release moved an anchor our diffs depend on, without ever
+*blocking* that upgrade — see "Upgrade gating" at the end of §6. `pve-ext-patch` itself
+(the tool the ceiling watcher drives) is documented in `pve-ext/README.md`; the
+research that led to pve-meta's own seven-file lifecycle manifest is in
+`docs/LIFECYCLE-PATCHES.md` (superseded by `pve-ext-patch` + `patches/lifecycle.toml`,
+§10 of that document).
 
 ## 1. Repo layout
 
@@ -30,8 +40,7 @@ The apt tree is static files in a bucket, nothing server-side:
 four characters for anything starting with `lib` (e.g. `pve-meta` -> `pool/main/p/`,
 `libpve-meta-rs-perl` -> `pool/main/libp/`).
 
-Only `amd64` + `trixie` exist; there is no need for more (PVE 9 targets trixie only, see
-`docs/VISION.typ`).
+Only `amd64` + `trixie` exist; there is no need for more (PVE 9 targets trixie only).
 
 ### The three scripts
 
@@ -101,8 +110,8 @@ do give it a passphrase, also set `APT_GPG_PASSPHRASE`.
 
 1. Cloudflare dashboard -> R2 -> **Create bucket** (any name; matches `R2_BUCKET`).
 2. **Settings -> Public access -> Custom Domains -> Connect Domain** -> e.g.
-   `apt.<domain>`. This is the "R2 public bucket bound to a custom domain" from
-   `docs/VISION.typ` -- free egress, no separate CDN/Pages config, and it's what makes
+   `apt.<domain>`. An R2 public bucket bound to a custom domain like this needs no
+   separate CDN/Pages config and has free egress, and it's what makes
    `https://apt.<domain>/pool/...` resolve directly to bucket objects.
 3. DNS: Cloudflare creates the CNAME for you when the domain is on Cloudflare; confirm
    it under the zone's DNS tab.
@@ -150,8 +159,9 @@ requirement, just convenient). It:
 
 ## 5. Private prefix
 
-Private packages (personal theming/boot-logo debs, per `docs/VISION.typ`) live at the
-same bucket under `private/`, built and published by the exact same two scripts (they
+Private packages (e.g. personal theming/boot-logo debs not meant for public
+distribution) live at the same bucket under `private/`, built and published by the
+exact same two scripts (they
 already know about `private/` -- see §1). The bucket itself has no separate ACL for
 that prefix; a tiny Cloudflare Worker in front of the custom domain gates it:
 
@@ -194,14 +204,13 @@ issue a client credential by handing out those same two values via
 `client-setup.sh --private --private-user ... --private-pass ...` (or letting the user
 edit `/etc/apt/auth.conf.d/pve-meta.conf`'s placeholders by hand). This is a sketch, not
 a deployed Worker -- routing config, `wrangler.toml`, and the R2 binding name are left
-to whoever stands it up, per `docs/VISION.typ`'s "tiny Cloudflare Worker doing
-basic-auth" framing.
+to whoever stands it up.
 
 ## 6. Ceiling watcher
 
-`docs/VISION.typ` ("Upgrade gating"): the patched packages carry a *tested ceiling*,
-not a dependency pin, so `apt dist-upgrade` is never blocked. `ceilings.toml` at the
-repo root holds it:
+The patched packages carry a *tested ceiling*, not a dependency pin, so
+`apt dist-upgrade` is never blocked (see "Upgrade gating" at the end of this section).
+`ceilings.toml` at the repo root holds it:
 
 ```toml
 [tested]
@@ -218,37 +227,36 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
 2. for each of the four tracked packages, compares its current version there (via
    `dpkg --compare-versions`) against `ceilings.toml`'s ceiling;
 3. for every package strictly newer than its ceiling: downloads the `.deb`, extracts it
-   with `dpkg-deb -x`, and dry-runs our patches against the extracted tree:
-   - **pve-manager**: `pve-manager-patch/pve-meta-patch verify <extracted>/usr/share/pve-manager/js/pvemanagerlib.js <extracted>/usr/share/pve-manager/index.html.tpl`
-     (the tool's `verify` subcommand already takes explicit file paths -- no wiring
-     changes needed; see the `--root` note below for a nicer interface later);
-   - **pve-container / qemu-server / libpve-guest-common-perl**: `patch --dry-run -p1`
-     of every `pve-manager-patches/lifecycle/<pkg>_*.diff` registered for that package,
-     against `<extracted>/usr/share/perl5`;
+   with `dpkg-deb -x`, and runs `pve-ext-patch --root <extracted> verify <manifest>`
+   (see `pve-ext/README.md` for what `verify` does: a dry-run of every entry's diff
+   against the pristine copy it can find under `--root`, never touching anything):
+   - **pve-manager**: verifies pve-ext's own manifest,
+     `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
+   - **pve-container / qemu-server / libpve-guest-common-perl**: verifies
+     `patches/lifecycle.toml` (pve-meta's seven guest-lifecycle diffs), filtered down
+     first to just that package's own `[[file]]` entries -- a single package's
+     extracted tree never has the *other* two packages' files, so verifying the whole
+     manifest against it would misreport "no pristine source found" for those;
 4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
    packages with any failure get **one GitHub issue** (label `pve-upgrade`) carrying the
-   full `patch`/`verify` output, plus a `TODO(llm-fix)` block marking the hand-off to
-   the planned LLM-assisted fix flow (`docs/VISION.typ`: "hands the diff to an LLM flow
-   (claude-code-action) to draft a fix PR for human review" -- not implemented yet).
+   full `pve-ext-patch verify` output, plus a `TODO(llm-fix)` block marking the hand-off
+   to a planned (not yet implemented) LLM-assisted fix flow that would hand the failing
+   diff to an LLM run to draft a fix PR for human review.
    Both checks are best-effort deduplicated against already-open PRs/issues with the
    same exact title, so a repeated 6-hourly run doesn't spam.
 
-A `--root` convenience flag for `pve-meta-patch` (defaulting all its paths under one
-prefix, the way this watcher wants to point it at an extracted tree instead of the live
-filesystem) is a small, non-urgent follow-up for `pve-manager-patch/pve-meta-patch`
-itself -- not added here since that file isn't owned by this change; `verify`'s
-existing two positional args already cover the watcher's needs.
-
-### Escape hatch
+### Escape hatch (Upgrade gating)
 
 The watcher is advisory, never a gate on anything:
 
-* A failed dry-run only opens an issue; it does not block `build.yml`, does not touch
+* A failed verify only opens an issue; it does not block `build.yml`, does not touch
   `ceilings.toml`, and does not stop anyone from installing the newer upstream package
-  by hand (there is no `Depends:` pin -- see `docs/VISION.typ`).
-* If the automated dry-run has a false negative (e.g. it needs a check this script
-  can't perform), a human just edits `pve-manager-patches/lifecycle/*.diff` or
-  `pve-manager-patch/`, confirms locally, and hand-edits `ceilings.toml` in a normal PR
+  by hand -- there is no `Depends:` pin on any tracked package's version, only a
+  `Depends: pve-manager (>= 9.0)`-style floor (see `debian/control`,
+  `pve-ext/debian/control`).
+* If the automated verify has a false negative (e.g. it needs a check this script
+  can't perform), a human just edits the failing diff under `pve-ext/patches/` or
+  `patches/lifecycle/`, confirms locally, and hand-edits `ceilings.toml` in a normal PR
   -- the watcher's own PRs are not special, just the same file anyone can bump.
 * Local dry run before trusting a real run:
   ```sh
@@ -354,18 +362,26 @@ PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
   correct two-stanza deb822 `.sources` file with `--private`, and wrote
   `/etc/apt/auth.conf.d/pve-meta.conf` at mode `0600` with the given credentials.
 * `scripts/watch-pve/check.sh`: run for real against the live Proxmox no-subscription
-  index (no credentials needed for this part) with `PVE_META_DRY_RUN=1`. Confirmed
-  correct version parsing and `dpkg --compare-versions` behavior (including a tricky
-  `~` pre-release version). Then, with ceilings temporarily lowered in a scratch copy
-  of the repo (never the real `ceilings.toml`) to force the "newer version" branch: it
-  downloaded and extracted real `pve-container`, `libpve-guest-common-perl`, and
-  `pve-manager` packages from the live Proxmox repo and ran the real dry-run checks --
-  observed both an actual **pass** (`libpve-guest-common-perl` 6.0.2, and an older
-  `pve-manager` 9.0.0~10 against `pve-meta-patch verify`) and an actual **fail**
-  (`pve-container` 6.0.10, whose `API2/LXC.pm` hunk #1 no longer applies against that
-  older release -- the diffs in this repo were generated against 6.1.13), with correct
-  per-package pass/fail aggregation and correct dry-run output (no `gh` calls attempted
-  -- confirmed `gh` isn't even installed on the test host).
+  index (no credentials needed for this part) with `PVE_META_DRY_RUN=1`, on the
+  `pve-ext-patch verify`-based mechanism described in §6 above (re-verified after
+  fixing the tool references that used to point at a `pve-manager-patches/lifecycle/`
+  layout that never existed in this repo). Confirmed correct version parsing and
+  `dpkg --compare-versions` behavior (including a tricky `~` pre-release version).
+  Then, with ceilings temporarily lowered in a scratch copy of the repo on the build
+  host (never the real `ceilings.toml`) to force the "newer version" branch: it
+  downloaded and extracted real `pve-container`, `qemu-server`,
+  `libpve-guest-common-perl`, and `pve-manager` packages from the live Proxmox repo and
+  ran the real `pve-ext-patch verify` checks -- observed an actual **pass** for
+  `qemu-server` 9.0.10, `libpve-guest-common-perl` 6.0.2, and an older `pve-manager`
+  9.0.0~10 (against pve-ext's own `pve-manager.toml` manifest -- the `PVE::API2::Ext`
+  registration-ordering diff from §5 of `docs/DESIGN.md` still applies cleanly even
+  that far back), and an actual **fail** for `pve-container` 6.0.10, whose
+  `API2/LXC.pm` hunk #1 no longer applies against that older release (the diffs in
+  this repo were generated against 6.1.13/6.1.14), with correct per-package pass/fail
+  aggregation and correct per-package manifest filtering (no "no pristine source
+  found" noise for the two packages' files not present in each other's extracted
+  tree) and correct output (no `gh` calls attempted -- confirmed `gh` isn't even
+  installed on the test host).
 
 ### What still needs real credentials / hasn't been exercised
 
