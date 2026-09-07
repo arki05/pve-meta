@@ -14,6 +14,8 @@ pub mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod app;
 #[cfg(target_arch = "wasm32")]
+pub mod auth;
+#[cfg(target_arch = "wasm32")]
 pub mod editor;
 #[cfg(target_arch = "wasm32")]
 pub mod form;

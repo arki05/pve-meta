@@ -1,5 +1,6 @@
-//! Top-level `App`: login check, `?vmid=`/`?dc=` routing, the guest list, the
-//! version-poll long-poll loop, and the not-logged-in notice.
+//! Top-level `App`: login/CSRF-token resolution (`crate::auth`), `?vmid=`/`?dc=`
+//! routing, the guest list, the `GET /meta/version` interval poll, and the
+//! not-logged-in notice.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -11,12 +12,23 @@ use yew::prelude::*;
 use pwt::prelude::*;
 use pwt::widget::{Column, DesktopApp, Row, ThemeModeSelector};
 
+use proxmox_login::Authentication;
 use proxmox_yew_comp::{authentication_from_cookie, ExistingProduct};
 
 use crate::api::{self, InventoryEntry, Operator};
 use crate::editor::Editor;
 use crate::guests::GuestList;
 use crate::model::DocId;
+
+/// Login-resolution state: see `crate::auth` for how a usable session/CSRF token is
+/// found now that nothing server-side templates one into the page for us.
+enum AuthState {
+    /// Still trying `crate::auth::resolve_auth()` (an async ticket-renewal round trip
+    /// may be in flight).
+    Resolving,
+    LoggedIn(String),
+    NotLoggedIn,
+}
 
 /// Parse `?vmid=`/`?dc=` from the current URL. `dc=1` wins if both are present.
 /// Returns `(selected document, embedded mode)`.
@@ -46,6 +58,7 @@ fn parse_route() -> (Option<DocId>, bool) {
 }
 
 pub enum Msg {
+    AuthResolved(Option<Authentication>),
     GuestsLoaded(Result<Vec<InventoryEntry>, Error>),
     RegistryLoaded(Result<Vec<Operator>, Error>),
     SchemasLoaded(Result<HashMap<String, Value>, Error>),
@@ -54,7 +67,7 @@ pub enum Msg {
 }
 
 pub struct App {
-    user: Option<String>,
+    auth: AuthState,
     embedded: bool,
     selected: Option<DocId>,
     guests: Option<Result<Vec<InventoryEntry>, String>>,
@@ -93,14 +106,27 @@ impl Component for App {
     type Properties = ();
 
     fn create(ctx: &Context<Self>) -> Self {
-        let login = authentication_from_cookie(&ExistingProduct::PVE);
-        let user = login.as_ref().map(|a| a.userid.clone());
-        if let Some(info) = login {
-            proxmox_yew_comp::http_set_auth(info);
-        }
+        // Fast path: a cookie ticket plus an already-known CSRF token (e.g. a repeat
+        // visit within the same tab session, sessionStorage already populated).
+        // Otherwise resolve one asynchronously — see `crate::auth`.
+        let auth = match authentication_from_cookie(&ExistingProduct::PVE) {
+            Some(info) => {
+                let userid = info.userid.clone();
+                proxmox_yew_comp::http_set_auth(info);
+                AuthState::LoggedIn(userid)
+            }
+            None => {
+                ctx.link()
+                    .send_future(async { Msg::AuthResolved(crate::auth::resolve_auth().await) });
+                AuthState::Resolving
+            }
+        };
 
         let (selected, embedded) = parse_route();
 
+        // Read-only, so these are fine even before auth resolves (the browser already
+        // attaches the session cookie to every same-origin request regardless; only
+        // mutating calls need the CSRF token `crate::auth`/`http_set_auth` provide).
         ctx.link()
             .send_future(async { Msg::GuestsLoaded(api::inventory().await) });
         ctx.link()
@@ -110,30 +136,27 @@ impl Component for App {
                 .send_future(async move { Msg::SchemasLoaded(api::schemas(vmid).await) });
         }
 
-        // Long-poll `GET /meta/version` for the app's lifetime. Runs regardless of
-        // login state (harmless if unauthenticated: the request just fails and we
-        // back off) so nothing extra needs wiring once a login happens.
+        // Poll `GET /meta/version` for the app's lifetime — the native module answers
+        // immediately (no long-poll), so this is a plain interval (docs/API.md).
         let poll_link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
-            let mut since: Option<String> = None;
+            let mut last_token: Option<String> = None;
             loop {
-                match api::version(Some(25), since.as_deref()).await {
+                match api::version().await {
                     Ok(info) => {
-                        if since.as_ref() != Some(&info.token) {
-                            since = Some(info.token.clone());
+                        if last_token.as_ref() != Some(&info.token) {
+                            last_token = Some(info.token.clone());
                             poll_link.send_message(Msg::VersionToken(info.token));
                         }
                     }
-                    Err(e) => {
-                        log::warn!("pve-meta-ui: version poll failed: {e}");
-                        gloo_timers::future::TimeoutFuture::new(3_000).await;
-                    }
+                    Err(e) => log::warn!("pve-meta-ui: version poll failed: {e}"),
                 }
+                gloo_timers::future::TimeoutFuture::new(5_000).await;
             }
         });
 
         Self {
-            user,
+            auth,
             embedded,
             selected,
             guests: None,
@@ -145,6 +168,12 @@ impl Component for App {
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         match msg {
+            Msg::AuthResolved(Some(info)) => {
+                let userid = info.userid.clone();
+                proxmox_yew_comp::http_set_auth(info);
+                self.auth = AuthState::LoggedIn(userid);
+            }
+            Msg::AuthResolved(None) => self.auth = AuthState::NotLoggedIn,
             Msg::GuestsLoaded(result) => {
                 self.guests = Some(result.map_err(|e| api::error_text(&e)));
             }
@@ -177,9 +206,15 @@ impl Component for App {
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
-        if self.user.is_none() {
-            return DesktopApp::new(not_logged_in_notice()).into();
-        }
+        let user = match &self.auth {
+            AuthState::Resolving => {
+                return DesktopApp::new(html! {<div class="pve-meta-loading">{"Loading…"}</div>}).into();
+            }
+            AuthState::NotLoggedIn => {
+                return DesktopApp::new(not_logged_in_notice()).into();
+            }
+            AuthState::LoggedIn(user) => user,
+        };
 
         let mut header = Row::new()
             .class("pve-meta-header pwt-bg-color-primary pwt-color-on-primary pwt-align-items-center")
@@ -190,7 +225,7 @@ impl Component for App {
             .with_flex_spacer();
 
         if !self.embedded {
-            header.add_child(html! {<span>{self.user.clone().unwrap_or_default()}</span>});
+            header.add_child(html! {<span>{user.clone()}</span>});
         }
         header.add_child(ThemeModeSelector::new());
 

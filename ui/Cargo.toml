@@ -30,9 +30,11 @@ similar = "2"
 # the Mac never needs to fetch or build them at all.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 futures = "0.3"
+gloo-net = "0.4"
 gloo-timers = "0.3"
 js-sys = "0.3"
 log = "0.4"
+percent-encoding = "2"
 url = "2"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

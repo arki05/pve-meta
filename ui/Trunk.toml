@@ -1,6 +1,8 @@
 [build]
 release = true
-public_url = "/ui/"
+# Served natively by pveproxy at /pve2/js/pve-meta-ui/ (see docs/NATIVE-API-SPEC.md); the
+# `ui` Makefile target installs `dist/` to /usr/share/pve-manager/js/pve-meta-ui/.
+public_url = "/pve2/js/pve-meta-ui/"
 
 [[hooks]]
 stage = "build"
