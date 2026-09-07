@@ -140,3 +140,47 @@ patches/lifecycle/       the Perl diffs + manifest
 pve-ext/                 the extension layer (its own Debian package; may move to its own repo)
 debian/, Makefile        two packages: pve-meta, libpve-meta-rs-perl (plus pve-ext)
 ```
+
+## 8. Decisions from the 2026-09-07 review (binding)
+
+These resolve the under-specified corners the review found (`REVIEW-2026-09-07.md`).
+
+* **Authorization is decided from the request, never from a diff.** A write must satisfy
+  `can_write(view)` before anything is computed, and every path the planned mutation
+  touches is checked on a *plan* computed against a copy; the stored document is only
+  modified after the check passes. A caller without full write may not write the root
+  view. 403 messages never name a path the caller cannot read.
+* **Reads require a grant.** A principal with neither an ACL nor a scope covering
+  anything in a document gets 403, not an empty document. `GET /meta/guests` lists
+  only guests the caller can read something of; `name` and `node` are included only
+  with `VM.Audit` on that guest.
+* **`merge` with `null` deletes; `replace` with `{}` stores an empty map.** Deleting a
+  view is `DELETE …?view=`. Payload lint allows `null` only as a merge delete marker.
+  A merge that touches nothing changes nothing (no container creation).
+* **Comment keys follow their subject.** A scope on prefix `p` also covers the sibling
+  comment key `p__`; a view of `p` contains only the subtree of `p`.
+* **`GET /meta/access`** takes an optional `vmid` and returns `{ read, write, scopes }`
+  for that guest (or for the datacenter with `dc=1`); without either it returns the
+  caller's scopes and whether they have datacenter read/write.
+* **Key order is guaranteed in YAML text only.** `data` (JSON) is an unordered object
+  on the wire; clients that care about order use `format=yaml`.
+* **`scopes` is validated at write time** (400 naming the entry) and read leniently:
+  a malformed entry for another principal is skipped with a warning and never denies
+  service to anyone else.
+* **Writes are serialised.** Every API write runs under `PVE::Cluster::cfs_lock_domain`
+  keyed by document id, with the digest check inside the lock. Lifecycle hooks run
+  inside PVE's own guest locks and copy files; a rollback may replace an in-flight edit,
+  which the editor detects through the digest.
+* **The API never creates documents for guests that do not exist** (404 from the vmlist),
+  and `DELETE` of a document removes only the current document; snapshot copies are
+  handled exclusively by the lifecycle hooks.
+* **YAML only on disk.** TOML/JSON on-disk support, `convert`, format settings, the
+  format-preserving edit engine and other unreachable core code are removed. Digest
+  and version are computed from file content on every call (no mtime cache).
+* **Extension registration happens after the core.** `PVE::API2::Ext` registers its
+  modules from an explicit call at the end of `PVE/API2.pm`, skips paths that already
+  exist, and never dies.
+* **Managed patches: no fuzz, no stacking.** `patch -F0`; a manifest whose file is already
+  diverted for another manifest is refused with a clear error (documented limitation).
+* **Service restarts** in maintainer scripts go through `deb-systemd-invoke
+  reload-or-try-restart`.
