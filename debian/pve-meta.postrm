@@ -1,0 +1,15 @@
+#!/bin/sh
+# postrm for the pve-meta package.
+#
+# The actual patch reversal (dpkg-divert --remove, restoring pve-manager's
+# pristine index.html.tpl, deleting the lifecycle patch's applied diffs)
+# happens in debian/prerm's `remove` case, *before* this package's own
+# files (including the pve-meta-patch/pve-meta-lifecycle-patch tools
+# themselves) are deleted -- by the time postrm runs those tools are
+# already gone. This script exists for documentation and to host debhelper's own
+# generated systemd-remove snippet below.
+set -e
+
+#DEBHELPER#
+
+exit 0

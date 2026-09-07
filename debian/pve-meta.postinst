@@ -1,0 +1,62 @@
+#!/bin/sh
+# postinst for the pve-meta package.
+#
+# Applies (or re-applies) two local patches to the surrounding PVE install:
+#   1. pve-meta-patch: injects the "Metadata" tab into pve-manager's web UI
+#      (index.html.tpl / pvemanagerlib.js) -- see pve-manager-patch/README.md.
+#   2. pve-meta-lifecycle-patch: wires snapshot/rollback/clone/destroy and
+#      vzdump export/import hooks into pve-container/qemu-server (see
+#      pve-manager-patches/lifecycle/). This tool may not be installed yet
+#      (it ships once crates/pve-meta-perl's Perl bindings are wired up), so
+#      this step is a tolerant no-op until it exists.
+#
+# Re-running either `apply` is safe and idempotent. Neither is allowed to
+# fail the package install/configure -- both patch tools are themselves
+# designed to no-op harmlessly if their anchors are missing, and `verify`/
+# `status` subcommands exist to diagnose problems afterwards.
+set -e
+
+apply_patch() {
+    tool="$1"
+    if [ -x "$tool" ]; then
+        "$tool" apply || {
+            echo "pve-meta: warning: $tool apply failed, see above." >&2
+        }
+    fi
+}
+
+# Both patch tools change files pvedaemon/pveproxy have already loaded into memory
+# (pve-meta-lifecycle-patch's PVE/API2.pm change registers PVE::API2::Meta; see
+# docs/NATIVE-API-SPEC.md), so restart both to pick the changes up. Best-effort only:
+# never fails the package install/configure, and is a harmless no-op off a systemd host
+# (e.g. inside some build/test environments).
+restart_pve_services() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart pvedaemon pveproxy 2>/dev/null || {
+            echo "pve-meta: warning: could not restart pvedaemon/pveproxy; restart them manually to pick up the pve-meta patches." >&2
+        }
+    fi
+}
+
+case "$1" in
+    configure)
+        apply_patch /usr/sbin/pve-meta-patch
+        apply_patch /usr/sbin/pve-meta-lifecycle-patch
+        restart_pve_services
+        ;;
+    triggered)
+        # $2 is the whitespace-separated list of trigger names that fired
+        # (see debian/pve-meta.triggers); re-applying is enough either way.
+        apply_patch /usr/sbin/pve-meta-patch
+        apply_patch /usr/sbin/pve-meta-lifecycle-patch
+        restart_pve_services
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

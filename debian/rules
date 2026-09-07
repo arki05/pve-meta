@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) build ui
+
+# Three binary packages from this one source (see debian/control; per
+# docs/NATIVE-API-SPEC.md the daemon is now a separate, optional package):
+#   - `pve-meta`:            top-level Makefile's `install-cli` target
+#   - `pve-metad`:           top-level Makefile's `install-daemon` target
+#   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own Makefile, its own DESTDIR
+#     (see crates/pve-meta-perl/PACKAGING.md, option 1) so its files never land in
+#     either of the other two package trees.
+override_dh_auto_install:
+	$(MAKE) install-cli DESTDIR=$(CURDIR)/debian/pve-meta PREFIX=/usr
+	$(MAKE) install-daemon DESTDIR=$(CURDIR)/debian/pve-metad PREFIX=/usr
+	$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(CURDIR)/debian/libpve-meta-rs-perl
+
+override_dh_auto_test:
+	# Rust tests run separately on the build host (cargo test -p pve-meta-core -p
+	# pve-meta-api); skipped here since the packaging build runs with -d and no
+	# guaranteed network access for crates.io during a plain `dpkg-buildpackage`.
+
+override_dh_installsystemd:
+	dh_installsystemd -ppve-metad pve-metad.service
