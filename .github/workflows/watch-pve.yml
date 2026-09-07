@@ -1,0 +1,33 @@
+name: watch-pve
+
+on:
+  schedule:
+    # Every 6 hours. The exact minute is offset from :00 to avoid the
+    # scheduling stampede at the top of the hour.
+    - cron: "17 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure patch(1) is present
+        run: |
+          if ! command -v patch >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends patch
+          fi
+
+      - name: Run ceiling watcher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/watch-pve/check.sh

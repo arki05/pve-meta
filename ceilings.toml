@@ -1,0 +1,16 @@
+# Tested ceilings for the upstream Proxmox packages our lifecycle/UI patches
+# touch (see docs/LIFECYCLE-PATCHES.md and pve-manager-patch/README.md).
+#
+# Bumped automatically by .github/workflows/watch-pve.yml
+# (scripts/watch-pve/check.sh) once a newer upstream release's dry-run of
+# every registered patch still applies cleanly. See docs/DISTRIBUTION.md
+# ("Ceiling watcher") for the full mechanism and the manual escape hatch.
+#
+# This is a warn-only ceiling, not a dependency pin: apt dist-upgrade is
+# never blocked by it (see docs/VISION.typ, "Upgrade gating").
+
+[tested]
+pve-manager = "9.2.11"
+pve-container = "6.1.13"
+qemu-server = "9.2.6"
+libpve-guest-common-perl = "6.0.5"

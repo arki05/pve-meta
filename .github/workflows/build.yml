@@ -1,0 +1,135 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      # actions/checkout needs git; debian:trixie ships without it, so
+      # install it (and the other bits checkout/curl steps need) before the
+      # checkout step runs.
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential curl git pkg-config libssl-dev libperl-dev perl \
+            debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen
+
+      - name: Install rustup toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+            ui/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Install trunk
+        run: |
+          if ! command -v trunk >/dev/null 2>&1; then
+            curl -fsSL -o /tmp/trunk.tar.gz \
+              https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz
+            tar -xzf /tmp/trunk.tar.gz -C "$HOME/.cargo/bin" trunk
+            chmod +x "$HOME/.cargo/bin/trunk"
+          fi
+          trunk --version
+
+      - name: Install grass
+        run: |
+          command -v grass >/dev/null 2>&1 || cargo install grass --locked
+          grass --version
+
+      - name: Build .deb packages
+        run: make deb
+
+      - name: Collect built .deb artifacts
+        run: |
+          mkdir -p dist-out
+          shopt -s nullglob
+          debs=(../*.deb dist/*.deb)
+          if [ ${#debs[@]} -eq 0 ]; then
+            echo "no .deb files found in ../ or dist/ after 'make deb'" >&2
+            exit 1
+          fi
+          cp -v "${debs[@]}" dist-out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pve-meta-deb
+          path: dist-out/*.deb
+          if-no-files-found: error
+
+  publish-repo:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    permissions:
+      contents: read
+    steps:
+      - name: Install git
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
+
+      - uses: actions/checkout@v4
+
+      - name: Install repo tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            apt-utils dpkg-dev gnupg curl unzip ca-certificates
+          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+          unzip -q /tmp/rclone.zip -d /tmp
+          install -m 0755 /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pve-meta-deb
+          path: incoming-debs
+
+      - name: Build signed repo tree
+        env:
+          APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: bash scripts/apt-repo/build-repo.sh incoming-debs repo-out
+
+      - name: Publish to R2
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: bash scripts/apt-repo/publish-r2.sh repo-out

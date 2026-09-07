@@ -1,8 +1,10 @@
 # pve-meta HTTP API (v1, trusted-lab)
 
-Served by `pve-metad` on every node, default port **8007**, TLS with the node's PVE
-certificate (`/etc/pve/local/pve-ssl.pem`). All paths are under `/api2/json`. Shapes
-follow PVE conventions: responses are `{"data": ...}`, errors are HTTP 4xx/5xx with a
+Served natively by PVE (pveproxy/pvedaemon) on port **8006** as the API module
+`PVE::API2::Meta` (see `docs/NATIVE-API-SPEC.md`); the standalone `pve-metad` daemon on
+port 8007 exposes the same tree and is optional. All paths are under `/api2/json`.
+Bodies are ordinary PVE request parameters (form-encoded or JSON); object-valued
+parameters (`patch`) are passed as JSON-encoded strings. Shapes follow PVE conventions: responses are `{"data": ...}`, errors are HTTP 4xx/5xx with a
 plain-text or `{"errors": {...}}` body, optimistic concurrency uses a `digest`
 parameter (like `pvesh`), and `GET` never mutates.
 
@@ -42,7 +44,7 @@ cluster-wide. Representation on the wire:
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/meta/version` | `{ "token": "...", "changed": <unix> }`. With `wait=<secs>` (max 60) and `since=<token>`, long-polls until the token differs or the timeout passes (returns the current token either way). |
+| GET | `/meta/version` | `{ "token": "...", "changed": <unix> }`. Cheap; poll it every few seconds. `wait`/`since` are accepted but only the optional standalone daemon long-polls; the native module returns immediately. |
 | GET | `/meta/health` | `{ "store": {"root": "/etc/pve/meta", "files": n, "bytes": n}, "hooks": {...}, "version": "<daemon version>" }` |
 | GET | `/meta/inventory` | Guests from `/etc/pve/.vmlist`, enriched with the guest name read from the guest config (`name:` for qemu, `hostname:` for lxc): `[{ "vmid": 105, "node": "n1", "type": "lxc", "name": "wiki", "has_meta": true, "format": "yaml" }]` |
 | GET | `/meta/guests` | List guest documents: `[{ "vmid", "node", "type", "format", "digest", "mtime", "size", "namespaces": ["traefik", ...] }]`. Filter with `has=<namespace>` (top-level key or dotted prefix present). |
