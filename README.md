@@ -1,90 +1,20 @@
 # pve-meta
 
-A small, boring, permission-aware, structured (nested) key-value metadata store for
-Proxmox VE guests and the datacenter. Metadata lives in human-readable sidecar files
-(YAML by default, TOML or JSON per file) inside `/etc/pve`, so it replicates and
-fails over with the rest of the cluster config for free, participates in guest
-snapshot/clone/destroy/backup like any other piece of guest state, and is reachable
-through an API that behaves exactly like the rest of Proxmox's own `/api2` — because
-it *is* the rest of Proxmox's own `/api2`: `pve-meta` registers a native
-`PVE::API2::Meta` module served by pveproxy/pvedaemon on port 8006, a Yew/wasm editor
-embedded as a "Metadata" tab on every guest and the datacenter, and a set of
-reversible `dpkg-divert` patches that wire it into the surrounding PVE packages. It
-knows nothing about what anyone stores in it. See [`../docs/VISION.typ`](../docs/VISION.typ)
-for the full design rationale and roadmap.
+A structured metadata store for Proxmox VE. Every guest (vmid) and the datacenter get
+one nested key-value document, stored under `/etc/pve/meta` and replicated by pmxcfs
+like the rest of the cluster config. The document is reachable through a native API on
+port 8006 (`PVE::API2::Ext::Meta`) and edited through a Monaco-based editor embedded as
+a "Metadata" tab on every guest and on the Datacenter panel. Three packages: `pve-ext`
+(a generic extension layer for PVE), and `pve-meta` + `libpve-meta-rs-perl` (this
+project, a consumer of it).
 
-## Status
+## The document model
 
-Working, tested end-to-end on **PVE 9.2.11** in a nested/disposable lab
-(`pvemeta-node1`), including a real headless-Chromium pass over the injected
-"Metadata" tab and a full lifecycle-hook round trip (snapshot, rollback, clone,
-destroy, vzdump backup/restore for both a container and a VM). **Not yet used in
-production, and not yet installed from a published apt repository** — the
-distribution pipeline (`docs/DISTRIBUTION.md`) is built and dry-run tested, but no
-key has been published yet. Treat this as a v1 in the "trusted-lab" sense described
-below: the native API enforces normal PVE object permissions, but there is no
-namespace-claims authorization yet — see "Known limitations".
-
-## Architecture
-
-```
- ┌────────────────────────────────────────────────────────────────┐
- │  Browser: PVE web UI (ExtJS, pvemanagerlib.js)                  │
- │  "Metadata" tab on every guest + Datacenter panel               │
- │  (injected by pve-meta-patch: one <script> in index.html.tpl,   │
- │   one PVE.panel.Config.prototype.initComponent patch)           │
- │      │ same-origin iframe: /pve2/js/pve-meta-ui/index.html      │
- └──────┼───────────────────────────────────────────────────────────┘
-        │  PVEAuthCookie / CSRFPreventionToken (shared with the PVE UI)
-        ▼
- ┌────────────────────────────────────────────────────────────────┐
- │  pveproxy / pvedaemon — port 8006, node's real TLS cert          │
- │  PVE::API2::Meta  (perl/PVE/API2/Meta.pm)                        │
- │    reads  → pveproxy (www-data)      /api2/json/meta/...         │
- │    writes → pvedaemon (root)         VM.Audit / VM.Config.Options│
- └──────┼───────────────────────────────────────────────────────────┘
-        │  perlmod bindings — PVE::RS::Meta (crates/pve-meta-perl)
-        ▼
- ┌────────────────────────────────────────────────────────────────┐
- │  pve-meta-core (Rust): document model, YAML/TOML/JSON formats,   │
- │  merge-patch engine, atomic file store, snapshot/clone/destroy   │
- └──────┼───────────────────────────────────────────────────────────┘
-        │  reads/writes
-        ▼
- /etc/pve/meta/<vmid>.<ext>            (pmxcfs — replicated, no node affinity)
- /etc/pve/meta/datacenter.<ext>
- /etc/pve/meta/<vmid>.<snapname>.<ext>
-
- also driving pve-meta-core, independently of the API above:
-   • pve-meta-lifecycle-patch — dpkg-divert patches into pve-container / qemu-server /
-     libpve-guest-common-perl / vzdump, calling PVE::RS::Meta on snapshot, rollback,
-     delsnap, clone, destroy and backup export/import
-```
-
-Everything below the ExtJS layer is a thin Perl shim over Rust: `PVE::API2::Meta`'s
-methods are one or two lines each, calling into `PVE::RS::Meta::api_*` functions
-(`crates/pve-meta-perl`) that wrap `pve-meta-core` — one document model, one patch
-engine, one set of format writers, backing both the native API and the lifecycle
-hooks.
-
-## The document format
-
-Every document — one per guest (`vmid`) plus one for the datacenter — is a nested
-map of strings, numbers, booleans, arrays and maps: the plain JSON data model, with
-two rules layered on top:
-
-* **Ordered maps, no nulls.** Key insertion order is part of the document and
-  survives every write; new keys append. Absent means unset — there is no `null`.
-* **Comment keys.** A key ending in `__` documents its sibling; a bare `__`
-  documents the containing map. They are plain data (not real file comments), so
-  they survive every format and every client, and are stripped from API reads
-  unless `?comments=1` is passed.
-
-Format is a per-file choice, selected by the file extension (`.yaml`/`.toml`/`.json`
-under `/etc/pve/meta/`); **YAML is the default**. Write fidelity differs per format:
-TOML keeps real comments and formatting via `toml_edit` (minimal-diff edits, like
-`cargo` does to `Cargo.toml`); YAML and JSON are canonical dumps — order and comment
-keys survive, but real `#`/`//`-style file comments and original quoting do not.
+A document is the plain JSON data model — strings, numbers, booleans, arrays, maps —
+with two rules on top: **ordered maps, no nulls** (key insertion order is part of the
+document; absent means unset), and **comment keys** (a key ending in `__` documents its
+sibling, a bare `__` documents the containing map; comment keys are ordinary data and
+are stripped from API reads unless `comments=1` is passed).
 
 Example `/etc/pve/meta/105.yaml`:
 
@@ -95,203 +25,175 @@ backup:
   retention: 7
 ```
 
-Any top-level key is its own namespace; the UI renders each as its own collapsible
-panel.
+## Views and scopes
+
+A caller reads or writes the document through a **view**: a key-path prefix. A view of
+`backup` is the `backup` subtree, returned with the prefix stripped. Views are also the
+unit of access, via two grant paths:
+
+1. **PVE ACLs** (full access) — `VM.Audit`/`VM.Config.Options` on `/vms/<vmid>` for a
+   guest document, `Sys.Audit`/`Sys.Modify` on `/` for the datacenter document.
+2. **Scopes** (partial access) — entries in the datacenter document, keyed by authid:
+
+   ```yaml
+   scopes:
+     svc@pve!backup-agent:
+       - prefix: backup
+         mode: rw
+       - prefix: monitoring
+         mode: ro
+   ```
+
+Three rules govern scopes:
+
+* A scope grants that authid the listed prefix on **every** guest document (no
+  per-vmid scoping in this revision), without needing any VM privilege.
+* A scope never restricts a principal who already has full access through ACLs.
+* Only a principal with `Sys.Modify` on `/` may edit `scopes` itself.
+
+Reading a view `P` requires read on `P` (an ACL, or a scope whose prefix is a prefix of
+`P`); writing requires write on every path the write touches. A non-existent document
+is an empty document with digest `""` — there is no explicit create.
+
+## API
+
+Native, `/api2/json/meta`, served by pveproxy/pvedaemon. Reads run in pveproxy, writes
+are `protected` and run in pvedaemon.
+
+| Method | Path | Params | Returns |
+|---|---|---|---|
+| GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller] }]` — every guest in the vmlist, `digest: ""` when no document |
+| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ vmid, view, digest, data }` or `{ vmid, view, digest, text }` |
+| PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
+| DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
+| GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
+| GET | `/meta/access` | — | the caller's effective grants: `{ full: [vmids or "*"], scopes: [{prefix, mode}] }` (what the UI's "View as" offers) |
+| GET | `/meta/version` | — | `{ token }` — content hash over the store; poll it |
+
+`perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust core through the
+perlmod bindings (`PVE::RS::Meta`): view extraction, prefix stripping, merge/replace,
+touched-path computation, YAML/JSON rendering and digesting all happen in Rust.
+
+## The editor
+
+A **Metadata** tab appears on every LXC/QEMU guest's config panel and on the
+Datacenter panel, and the same page is reachable standalone, same origin as the PVE UI:
+
+```
+https://<node>:8006/pve2/js/pve-meta-ui/index.html?vmid=105&theme=light
+https://<node>:8006/pve2/js/pve-meta-ui/index.html?dc=1&theme=light
+```
+
+The page: a header line with the document's identity, a **View as** dropdown (the
+prefixes the caller may see, plus "whole document"), Reload/Apply/Discard, and a
+full-height Monaco editor in YAML mode. Editing is enabled only when the caller may
+write the selected view. Apply shows a diff confirmation dialog, then sends the write
+with the last-seen digest; a 409 (changed on the server since) shows a conflict notice
+with Reload. That toolbar and the editor are the whole page.
+
+## Lifecycle
+
+Metadata is part of the guest: snapshot, rollback, delete-snapshot, clone, destroy and
+container backup/restore all carry it, through one-line calls to `PVE::RS::Meta`
+inserted into pve-container, qemu-server, libpve-guest-common and vzdump. QEMU VMs with
+at least one disk are the one gap — both backup paths for those go through QEMU's own
+QMP `backup` command, whose fixed parameter set can't carry a third blob, so a
+disk-having VM's metadata is not included in its vzdump/PBS backup (see
+`docs/LIFECYCLE-PATCHES.md` §4).
+
+## How it plugs into PVE
+
+Everything that touches pve-manager or the PVE UI goes through `pve-ext`'s three
+generic seams, so pve-meta itself patches nothing directly:
+
+* **API modules.** One line in `PVE/API2.pm` loads `PVE::API2::Ext`, which scans
+  `/usr/share/perl5/PVE/API2/Ext/*.pm` at startup and mounts each module at the path it
+  declares — `perl/PVE/API2/Ext/Meta.pm` ends up at `/api2/json/meta`.
+* **UI pages.** One `<script>` line in `index.html.tpl` loads `pve-ext-loader.js`, which
+  fetches `GET /api2/json/ext/pages` and adds one tab per manifest (`pages/pve-meta.json`)
+  to its declared targets as a same-origin iframe.
+* **Managed patches.** `pve-ext-patch` applies, verifies, removes and reports a set of
+  dpkg-diverted file patches described by TOML manifests; pve-meta ships one
+  (`patches/lifecycle.toml`) for the seven guest-lifecycle files.
+
+pve-meta depends on pve-ext; the lifecycle patch is pve-meta's own manifest.
 
 ## Install
 
 There is no published apt repository yet — `docs/DISTRIBUTION.md` documents the
-full pipeline (a static, GPG-signed repo on Cloudflare R2), but no signing key has
-been published. Once it is:
+pipeline (a static, GPG-signed repo on Cloudflare R2), but no key has been published.
+Until then, `make deb` builds all three `.deb`s (see "Building" below); install in
+dependency order:
 
 ```sh
-# placeholder — see docs/DISTRIBUTION.md for the real script/URL once published
-curl -fsSL https://apt.<domain>/scripts/apt-repo/client-setup.sh | bash -s -- --url https://apt.<domain>
-apt update
-apt install pve-meta
-```
-
-Until then, build the two `.deb`s yourself (see "Building" below) and install them
-directly:
-
-```sh
+dpkg -i pve-ext_*.deb
 dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
 ```
 
-`pve-meta` depends on `pve-manager (>= 9.0)` and `libpve-meta-rs-perl`
-(`debian/control`). Installing/configuring it runs `postinst`, which:
-
-1. Runs `pve-meta-patch apply` — diverts `pve-manager`'s `index.html.tpl` and
-   `pvemanagerlib.js` (via `dpkg-divert`), re-renders them with the "Metadata" tab
-   loader script inserted, installs the loader at
-   `/usr/share/pve-manager/js/pve-meta-loader.js`.
-2. Runs `pve-meta-lifecycle-patch apply` — diverts the eight Perl files that need a
-   `PVE::RS::Meta` call site or the `PVE::API2::Meta` registration
-   (`PVE/AbstractConfig.pm`, `PVE/API2/{LXC,Qemu}.pm`, `PVE/LXC/Create.pm`,
-   `PVE/VZDump/{LXC,QemuServer}.pm`, and `PVE/API2.pm` itself), applies the
-   corresponding `pve-manager-patches/lifecycle/*.diff` with `patch -p1`, gates
-   installation on `perl -c` reporting `syntax OK`.
-3. Restarts `pvedaemon` and `pveproxy` so the patched files (and the newly
-   registered `PVE::API2::Meta` module) are picked up.
-
-Both patch steps are **best-effort per file** and never fail the package
-install/configure — a mismatched anchor on some future point release degrades to a
-warning, not a broken `apt upgrade`. `interest-noawait` dpkg triggers
-(`debian/pve-meta.triggers`) re-run both tools automatically whenever `pve-manager`,
-`pve-container`, `qemu-server` or `libpve-guest-common-perl` reship any of the
-patched files, so the patches survive their upgrades too.
-
-Check what's actually applied:
-
-```sh
-pve-meta-patch status              # web UI tab injection: diverted? patched? loader present?
-pve-meta-lifecycle-patch status    # all 7 lifecycle files: diverted? patched? in sync with the shipped diff?
-pve-meta-lifecycle-patch verify    # dry-run every diff without changing anything
-```
+Installing/configuring `pve-meta` runs its `postinst`, which runs
+`pve-ext-patch apply pve-meta-lifecycle` (dpkg-diverts the seven lifecycle files,
+applies the corresponding diffs, gates on `perl -c` reporting `syntax OK`) and restarts
+`pvedaemon`/`pveproxy`. The API module and the UI tab need no action — pve-ext
+discovers the API module at process startup and re-reads the page manifest on every
+`/ext/pages` request; `pve-ext`'s own `postinst` applies the two-file manifest that
+those two seams depend on. Both patch steps are best-effort per file and never fail
+install/configure; triggers re-run them whenever `pve-manager`, `pve-container`,
+`qemu-server` or `libpve-guest-common-perl` reship a patched file. Check what's applied with `pve-ext-patch status`.
 
 ### Uninstall
 
-`dpkg -r pve-meta` (or `apt remove pve-meta`) runs `prerm`, which calls
-`pve-meta-patch remove` and `pve-meta-lifecycle-patch remove` **before** the
-package's own files are deleted — each restores the pristine file via
-`dpkg-divert --remove --rename` (falling back to `cp -a` from the diverted backup if
-`dpkg-divert` itself fails), so the host is left byte-for-byte at stock `pve-manager`
-Perl/JS/HTML. `/etc/pve/meta/*` documents themselves are left untouched by
-uninstalling the package — they are guest data, not package state.
-
-## Usage
-
-### `pvesh` / curl, against the native API
-
-Because `PVE::API2::Meta` is a regular PVE API module, `pvesh` works against it like
-any other tree:
-
-```sh
-pvesh get /meta/version
-pvesh get /meta/guests/105
-pvesh set /meta/guests/105 -patch '{"backup":{"schedule":"03:00"}}'
-```
-
-Or with a PVE API token over HTTPS on port 8006 (`pveum user token add ...`):
-
-```sh
-curl -sk \
-  -H "Authorization: PVEAPIToken=root@pam!meta=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
-  https://pve1:8006/api2/json/meta/guests/105
-
-curl -sk -X PUT \
-  -H "Authorization: PVEAPIToken=root@pam!meta=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" \
-  --data-urlencode 'patch={"backup":{"retention":7}}' \
-  https://pve1:8006/api2/json/meta/guests/105
-```
-
-`patch` (and any other object-valued parameter) is passed as a JSON-encoded string,
-same as every other PVE API endpoint that takes structured input. See
-`docs/API.md` for the full endpoint table.
-
-### UI
-
-A **Metadata** tab appears on every LXC/QEMU guest's config panel and on the
-Datacenter panel — form view first (one collapsible panel per namespace, schema-
-driven fields where a schema is registered), source view second (raw YAML/TOML/JSON
-with convert/verify/diff-before-apply). It's also reachable standalone, same origin
-as the PVE UI, no separate login:
-
-```
-https://<node>:8006/pve2/js/pve-meta-ui/index.html?vmid=105&theme=light
-https://<node>:8006/pve2/js/pve-meta-ui/index.html?dc=1
-```
+`dpkg -r pve-meta` runs `prerm`, which calls `pve-ext-patch remove pve-meta-lifecycle`
+**before** the package's own files are deleted, restoring every pristine file via
+`dpkg-divert --remove --rename`. `/etc/pve/meta/*` documents are left untouched —
+they're guest data, not package state.
 
 ## Permissions
 
-The native module enforces ordinary PVE object permissions — there is no separate
-account/ACL system of its own:
+The native module enforces ordinary PVE object permissions; there is no separate
+account system of its own:
 
 | Scope | Read | Write |
 |---|---|---|
-| A guest's document (`/meta/guests/{vmid}`, `.../subtree`, `.../snapshots`) | `VM.Audit` on `/vms/{vmid}` | `VM.Config.Options` on `/vms/{vmid}` (`clone` additionally needs `VM.Clone`) |
-| Datacenter document, registry, inventory | `Sys.Audit` on `/` | `Sys.Modify` on `/` |
+| A guest's document | `VM.Audit` on `/vms/<vmid>` | `VM.Config.Options` on `/vms/<vmid>` |
+| Datacenter document | `Sys.Audit` on `/` | `Sys.Modify` on `/` |
 
-Identity is a PVE API token or a browser ticket — `pveum` issues and revokes both;
-`pve-meta` has no accounts of its own.
-
-## Known limitations
-
-* **QEMU VMs with at least one disk cannot carry the metadata blob inside a
-  vzdump/PBS backup.** Both the PBS and VMA backup paths for a disk-having VM go
-  through QEMU's own QMP `backup` command, whose fixed parameter set
-  (`config-file`/`firewall-file`) is compiled into `pve-qemu-kvm` and can't be
-  extended by a Perl-only patch. Container backups (PBS and local) are unaffected —
-  `pct`/vzdump's LXC path never touches QMP and accepts an arbitrary list of named
-  blobs — and diskless VMs and third-party backup-provider plugins that implement
-  the new optional `archive_get_meta_config` method also carry metadata through.
-  See `docs/LIFECYCLE-PATCHES.md` §4 for the full code-path analysis and the
-  considered (and rejected) workarounds.
-* **The ExtJS "Metadata" tab injection is only as durable as the PVE releases it was
-  tested against.** It works by patching a live prototype method
-  (`PVE.panel.Config.prototype.initComponent`) and matching literal ExtJS class
-  names — robust to code motion inside those files, not to a future rename.
-  `ceilings.toml` records the last version of `pve-manager`/`pve-container`/
-  `qemu-server`/`libpve-guest-common-perl` this was verified against; a scheduled CI
-  job (`.github/workflows/watch-pve.yml`, `scripts/watch-pve/check.sh`) dry-runs
-  every patch against each new upstream release and opens a PR (bump the ceiling) or
-  an issue (patch needs attention) — this is advisory, not a dependency pin, so
-  `apt dist-upgrade` is never blocked by it.
-* **No claims/authorization enforcement yet.** The native API enforces normal PVE
-  object permissions (above), but nothing yet stops an authorized writer from
-  touching a namespace another client claims — the "trusted-lab" framing from
-  `docs/VISION.typ`. Every write's touched-path set is already computed and returned
-  in the response, which is the seam claims enforcement slots into later.
-* **YAML and JSON writes are canonical dumps, not format-preserving edits.** Order
-  and comment keys (`key__`) survive every write in every format; real `#`-style
-  file comments and original quoting/whitespace survive only in TOML (via
-  `toml_edit`). Hand-edit a YAML/JSON file in `/etc/pve/meta/` and the next API
-  write will re-dump it canonically.
+A scope (above) additionally grants a prefix, read-only or read-write, on every guest
+document to a principal with no VM privilege at all; only `Sys.Modify` on `/` may edit
+`scopes`.
 
 ## Building
 
-Build host: Debian 13 (trixie), a [rustup](https://rustup.rs/) toolchain under
-`~/.cargo/bin` (not the distro `cargo`/`rustc` packages — `debian/control`
-deliberately excludes them from `Build-Depends`), `libperl-dev` for the perlmod
-crate, and, for the UI, `trunk`/`grass`/`wasm-opt` (the wasm toolchain doesn't build
-on macOS at all — only `pve-meta-core` compiles there; develop the rest on the Linux
-build host and `rsync` over).
-
-```sh
-make build          # builds crates/pve-meta-perl (the libpve-meta-rs-perl cdylib)
-make ui             # trunk build in ui/ (falls back to a placeholder page if trunk is missing)
-make deb            # == dpkg-buildpackage -b -us -uc -d
-```
-
-`make deb` produces two binary packages from one source package (see
-`debian/control`): `../pve-meta_<version>_<arch>.deb` and
-`../libpve-meta-rs-perl_<version>_<arch>.deb`. See `docs/BUILD.md` for the exact
-rsync/ssh incantation for the Linux build host.
+Build host: Debian 13 (trixie) with a [rustup](https://rustup.rs/) toolchain under
+`~/.cargo/bin` (not the distro `cargo`/`rustc` packages), `libperl-dev` for the perlmod
+crate, and, for the UI, `trunk`/`grass`/`wasm-opt` (only `pve-meta-core` builds on macOS
+— develop the rest on Linux and `rsync` over). `make build` builds `crates/pve-meta-perl`,
+`make ui` runs `trunk build` in `ui/`, and `make deb` builds `pve-ext` (its own source
+package) plus `pve-meta` and `libpve-meta-rs-perl`, dropping all three `.deb`s next to
+each other in the parent directory. See `docs/BUILD.md` for the exact rsync/ssh
+incantation and the safe way to replace the installed `.so` on a live node.
 
 ## Repo layout
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, YAML/TOML/JSON formats, merge-patch engine, file store — pure Rust, builds on macOS and Linux |
-| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings exposing lifecycle hooks and the `api_*` functions to Perl |
-| `perl/PVE/API2/Meta.pm` | The native `PVE::API2::Meta` REST module, thin over `PVE::RS::Meta` |
-| `ui/` | The Yew/`pwt`/wasm editor SPA (Form + Source views), served by pveproxy from `/pve2/js/pve-meta-ui/` |
-| `pve-manager-patch/` | `pve-meta-patch` — injects the "Metadata" tab into the PVE web UI |
-| `pve-manager-patches/lifecycle/` | The eight Perl diffs + `pve-meta-lifecycle-patch`, wiring snapshot/clone/destroy/backup hooks and registering `PVE::API2::Meta` |
-| `debian/` | The `pve-meta` source package: `control`, `rules`, triggers, `postinst`/`prerm`/`postrm` |
-| `docs/` | `API.md`, `NATIVE-API-SPEC.md`, `UI-SPEC.md`, `PERL-BINDINGS-SPEC.md`, `LIFECYCLE-PATCHES.md`, `BUILD.md`, `DISTRIBUTION.md` |
-| `scripts/apt-repo/` | Static signed-apt-repo build/publish scripts (Cloudflare R2) |
+| `crates/pve-meta-core` | Document model, YAML/TOML/JSON formats, merge-patch engine, file store — pure Rust |
+| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks and the `api_*` functions |
+| `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
+| `ui/` | The editor page (pwt + Monaco, compiled to wasm) |
+| `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
+| `patches/lifecycle/` | The seven guest-lifecycle Perl diffs + `lifecycle.toml` manifest |
+| `pages/pve-meta.json` | The "Metadata" tab's page manifest |
+| `debian/` | The `pve-meta` source package: `control`, triggers, `preinst`/`postinst`/`prerm`/`postrm` |
+| `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `PERL-BINDINGS-SPEC.md` |
+| `scripts/apt-repo/` | Signed apt repo build/publish scripts (Cloudflare R2) |
 | `scripts/watch-pve/` | The ceiling-watcher CI job |
 | `ceilings.toml` | Tested-ceiling versions for the four patched upstream packages |
-| `Makefile`, `Cargo.toml` | Top-level build orchestration and Rust workspace |
 
 ## License
 
-AGPL-3.0-or-later (see `debian/copyright`; every crate in the workspace inherits
-`license.workspace = true` from the root `Cargo.toml`).
+AGPL-3.0-or-later (see `debian/copyright`; every crate inherits `license.workspace =
+true` from the root `Cargo.toml`).
 
 ---
 
-Built largely with [Claude Code](https://claude.com/claude-code), in a
-pair-programming style — architecture and review by a human, most of the
-implementation, testing and documentation drafted by Claude across many sessions.
+Built with [Claude Code](https://claude.com/claude-code).
