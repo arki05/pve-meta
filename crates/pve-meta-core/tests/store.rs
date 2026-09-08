@@ -358,6 +358,33 @@ fn write_atomic_leaves_no_temp_files_behind() {
 }
 
 #[test]
+fn version_lists_documents_with_their_digests_and_never_snapshots() {
+    let (_dir, store) = store();
+    assert!(store.version().unwrap().documents.is_empty());
+
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(DocId::Datacenter, "b: 2\n", None).unwrap();
+    // A snapshot copy moves the token but is not a document: nothing addresses
+    // it through the API, so a caller diffing the list has nothing to do about it.
+    store.snapshot(100, "before").unwrap();
+
+    let v = store.version().unwrap();
+    let ids: Vec<DocId> = v.documents.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![DocId::Guest(100), DocId::Datacenter]);
+
+    // Each digest is that document's own, matching what a read reports.
+    for (id, digest) in &v.documents {
+        assert_eq!(*digest, store.read(*id).unwrap().digest);
+    }
+
+    let before = v.token.clone();
+    store.snapshot(100, "second").unwrap();
+    let after = store.version().unwrap();
+    assert_ne!(before, after.token, "a snapshot still moves the token");
+    assert_eq!(after.documents.len(), 2, "... but adds no document");
+}
+
+#[test]
 fn version_token_changes_on_write_not_on_read() {
     let (_dir, store) = store();
     let v0 = store.version().unwrap();

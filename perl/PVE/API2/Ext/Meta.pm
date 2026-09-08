@@ -320,20 +320,44 @@ __PACKAGE__->register_method({
     path => 'version',
     method => 'GET',
     permissions => { user => 'all' },
-    description => "The store's current change-version token. Cheap; poll it every few seconds.",
+    description => "The store's current change-version token. Cheap; poll it every few "
+        . "seconds. With 'detail', also every document's own digest, so a caller that saw "
+        . "the token move can tell which documents to re-read instead of re-listing the "
+        . "store. Digests are not filtered per caller (docs/DESIGN.md §1).",
     parameters => {
         additionalProperties => 0,
-        properties => {},
+        properties => {
+            detail => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "Also return each document's digest.",
+            },
+        },
     },
     returns => {
         type => 'object',
         properties => {
             token => { type => 'string', description => "Changes whenever any document's content changes." },
             changed => { type => 'integer', description => "Newest document mtime, as a unix timestamp." },
+            documents => {
+                type => 'array',
+                optional => 1,
+                description => "With 'detail': [{ id, digest }] for every document, sorted by id. "
+                    . "Snapshot copies are not documents and are not listed, though they do move 'token'.",
+                items => {
+                    type => 'object',
+                    properties => {
+                        id => { type => 'string', description => "A vmid, or 'datacenter'." },
+                        digest => { type => 'string' },
+                    },
+                },
+            },
         },
     },
     code => sub {
-        return _call(\&PVE::RS::Meta::api_version);
+        my ($param) = @_;
+        return _call(\&PVE::RS::Meta::api_version, $param->{detail} ? 1 : 0);
     },
 });
 

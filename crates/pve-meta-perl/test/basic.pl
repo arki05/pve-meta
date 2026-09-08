@@ -219,9 +219,18 @@ for my $case (
 # api_* : reads and writes
 # =========================================================================
 
-my $v = PVE::RS::Meta::api_version();
-like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token looks like a sha256 hex digest');
-ok($v->{changed} > 0, 'api_version changed is a unix timestamp');
+my $v = PVE::RS::Meta::api_version(0);
+like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
+ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
+ok(!defined($v->{documents}), 'no `documents` without detail');
+
+my $vd = PVE::RS::Meta::api_version(1);
+is($vd->{token}, $v->{token}, 'detail does not change the token');
+ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
+ok((grep { $_->{id} eq 'datacenter' } @{ $vd->{documents} }),
+    'the datacenter document is listed by id');
+ok((!grep { $_->{id} =~ /\./ } @{ $vd->{documents} }),
+    'snapshot copies are not listed as documents');
 
 # A missing document is the empty document with digest "".
 my $missing = PVE::RS::Meta::api_get('9101', undef, 'json', $FULL);
@@ -602,7 +611,7 @@ my ($listed_big) = grep { $_->{vmid} == 9504 }
     @{ PVE::RS::Meta::api_list_guests('root@pam', [guest_row(9504, read => 1)], undef) };
 ok(defined($listed_big), 'one oversized document does not take the listing down');
 isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
-ok(defined(PVE::RS::Meta::api_version()->{token}), '... nor the version poll');
+ok(defined(PVE::RS::Meta::api_version(0)->{token}), '... nor the version poll');
 
 $res = eval { PVE::RS::Meta::api_put('9504', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
 ok(!defined($res), 'a view write against an oversized document is refused');
@@ -617,10 +626,10 @@ PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
 # is skipped: `version()`'s token does not move for it, so `changed` must not
 # either.
 write_file('9506.yaml', "traefik:\n  spec:\n    host: x\n");
-my $noop_before = PVE::RS::Meta::api_version();
+my $noop_before = PVE::RS::Meta::api_version(0);
 my $noop = PVE::RS::Meta::api_put('9506', 'traefik.spec', 'json', '{}', 'merge', undef, 0, $FULL);
 is_deeply($noop->{touched}, [], 'a no-op merge touches nothing');
-is_deeply(PVE::RS::Meta::api_version(), $noop_before, '... and moves neither token nor changed');
+is_deeply(PVE::RS::Meta::api_version(0), $noop_before, '... and moves neither token nor changed');
 is(read_file('9506.yaml'), "traefik:\n  spec:\n    host: x\n", '... and rewrites nothing');
 unlink("$root/9506.yaml");
 

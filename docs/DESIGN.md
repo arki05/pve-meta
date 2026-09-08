@@ -112,7 +112,7 @@ Grants for a caller on a guest document:
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store; poll it |
+| GET | `/meta/version` | `detail` | `{ token, changed }` — content hash over the store; poll it. With `detail`, also `documents: [{ id, digest }]` (sorted) so a caller that saw the token move knows which documents to re-read instead of re-listing. Snapshot copies move `token` but are not documents and are not listed. Digests are unfiltered (§1). |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags: [..], digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |

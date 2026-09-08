@@ -162,6 +162,14 @@ pub struct StoreVersion {
     pub token: String,
     /// The most recent modification time observed among the store's files.
     pub changed: SystemTime,
+    /// Every **document** in the store with its own digest, sorted by id — the
+    /// per-document half of the same walk the token is hashed from.
+    ///
+    /// Snapshot copies are deliberately absent: they are not addressable through
+    /// the API, so a caller diffing this list has nothing to do about one. They
+    /// still move [`Self::token`], which is the honest answer — something in the
+    /// store changed, just nothing this caller can read.
+    pub documents: Vec<(DocId, String)>,
 }
 
 /// What [`MetaStore::rollback`] actually did.
@@ -720,6 +728,7 @@ impl MetaStore {
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
+        let mut documents: Vec<(DocId, String)> = Vec::new();
         let mut latest: Option<SystemTime> = None;
         if self.root.is_dir() {
             for entry in fs::read_dir(&self.root)? {
@@ -738,6 +747,9 @@ impl MetaStore {
                 let Some(dig) = identify(&entry.path())? else {
                     continue;
                 };
+                if let Some(id) = document_id(&name) {
+                    documents.push((id, dig.clone()));
+                }
                 entries.push((name, dig));
                 latest = Some(match latest {
                     Some(t) if t >= mtime => t,
@@ -753,11 +765,26 @@ impl MetaStore {
             hasher.update(dig.as_bytes());
         }
         let token = hex::encode(hasher.finalize());
+        documents.sort();
         Ok(StoreVersion {
             token,
             changed: latest.unwrap_or(SystemTime::UNIX_EPOCH),
+            documents,
         })
     }
+}
+
+/// The [`DocId`] a store file name addresses, or `None` when it addresses no
+/// document: a snapshot copy (`<vmid>.<snapname>.yaml`), a temp file, or
+/// anything else that happens to be in the directory.
+fn document_id(name: &str) -> Option<DocId> {
+    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
+    if stem == "datacenter" {
+        return Some(DocId::Datacenter);
+    }
+    // `<vmid>.<snapname>.yaml` also ends with the suffix; its stem is not a
+    // bare number, which is exactly what tells the two apart.
+    stem.parse::<u32>().ok().map(DocId::Guest)
 }
 
 /// A filesystem-safe tag identifying this node, for temp file names. Falls

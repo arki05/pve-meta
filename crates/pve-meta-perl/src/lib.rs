@@ -214,10 +214,11 @@ mod pve_rs_meta {
     // addressed and `tags` are the guest's PVE tags, which resolve the
     // registrations' selectors. Rust computes the caller's scopes from it.
 
-    /// `GET /meta/version` -> `{ token, changed }`.
+    /// `GET /meta/version` -> `{ token, changed }`, plus `documents`
+    /// (`[{ id, digest }]`, sorted) when `$detail` is true.
     #[export]
-    pub fn api_version() -> Result<api::ApiVersion, Error> {
-        api::version(&open_store())
+    pub fn api_version(detail: bool) -> Result<api::ApiVersion, Error> {
+        api::version(&open_store(), detail)
     }
 
     /// `GET /meta/operators` -> every registration, as native hashes.

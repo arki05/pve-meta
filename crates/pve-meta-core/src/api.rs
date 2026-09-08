@@ -306,6 +306,24 @@ pub struct ApiVersion {
     pub token: String,
     /// The newest document mtime, as a unix timestamp.
     pub changed: u64,
+    /// With `detail`: every document's own digest, sorted by id, so a caller
+    /// that saw the token move can tell **which** documents to re-read instead
+    /// of re-listing the store.
+    ///
+    /// Unfiltered by design. A digest is not sensitive (`docs/DESIGN.md` §1
+    /// puts digests and listings out of scope), and filtering would cost a
+    /// grant computation per document on the one endpoint whose whole purpose
+    /// is to be cheap enough to poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<ApiDocumentDigest>>,
+}
+
+/// One row of `GET /meta/version?detail=1`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiDocumentDigest {
+    /// A vmid, or `"datacenter"`.
+    pub id: String,
+    pub digest: String,
 }
 
 /// One row of `GET /meta/guests` (`docs/DESIGN.md` §5).
@@ -396,11 +414,20 @@ pub struct GuestInput {
 }
 
 /// `api_version()` -> `{ token, changed }`.
-pub fn version(store: &MetaStore) -> Result<ApiVersion, anyhow::Error> {
+pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Error> {
     let v = store.version().map_err(api_err)?;
     Ok(ApiVersion {
         token: v.token,
         changed: unix_secs(v.changed),
+        documents: detail.then(|| {
+            v.documents
+                .into_iter()
+                .map(|(id, digest)| ApiDocumentDigest {
+                    id: id_str(id),
+                    digest,
+                })
+                .collect()
+        }),
     })
 }
 
@@ -1001,7 +1028,25 @@ mod tests {
     // -- grants from registrations ----------------------------------------
 
     #[test]
-    fn a_selector_resolves_against_the_guests_tags() {
+fn version_detail_names_the_documents_that_changed() {
+        let (_dir, store) = store();
+        store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+        store.put_raw(DocId::Datacenter, "b: 2\n", None).unwrap();
+
+        // Without `detail` the shape is unchanged: no `documents` on the wire.
+        let plain = version(&store, false).unwrap();
+        assert!(plain.documents.is_none());
+
+        let detailed = version(&store, true).unwrap();
+        let docs = detailed.documents.expect("detail asked for");
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["100", "datacenter"]);
+        assert_eq!(docs[0].digest, store.read(DocId::Guest(100)).unwrap().digest);
+        assert_eq!(detailed.token, plain.token, "detail does not change the token");
+    }
+
+    #[test]
+        fn a_selector_resolves_against_the_guests_tags() {
         // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
         // granting the operator that guest.
         let regs = regs();
@@ -1681,7 +1726,8 @@ mod tests {
         assert_eq!(listed[0].digest, "");
 
         // The version poll skips it rather than failing.
-        assert!(version(&store).is_ok());
+        assert!(version(&store, false).is_ok());
+        assert!(version(&store, true).is_ok());
 
         // A DELETE of a document another caller already removed is that
         // caller's request satisfied.
