@@ -62,7 +62,7 @@ are `protected` and run in pvedaemon.
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller] }]` — every guest in the vmlist, `digest: ""` when no document |
+| GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller], orphan }]` — every guest in the vmlist the caller can read something of, `digest: ""` when no document; `node`/`name` only with `VM.Audit`; documents whose vmid is no longer in the vmlist are listed with `orphan: 1` (and `node`/`type`/`name` null) for callers with datacenter read |
 | GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object |
 | PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 when the write touches a path outside the caller's write grants (including the view itself, and any write to `scopes` for a scope-granted principal — see "Permissions"), 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
