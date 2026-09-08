@@ -7,13 +7,13 @@ Yew or the store.
 
 | Script | What it asserts |
 |---|---|
-| `meta-ui-lib.js` | Shared helpers: ticket, raw API calls, `rows()`, `clickRow`, `clickButton`, `setField`/`pickCombo` (pwt fields carry no DOM `name`; they are found by their `aria-labelledby` label), Monaco readers. |
-| `meta-ui-tree-check.js` | Rendering: alphabetical rows, nesting, comment keys as descriptions, arrays as one leaf, the Owner column, and the toolbar's per-row enablement. |
+| `meta-ui-lib.js` | Shared helpers: ticket, raw API calls, `rows()` (four columns, with each row's pixel height), `hoverTip()` (pwt's 1 s dwell), `clickRow`, `clickButton`, `setField`/`pickCombo` (pwt fields carry no DOM `name`; they are found by their `aria-labelledby` label), Monaco readers. |
+| `meta-ui-tree-check.js` | Rendering: alphabetical rows, nesting, the Description column, arrays as one leaf, one-line rows of a uniform height, the Access column and its tooltip, no per-row action controls, Enter opening the row editor, and the toolbar's per-row enablement. |
 | `meta-ui-write-check.js` | Edit a scalar and its description, Add (typed), Remove — each verified against the API, including the shape of the `PUT`/`DELETE`. |
-| `meta-ui-grammar-check.js` | Declared-but-unset rows: greyed, with default, description, owner and the "set" action that writes them. Skips itself when no registration on the cluster carries a grammar. |
-| `meta-ui-text-check.js` | "Edit as text": the subtree it edits, the YAML/JSON toggle, the Monaco diff confirmation, and the `text` replace it applies. |
+| `meta-ui-grammar-check.js` | Declared-but-unset rows: greyed, with their default and Access, the declared description as the Description column's *tooltip* and not its text, and the toolbar's Edit setting them. Skips itself when no registration on the cluster carries a grammar. |
+| `meta-ui-text-check.js` | "Edit selection as text" (needs a selection, edits that subtree) and the `Tree \| Text` body toggle: the YAML/JSON toggle, Apply/Discard, the ask-before-leaving-dirty dialog, the Monaco diff confirmation, and the subtree and root `text` replaces they apply. |
 | `meta-ui-live-check.js` | The 5 s version poll refreshing the tree, the poll holding still while a dialog is open, a 409 reloading with a notice, and a scoped principal's per-row editability. |
-| `meta-ui-shots.js` | The screenshots in `../docs/screenshots/` (embedded in the PVE tab and standalone, light and dark, plus the dialogs). |
+| `meta-ui-shots.js` | The screenshots in `../docs/screenshots/`: the tree, the Text body, the selection dialog, the Access tooltip and the page embedded in the PVE tab, each in light and dark. |
 | `check-tab*.js` | The `pve-ext` tab injection itself, not this page. |
 
 Run from a directory that has `node_modules/puppeteer-core` (`/root/headless` on the build

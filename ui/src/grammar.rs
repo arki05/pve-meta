@@ -9,10 +9,10 @@
 //! `GET /meta/access`, `crate::model::Access`):
 //!
 //! * **Rows that ought to exist.** A grammar's `properties` name keys the operator expects;
-//!   the tree shows them greyed with their default and description even when the document
-//!   has never carried them, plus a "set" action.
-//! * **Owner.** The registration whose scope covers a row is the thing that put it there,
-//!   and the column says so — with the selector that made it apply to this guest.
+//!   the tree shows them greyed with their default even when the document has never carried
+//!   them, and the declared `description` is the Description column's tooltip.
+//! * **Access.** Every registration whose scope covers a row is listed in the Access column
+//!   — `rw` by name, `ro` muted — with the selector that made it apply to this guest.
 //!
 //! Pure module: unit-tested natively (`cargo test --lib`).
 
@@ -85,7 +85,8 @@ impl Selector {
         }
     }
 
-    /// A short human label for the owner column: `all`, `tag: traefik`, or nothing.
+    /// A short human label for the Access column's tooltip: `all`, `tag: traefik`, or
+    /// nothing.
     pub fn label(&self) -> Option<String> {
         if self.all.as_ref().is_some_and(flag_value) {
             return Some("all".to_string());

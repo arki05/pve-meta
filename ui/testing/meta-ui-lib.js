@@ -66,7 +66,8 @@ async function open(browser, host, t, query, operators) {
     return page;
 }
 
-// Every row of the tree as {key, value, owner, level, description, expanded}.
+// Every row of the tree as {key, value, description, access, ...}. Four one-line columns
+// since rev 5: Key, Value, Description, Access (`docs/DESIGN.md` section 8).
 const rows = (page) => page.evaluate(() => {
     const table = document.querySelector('.pwt-datatable, [role="grid"], table');
     if (!table) return [];
@@ -76,12 +77,12 @@ const rows = (page) => page.evaluate(() => {
             const cells = Array.from(r.querySelectorAll('[role="gridcell"], td'));
             const text = (i) => (cells[i] ? cells[i].innerText.replace(/\s+/g, ' ').trim() : '');
             const keyCell = cells[0];
-            const lines = keyCell ? keyCell.innerText.split('\n').map((s) => s.trim()).filter(Boolean) : [];
             return {
-                key: lines[0] || '',
-                description: lines.slice(1).join(' '),
+                key: text(0),
                 value: text(1),
-                owner: text(2),
+                description: text(2),
+                access: text(3),
+                height: Math.round(r.getBoundingClientRect().height),
                 selected: r.getAttribute('aria-selected') === 'true',
                 expanded: !!keyCell && !!keyCell.querySelector('.fa-caret-down'),
                 collapsed: !!keyCell && !!keyCell.querySelector('.fa-caret-right'),
@@ -89,6 +90,29 @@ const rows = (page) => page.evaluate(() => {
             };
         });
 });
+
+// Hover a row's Description (2) or Access (3) cell and read the pwt tooltip it opens.
+// pwt shows it after a 1 s dwell, so this waits that out rather than guessing.
+async function hoverTip(page, key, column) {
+    const box = await page.evaluate((key, column) => {
+        const row = Array.from(document.querySelectorAll('[role="row"]')).find((r) => {
+            const c = r.querySelector('[role="gridcell"], td');
+            return c && c.innerText.trim() === key;
+        });
+        if (!row) return null;
+        const cell = row.querySelectorAll('[role="gridcell"], td')[column];
+        if (!cell) return null;
+        const b = cell.getBoundingClientRect();
+        return { x: b.x + 20, y: b.y + b.height / 2 };
+    }, key, column);
+    if (!box) throw new Error('no cell ' + column + ' on a row keyed "' + key + '"');
+    await page.mouse.move(box.x, box.y);
+    await sleep(1600);
+    return page.evaluate(() => {
+        const tip = document.querySelector('.pwt-tooltip[data-show]');
+        return tip ? tip.innerText.replace(/\n+/g, '\n').trim() : null;
+    });
+}
 
 async function clickRow(page, key) {
     const ok = await page.evaluate((key) => {
@@ -104,6 +128,24 @@ async function clickRow(page, key) {
     }, key);
     if (!ok) throw new Error('no row with key "' + key + '"');
     await sleep(300);
+}
+
+// Select a row with a real pointer click, which also puts pwt's cell cursor on it — the
+// keyboard only reaches `on_row_keydown` through a focused cell, and a synthetic
+// `element.click()` never focuses anything.
+async function focusRow(page, key) {
+    const box = await page.evaluate((key) => {
+        const row = Array.from(document.querySelectorAll('[role="row"]')).find((r) => {
+            const c = r.querySelector('[role="gridcell"], td');
+            return c && c.innerText.trim() === key;
+        });
+        if (!row) return null;
+        const b = row.querySelector('[role="gridcell"], td').getBoundingClientRect();
+        return { x: b.x + Math.min(60, b.width / 2), y: b.y + b.height / 2 };
+    }, key);
+    if (!box) throw new Error('no row with key "' + key + '"');
+    await page.mouse.click(box.x, box.y);
+    await sleep(400);
 }
 
 // Plain DOM clicks throughout: a leftover popover would swallow a real mouse click and
@@ -200,7 +242,17 @@ const toolbarButtons = (page) => page.evaluate(() =>
     Array.from(document.querySelectorAll('.pwt-toolbar button, .pwt-toolbar .pwt-button')).map((b) => ({
         label: b.textContent.trim() || b.getAttribute('aria-label'),
         disabled: !!b.disabled || b.getAttribute('aria-disabled') === 'true',
+        pressed: b.getAttribute('aria-pressed') === 'true' || b.classList.contains('pressed'),
     })));
+
+// The muted label the toolbar shows only for a restricted caller.
+const restriction = (page) => page.evaluate(() => {
+    const bar = document.querySelector('.pwt-toolbar');
+    if (!bar) return null;
+    const span = Array.from(bar.querySelectorAll('span'))
+        .find((e) => /^(Read-only|Scoped write access)$/.test(e.textContent.trim()));
+    return span ? span.textContent.trim() : '';
+});
 
 // The text of the Monaco editor that is on screen (not the diff editor's models).
 const readEditor = (page) => page.evaluate(() => {
@@ -228,6 +280,6 @@ async function waitForTree(page, timeout) {
 }
 
 module.exports = {
-    sleep, ticket, api, doc, open, rows, clickRow, clickButton, modal, setField, pickCombo,
-    toolbarButtons, readEditor, editModel, url, waitForTree,
+    sleep, ticket, api, doc, open, rows, hoverTip, clickRow, focusRow, clickButton, modal, setField,
+    pickCombo, toolbarButtons, restriction, readEditor, editModel, url, waitForTree,
 };

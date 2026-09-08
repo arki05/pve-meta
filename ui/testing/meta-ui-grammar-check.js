@@ -1,6 +1,7 @@
 // Grammar-declared rows: the keys an operator registration declares are rows even when
-// the document has never carried them — greyed, with their default and description, an
-// Owner, and a "set" action that writes them.
+// the document has never carried them — greyed across every column, with their default,
+// the declared description as the Description column's tooltip, and an Access entry. They
+// are set through the toolbar's Edit like any other row; no action lives in a cell.
 //
 // Needs a registration with a grammar whose selector matches the guest (the lab ships
 // `example-traefik` for all guests and `traefik-demo` for `tag: traefik`).
@@ -63,21 +64,26 @@ const vmid = process.argv[3] || '200';
         const port = by('port');
         check('an unset row is greyed', !!port && port.dimmed);
         check('an unset row shows the grammar default',
-            !!port && port.value.startsWith(String(declaredDefault)),
+            !!port && port.value.includes(String(declaredDefault)),
             port && port.value + ' (declared ' + declaredDefault + ')');
         if (declaredDescription) {
-            // Two registrations may declare the same key; the row merges what they say, so
-            // a description from either one has to reach it.
-            check('an unset row shows the grammar description',
-                !!port && port.description === declaredDescription,
-                port && port.description);
+            // Section 8: the Description column is the comment key "if present, else
+            // nothing; the grammar description is the tooltip". Two registrations may
+            // declare the same key, so a description from either one has to reach it.
+            check('a grammar description is not written into the Description column',
+                !!port && port.description === '', port && port.description);
+            const tip = await L.hoverTip(page, 'port', 2);
+            check('it is the Description column\'s tooltip instead',
+                tip === declaredDescription, JSON.stringify(tip));
         } else {
             console.log('note: no grammar on this cluster describes traefik.spec.port');
         }
-        check('an unset row offers a "set" action', !!port && port.value.includes('Set'),
+        check('an unset row carries no action of its own', !!port && !port.value.includes('Set'),
             port && port.value);
-        check('a declared row is owned by the registration that declared it',
-            !!port && /\(.+\)/.test(port.owner), port && port.owner);
+        check('an unset row reads "not set" with its declared default',
+            !!port && port.value.startsWith('not set'), port && port.value);
+        check('a declared row names the registration that declared it',
+            !!port && port.access.length > 0, port && port.access);
         check('a set key keeps its own value', !!by('host') && by('host').value === 'ct200.example',
             by('host') && by('host').value);
         check('declared siblings sort alphabetically',
@@ -85,21 +91,14 @@ const vmid = process.argv[3] || '200';
             || rows.map((r) => r.key).join(',').includes('host,port'),
             rows.map((r) => r.key).join(','));
 
-        // --- the "set" action writes the row ---------------------------------
-        const clicked = await page.evaluate(() => {
-            const rows = Array.from(document.querySelectorAll('[role="row"]'));
-            const row = rows.find((r) => {
-                const c = r.querySelector('[role="gridcell"], td');
-                return c && c.innerText.split('\n')[0].trim() === 'port';
-            });
-            if (!row) return false;
-            const set = Array.from(row.querySelectorAll('a, [role="button"]'))
-                .find((e) => e.textContent.trim() === 'Set');
-            if (!set) return false;
-            set.click();
-            return true;
-        });
-        check('the "set" action is clickable', clicked);
+        // --- the toolbar sets the row ----------------------------------------
+        await L.clickRow(page, 'port');
+        const tb = await L.toolbarButtons(page);
+        check('Edit is offered for a declared row nobody has set yet',
+            !tb.find((b) => b.label === 'Edit').disabled);
+        check('Remove is not — there is nothing there to remove',
+            tb.find((b) => b.label === 'Remove').disabled);
+        await L.clickButton(page, 'Edit');
         await L.sleep(700);
 
         const dialog = await L.modal(page);

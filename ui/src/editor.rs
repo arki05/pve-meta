@@ -2,10 +2,16 @@
 //!
 //! One `LoadableComponent` (`docs/design/PDM-DESIGN-LANGUAGE.md` §2), structured exactly
 //! like `proxmox_yew_comp::PermissionPanel` — the stack's own `DataTable`-over-`TreeStore`
-//! page: `load()` fetches, `main_view()` is the table, `toolbar()` is the standard
+//! page: `load()` fetches, `main_view()` is the body, `toolbar()` is the standard
 //! three-class `Toolbar`, `dialog_view()` returns the modals. Everything else — the outer
 //! column, the load-error strip, dialog stacking, off-screen refresh suspension — comes
 //! from `LoadableComponentMaster`.
+//!
+//! The page is meant to read as a PVE panel from inside the PVE tab that hosts it, so the
+//! grid is deliberately plain and dense: four one-line columns (Key, Value, Description,
+//! Access), no per-row action icons, and every action in the toolbar acting on the
+//! selection — the shape of every ExtJS grid one tab away
+//! (`docs/design/comparison/ct200-extjs-*.jpg` is the fidelity reference).
 //!
 //! **Rows are edited in an `EditWindow`, not in the cell.** That is what the Proxmox stack
 //! does for every key/value grid it has: `proxmox_yew_comp::ObjectGrid` (the widget behind
@@ -17,8 +23,10 @@
 //! already has an answer. The dialog also has room for the row's *description*, which is a
 //! second key on the wire (the sibling comment key) and has nowhere to go in a cell.
 //!
-//! Monaco keeps exactly two jobs (§8): "Edit as text" for one subtree, and the diff that
-//! confirms applying it.
+//! Monaco has three jobs (§8): **Edit selection as text** for the selected subtree, the
+//! **Text** half of the body's `Tree | Text` toggle for the whole document, and the diff
+//! that confirms applying either one. The two buffers never coexist — the dialog is only
+//! reachable from the tree body — which is why one [`TextState`] accessor serves both.
 //!
 //! Two disciplines run through this file, both from `docs/REVIEW-2026-09-07.md`:
 //!
@@ -39,16 +47,18 @@ use web_sys::Element;
 use yew::html::IntoPropValue;
 use yew::virtual_dom::{Key, VComp, VNode};
 
-use pwt::css::{AlignItems, ColorScheme, FlexFit, FontStyle, JustifyContent};
+use pwt::css::{AlignItems, ColorScheme, FlexFit, JustifyContent};
 use pwt::prelude::*;
 use pwt::props::ExtractPrimaryKey;
 use pwt::state::{Selection, SlabTree, SlabTreeNodeMut, ThemeObserver, TreeStore};
 use pwt::widget::data_table::{
-    DataTable, DataTableCellRenderArgs, DataTableColumn, DataTableHeader, DataTableMouseEvent,
+    DataTable, DataTableCellRenderArgs, DataTableColumn, DataTableHeader, DataTableKeyboardEvent,
+    DataTableMouseEvent,
 };
 use pwt::widget::form::{Checkbox, Combobox, Field, FormContext, Number, TextArea};
 use pwt::widget::{
-    Button, Column, Container, Dialog, Fa, InputPanel, Row, SegmentedButton, Toolbar, error_message,
+    Button, Column, ConfirmDialog, Container, Dialog, Fa, InputPanel, Row, SegmentedButton,
+    Toolbar, Tooltip, error_message,
 };
 use pwt_macros::builder;
 
@@ -60,7 +70,7 @@ use proxmox_yew_comp::{
 use crate::api::{self, WriteResult};
 use crate::edit::{self, Write};
 use crate::grammar::Operator;
-use crate::model::{Access, DocId, GuestInfo};
+use crate::model::{Access, DocId, GuestInfo, Mode};
 use crate::monaco;
 use crate::request::{Channel, RequestId, RequestTracker};
 use crate::tree::{self, BuildContext, Node, Row as TreeRow, ValueKind};
@@ -70,8 +80,26 @@ use crate::tree::{self, BuildContext, Node, Row as TreeRow, ValueKind};
 /// a grant moved, none of which touch this document's own digest.
 const VERSION_POLL_MS: u32 = 5_000;
 
-/// Which text format the "Edit as text" dialog is showing. Presentation only (§8): the
-/// apply always sends `text`, and JSON is a subset of YAML.
+/// The muting the tree uses for a row the document does not carry: the ExtJS grid greys
+/// the *whole* declared-but-unset row, not only its value.
+const UNSET: &str = "pwt-opacity-50";
+
+/// The muted colour for secondary text — a `ro` registration, the header's tags, the
+/// "Read-only" label.
+const MUTED: &str = "pwt-color-on-neutral-alt";
+
+/// Which half of the panel body the `Tree | Text` toggle is showing (§8: it "swaps the
+/// panel body in place").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Body {
+    /// The `DataTable` over the document.
+    Tree,
+    /// A Monaco editor over the whole document, with Apply and Discard.
+    Text,
+}
+
+/// Which text format a Monaco buffer is showing. Presentation only (§8): the apply always
+/// sends `text`, and JSON is a subset of YAML.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextFormat {
     Yaml,
@@ -87,11 +115,11 @@ impl TextFormat {
     }
 }
 
-/// The "Edit as text" dialog's buffers.
+/// One Monaco buffer: the subtree it edits, and both renderings of it.
 ///
-/// Both renderings of the same subtree are kept, so the format toggle never has to throw
-/// away what was typed (there is no YAML parser in the page — the server renders YAML, the
-/// page renders JSON — so a toggle cannot convert one buffer into the other).
+/// Both renderings are kept, so the format toggle never has to throw away what was typed
+/// (there is no YAML parser in the page — the server renders YAML, the page renders JSON —
+/// so a toggle cannot convert one buffer into the other).
 struct TextState {
     /// The subtree being edited; empty is the whole document.
     path: String,
@@ -100,11 +128,39 @@ struct TextState {
     yaml_draft: Option<String>,
     json: String,
     json_draft: Option<String>,
-    /// Bumped whenever the text Monaco should show changes without the user typing it.
+    /// Bumped whenever the mounted editor should show something the user did not type.
     generation: u64,
 }
 
 impl TextState {
+    /// A buffer over `path`, with the JSON rendering ready and the YAML still to be
+    /// fetched (the server is the authority on how a document is written down).
+    ///
+    /// `generation` never restarts: a buffer may be replaced under a *live* editor (the
+    /// Text body re-reads the document after every load), and an editor showing
+    /// generation N must not be left alone because the buffer that replaced it happens to
+    /// start at N too.
+    fn new(path: String, subtree: &Value, generation: u64) -> Self {
+        Self {
+            path,
+            format: TextFormat::Yaml,
+            yaml: None,
+            yaml_draft: None,
+            json: serde_json::to_string_pretty(subtree).unwrap_or_default(),
+            json_draft: None,
+            generation,
+        }
+    }
+
+    /// True once there is something real to show. A YAML buffer is empty until the server
+    /// has answered; JSON is rendered in the page and is ready at once.
+    fn ready(&self) -> bool {
+        match self.format {
+            TextFormat::Yaml => self.yaml.is_some(),
+            TextFormat::Json => true,
+        }
+    }
+
     /// The pristine text of the shown format, as loaded.
     fn loaded(&self) -> &str {
         match self.format {
@@ -131,10 +187,81 @@ impl TextState {
         }
     }
 
-    fn ready(&self) -> bool {
-        match self.format {
-            TextFormat::Yaml => self.yaml.is_some(),
-            TextFormat::Json => true,
+    /// Throw both drafts away and make the editor show the loaded text again (Discard, and
+    /// the moment an apply lands).
+    fn clear_drafts(&mut self) {
+        self.yaml_draft = None;
+        self.json_draft = None;
+        self.generation += 1;
+    }
+}
+
+/// One mounted Monaco instance, and the element it lives in.
+///
+/// Monaco leaks a `ResizeObserver` and a model unless it is disposed, and a buffer left
+/// over from another view is a buffer that can be applied to the wrong path — so every
+/// pane is disposed the moment the page stops showing what it was mounted for.
+#[derive(Default)]
+struct MonacoPane {
+    node_ref: NodeRef,
+    id: Option<String>,
+    /// The `TextState::generation` the mounted editor is showing.
+    generation: u64,
+    /// Kept alive for as long as the editor exists.
+    on_change: Option<Closure<dyn Fn(String)>>,
+}
+
+impl MonacoPane {
+    fn dispose(&mut self) {
+        if let Some(id) = self.id.take() {
+            monaco::dispose(&id);
+        }
+        self.on_change = None;
+    }
+
+    /// Mount the editor if its host is on screen and nothing is mounted yet, else push in
+    /// only what changed.
+    ///
+    /// The value is never written back over what the user is typing: only a load, a format
+    /// switch or a discard bumps `TextState::generation`.
+    fn sync(
+        &mut self,
+        text: &TextState,
+        read_only: bool,
+        dark_mode: bool,
+        on_input: impl Fn(String) + 'static,
+    ) {
+        match &self.id {
+            None => {
+                let Some(el) = self.node_ref.cast::<Element>() else {
+                    return;
+                };
+                let id = monaco::mount(
+                    &el,
+                    &monaco::MountOptions {
+                        value: text.current(),
+                        language: text.format.language(),
+                        read_only,
+                        theme: if dark_mode { "dark" } else { "light" },
+                    },
+                );
+                self.on_change = Some(monaco::on_change(&id, on_input));
+                self.generation = text.generation;
+                self.id = Some(id);
+            }
+            Some(id) => {
+                // `ready()` guards the one case that used to corrupt the buffer: the Text
+                // body replaces its buffer after every load, and pushing that buffer
+                // before the server has answered would blank the editor — which Monaco
+                // then reports back through `on_change` as the user's own edit, leaving a
+                // dirty, empty document staged for apply.
+                if self.generation != text.generation && text.ready() {
+                    monaco::set_language(id, text.format.language());
+                    monaco::set_value(id, text.current());
+                    self.generation = text.generation;
+                }
+                monaco::set_read_only(id, read_only);
+            }
         }
     }
 }
@@ -160,10 +287,12 @@ pub enum ViewState {
     EditRow,
     /// Add a key under the selected map row.
     AddRow,
-    /// The Monaco text editor for one subtree.
+    /// The Monaco text editor for the selected subtree.
     EditText,
-    /// The diff that confirms applying it.
+    /// The diff that confirms applying a text buffer.
     ConfirmText,
+    /// "You have unsaved text" — leaving the Text body while it is dirty.
+    LeaveText,
 }
 
 pub enum Msg {
@@ -174,8 +303,7 @@ pub enum Msg {
     /// The Reload button: catch up *and* drop whatever the page was complaining about.
     UserReload,
     VersionToken(String),
-    /// Open the row dialog for `path` (the Value column's "set" action, and a double
-    /// click).
+    /// Open the row dialog for `path` (a double click, or Enter on the row).
     EditRow(String),
     OpenAdd,
     OpenEdit,
@@ -186,10 +314,17 @@ pub enum Msg {
     WriteOk,
     /// A dialog's submit failed: the server's message, and whether it was a 409.
     WriteFailed(String, bool),
+    /// Switch the panel body. Leaving a dirty Text body asks first.
+    SetBody(Body),
+    /// Leave the Text body, dropping whatever it holds.
+    DiscardText,
+    /// Open "Edit selection as text" on the selected row.
     OpenText,
     TextLoaded(RequestId, Result<String, String>),
     TextFormat(TextFormat),
     TextInput(String),
+    /// Discard the drafts of the buffer on screen, keeping it open.
+    RevertText,
     ShowTextDiff,
     ApplyText,
     CancelDiff,
@@ -246,7 +381,7 @@ pub struct PveMetaTree {
     /// Every registration; empty when `/meta/operators` is unavailable.
     operators: Vec<Operator>,
     /// Why the registrations are unknown. Not an error strip: the tree is complete
-    /// without them, only the declared rows and the Owner column are missing.
+    /// without them, only the declared rows and the Access column are missing.
     operators_error: Option<String>,
     guest: GuestInfo,
 
@@ -256,17 +391,19 @@ pub struct PveMetaTree {
     /// The document's own note (its bare `__` key).
     description: Option<String>,
     /// Set when the stored file does not parse: the tree is empty and only a root replace
-    /// through "Edit as text" can repair it (`docs/DESIGN.md` §4).
+    /// through the Text body can repair it (`docs/DESIGN.md` §4).
     parse_error: Option<String>,
 
+    /// Which half of the body is on screen.
+    body: Body,
     /// Mirrors the master's view state, which it does not expose.
     dialog: Option<ViewState>,
-    /// A version-poll tick that arrived while a dialog was open.
+    /// A version-poll tick that arrived while an editor held the page still.
     pending_refresh: bool,
-    /// The last message of a failed write, shown verbatim under the tree.
+    /// The last message of a failed write, shown verbatim under the body.
     write_error: Option<String>,
     /// The standing "this document moved on the server" notice: set by a 409 and by a
-    /// poll tick that arrives while a dialog holds the page still. It deliberately
+    /// poll tick that arrives while an editor holds the page still. It deliberately
     /// survives the reload it triggers — the reload is what makes the tree correct again,
     /// and clearing the notice with it would leave the user with a page that silently
     /// changed under them. A user-initiated Reload, or the next write that lands, clears
@@ -276,15 +413,14 @@ pub struct PveMetaTree {
     /// True until the first load has expanded the tree once.
     first_load: bool,
 
+    /// "Edit selection as text": the subtree buffer, live only while its dialog is open.
     text: Option<TextState>,
-    text_ref: NodeRef,
-    text_editor: Option<String>,
-    /// The generation the mounted text editor is showing.
-    text_generation: u64,
+    text_pane: MonacoPane,
+    /// The Text body's whole-document buffer, live only while `body` is `Text`.
+    doc_text: Option<TextState>,
+    doc_pane: MonacoPane,
     diff_ref: NodeRef,
     diff_id: Option<String>,
-    /// Kept alive for as long as the text editor exists.
-    on_change: Option<Closure<dyn Fn(String)>>,
     /// Kept alive so the `pwt-theme-changed` listeners stay registered.
     _theme_observer: ThemeObserver,
     dark_mode: bool,
@@ -298,29 +434,67 @@ impl PveMetaTree {
         tree::find(&self.rows, self.selected.as_deref()?)
     }
 
+    /// The text buffer on screen. The two never coexist: the "Edit selection as text"
+    /// dialog is only reachable from the tree body.
+    fn edited_text(&self) -> Option<&TextState> {
+        match self.body {
+            Body::Tree => self.text.as_ref(),
+            Body::Text => self.doc_text.as_ref(),
+        }
+    }
+
+    fn edited_text_mut(&mut self) -> Option<&mut TextState> {
+        match self.body {
+            Body::Tree => self.text.as_mut(),
+            Body::Text => self.doc_text.as_mut(),
+        }
+    }
+
     /// True if the caller may create a key under the row `add_dialog()` would target:
     /// the selected map, else the selected leaf's parent, else the document root.
     ///
-    /// Mirrors `text_dialog()`'s gate rather than asking "is there *any* writable scope
+    /// Mirrors the dialog's own target rather than asking "is there *any* writable scope
     /// anywhere" — that older check ignored the selection entirely, so a principal
     /// scoped to one prefix kept an enabled Add button while an unwritable row (or
     /// nothing) was selected, and the dialog opened targeting it only to fail at
     /// submit (`docs/REVIEW-2026-09-08-rev5.md` S7). The server remains the arbiter
     /// either way; this only decides whether the button is offered.
     fn may_add(&self) -> bool {
-        let parent = match self.selected_node() {
+        self.access.may_write(&self.add_target())
+    }
+
+    /// Where Add creates its key: the selected map, else the selected leaf's parent, else
+    /// the document root (§8).
+    fn add_target(&self) -> String {
+        match self.selected_node() {
             Some(node) if node.kind.is_map() => node.path.clone(),
             Some(node) => parent_path(&node.path),
             None => String::new(),
-        };
-        self.access.may_write(&parent) || (parent.is_empty() && self.access.write)
+        }
     }
 
-    /// The subtree "Edit as text" acts on: the selected map, else the whole document.
-    fn text_target(&self) -> String {
-        match self.selected_node() {
-            Some(node) if node.kind.is_map() && node.is_set() => node.path.clone(),
-            _ => String::new(),
+    /// The subtree "Edit selection as text" acts on: the selected row (§8 — the action is
+    /// enabled only with a selection). A row the document does not carry has no text to
+    /// fetch, so it is not a target either.
+    fn text_target(&self) -> Option<String> {
+        let node = self.selected_node()?;
+        node.is_set().then(|| node.path.clone())
+    }
+
+    /// What the toolbar says about the caller's rights — nothing at all for a full writer
+    /// (§8: the label appears "only when the caller is restricted").
+    fn restriction(&self) -> Option<String> {
+        if self.access.write {
+            return None;
+        }
+        match self
+            .access
+            .scopes
+            .iter()
+            .any(|scope| scope.mode == Mode::Rw)
+        {
+            true => Some(tr!("Scoped write access")),
+            false => Some(tr!("Read-only")),
         }
     }
 
@@ -373,25 +547,35 @@ impl PveMetaTree {
         ctx.link().change_view(Some(state));
     }
 
-    /// Close whichever modal is open, dropping the Monaco instances with it.
+    /// Close whichever modal is open, dropping the subtree buffer with it. The Text body's
+    /// own buffer is not a dialog's and survives.
     fn close_dialog(&mut self, ctx: &LoadableComponentContext<Self>) {
         self.dialog = None;
         self.text = None;
-        self.dispose_text();
+        self.text_pane.dispose();
         self.dispose_diff();
         ctx.link().change_view(None);
-        if self.pending_refresh {
-            // The store moved while the dialog held the page still.
+        self.resume_refresh(ctx);
+    }
+
+    /// Catch up on a version-poll tick that was held back while an editor was open.
+    fn resume_refresh(&mut self, ctx: &LoadableComponentContext<Self>) {
+        if self.pending_refresh && !self.editing() {
             self.pending_refresh = false;
             ctx.link().send_message(Msg::Reload);
         }
     }
 
-    fn dispose_text(&mut self) {
-        if let Some(id) = self.text_editor.take() {
-            monaco::dispose(&id);
-        }
-        self.on_change = None;
+    /// True while a reload would take something away from the user: a dialog is open, or
+    /// the Text body holds changes that were never applied.
+    ///
+    /// §8 says the poll never refreshes "while an editor is open", and this is that rule
+    /// with the one case it is about. A Text body with a clean buffer has nothing to lose
+    /// — it re-reads the document and shows what the server now says, which is the whole
+    /// point of the poll. Warning there would mean warning about the user's own apply, a
+    /// second after they made it.
+    fn editing(&self) -> bool {
+        self.dialog.is_some() || self.doc_text.as_ref().is_some_and(TextState::dirty)
     }
 
     fn dispose_diff(&mut self) {
@@ -400,72 +584,67 @@ impl PveMetaTree {
         }
     }
 
-    /// The document identity line: `200 test-ct-200 (lxc, node1)`, plus the document's own
-    /// note when it has one.
-    fn header(&self, ctx: &LoadableComponentContext<Self>) -> Column {
-        let props = ctx.props();
-
-        let (icon, title) = match props.doc {
-            DocId::Datacenter => ("building", tr!("Datacenter")),
-            DocId::Guest(vmid) => {
-                let icon = match self
-                    .guest
-                    .guest_type
-                    .as_deref()
-                    .or(props.guest_type.as_deref())
-                {
-                    Some("lxc") => "cube",
-                    _ => "desktop",
-                };
-                let title = match &self.guest.name {
-                    Some(name) => format!("{vmid} {name}"),
-                    None => vmid.to_string(),
-                };
-                (icon, title)
-            }
-        };
-
-        let mut details: Vec<String> = Vec::new();
-        if let Some(guest_type) = self
-            .guest
-            .guest_type
-            .as_deref()
-            .or(props.guest_type.as_deref())
-        {
-            details.push(guest_type.to_string());
-        }
-        if let Some(node) = self.guest.node.as_deref().or(props.node.as_deref()) {
-            details.push(node.to_string());
-        }
-        if !self.guest.tags.is_empty() {
-            details.push(self.guest.tags.join(", "));
+    /// Start a text buffer over `path` and fetch the server's own YAML for it.
+    fn open_text(&mut self, ctx: &LoadableComponentContext<Self>, path: String) {
+        let generation = self.edited_text().map_or(0, |text| text.generation) + 1;
+        let state = TextState::new(path.clone(), &subtree_at(&self.data, &path), generation);
+        match self.body {
+            Body::Tree => self.text = Some(state),
+            Body::Text => self.doc_text = Some(state),
         }
 
-        Column::new()
-            .class("pwt-border-bottom")
-            .padding(2)
-            .gap(1)
-            .with_child(
-                Row::new()
-                    .class(AlignItems::Baseline)
-                    .gap(2)
-                    .with_child(Fa::new(icon))
-                    .with_child(
-                        Container::from_tag("span")
-                            .class(FontStyle::TitleMedium)
-                            .with_child(title),
-                    )
-                    .with_optional_child((!details.is_empty()).then(|| {
-                        Container::from_tag("span")
-                            .class("pwt-color-on-neutral-alt")
-                            .with_child(format!("({})", details.join(", ")))
-                    })),
-            )
-            .with_optional_child(self.description.as_deref().map(|note| {
-                Container::from_tag("span")
-                    .class("pwt-color-on-neutral-alt")
-                    .with_child(note.to_string())
-            }))
+        let id = self.requests.issue(Channel::Text);
+        let doc = id.doc;
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            let result = api::get_text(doc, &path)
+                .await
+                .map(|document| document.text)
+                .map_err(|err| err.to_string());
+            link.send_message(Msg::TextLoaded(id, result));
+        });
+    }
+
+    /// Leave the Text body for the tree, dropping the buffer.
+    fn leave_text(&mut self, ctx: &LoadableComponentContext<Self>) {
+        self.body = Body::Tree;
+        self.doc_text = None;
+        self.doc_pane.dispose();
+        self.resume_refresh(ctx);
+    }
+
+    /// The panel's identity line: only what a PVE panel would add to a tab that already
+    /// names the guest — the guest's tags, and the document's own note.
+    ///
+    /// Nothing at all when the document has neither, which is the common case; the ExtJS
+    /// grid shows no such line and neither should this one.
+    fn header(&self) -> Option<Row> {
+        if self.guest.tags.is_empty() && self.description.is_none() {
+            return None;
+        }
+        Some(
+            Row::new()
+                .class("pwt-border-bottom")
+                .class(AlignItems::Baseline)
+                .class(MUTED)
+                .padding_x(2)
+                .padding_y(1)
+                .gap(2)
+                .with_optional_child((!self.guest.tags.is_empty()).then(|| {
+                    Row::new()
+                        .class(AlignItems::Baseline)
+                        .gap(1)
+                        .with_child(Fa::new("tags").fixed_width())
+                        .with_child(
+                            Container::from_tag("span").with_child(self.guest.tags.join(", ")),
+                        )
+                }))
+                .with_optional_child(
+                    self.description
+                        .as_deref()
+                        .map(|note| Container::from_tag("span").with_child(note.to_string())),
+                ),
+        )
     }
 
     /// The non-modal "changed on the server" notice.
@@ -486,7 +665,8 @@ impl PveMetaTree {
             )
     }
 
-    /// The unparsable-file notice: the tree cannot be built, only a root replace repairs it.
+    /// The unparsable-file notice: the tree cannot be built, only a root replace repairs
+    /// it, and the Text body is where that happens.
     fn parse_error_banner(&self, ctx: &LoadableComponentContext<Self>, message: &str) -> Column {
         Column::new()
             .padding(2)
@@ -503,11 +683,11 @@ impl PveMetaTree {
                         "This document is not valid YAML and cannot be shown as a tree."
                     ))
                     .with_flex_spacer()
-                    .with_child(
+                    .with_optional_child((self.body == Body::Tree).then(|| {
                         Button::new(tr!("Edit as text"))
                             .disabled(!self.access.write)
-                            .on_activate(ctx.link().callback(|_| Msg::OpenText)),
-                    ),
+                            .on_activate(ctx.link().callback(|_| Msg::SetBody(Body::Text)))
+                    })),
             )
             .with_child(Container::from_tag("span").with_child(message.to_string()))
     }
@@ -557,11 +737,7 @@ impl PveMetaTree {
         let doc = ctx.props().doc;
         let digest = self.digest.clone();
         let link = ctx.link().clone();
-        let parent = match self.selected_node() {
-            Some(node) if node.kind.is_map() => node.path.clone(),
-            Some(node) => parent_path(&node.path),
-            None => String::new(),
-        };
+        let parent = self.add_target();
 
         let title = match parent.is_empty() {
             true => tr!("Add") + ": " + &tr!("Key"),
@@ -588,30 +764,41 @@ impl PveMetaTree {
             .into()
     }
 
-    /// The "Edit as text" dialog: Monaco over one subtree, YAML or JSON.
-    fn text_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+    /// The YAML | JSON format toggle, shared by the dialog and the Text body.
+    fn format_toggle(&self, ctx: &LoadableComponentContext<Self>) -> SegmentedButton {
         let link = ctx.link();
-        let text = self.text.as_ref();
-        let format = text.map(|t| t.format).unwrap_or(TextFormat::Yaml);
-        let path = text.map(|t| t.path.clone()).unwrap_or_default();
-        let writable = self.access.may_write(&path) || (path.is_empty() && self.access.write);
-
-        let title = match path.is_empty() {
-            true => tr!("Edit as text") + ": " + &tr!("Whole document"),
-            false => tr!("Edit as text") + ": " + &path,
-        };
-
-        let toggle = |label: String, value: TextFormat| {
+        let format = self
+            .edited_text()
+            .map(|text| text.format)
+            .unwrap_or(TextFormat::Yaml);
+        let button = |label: String, value: TextFormat| {
             let active = format == value;
             Button::new(label)
                 .pressed(active)
                 .class(active.then_some(ColorScheme::Primary))
                 .on_activate(link.callback(move |_| Msg::TextFormat(value)))
         };
+        SegmentedButton::new()
+            .aria_label(tr!("Format"))
+            .with_button(button(tr!("YAML"), TextFormat::Yaml))
+            .with_button(button(tr!("JSON"), TextFormat::Json))
+    }
 
-        Dialog::new(title)
+    /// "Edit selection as text": Monaco over one subtree, YAML or JSON.
+    fn text_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link();
+        let path = self
+            .text
+            .as_ref()
+            .map(|t| t.path.clone())
+            .unwrap_or_default();
+        let writable = self.access.may_write(&path);
+
+        Dialog::new(tr!("Edit selection as text") + ": " + &path)
             .width(900)
-            .height(600)
+            // The PVE guest tab's content area is about 615px tall, so a 600px dialog
+            // filled it edge to edge with no chrome showing around it.
+            .height(520)
             .resizable(true)
             .on_close(link.callback(|_| Msg::CloseDialog))
             .with_child(
@@ -620,16 +807,11 @@ impl PveMetaTree {
                     .gap(2)
                     .class(AlignItems::Center)
                     .class("pwt-border-bottom")
-                    .with_child(
-                        SegmentedButton::new()
-                            .aria_label(tr!("Format"))
-                            .with_button(toggle(tr!("YAML"), TextFormat::Yaml))
-                            .with_button(toggle(tr!("JSON"), TextFormat::Json)),
-                    )
+                    .with_child(self.format_toggle(ctx))
                     .with_flex_spacer()
                     .with_optional_child((!writable).then(|| {
                         Container::from_tag("span")
-                            .class("pwt-color-on-neutral-alt")
+                            .class(MUTED)
                             .with_child(tr!("Read-only"))
                     })),
             )
@@ -637,7 +819,7 @@ impl PveMetaTree {
                 Container::new()
                     .class(FlexFit)
                     .class("pve-meta-monaco-host")
-                    .into_html_with_ref(self.text_ref.clone()),
+                    .into_html_with_ref(self.text_pane.node_ref.clone()),
             )
             .with_child(
                 Row::new()
@@ -650,19 +832,24 @@ impl PveMetaTree {
                     )
                     .with_child(
                         Button::new(tr!("Apply"))
-                            .disabled(!writable || !text.is_some_and(TextState::dirty))
+                            .class(ColorScheme::Primary)
+                            .disabled(
+                                !writable || !self.text.as_ref().is_some_and(TextState::dirty),
+                            )
                             .on_activate(link.callback(|_| Msg::ShowTextDiff)),
                     ),
             )
             .into()
     }
 
-    /// The diff that confirms a text apply.
+    /// The diff that confirms a text apply, for either buffer.
     fn diff_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
         let link = ctx.link();
         Dialog::new(tr!("Apply") + ": " + &tr!("Changes"))
             .width(900)
-            .height(600)
+            // The PVE guest tab's content area is about 615px tall, so a 600px dialog
+            // filled it edge to edge with no chrome showing around it.
+            .height(520)
             .resizable(true)
             .on_close(link.callback(|_| Msg::CancelDiff))
             .with_child(
@@ -688,12 +875,109 @@ impl PveMetaTree {
             )
             .into()
     }
+
+    /// Leaving the Text body while it holds unapplied changes (§8: "leaving Text while
+    /// dirty asks first").
+    fn leave_text_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link();
+        ConfirmDialog::new(
+            tr!("Discard changes?"),
+            tr!("The text editor holds changes that were never applied. Leaving it discards them."),
+        )
+        .dangerous(true)
+        .on_confirm(link.callback(|_| Msg::DiscardText))
+        .on_close(link.callback(|_| Msg::CloseDialog))
+        .into()
+    }
+
+    /// The toolbar of the tree body: the actions, all acting on the selection.
+    fn tree_tools(&self, ctx: &LoadableComponentContext<Self>, toolbar: &mut Toolbar) {
+        let link = ctx.link();
+        let node = self.selected_node();
+        let writable = node.is_some_and(|node| node.writable);
+        let removable = writable && node.is_some_and(Node::is_set);
+
+        toolbar.add_child(
+            Button::new(tr!("Add"))
+                .icon_class("fa fa-plus")
+                .disabled(!self.may_add())
+                .on_activate(link.callback(|_| Msg::OpenAdd)),
+        );
+        toolbar.add_child(
+            Button::new(tr!("Edit"))
+                .icon_class("fa fa-pencil")
+                .disabled(!writable)
+                .on_activate(link.callback(|_| Msg::OpenEdit)),
+        );
+        toolbar.add_child(
+            ConfirmButton::new(tr!("Remove"))
+                .icon_class("fa fa-trash-o")
+                .dangerous(true)
+                .disabled(!removable)
+                .confirm_message(match node {
+                    Some(node) => tr!(
+                        "Are you sure you want to remove entry {0}",
+                        node.path.clone()
+                    ),
+                    None => tr!("Are you sure you want to remove this entry?"),
+                })
+                .on_activate(link.callback(|_| Msg::RemoveRow)),
+        );
+        toolbar.add_spacer();
+        toolbar.add_child(
+            Button::new(tr!("Edit selection as text"))
+                .icon_class("fa fa-file-code-o")
+                .disabled(self.text_target().is_none())
+                .on_activate(link.callback(|_| Msg::OpenText)),
+        );
+        toolbar.add_spacer();
+        // `Button::refresh`'s icon and spinner, but built by hand because that constructor
+        // is icon-only and the ExtJS grid's Reload is a labelled button.
+        toolbar.add_child(
+            Button::new(tr!("Reload"))
+                .icon_class(match self.loading() {
+                    true => "fa fa-fw fa-refresh fa-spin",
+                    false => "fa fa-fw fa-refresh",
+                })
+                .disabled(self.loading())
+                .on_activate(link.callback(|_| Msg::UserReload)),
+        );
+    }
+
+    /// The toolbar of the Text body: the format toggle and the two things that end it.
+    ///
+    /// Reload has no place here — the two answers to "the document moved" are Apply and
+    /// Discard, and a Reload that either clobbered the buffer or silently did nothing
+    /// would be neither.
+    fn text_tools(&self, ctx: &LoadableComponentContext<Self>, toolbar: &mut Toolbar) {
+        let link = ctx.link();
+        let dirty = self.doc_text.as_ref().is_some_and(TextState::dirty);
+
+        toolbar.add_child(self.format_toggle(ctx));
+        toolbar.add_spacer();
+        toolbar.add_child(
+            Button::new(tr!("Apply"))
+                .icon_class("fa fa-check")
+                .class(dirty.then_some(ColorScheme::Primary))
+                // A root replace is a write of the whole document, which no scope grants
+                // however wide it is (`docs/DESIGN.md` §3).
+                .disabled(!dirty || !self.access.write)
+                .on_activate(link.callback(|_| Msg::ShowTextDiff)),
+        );
+        toolbar.add_child(
+            Button::new(tr!("Discard"))
+                .icon_class("fa fa-undo")
+                .disabled(!dirty)
+                .on_activate(link.callback(|_| Msg::RevertText)),
+        );
+    }
 }
 
 impl Drop for PveMetaTree {
     fn drop(&mut self) {
         // Monaco leaks a ResizeObserver and a model otherwise.
-        self.dispose_text();
+        self.text_pane.dispose();
+        self.doc_pane.dispose();
         self.dispose_diff();
     }
 }
@@ -709,7 +993,7 @@ impl LoadableComponent for PveMetaTree {
         let dark_mode = theme_observer.dark_mode();
 
         let store: TreeStore<Node> = TreeStore::new().view_root(false);
-        let columns = Rc::new(columns(&store, ctx.link().clone()));
+        let columns = Rc::new(columns(&store));
 
         let selection = Selection::new().on_select({
             let link = ctx.link().clone();
@@ -747,6 +1031,7 @@ impl LoadableComponent for PveMetaTree {
             rows: Vec::new(),
             description: None,
             parse_error: None,
+            body: Body::Tree,
             dialog: None,
             pending_refresh: false,
             write_error: None,
@@ -754,12 +1039,11 @@ impl LoadableComponent for PveMetaTree {
             version_token: None,
             first_load: true,
             text: None,
-            text_ref: NodeRef::default(),
-            text_editor: None,
-            text_generation: 0,
+            text_pane: MonacoPane::default(),
+            doc_text: None,
+            doc_pane: MonacoPane::default(),
             diff_ref: NodeRef::default(),
             diff_id: None,
-            on_change: None,
             _theme_observer: theme_observer,
             dark_mode,
         }
@@ -782,6 +1066,7 @@ impl LoadableComponent for PveMetaTree {
             self.parse_error = None;
             self.first_load = true;
             self.close_dialog(ctx);
+            self.leave_text(ctx);
             ctx.link().send_reload();
         }
         true
@@ -836,7 +1121,7 @@ impl LoadableComponent for PveMetaTree {
                 Err(err) => {
                     // An unparsable file 422s as JSON but still answers as text, with the
                     // parse error (`docs/DESIGN.md` §4) — show that rather than an empty
-                    // page, so it can be repaired through "Edit as text".
+                    // page, so it can be repaired in the Text body.
                     match api::get_text(doc, "").await {
                         Ok(text) if text.parse_error.is_some() => {
                             (text.digest, json!({}), text.parse_error)
@@ -911,6 +1196,15 @@ impl LoadableComponent for PveMetaTree {
                 self.data = data;
                 self.parse_error = parse_error;
                 self.rebuild();
+
+                // The Text body shows the *server's* rendering of the document, so a load
+                // has to re-fetch it — unless the buffer holds unapplied changes, which a
+                // reload must never throw away. The standing notice already says the
+                // document moved, and the apply will 409 on the digest it was opened with.
+                if self.body == Body::Text && !self.doc_text.as_ref().is_some_and(TextState::dirty)
+                {
+                    self.open_text(ctx, String::new());
+                }
             }
             Msg::Select(key) => {
                 let selected = key.map(|key| key.to_string());
@@ -939,11 +1233,10 @@ impl LoadableComponent for PveMetaTree {
                 // alongside the document, so a change between the two is a change this
                 // tick has to act on, not one it may adopt as its starting point.
                 self.version_token = Some(token);
-                if self.dialog.is_some() {
-                    // Never reload the tree out from under an open editor (§8: the poll
-                    // does not refresh while a cell is being edited). Say the document
-                    // moved and catch up when the dialog closes; a write from that dialog
-                    // still carries the digest it was opened with, so it 409s rather than
+                if self.editing() {
+                    // Never reload out from under an open editor (§8). Say the document
+                    // moved and catch up when the editor closes; a write from it still
+                    // carries the digest it was opened with, so it 409s rather than
                     // silently overwriting whatever moved.
                     self.pending_refresh = true;
                     self.notice = Some(tr!(
@@ -957,6 +1250,14 @@ impl LoadableComponent for PveMetaTree {
                 return false;
             }
             Msg::EditRow(path) => {
+                // A double click or Enter opens exactly what the Edit button opens, and on
+                // the same terms: an unwritable row has no editor.
+                let Some(node) = tree::find(&self.rows, &path) else {
+                    return false;
+                };
+                if !node.writable {
+                    return false;
+                }
                 self.selection.select(Key::from(path.as_str()));
                 self.selected = Some(path);
                 self.open_dialog(ctx, ViewState::EditRow);
@@ -1020,42 +1321,46 @@ impl LoadableComponent for PveMetaTree {
             Msg::WriteFailed(message, conflict) => {
                 self.write_error = Some(message);
                 if conflict {
-                    // §8: 409 → reload and say so. The dialog keeps what was typed and
+                    // §8: 409 → reload and say so. The editor keeps what was typed and
                     // shows the server's message inline, so nothing typed is lost.
                     self.notice = Some(conflict_notice());
                     ctx.link().send_message(Msg::Reload);
                 }
             }
+            Msg::SetBody(body) => {
+                if self.body == body {
+                    return false;
+                }
+                match body {
+                    Body::Text => {
+                        self.body = Body::Text;
+                        self.open_text(ctx, String::new());
+                    }
+                    Body::Tree => {
+                        if self.doc_text.as_ref().is_some_and(TextState::dirty) {
+                            self.open_dialog(ctx, ViewState::LeaveText);
+                            return true;
+                        }
+                        self.leave_text(ctx);
+                    }
+                }
+            }
+            Msg::DiscardText => {
+                self.close_dialog(ctx);
+                self.leave_text(ctx);
+            }
             Msg::OpenText => {
-                let path = self.text_target();
-                let subtree = subtree_at(&self.data, &path);
-                self.text = Some(TextState {
-                    path: path.clone(),
-                    format: TextFormat::Yaml,
-                    yaml: None,
-                    yaml_draft: None,
-                    json: serde_json::to_string_pretty(&subtree).unwrap_or_default(),
-                    json_draft: None,
-                    generation: 0,
-                });
+                let Some(path) = self.text_target() else {
+                    return false;
+                };
+                self.open_text(ctx, path);
                 self.open_dialog(ctx, ViewState::EditText);
-
-                let id = self.requests.issue(Channel::Text);
-                let doc = id.doc;
-                let link = ctx.link().clone();
-                ctx.link().spawn(async move {
-                    let result = api::get_text(doc, &path)
-                        .await
-                        .map(|document| document.text)
-                        .map_err(|err| err.to_string());
-                    link.send_message(Msg::TextLoaded(id, result));
-                });
             }
             Msg::TextLoaded(id, result) => {
                 if !self.requests.accepts(&id) {
                     return false;
                 }
-                let Some(text) = self.text.as_mut() else {
+                let Some(text) = self.edited_text_mut() else {
                     return false;
                 };
                 match result {
@@ -1072,7 +1377,7 @@ impl LoadableComponent for PveMetaTree {
                 }
             }
             Msg::TextFormat(format) => {
-                let Some(text) = self.text.as_mut() else {
+                let Some(text) = self.edited_text_mut() else {
                     return false;
                 };
                 if text.format == format {
@@ -1082,9 +1387,10 @@ impl LoadableComponent for PveMetaTree {
                 text.generation += 1;
             }
             Msg::TextInput(input) => {
-                let Some(text) = self.text.as_mut() else {
+                let Some(text) = self.edited_text_mut() else {
                     return false;
                 };
+                let was_dirty = text.dirty();
                 match text.format {
                     TextFormat::Yaml => {
                         text.yaml_draft =
@@ -1092,22 +1398,37 @@ impl LoadableComponent for PveMetaTree {
                     }
                     TextFormat::Json => text.json_draft = (input != text.json).then_some(input),
                 }
-                // Only the Apply button's enabled state depends on this.
+                // Only the Apply/Discard enablement depends on this, so re-render only
+                // when it actually flipped.
+                return was_dirty != text.dirty();
+            }
+            Msg::RevertText => {
+                let Some(text) = self.edited_text_mut() else {
+                    return false;
+                };
+                text.clear_drafts();
             }
             Msg::ShowTextDiff => {
-                self.dispose_text();
+                // The dialog's editor is torn down with its dialog; the body's stays
+                // mounted behind the modal and is still there when the diff closes.
+                self.text_pane.dispose();
                 self.open_dialog(ctx, ViewState::ConfirmText);
             }
             Msg::CancelDiff => {
                 self.dispose_diff();
-                self.open_dialog(ctx, ViewState::EditText);
-                if let Some(text) = self.text.as_mut() {
-                    // The editor is remounted from scratch; make it show the draft.
-                    text.generation += 1;
+                match self.body {
+                    Body::Tree => {
+                        self.open_dialog(ctx, ViewState::EditText);
+                        if let Some(text) = self.text.as_mut() {
+                            // The editor is remounted from scratch; make it show the draft.
+                            text.generation += 1;
+                        }
+                    }
+                    Body::Text => self.close_dialog(ctx),
                 }
             }
             Msg::ApplyText => {
-                let Some(text) = self.text.as_ref() else {
+                let Some(text) = self.edited_text() else {
                     return false;
                 };
                 let writes = vec![Write::PutText {
@@ -1118,6 +1439,11 @@ impl LoadableComponent for PveMetaTree {
                 let doc = id.doc;
                 let digest = self.digest.clone();
                 let link = ctx.link().clone();
+                // The drafts have gone to the server; dropping them here is what lets the
+                // reload that follows put the server's own rendering back on screen.
+                if let Some(text) = self.edited_text_mut() {
+                    text.clear_drafts();
+                }
                 self.close_dialog(ctx);
                 ctx.link().spawn(async move {
                     let result = api::apply(doc, writes, &digest).await;
@@ -1136,66 +1462,49 @@ impl LoadableComponent for PveMetaTree {
 
     fn toolbar(&self, ctx: &LoadableComponentContext<Self>) -> Option<Html> {
         let link = ctx.link();
-        let node = self.selected_node();
-        let writable = node.is_some_and(|node| node.writable);
-        let removable = writable && node.is_some_and(Node::is_set);
+        let mut toolbar = Toolbar::new()
+            .class("pwt-w-100")
+            .class("pwt-overflow-hidden")
+            .class("pwt-border-bottom");
 
-        Some(
-            Toolbar::new()
-                .class("pwt-w-100")
-                .class("pwt-overflow-hidden")
-                .class("pwt-border-bottom")
-                .with_child(
-                    Button::new(tr!("Add"))
-                        .disabled(!self.may_add())
-                        .on_activate(link.callback(|_| Msg::OpenAdd)),
-                )
-                .with_spacer()
-                .with_child(
-                    Button::new(tr!("Edit"))
-                        .disabled(!writable)
-                        .on_activate(link.callback(|_| Msg::OpenEdit)),
-                )
-                .with_child(
-                    ConfirmButton::new(tr!("Remove"))
-                        .dangerous(true)
-                        .disabled(!removable)
-                        .confirm_message(match node {
-                            Some(node) => {
-                                tr!(
-                                    "Are you sure you want to remove entry {0}",
-                                    node.path.clone()
-                                )
-                            }
-                            None => tr!("Are you sure you want to remove this entry?"),
-                        })
-                        .on_activate(link.callback(|_| Msg::RemoveRow)),
-                )
-                .with_spacer()
-                .with_child(
-                    Button::new(tr!("Edit as text")).on_activate(link.callback(|_| Msg::OpenText)),
-                )
-                .with_flex_spacer()
-                .with_optional_child((!self.access.write && self.access.scopes.is_empty()).then(
-                    || {
-                        Container::from_tag("span")
-                            .class("pwt-color-on-neutral-alt")
-                            .with_child(tr!("Read-only"))
-                    },
-                ))
-                .with_child(
-                    Button::refresh(self.loading()).on_activate(link.callback(|_| Msg::UserReload)),
-                )
-                .into(),
-        )
+        match self.body {
+            Body::Tree => self.tree_tools(ctx, &mut toolbar),
+            Body::Text => self.text_tools(ctx, &mut toolbar),
+        }
+
+        toolbar.add_flex_spacer();
+
+        // §8: the label appears "only when the caller is restricted" — a full writer needs
+        // no telling, and the ExtJS grid's permanent "Full write access" was noise.
+        if let Some(label) = self.restriction() {
+            toolbar.add_child(Container::from_tag("span").class(MUTED).with_child(label));
+        }
+
+        let view_button = |label: String, value: Body| {
+            let active = self.body == value;
+            Button::new(label)
+                .pressed(active)
+                .class(active.then_some(ColorScheme::Primary))
+                .on_activate(link.callback(move |_| Msg::SetBody(value)))
+        };
+        toolbar.add_child(
+            SegmentedButton::new()
+                .aria_label(tr!("View"))
+                // Outline, not filled: this is a view switch sitting in a toolbar of plain
+                // buttons, and PVE's own segmented controls are outlines. A filled half
+                // read as the page's primary action, which it is not.
+                .class("pwt-button-outline")
+                .with_button(view_button(tr!("Tree"), Body::Tree))
+                .with_button(view_button(tr!("Text"), Body::Text)),
+        );
+
+        Some(toolbar.into())
     }
 
     fn main_view(&self, ctx: &LoadableComponentContext<Self>) -> Html {
-        let link = ctx.link().clone();
-
         Column::new()
             .class(FlexFit)
-            .with_child(self.header(ctx).key("header"))
+            .with_optional_child(self.header().map(|header| header.key("header")))
             .with_optional_child(
                 self.notice
                     .as_deref()
@@ -1206,20 +1515,14 @@ impl LoadableComponent for PveMetaTree {
                     .as_deref()
                     .map(|err| self.parse_error_banner(ctx, err).key("parse-error")),
             )
-            .with_child(
-                DataTable::new(Rc::clone(&self.columns), self.store.clone())
-                    .key("tree")
+            .with_child(match self.body {
+                Body::Tree => self.tree_view(ctx),
+                Body::Text => Container::new()
+                    .key("text-body")
                     .class(FlexFit)
-                    .selection(self.selection.clone())
-                    .striped(false)
-                    .hover(true)
-                    // Rows carry a description line, so their height varies; virtual
-                    // scrolling assumes a uniform one. Documents are small.
-                    .virtual_scroll(false)
-                    .on_row_dblclick(move |event: &mut DataTableMouseEvent| {
-                        link.send_message(Msg::EditRow(event.record_key.to_string()));
-                    }),
-            )
+                    .class("pve-meta-monaco-host")
+                    .into_html_with_ref(self.doc_pane.node_ref.clone()),
+            })
             .with_optional_child(self.access_error.as_deref().map(|err| {
                 error_message(&tr!(
                     "Could not determine your access to this document; it is shown \
@@ -1236,10 +1539,10 @@ impl LoadableComponent for PveMetaTree {
                     .gap(2)
                     .class(AlignItems::Center)
                     .class("pwt-border-top")
-                    .class("pwt-color-on-neutral-alt")
+                    .class(MUTED)
                     .with_child(Fa::new("info-circle"))
                     .with_child(tr!(
-                        "Declared keys and owners are unavailable: {0}",
+                        "Declared keys and access are unavailable: {0}",
                         err.to_string()
                     ))
             }))
@@ -1261,74 +1564,104 @@ impl LoadableComponent for PveMetaTree {
             ViewState::AddRow => Some(self.add_dialog(ctx)),
             ViewState::EditText => Some(self.text_dialog(ctx)),
             ViewState::ConfirmText => Some(self.diff_dialog(ctx)),
+            ViewState::LeaveText => Some(self.leave_text_dialog(ctx)),
         }
     }
 
     fn rendered(&mut self, ctx: &LoadableComponentContext<Self>, _first_render: bool) {
-        // The text editor belongs to the dialog it was mounted in; nothing else may keep
-        // it alive (Monaco leaks a ResizeObserver and a model).
+        // A Monaco instance belongs to the thing it was mounted for; nothing else may keep
+        // it alive.
         if self.dialog != Some(ViewState::EditText) {
-            self.dispose_text();
+            self.text_pane.dispose();
         }
         if self.dialog != Some(ViewState::ConfirmText) {
             self.dispose_diff();
         }
+        if self.body != Body::Text {
+            self.doc_pane.dispose();
+        }
 
+        // `take`/restore rather than a borrow: the pane and the buffer both live in `self`.
         if self.dialog == Some(ViewState::EditText) {
-            let (value, language, generation, read_only) = match self.text.as_ref() {
-                Some(text) if text.ready() => (
-                    text.current().to_string(),
-                    text.format.language(),
-                    text.generation,
-                    !(self.access.may_write(&text.path)
-                        || (text.path.is_empty() && self.access.write)),
-                ),
-                _ => (String::new(), "yaml", 0, true),
-            };
+            if let Some(text) = self.text.take() {
+                let read_only = !self.access.may_write(&text.path);
+                let link = ctx.link().clone();
+                let dark_mode = self.dark_mode;
+                self.text_pane
+                    .sync(&text, read_only, dark_mode, move |input| {
+                        link.send_message(Msg::TextInput(input))
+                    });
+                self.text = Some(text);
+            }
+        }
 
-            match &self.text_editor {
-                None => {
-                    if let Some(el) = self.text_ref.cast::<Element>() {
-                        let id = monaco::mount(
-                            &el,
-                            &monaco::MountOptions {
-                                value: &value,
-                                language,
-                                read_only,
-                                theme: if self.dark_mode { "dark" } else { "light" },
-                            },
-                        );
-                        let link = ctx.link().clone();
-                        self.on_change = Some(monaco::on_change(&id, move |text| {
-                            link.send_message(Msg::TextInput(text))
-                        }));
-                        self.text_editor = Some(id);
-                        self.text_generation = generation;
-                    }
-                }
-                Some(id) => {
-                    // Never write over what the user is typing: only a load or a format
-                    // switch bumps the generation.
-                    if self.text_generation != generation {
-                        monaco::set_language(id, language);
-                        monaco::set_value(id, &value);
-                        self.text_generation = generation;
-                    }
-                    monaco::set_read_only(id, read_only);
-                }
+        if self.body == Body::Text {
+            if let Some(text) = self.doc_text.take() {
+                // A root replace needs the full `write` grant, never a scope (§3).
+                let read_only = !self.access.write;
+                let link = ctx.link().clone();
+                let dark_mode = self.dark_mode;
+                self.doc_pane
+                    .sync(&text, read_only, dark_mode, move |input| {
+                        link.send_message(Msg::TextInput(input))
+                    });
+                self.doc_text = Some(text);
             }
         }
 
         if self.dialog == Some(ViewState::ConfirmText) && self.diff_id.is_none() {
-            if let (Some(text), Some(el)) = (self.text.as_ref(), self.diff_ref.cast::<Element>()) {
+            let buffers = self.edited_text().map(|text| {
+                (
+                    text.loaded().to_string(),
+                    text.current().to_string(),
+                    text.format,
+                )
+            });
+            if let (Some((loaded, current, format)), Some(el)) =
+                (buffers, self.diff_ref.cast::<Element>())
+            {
                 self.diff_id = Some(monaco::mount_diff(
                     &el,
-                    text.loaded(),
-                    text.current(),
-                    text.format.language(),
+                    &loaded,
+                    &current,
+                    format.language(),
                 ));
             }
         }
+    }
+}
+
+impl PveMetaTree {
+    /// The tree body: the grid, with the selection driving the toolbar.
+    fn tree_view(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        DataTable::new(Rc::clone(&self.columns), self.store.clone())
+            .key("tree")
+            .class(FlexFit)
+            .selection(self.selection.clone())
+            .striped(false)
+            .hover(true)
+            // Rows are one line each, but a document is small enough that the whole tree
+            // fits in the DOM — and a non-virtual table needs no row-height guess to keep
+            // the grid's density identical to the ExtJS one.
+            .virtual_scroll(false)
+            // §8: "opened by Edit, double-click or Enter". Both land on the same message,
+            // which refuses a row the caller may not write — exactly as the Edit button is
+            // disabled for it.
+            .on_row_dblclick({
+                let link = ctx.link().clone();
+                move |event: &mut DataTableMouseEvent| {
+                    link.send_message(Msg::EditRow(event.record_key.to_string()));
+                }
+            })
+            .on_row_keydown({
+                let link = ctx.link().clone();
+                move |event: &mut DataTableKeyboardEvent| {
+                    if event.key() == "Enter" {
+                        link.send_message(Msg::EditRow(event.record_key.to_string()));
+                    }
+                }
+            })
+            .into()
     }
 }
 
@@ -1346,44 +1679,40 @@ fn append_rows(parent: &mut SlabTreeNodeMut<'_, Node>, rows: &[TreeRow], expand:
     }
 }
 
-/// The three columns of `docs/DESIGN.md` §8: key, value, owner.
-fn columns(
-    store: &TreeStore<Node>,
-    link: yew::html::Scope<LoadableComponentMaster<PveMetaTree>>,
-) -> Vec<DataTableHeader<Node>> {
+/// The four columns of `docs/DESIGN.md` §8: Key, Value, Description, Access.
+///
+/// Every cell is one line — that is the whole point of a separate Description column, and
+/// it is what makes the grid's row height the ExtJS grid's row height. A row the document
+/// does not carry is greyed across all four, the way the ExtJS grid greys it.
+fn columns(store: &TreeStore<Node>) -> Vec<DataTableHeader<Node>> {
     vec![
         DataTableColumn::new(tr!("Key"))
-            .width("340px")
+            // The ExtJS grid gives Key about 200px inside the tab and lets Value and
+            // Description share the rest evenly; 240px keeps a three-deep path readable
+            // without stealing a column's worth of room from the other two.
+            .width("240px")
             .tree_column(store.clone())
             .render_cell(|args: &mut DataTableCellRenderArgs<Node>| {
                 let node = args.record();
-                let icon = match (&node.kind, node.is_set()) {
-                    (ValueKind::Map, _) => "folder-o",
-                    (ValueKind::Array, _) => "list",
+                let icon = match node.kind {
+                    ValueKind::Map => "folder-o",
+                    ValueKind::Array => "list",
                     _ => "file-text-o",
                 };
                 let mut key = Row::new()
-                    .class(AlignItems::Baseline)
+                    .class(AlignItems::Center)
                     .gap(1)
                     .with_child(Fa::new(icon).fixed_width())
                     .with_child(Container::from_tag("span").with_child(node.key.clone()));
                 if !node.is_set() {
-                    key.add_class("pwt-opacity-50");
+                    key.add_class(UNSET);
                 }
-                Column::new()
-                    .with_child(key)
-                    .with_optional_child(node.description.as_deref().map(|note| {
-                        Container::from_tag("span")
-                            .class("pwt-font-label-small")
-                            .class("pwt-color-on-neutral-alt")
-                            .with_child(note.to_string())
-                    }))
-                    .into()
+                key.into()
             })
             .into(),
         DataTableColumn::new(tr!("Value"))
-            .flex(1)
-            .render_cell(move |args: &mut DataTableCellRenderArgs<Node>| {
+            .flex(3)
+            .render_cell(|args: &mut DataTableCellRenderArgs<Node>| {
                 let node = args.record();
                 if node.is_set() {
                     return Container::from_tag("span")
@@ -1391,47 +1720,73 @@ fn columns(
                         .with_child(node.display_value())
                         .into();
                 }
-                // A declared-but-unset row: its default, greyed, plus the "set" action.
-                let default = node.default_text().unwrap_or_default();
-                let path = node.path.clone();
-                let link = link.clone();
-                Row::new()
-                    .class(AlignItems::Baseline)
-                    .gap(2)
-                    .with_child(
-                        Container::from_tag("span")
-                            .class("pwt-font-monospace")
-                            .class("pwt-opacity-50")
-                            .with_child(match default.is_empty() {
-                                true => tr!("not set"),
-                                false => default,
-                            }),
-                    )
-                    .with_optional_child(node.writable.then(|| {
-                        Container::from_tag("a")
-                            .class("pwt-pointer")
-                            .attribute("role", "button")
-                            .attribute("tabindex", "0")
-                            .onclick(move |event: MouseEvent| {
-                                event.stop_propagation();
-                                link.send_message(Msg::EditRow(path.clone()));
-                            })
-                            .with_child(tr!("Set"))
-                    }))
+                // A row only a grammar declares: greyed, with the declared default. It is
+                // set through Edit like any other row — no per-row action lives in a cell.
+                Container::from_tag("span")
+                    .class(UNSET)
+                    .with_child(match node.default_text() {
+                        Some(default) => tr!("not set (default: {0})", default),
+                        None => tr!("not set"),
+                    })
                     .into()
             })
             .into(),
-        DataTableColumn::new(tr!("Owner"))
-            .width("220px")
-            .render_cell(
-                |args: &mut DataTableCellRenderArgs<Node>| match &args.record().owner {
-                    Some(owner) => Container::from_tag("span")
-                        .attribute("title", owner.detail())
-                        .with_child(owner.label())
-                        .into(),
-                    None => html! {},
-                },
-            )
+        DataTableColumn::new(tr!("Description"))
+            .flex(3)
+            .render_cell(|args: &mut DataTableCellRenderArgs<Node>| {
+                let node = args.record();
+                // The document's own note is the text; a grammar's `description` is only
+                // ever the tooltip (§8), because it is documentation about the key and not
+                // data in this document.
+                let mut cell = Tooltip::new(node.note.clone().unwrap_or_default())
+                    .class("pwt-w-100")
+                    .tip(node.hint.clone().map(AttrValue::from));
+                if !node.is_set() {
+                    cell.add_class(UNSET);
+                }
+                cell.into()
+            })
+            .into(),
+        DataTableColumn::new(tr!("Access"))
+            .width("200px")
+            .render_cell(|args: &mut DataTableCellRenderArgs<Node>| {
+                let node = args.record();
+                if node.access.is_empty() {
+                    return html! {};
+                }
+                let mut names = Row::new().class(AlignItems::Center);
+                for (position, entry) in node.access.iter().enumerate() {
+                    let text = match position {
+                        0 => entry.label(),
+                        _ => format!(", {}", entry.label()),
+                    };
+                    let mut chip = Container::from_tag("span").with_child(text);
+                    if entry.muted() {
+                        // A reader, not a writer: present, but not competing with the
+                        // registration that actually holds the write.
+                        chip.add_class(MUTED);
+                    }
+                    names.add_child(chip);
+                }
+                // The tooltip is the whole registration: authid, prefix, mode and the
+                // selector that made the scope apply to this guest (§8).
+                let mut cell = Tooltip::new(names).rich_tip(
+                    Column::new().class("pwt-font-label-small").children(
+                        node.access
+                            .iter()
+                            .map(|entry| {
+                                Container::from_tag("span")
+                                    .with_child(entry.detail())
+                                    .into()
+                            })
+                            .collect::<Vec<Html>>(),
+                    ),
+                );
+                if !node.is_set() {
+                    cell.add_class(UNSET);
+                }
+                cell.into()
+            })
             .into(),
     ]
 }
@@ -1447,10 +1802,9 @@ fn row_form(node: &Node) -> Html {
         ValueKind::Map => {
             panel.add_field(
                 label,
-                Field::new()
-                    .name("value")
-                    .disabled(true)
-                    .placeholder(tr!("a map — edit its keys, or use \"Edit as text\"")),
+                Field::new().name("value").disabled(true).placeholder(tr!(
+                    "a map — edit its keys, or use \"Edit selection as text\""
+                )),
             );
         }
         ValueKind::Boolean => {
@@ -1510,13 +1864,18 @@ fn row_form(node: &Node) -> Html {
     }
 
     // The row's note is the sibling comment key (`docs/DESIGN.md` §2) — a second key on
-    // the wire, which is why it belongs in a dialog rather than in a cell.
+    // the wire, which is why it belongs in a dialog rather than in a cell. Its placeholder
+    // is the grammar's own prose when there is one, so the dialog shows what the
+    // Description column can only offer as a tooltip — without ever pre-filling it.
     panel.add_field(
         tr!("Description"),
         Field::new()
             .name("description")
             .default(node.note.clone().unwrap_or_default())
-            .placeholder(tr!("stored as {0}", node.comment_path())),
+            .placeholder(match &node.hint {
+                Some(hint) => hint.clone(),
+                None => tr!("stored as {0}", node.comment_path()),
+            }),
     );
 
     panel.into()

@@ -1,9 +1,11 @@
 //! The row model behind the tree (`docs/DESIGN.md` §8).
 //!
-//! > "rows are the union of the keys present and the keys the applicable grammars declare
-//! > (declared-but-unset rows are greyed with default and description and a "set" action).
-//! > Columns: key, value …, owner …. Comment keys are shown as the row description, not as
-//! > rows. Editability is per row from `/meta/access`."
+//! > "Rows are the union of the keys present and the keys the applicable grammars declare
+//! > (declared-but-unset rows are greyed with their default and a "set" action). Columns:
+//! > **Key**; **Value**; **Description**: the row's comment key (`k__`) if present, else
+//! > nothing, the grammar description is the tooltip; **Access**: every registration whose
+//! > scope covers the row, `rw` ones by name, `ro` ones muted with "(ro)", tooltip with
+//! > selectors. Editability is per row from `/meta/access`."
 //!
 //! This module is that sentence, and nothing else: it turns a document (`data`, an
 //! unordered JSON object), the operator registrations, the guest's tags and the caller's
@@ -51,10 +53,13 @@ impl ValueKind {
     }
 }
 
-/// The registration a row belongs to: the scope covering it, and the selector that made
-/// that scope apply to this guest.
+/// One registration whose scope covers a row — the unit of the **Access** column.
+///
+/// Access is deliberately not ownership (§8): several principals may read the same
+/// subtree, and the column answers "who writes this, and who is watching it", not "whose
+/// key is this". So a row carries *every* covering registration, not just the closest one.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Owner {
+pub struct Registration {
     /// Registration name (the drop-in file's name).
     pub name: String,
     /// The principal it registers.
@@ -67,18 +72,34 @@ pub struct Owner {
     pub selector: Option<String>,
 }
 
-impl Owner {
-    /// `traefik (tag: traefik)` — the owner column's text.
+impl Registration {
+    /// The Access column's text: `rw` registrations by name, `ro` ones with a "(ro)"
+    /// suffix (which [`Self::muted`] then greys).
     pub fn label(&self) -> String {
-        match &self.selector {
-            Some(selector) => format!("{} ({selector})", self.name),
-            None => self.name.clone(),
+        match self.mode {
+            Mode::Rw => self.name.clone(),
+            Mode::Ro => format!("{} (ro)", self.name),
         }
     }
 
-    /// The tooltip: who it is and what the scope grants.
+    /// True for a reader: the column shows it muted, so the writers stand out.
+    pub fn muted(&self) -> bool {
+        self.mode == Mode::Ro
+    }
+
+    /// One tooltip line: who it is, what it holds, and the selector that made it apply.
     pub fn detail(&self) -> String {
-        format!("{} — {} ({})", self.authid, self.prefix, self.mode.as_str())
+        let mut line = format!(
+            "{} — {} — {} ({})",
+            self.name,
+            self.authid,
+            self.prefix,
+            self.mode.as_str()
+        );
+        if let Some(selector) = &self.selector {
+            line.push_str(&format!(" — {selector}"));
+        }
+        line
     }
 }
 
@@ -96,22 +117,23 @@ pub struct Node {
     pub kind: ValueKind,
     /// The value in the document, or `None` for a row only a grammar declares.
     pub value: Option<Value>,
-    /// What the row's note says, shown under the key: the sibling comment key
-    /// (`key__`), the map's own `__`, or — when the document carries neither — the
-    /// grammar's `description`.
-    pub description: Option<String>,
-    /// The note the *document* carries, if any. Deliberately not `description`: a
-    /// grammar's description is documentation about the key, not data in this document,
-    /// and pre-filling an edit dialog with it would write the grammar's own prose into a
-    /// comment key on the first save.
+    /// The **Description** column: the note the *document* carries — the sibling comment
+    /// key (`key__`) or the map's own bare `__` — and nothing else (§8). A grammar's
+    /// description is documentation *about* the key, not data in this document; it is
+    /// [`Self::hint`], the column's tooltip. Keeping the two apart is what stops the edit
+    /// dialog from copying a grammar's own prose into a comment key on the first save.
     pub note: Option<String>,
     /// Where that note lives (or would live): the sibling `key__`, or `key.__` for a map
     /// documented by its own bare `__` (`docs/DESIGN.md` §2).
     pub note_path: String,
+    /// The `description` a grammar declares for this key: the Description column's
+    /// tooltip, never written to the document.
+    pub hint: Option<String>,
     /// The grammar's `default`, shown on an unset row.
     pub default: Option<Value>,
-    /// The registration whose scope covers this row.
-    pub owner: Option<Owner>,
+    /// Every registration whose scope covers this row, writers first (see
+    /// [`Registration`]).
+    pub access: Vec<Registration>,
     /// Whether `/meta/access` says this row may be written.
     pub writable: bool,
     /// Whether a grammar declares this key.
@@ -126,11 +148,11 @@ impl Node {
             key: String::new(),
             kind: ValueKind::Map,
             value: None,
-            description: None,
             note: None,
             note_path: "__".to_string(),
+            hint: None,
             default: None,
-            owner: None,
+            access: Vec::new(),
             writable: false,
             declared: false,
         }
@@ -159,6 +181,21 @@ impl Node {
     /// The comment key that documents this row (`traefik.host` → `traefik.host__`).
     pub fn comment_path(&self) -> &str {
         &self.note_path
+    }
+
+    /// The Access column's tooltip: one line per covering registration, or nothing when
+    /// no scope reaches this row.
+    pub fn access_detail(&self) -> Option<String> {
+        match self.access.is_empty() {
+            true => None,
+            false => Some(
+                self.access
+                    .iter()
+                    .map(Registration::detail)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        }
     }
 }
 
@@ -308,15 +345,14 @@ fn build_map(
             };
 
             let (note, note_path) = note_of(obj, &key, value, &child_path);
-            let description = note.clone().or_else(|| schema.and_then(schema_description));
 
             Row {
                 node: Node {
-                    description,
                     note,
                     note_path,
+                    hint: schema.and_then(schema_description),
                     default: schema.and_then(schema_default).cloned(),
-                    owner: owner_for(&child_path, applicable),
+                    access: access_for(&child_path, applicable),
                     writable: ctx.access.may_write(&child_path),
                     declared: declared.schemas.contains_key(&key),
                     value: value.cloned(),
@@ -474,18 +510,27 @@ fn note_of(
     (None, format!("{path}__"))
 }
 
-fn owner_for<'a>(path: &str, applicable: &[Applicable<'a>]) -> Option<Owner> {
-    applicable
+/// Every registration whose scope covers `path` — not just the closest one (§8: several
+/// principals may read the same subtree).
+///
+/// Writers come first, then readers, each group by name and then by prefix: a fixed order,
+/// so the column does not shuffle between two reloads of the same document. Two scopes of
+/// the same registration that both cover a row collapse into one entry.
+fn access_for(path: &str, applicable: &[Applicable]) -> Vec<Registration> {
+    let mut entries: Vec<Registration> = applicable
         .iter()
         .filter(|entry| Access::covers(&entry.scope.prefix, path))
-        .max_by_key(|entry| entry.scope.prefix.len())
-        .map(|entry| Owner {
+        .map(|entry| Registration {
             name: entry.operator.name.clone(),
             authid: entry.operator.authid.clone(),
             prefix: entry.scope.prefix.clone(),
             mode: entry.scope.mode,
             selector: entry.scope.selector.label(),
         })
+        .collect();
+    entries.sort_by(|a, b| (a.muted(), &a.name, &a.prefix).cmp(&(b.muted(), &b.name, &b.prefix)));
+    entries.dedup();
+    entries
 }
 
 /// What kind of value this row holds: the document decides for a key that exists, the
@@ -645,7 +690,9 @@ mod tests {
         assert!(port.declared);
         assert_eq!(port.kind, ValueKind::Integer);
         assert_eq!(port.default_text().as_deref(), Some("80"));
-        assert_eq!(port.description.as_deref(), Some("Backend port"));
+        // The grammar's prose is the Description column's *tooltip*, never its text (§8).
+        assert_eq!(port.hint.as_deref(), Some("Backend port"));
+        assert_eq!(port.note, None);
     }
 
     #[test]
@@ -698,7 +745,7 @@ mod tests {
     #[test]
     fn scopes_do_not_apply_to_the_datacenter_document() {
         // §3: the datacenter document is governed by ACLs alone — no declared rows, no
-        // owners.
+        // Access entries.
         let access = access(json!({"read": 1, "write": 1}));
         let operators = operators();
         let rows = build(
@@ -711,7 +758,7 @@ mod tests {
             },
         );
         assert_eq!(paths(&rows), ["site"]);
-        assert!(find(&rows, "site").unwrap().owner.is_none());
+        assert!(find(&rows, "site").unwrap().access.is_empty());
     }
 
     #[test]
@@ -732,26 +779,22 @@ mod tests {
             Some("the whole document"),
         );
         assert_eq!(
-            find(&rows, "netbird").unwrap().description.as_deref(),
+            find(&rows, "netbird").unwrap().note.as_deref(),
             Some("netbird settings"),
         );
         let groups = find(&rows, "netbird.groups").unwrap();
-        assert_eq!(groups.description.as_deref(), Some("peer groups"));
+        assert_eq!(groups.note.as_deref(), Some("peer groups"));
         assert_eq!(groups.kind, ValueKind::Array);
         assert_eq!(groups.display_value(), "[\"lan\"]");
     }
 
     #[test]
-    fn a_sibling_note_wins_over_the_grammars_description() {
+    fn the_description_column_is_the_comment_key_and_the_grammar_is_its_tooltip() {
         let data = json!({ "traefik": { "spec": { "host": "h", "host__": "our own note" } } });
         let rows = build_for(&data, json!({"read": 1, "write": 1}), &["traefik"]);
-        assert_eq!(
-            find(&rows, "traefik.spec.host")
-                .unwrap()
-                .description
-                .as_deref(),
-            Some("our own note"),
-        );
+        let host = find(&rows, "traefik.spec.host").unwrap();
+        assert_eq!(host.note.as_deref(), Some("our own note"));
+        assert_eq!(host.hint.as_deref(), Some("Public host name"));
     }
 
     #[test]
@@ -760,7 +803,7 @@ mod tests {
         // otherwise the first save would copy the grammar's own prose into a comment key.
         let rows = build_for(&json!({}), json!({"read": 1, "write": 1}), &["traefik"]);
         let port = find(&rows, "traefik.spec.port").unwrap();
-        assert_eq!(port.description.as_deref(), Some("Backend port"));
+        assert_eq!(port.hint.as_deref(), Some("Backend port"));
         assert_eq!(port.note, None);
         assert_eq!(port.comment_path(), "traefik.spec.port__");
     }
@@ -788,10 +831,7 @@ mod tests {
         let rows = build_for(&data, json!({"read": 1, "write": 1}), &[]);
         let gone = find(&rows, "gone").unwrap();
         assert!(!gone.is_set());
-        assert_eq!(
-            gone.description.as_deref(),
-            Some("a note about a key nobody set"),
-        );
+        assert_eq!(gone.note.as_deref(), Some("a note about a key nobody set"));
     }
 
     #[test]
@@ -813,23 +853,76 @@ mod tests {
     }
 
     #[test]
-    fn the_owner_is_the_registration_with_the_longest_covering_prefix() {
+    fn access_lists_every_registration_whose_scope_covers_the_row() {
         let data = json!({ "traefik": { "spec": { "host": "h" } } });
         let rows = build_for(&data, json!({"read": 1, "write": 1}), &["traefik"]);
 
-        let owner = find(&rows, "traefik.spec.host")
-            .unwrap()
-            .owner
-            .clone()
-            .unwrap();
-        assert_eq!(owner.name, "traefik");
-        assert_eq!(owner.label(), "traefik (tag: traefik)");
-        assert_eq!(owner.detail(), "svc@pve!traefik — traefik (rw)");
+        let access = find(&rows, "traefik.spec.host").unwrap().access.clone();
+        assert_eq!(access.len(), 1);
+        assert_eq!(access[0].name, "traefik");
+        assert_eq!(access[0].label(), "traefik");
+        assert!(!access[0].muted());
+        assert_eq!(
+            access[0].detail(),
+            "traefik \u{2014} svc@pve!traefik \u{2014} traefik (rw) \u{2014} tag: traefik",
+        );
 
-        // A key no scope covers has no owner.
+        // A key no scope covers has no access entry at all.
         let data = json!({ "notes": "hello" });
         let rows = build_for(&data, json!({"read": 1, "write": 1}), &["traefik"]);
-        assert!(find(&rows, "notes").unwrap().owner.is_none());
+        assert!(find(&rows, "notes").unwrap().access.is_empty());
+    }
+
+    #[test]
+    fn several_registrations_share_a_row_writers_first_and_readers_muted() {
+        // "Several principals may read a subtree; access is about who writes and who
+        // subscribes, not ownership". A watcher holding a `ro` scope over the same prefix
+        // has to appear next to the writer, muted.
+        let operators: Vec<Operator> = serde_json::from_value(json!([
+            {
+                "name": "watcher", "authid": "svc@pve!watch",
+                "scopes": [{"prefix": "traefik", "mode": "ro", "selector": {"all": 1}}],
+            },
+            {
+                "name": "traefik", "authid": "svc@pve!traefik",
+                "scopes": [{"prefix": "traefik.spec", "mode": "rw", "selector": {"all": 1}}],
+            },
+        ]))
+        .unwrap();
+        let access = access(json!({"read": 1, "write": 1}));
+        let rows = build(
+            &json!({ "traefik": { "spec": { "host": "h" } } }),
+            &BuildContext {
+                access: &access,
+                operators: &operators,
+                tags: &[],
+                scoped: true,
+            },
+        );
+
+        let host = find(&rows, "traefik.spec.host").unwrap();
+        let labels: Vec<String> = host.access.iter().map(Registration::label).collect();
+        // The writer first, the reader after it and marked as one.
+        assert_eq!(labels, ["traefik", "watcher (ro)"]);
+        assert!(!host.access[0].muted());
+        assert!(host.access[1].muted());
+
+        // One tooltip line per registration, each naming its selector.
+        let detail = host.access_detail().unwrap();
+        assert_eq!(detail.lines().count(), 2);
+        assert!(detail.contains("svc@pve!traefik \u{2014} traefik.spec (rw) \u{2014} all"));
+        assert!(detail.contains("svc@pve!watch \u{2014} traefik (ro) \u{2014} all"));
+
+        // The narrower scope does not reach the parent, so only the reader covers it.
+        let traefik = find(&rows, "traefik").unwrap();
+        assert_eq!(
+            traefik
+                .access
+                .iter()
+                .map(Registration::label)
+                .collect::<Vec<_>>(),
+            ["watcher (ro)"],
+        );
     }
 
     #[test]
@@ -916,7 +1009,7 @@ mod tests {
 
         let port = find(&rows, "traefik.port").unwrap();
         assert_eq!(port.default_text().as_deref(), Some("80"));
-        assert_eq!(port.description.as_deref(), Some("Backend port"));
+        assert_eq!(port.hint.as_deref(), Some("Backend port"));
         assert_eq!(port.kind, ValueKind::Integer);
         // A key only the second registration declares is a row all the same.
         assert!(find(&rows, "traefik.scheme").is_some());
@@ -941,7 +1034,7 @@ mod tests {
         );
         // `a` exists as a row; `a.b` under it; `a.b.c` under that. Nothing else.
         assert_eq!(paths(&rows), ["a", "a.b", "a.b.c"]);
-        assert!(find(&rows, "a.b.c").unwrap().owner.is_some());
+        assert!(!find(&rows, "a.b.c").unwrap().access.is_empty());
     }
 
     #[test]

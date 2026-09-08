@@ -117,9 +117,9 @@ pub async fn access(doc: DocId) -> Result<Access, Error> {
 
 /// `GET /meta/operators` — every registration, readable by any authenticated user.
 ///
-/// The tree needs these for the declared-but-unset rows and for the Owner column; it is
+/// The tree needs these for the declared-but-unset rows and for the Access column; it is
 /// never an access decision, so a page whose cluster has no registrations (or whose API
-/// predates the endpoint) simply shows no owners.
+/// predates the endpoint) simply shows no Access entries.
 pub async fn operators() -> Result<Vec<Operator>, Error> {
     get_json("/meta/operators", None).await
 }
@@ -220,7 +220,7 @@ pub fn is_conflict(err: &Error) -> bool {
 /// True if `err` is an HTTP 404 or 501: an endpoint this API revision does not serve.
 ///
 /// `GET /meta/operators` is new in revision 5; a page talking to an older node must still
-/// render its document, just without grammars or owners.
+/// render its document, just without grammars or Access entries.
 pub fn is_unimplemented(err: &Error) -> bool {
     matches!(status_of(err), Some(404) | Some(501)) || err.to_string().contains("not implemented")
 }

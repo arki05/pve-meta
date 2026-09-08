@@ -41,7 +41,7 @@ impl DocId {
     ///
     /// They do not to the datacenter document: `docs/DESIGN.md` §3 — "Scopes apply to
     /// **guest documents only**. The datacenter document is governed by ACLs alone." So no
-    /// grammar row, and no owner, is ever shown for it.
+    /// grammar row, and no Access entry, is ever shown for it.
     pub fn scoped(&self) -> bool {
         matches!(self, DocId::Guest(_))
     }

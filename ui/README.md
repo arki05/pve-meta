@@ -13,21 +13,46 @@ Query parameters, as substituted by `pve-ext-loader.js`:
 ## The page
 
 A `DataTable` over a `TreeStore` — the pattern `proxmox_yew_comp::PermissionPanel` uses,
-which is the stack's own `DataTable`-over-`TreeStore` page. Three columns:
+which is the stack's own `DataTable`-over-`TreeStore` page. **Four one-line columns**, at
+the density of the ExtJS grid one tab away (24 px rows, measured against it — see
+*Looking like PVE* below):
 
-* **Key** — the key, with its *description* underneath. A description is the sibling
-  comment key (`host__` documents `host`, a bare `__` documents the map it is in), or, when
-  the document carries no note, the `description` a grammar declares. Comment keys are
-  never rows of their own.
+* **Key** — the key, with a folder icon for a map, a list icon for an array and a leaf icon
+  for a value, next to the expander.
 * **Value** — the scalar, an array as one JSON leaf, nothing for a map. A row that only a
-  grammar declares is greyed and shows the declared default plus a **Set** action.
-* **Owner** — the registration whose scope covers the row, with the selector that made it
-  apply (`traefik (tag: traefik)`); the tooltip adds the authid and the scope's mode.
+  grammar declares is greyed across every column and reads `not set (default: 80)`.
+* **Description** — the note the *document* carries: the sibling comment key (`host__`
+  documents `host`, a bare `__` documents the map it is in). Nothing else; a grammar's
+  `description` is the column's **tooltip**, never its text, because it is documentation
+  about the key rather than data in this document. Comment keys are never rows of their own.
+* **Access** — every registration whose scope covers the row, `rw` ones by name and `ro`
+  ones muted with `(ro)`; the tooltip is one line per registration with its authid, prefix,
+  mode and the selector that made it apply. Several principals may read the same subtree,
+  so this is *not* an owner column: it answers who writes this row and who is watching it.
 
 Rows are the union of the keys present and the keys the applicable grammars declare
 (`GET /meta/operators`, matched by prefix and by selector against this guest's tags).
 Siblings sort **alphabetically** — `data` is unordered on the wire (§4) — unless an object
 schema declares an `order` array, whose keys come first in that order.
+
+Above the grid the page adds at most one muted line: the guest's tags and the document's
+own `__` note. The PVE tab already names the guest, so the page does not repeat it.
+
+### The toolbar
+
+**Add**, **Edit**, **Remove**, **Edit selection as text**, **Reload**, and at the right end
+a `Tree | Text` toggle. Everything acts on the selection and nothing lives in a row:
+
+| Control | Acts on |
+|---|---|
+| Add | the selected map, else the selected leaf's parent, else the document root |
+| Edit | the selected row — also a double click, or Enter |
+| Remove | the selected row, confirmed |
+| Edit selection as text | the selected row's subtree; disabled without a selection |
+| `Tree \| Text` | swaps the panel body in place |
+
+A muted **Scoped write access** / **Read-only** label sits next to the toggle, and only
+when the caller is actually restricted.
 
 Editing is per row and goes straight to the server; there is no draft, no Apply button and
 nothing to lose on a reload:
@@ -42,11 +67,33 @@ nothing to lose on a reload:
 A 409 reloads the tree and leaves a standing notice; the server's own message is shown
 verbatim underneath. `GET /meta/version` is polled every 5 s and any change reloads the
 tree, the grants, the registrations and the guest's tags — **except** while a dialog is
-open, when the page holds still and says the document moved instead.
+open or the text buffer is dirty, when the page holds still and says the document moved
+instead.
 
-Monaco keeps exactly two jobs (§8): **"Edit as text"** for the selected subtree (the whole
-document when nothing is selected) with a YAML/JSON toggle that is presentation only, and
-the **diff** that confirms applying it as `PUT ?view=<path>&text=…`.
+Monaco has three jobs (§8), all of them diff-confirmed:
+
+* **Edit selection as text** — a dialog over the selected row's subtree, with a YAML/JSON
+  toggle that is presentation only. Applies as `PUT ?view=<path>&text=…`.
+* the **Text** half of the `Tree | Text` toggle — the whole document in the panel body,
+  with **Apply** (a root `PUT` with the digest) and **Discard**. Leaving it while it holds
+  unapplied changes asks first.
+* the **diff** that confirms either apply.
+
+The two buffers never coexist: the dialog is only reachable from the tree body. The
+version poll holds still while a dialog is open or the text buffer is dirty, and says the
+document moved instead; a clean Text body simply re-reads, because there is nothing there
+to lose.
+
+### Looking like PVE
+
+The page is a same-origin iframe inside a PVE tab, so it has to read as the same product as
+the ExtJS grid next to it (`docs/design/comparison/ct200-extjs-*.jpg`). Everything that
+matters is a pwt token or class; `css/pve-meta.scss` carries the seven rules no token can
+express, each with its reason in the file — the font retarget, Monaco's host box, the
+iframe edge, PVE's selection and hover colours, the 24 px row, tooltips inside a grid cell,
+and the monospace Value cell's line box. Measured on the lab node, the ExtJS grid puts
+13px/15px text in a 23-24 px row with a 29 px header and a 36 px toolbar; this page is
+13px/17px in a 24 px row, with the same 29 px header and 36 px toolbar.
 
 ### Why an `EditWindow` per row and not an editor in the cell
 
@@ -65,7 +112,7 @@ description, which is a *second key* on the wire and has no room in a cell.
 |---|---|
 | `src/model.rs` | `DocId`, grants (`Access::may_write`), comment-key rules. Pure, unit-tested natively. |
 | `src/grammar.rs` | `GET /meta/operators`: registrations, selectors, the `PVE::JSONSchema` accessors. Pure. |
-| `src/tree.rs` | The row model: present ∪ declared, descriptions, owners, per-row editability, ordering. Pure. |
+| `src/tree.rs` | The row model: present ∪ declared, notes, the Access entries, per-row editability, ordering. Pure. |
 | `src/edit.rs` | One row edit → one request: value parsing and the `PUT`/`DELETE` bodies. Pure. |
 | `src/request.rs` | Request identity: what an async answer was asked for. Pure. |
 | `src/api.rs` | `/api2/json/meta/...` wrappers (`docs/DESIGN.md` §5). |
@@ -75,7 +122,7 @@ description, which is a *second key* on the wire and has no room in a cell.
 | `src/editor.rs` | The page: a `LoadableComponent` with the table, the toolbar and the dialogs. |
 | `src/monaco.rs` | `#[wasm_bindgen]` externs for the glue. |
 | `js/pve-meta-monaco.js` | Monaco glue: mount, diff, language, theme from `--pwt-*`. |
-| `css/pve-meta.scss` | Two rules: the font retarget and Monaco's host box. |
+| `css/pve-meta.scss` | Seven rules, all of them about looking like PVE; each one explains itself. |
 
 ## Build
 
@@ -140,9 +187,10 @@ answered with a 500 until pveproxy is restarted.
 * Editability is per row, from `GET /meta/access?vmid=<id>` / `?dc=1`, whose `write` half
   is separate from `read`: an auditor gets a readable tree with Add/Edit/Remove disabled
   and a "Read-only" label, not a 403 after the fact. If the call fails, the page stays
-  read-only and says why rather than not loading at all.
+  read-only and says why rather than not loading at all. A root replace — the Text body's
+  Apply — needs the full `write` grant; no scope, however wide, grants it (§3).
 * Scopes apply to guest documents only (§3), so the datacenter document has no declared
-  rows and no owners.
+  rows and no Access entries.
 * A row's *note* and its *description* are deliberately different things: the note is what
   the document carries, the description is the note or — failing that — the grammar's own
   prose. The edit dialog pre-fills from the note, so saving a row never copies a grammar's
@@ -150,13 +198,18 @@ answered with a 500 until pveproxy is restarted.
 * If the stored file does not parse, the page shows the parse error and offers "Edit as
   text" on the root, which is the only repair the API allows (§4).
 * `GET /meta/operators` is revision 5. On an older node the page logs it, shows a muted
-  note under the tree, and renders the document without declared rows or owners.
+  note under the tree, and renders the document without declared rows or Access entries.
 
 ## Screenshots
 
-`docs/screenshots/`, all from the lab node: `embedded-{light,dark}.png` (inside the PVE
-tab), `standalone-{light,dark}.png`, `declared-rows.png` (a grammar-declared row, greyed,
-with its default and the Set action), `row-edit.png`, `add-row.png`, `edit-as-text.png`,
-`edit-as-text-json.png`, `diff-dialog.png`, `conflict-notice.png` (a 409: the banner, the
-reloaded tree and the server's message), `read-only.png` (an auditor) and
-`datacenter.png`. Regenerate with `testing/meta-ui-shots.js`.
+`docs/screenshots/`, all from the lab node, each in light and dark:
+
+| File | What it shows |
+|---|---|
+| `tree-{light,dark}.png` | the four columns, a selected row, and a declared-but-unset row greyed with its default |
+| `text-{light,dark}.png` | the Text half of the `Tree \| Text` toggle |
+| `selection-dialog-{light,dark}.png` | "Edit selection as text" on one subtree |
+| `access-tooltip-{light,dark}.png` | the Access column's tooltip, with the selector |
+| `embedded-{light,dark}.png` | the page inside the real PVE Metadata tab, next to the ExtJS one |
+
+Regenerate with `testing/meta-ui-shots.js`.
