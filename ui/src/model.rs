@@ -121,11 +121,22 @@ impl Access {
     /// The prefixes the "View as" selector offers, whole document (the empty prefix)
     /// first, then the document's own top-level keys, then any scope prefix not already
     /// listed.
+    ///
+    /// A comment key — the bare `__` map note or any `name__` subject note — is never
+    /// offered, however it got into `keys` or a scope's own prefix: the store addresses
+    /// one (`docs/DESIGN.md` §9, review pass 4 Q1/Q2) but its value must be a plain
+    /// string, and `PUT` sends the editor's buffer as `text`, parsed as YAML on the
+    /// server like any other view rather than stored as the literal characters typed —
+    /// a note that happens to look like a mapping 400s, and a multi-line note round-trips
+    /// folded onto one line. Selecting one through this list would hand the user that
+    /// landmine for no reason: nothing about editing a note benefits from the YAML editor
+    /// a *document* view gets, and every comment key is already shown, read-only, as part
+    /// of whatever view holds its subject.
     pub fn view_options(&self, keys: &[String]) -> Vec<String> {
         let mut options = vec![String::new()];
 
         for key in keys {
-            if !key.is_empty() && !options.contains(key) {
+            if !key.is_empty() && !is_comment_key(key) && !options.contains(key) {
                 options.push(key.clone());
             }
         }
@@ -133,7 +144,10 @@ impl Access {
         // Scopes are granted on every document (§2: no per-vmid scoping), so they are
         // offered even when the document itself has no such key yet.
         for scope in &self.scopes {
-            if scope.prefix.is_empty() || options.contains(&scope.prefix) {
+            if scope.prefix.is_empty()
+                || is_comment_key(&scope.prefix)
+                || options.contains(&scope.prefix)
+            {
                 continue;
             }
             options.push(scope.prefix.clone());
@@ -187,6 +201,14 @@ fn covers_exactly(prefix: &str, view: &str) -> bool {
         || (view.len() > prefix.len()
             && view.starts_with(prefix)
             && view.as_bytes()[prefix.len()] == b'.')
+}
+
+/// True if `key` (a top-level document key, or a scope prefix's final path segment) is a
+/// comment key: the bare `__` map note, or a `name__` subject note. Mirrors
+/// `pve-meta-core`'s `model::is_comment_key` (`k.ends_with("__")`) — a dotted prefix's
+/// suffix check is the same test, since `__` never contains the `.` path separator.
+fn is_comment_key(key: &str) -> bool {
+    key.ends_with("__")
 }
 
 /// `traefik.host__` → `traefik.host`: the subject a comment key documents. A bare `__`
@@ -380,6 +402,29 @@ mod tests {
             access.view_options(&keys),
             vec!["", "traefik", "notes", "netbird"],
         );
+    }
+
+    #[test]
+    fn view_options_never_offers_a_comment_key() {
+        // Q2: a comment key is addressable (`docs/DESIGN.md` §9) but its value must stay
+        // a plain string, and the editor's `text` payload round-trips through the
+        // server's YAML parser like any other view — offering one as a "View as" option
+        // hands the user a note-editing landmine for no reason (folding, or a 400 on
+        // anything that parses as a mapping).
+        let access: Access = serde_json::from_value(json!({
+            "read": 1,
+            "write": 1,
+            "scopes": [{"prefix": "netbird__", "mode": "rw"}, {"prefix": "traefik", "mode": "rw"}],
+        }))
+        .unwrap();
+        let keys = vec![
+            "traefik".to_string(),
+            "__".to_string(),
+            "traefik__".to_string(),
+            "notes".to_string(),
+        ];
+
+        assert_eq!(access.view_options(&keys), vec!["", "traefik", "notes"],);
     }
 
     #[test]

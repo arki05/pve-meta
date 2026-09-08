@@ -98,6 +98,9 @@ pub enum Msg {
     Reload,
     VersionToken(String),
     ServerDigest(RequestId, api::DocText),
+    /// `api::access(doc)` answered a re-fetch issued outside `load()`: `Msg::Reload`, or
+    /// a version-poll tick whose token changed (`docs/REVIEW-2026-09-08-pass4.md` Q2).
+    AccessRefreshed(RequestId, Result<Access, String>),
     ThemeChanged(bool),
 }
 
@@ -206,7 +209,9 @@ impl PveMetaEditor {
     /// Called wherever either input changes: a load's answer (`Msg::Loaded`) and the
     /// version poll's whole-document digest check (`Msg::ServerDigest`) both refresh
     /// `self.keys`, and the dropdown should never lag one load behind what those two
-    /// already know (`docs/REVIEW-2026-09-08-pass3.md` R3).
+    /// already know (`docs/REVIEW-2026-09-08-pass3.md` R3). `Msg::AccessRefreshed`
+    /// refreshes `self.access` the same way, on Reload and on a token-changed poll tick
+    /// (Q2).
     fn refresh_views(&mut self) {
         self.views = Rc::new(
             self.access
@@ -218,6 +223,28 @@ impl PveMetaEditor {
                 })
                 .collect(),
         );
+    }
+
+    /// Re-fetch this document's grants outside `load()`.
+    ///
+    /// `load()` only fetches `api::access` once per document (`need_access`, editor.rs
+    /// `load()`), because the same grants cover every view of it. But they live in the
+    /// *datacenter* document's `scopes` map, so nothing about a guest document's own
+    /// digest or content ever signals that an admin changed them — a load, however
+    /// often it reruns, never notices a revoked scope. Called from `Msg::Reload` (an
+    /// explicit request to catch up) and from the version-poll tick whenever the store
+    /// token changed (the closest thing to a signal the poll has,
+    /// `docs/REVIEW-2026-09-08-pass4.md` Q2 — R3's own fix text asked for this and it was
+    /// never shipped). The answer feeds `refresh_views()`/`view_outcome()` exactly like
+    /// fresh `keys` already do.
+    fn refresh_access(&self, ctx: &LoadableComponentContext<Self>) {
+        let id = self.requests.issue(Channel::Access);
+        let doc = id.doc;
+        let link = ctx.link().clone();
+        ctx.link().spawn(async move {
+            let result = api::access(doc).await.map_err(|e| e.to_string());
+            link.send_message(Msg::AccessRefreshed(id, result));
+        });
     }
 
     /// Show `view` from now on: strand everything in flight and load the new one.
@@ -299,13 +326,21 @@ impl PveMetaEditor {
 
     /// The Reload button. With unapplied edits it asks first — a reload throws them away
     /// just as the Discard button next to it does, so it uses the same confirmation.
+    ///
+    /// Both branches dispatch `Msg::Reload` rather than the framework's own
+    /// `LoadableComponentScope::send_reload()` directly: that helper only sends the
+    /// master's `Msg::Load`, bypassing `PveMetaEditor::update`'s `Msg::Reload` arm
+    /// entirely — which is where `self.requests.invalidate()` (P8) and the grants
+    /// re-fetch (`refresh_access`, Q2) live. A clean Reload (no draft to confirm) is by
+    /// far the common case, so routing it around `Msg::Reload` would have left both of
+    /// those unexercised for everyday use.
     fn reload_button(&self, ctx: &LoadableComponentContext<Self>) -> Html {
         let link = ctx.link().clone();
         let loading = self.loading();
 
         if !self.dirty() {
             return Button::refresh(loading)
-                .on_activate(move |_| link.send_reload())
+                .on_activate(link.callback(|_| Msg::Reload))
                 .into();
         }
 
@@ -760,6 +795,11 @@ impl LoadableComponent for PveMetaEditor {
                 self.draft = None;
                 self.write_error = None;
                 self.generation += 1;
+                // The datacenter document's scopes are invisible to this document's own
+                // digest, so an explicit reload is also the only other place (besides a
+                // token-changed poll tick) that ever catches up on a revoked or widened
+                // scope (Q2).
+                self.refresh_access(ctx);
                 ctx.link().send_reload();
             }
             Msg::VersionToken(token) => {
@@ -767,6 +807,11 @@ impl LoadableComponent for PveMetaEditor {
                     return false;
                 }
                 self.version_token = Some(token);
+                // The datacenter document's scopes live outside this one, so a change to
+                // them never moves this document's own digest — the store token changing
+                // at all is the only signal available, so re-fetch grants on every tick
+                // that reaches here rather than only when this document also moved (Q2).
+                self.refresh_access(ctx);
                 // The store token covers every document, so it only says "something,
                 // somewhere, moved". Ask this one whether it was this document — always
                 // for the *whole* document, never just the selected view: `get_document`
@@ -826,6 +871,45 @@ impl LoadableComponent for PveMetaEditor {
                 } else {
                     ctx.link().send_reload();
                     return false;
+                }
+            }
+            Msg::AccessRefreshed(id, result) => {
+                // An answer for a document/view the page has since left says nothing
+                // about the one it now shows — same discipline as every other channel.
+                if !self.requests.accepts(&id) {
+                    return false;
+                }
+                match result {
+                    Ok(access) => {
+                        self.access = access;
+                        self.access_for = Some(id.doc);
+                        self.access_error = None;
+                    }
+                    Err(err) => {
+                        // No grants until the endpoint answers again: the page stays
+                        // read-only and says why, exactly like a failed `load()` fetch.
+                        self.access = Access::default();
+                        self.access_for = None;
+                        self.access_error = Some(err);
+                    }
+                }
+                self.refresh_views();
+
+                // The freshly re-fetched grants may no longer cover the selected view
+                // (a scope was narrowed or revoked) — the same fallback `Msg::Loaded`
+                // and `Msg::ServerDigest` apply when fresh `keys` say a view is gone
+                // (`docs/REVIEW-2026-09-08-pass4.md` Q2).
+                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
+                    ViewOutcome::Keep => {}
+                    ViewOutcome::FallBack => {
+                        self.switch_view(ctx, String::new());
+                        return true;
+                    }
+                    ViewOutcome::ConfirmFallBack => {
+                        self.pending_view = Some(String::new());
+                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
+                        return true;
+                    }
                 }
             }
             Msg::ThemeChanged(dark) => {

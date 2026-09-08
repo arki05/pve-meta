@@ -36,10 +36,16 @@ pub enum Channel {
     Diff,
     /// The digest re-read triggered by a `GET /meta/version` token change.
     Digest,
+    /// A grants re-fetch outside `load()`: Reload, and a version-poll tick whose token
+    /// changed. The datacenter document's `scopes` live outside every guest document, so
+    /// nothing about *this* document's digest or content ever signals a scope change —
+    /// this is the only channel that keeps `self.access` from going stale for as long as
+    /// a document stays open (`docs/REVIEW-2026-09-08-pass4.md` Q2).
+    Access,
 }
 
 impl Channel {
-    const COUNT: usize = 4;
+    const COUNT: usize = 5;
 
     fn index(self) -> usize {
         match self {
@@ -47,6 +53,7 @@ impl Channel {
             Channel::Apply => 1,
             Channel::Diff => 2,
             Channel::Digest => 3,
+            Channel::Access => 4,
         }
     }
 }
@@ -231,8 +238,28 @@ mod tests {
         let _ = tracker.issue(Channel::Digest);
         let _ = tracker.issue(Channel::Load);
         let _ = tracker.issue(Channel::Diff);
+        let _ = tracker.issue(Channel::Access);
 
         assert!(tracker.accepts(&apply));
+    }
+
+    #[test]
+    fn an_access_refresh_does_not_strand_other_channels_and_vice_versa() {
+        // Q2: the poll-tick access re-fetch and an in-flight load/apply/digest must be
+        // independent of each other, exactly like every other channel pair.
+        let tracker = RequestTracker::new(DocId::Guest(200));
+        let load = tracker.issue(Channel::Load);
+        let access = tracker.issue(Channel::Access);
+
+        assert!(tracker.accepts(&load));
+        assert!(tracker.accepts(&access));
+
+        let access2 = tracker.issue(Channel::Access);
+        assert!(!tracker.accepts(&access));
+        assert!(tracker.accepts(&access2));
+        // A newer access request supersedes the older one, but the load beside it is
+        // untouched.
+        assert!(tracker.accepts(&load));
     }
 
     #[test]
