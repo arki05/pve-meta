@@ -2,7 +2,7 @@
 //! structural diff that turns a whole-document replace into the same
 //! leaf-granular `Touched` list.
 
-use crate::model::{self, Lint, Value};
+use crate::model::Value;
 use crate::path::Path;
 
 /// What happened to a path when a patch was applied (or when two documents
@@ -24,59 +24,6 @@ pub struct Touched {
     pub op: Op,
 }
 
-/// Validates `patch` with the same key rules as a document (see
-/// [`model::lint`]), except that `null` is permitted anywhere as a delete
-/// marker.
-pub fn lint_patch(patch: &Value) -> Vec<Lint> {
-    lint_patch_at(patch, &Path::root())
-}
-
-/// [`lint_patch`] for a patch that will be applied at `base` in the document
-/// — the merge-mode counterpart of [`model::lint_relaxed_at`], and for the
-/// same reason: the key rule is positional inside `scopes` (review P9).
-pub fn lint_patch_at(patch: &Value, base: &Path) -> Vec<Lint> {
-    let mut out = Vec::new();
-    if !patch.is_object() {
-        out.push(Lint {
-            path: base.clone(),
-            msg: "patch must be an object".to_string(),
-        });
-    }
-    walk_patch(patch, base, &mut out);
-    out
-}
-
-fn walk_patch(v: &Value, path: &Path, out: &mut Vec<Lint>) {
-    match v {
-        Value::Object(map) => {
-            for (k, val) in map.iter() {
-                let child_path = path.join(k.clone());
-                if let Some(msg) = model::key_lint(path, k) {
-                    out.push(Lint {
-                        path: child_path.clone(),
-                        msg,
-                    });
-                }
-                if model::is_comment_key(k) && !(val.is_string() || val.is_null()) {
-                    out.push(Lint {
-                        path: child_path.clone(),
-                        msg: "comment key value must be a string".to_string(),
-                    });
-                }
-                walk_patch(val, &child_path, out);
-            }
-        }
-        Value::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                walk_patch(item, &path.join(i.to_string()), out);
-            }
-        }
-        // Null is allowed anywhere in a patch (it is the delete marker);
-        // other scalars need no further checking.
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
 /// Applies `patch` to `doc` in place, using merge-patch semantics (RFC 7386)
 /// with explicit delete: for each `(k, v)` in a patch object — if `v` is an
 /// object and the target already has an object at `k`, recurse; if `v` is
@@ -90,7 +37,7 @@ fn walk_patch(v: &Value, path: &Path, out: &mut Vec<Lint>) {
 ///
 /// An object patch value always *applies* — it is never stored verbatim — so
 /// its `null` delete markers delete rather than being written into the
-/// document (review pass 3 R7). Against an absent container that means a
+/// document. Against an absent container that means a
 /// patch of nothing but deletes is a no-op and creates no container; against
 /// an existing scalar or array it means the value becomes a map (a change in
 /// itself, reported at the container's own path).
@@ -132,11 +79,10 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
             // A *non-empty* object patch over a target that is absent or is
             // not an object. Applying it verbatim spliced the patch's own
             // `null` delete markers into the document as literal nulls, which
-            // `model::lint` then rejected — so the documented combined
-            // set+delete patch shape (`{"sub": {"x": 1, "gone": null}}`) was
-            // unusable against a container that did not exist yet, even
-            // though `lint_patch_at` deliberately accepts those nulls (review
-            // pass 3 R7). It is applied to an empty scratch map instead —
+            // `model::lint` then rejects — so the documented combined
+            // set+delete patch shape (`{"sub": {"x": 1, "gone": null}}`)
+            // would be unusable against a container that does not exist yet.
+            // It is applied to an empty scratch map instead —
             // the same trick `view::merge` already used for the value at the
             // view prefix itself, one level down.
             Value::Object(patch_map) if !patch_map.is_empty() => {
@@ -150,7 +96,7 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
                 // in itself, even if the patch body wrote no leaves; creating
                 // a container the patch then writes nothing into is not (a
                 // merge that touches nothing changes nothing,
-                // `docs/DESIGN.md` §8). Either way the *container's* path is
+                // `docs/DESIGN.md` §4). Either way the *container's* path is
                 // what is reported, keeping this arm's "replacing a whole
                 // subtree yields its root path" convention.
                 if existed || !sub.is_empty() {
@@ -230,6 +176,7 @@ pub(crate) fn diff_at(old: &Value, new: &Value, path: &Path, out: &mut Vec<Touch
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -329,12 +276,12 @@ mod tests {
 
     #[test]
     fn a_nested_delete_marker_is_applied_not_spliced_into_the_document() {
-        // Review pass 3 R7: the catch-all arm inserted the patch value
+        // The catch-all arm must not insert the patch value
         // verbatim when the target key was absent or not an object, so a
         // nested `null` landed in the document as a literal null and the
         // whole-document lint then rejected the write -- making the
         // documented combined set+delete shape unusable against a container
-        // that does not exist yet. `lint_patch_at` accepts those nulls on
+        // that does not exist yet. A merge payload may carry those nulls on
         // purpose, so nothing it accepts may trip `model::lint`.
 
         // (a) Absent container, nothing but deletes: a no-op that creates
@@ -368,14 +315,14 @@ mod tests {
         assert_eq!(doc4, json!({"a": {}}));
         assert_eq!(touched4, vec![Touched { path: Path::parse("a").unwrap(), op: Op::Set }]);
 
-        // Nothing `lint_patch` accepts may produce a document `lint` rejects.
+        // No legal patch may produce a document `lint` rejects: a `null` is
+        // the delete marker and is applied, never stored.
         for patch in [
             json!({"sub": {"gone": null}}),
             json!({"sub": {"x": 1, "gone": null}}),
             json!({"a": {"deep": null}}),
             json!({"a": {"b": {"c": null}}}),
         ] {
-            assert!(lint_patch(&patch).is_empty(), "{patch} should be a legal patch");
             let mut target = json!({"a": "scalar", "keep": 1});
             apply_patch(&mut target, &patch);
             assert!(
@@ -386,18 +333,13 @@ mod tests {
     }
 
     #[test]
-    fn lint_patch_allows_null_but_checks_keys() {
-        assert!(lint_patch(&json!({"a": null, "b": {"c": null}})).is_empty());
-        let lints = lint_patch(&json!({"bad key": 1}));
-        assert_eq!(lints.len(), 1);
-        let lints = lint_patch(&json!({"foo__": 5}));
-        assert_eq!(lints.len(), 1);
-        assert!(lint_patch(&json!({"foo__": null})).is_empty());
-    }
-
-    #[test]
-    fn lint_patch_requires_object_top_level() {
-        let lints = lint_patch(&json!([1, 2]));
-        assert_eq!(lints.len(), 1);
+    fn a_patch_key_that_only_deletes_never_reaches_the_document() {
+        // There is no separate patch lint any more (`docs/DESIGN.md` §4: one
+        // lint, on the planned document). A patch key that would be invalid
+        // as a document key is harmless as long as it only ever deletes.
+        let mut doc = json!({"a": 1});
+        assert!(apply_patch(&mut doc, &json!({"bad key": null})).is_empty());
+        assert_eq!(doc, json!({"a": 1}));
+        assert!(model::lint(&doc).is_empty());
     }
 }

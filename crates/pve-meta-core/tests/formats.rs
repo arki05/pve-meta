@@ -1,6 +1,6 @@
 //! Integration tests for `pve_meta_core::format`: round trips, order
 //! preservation, and format-specific rejections. YAML is the only on-disk
-//! format; JSON is a wire format only (`docs/DESIGN.md` §8).
+//! format; JSON is a wire format only (`docs/DESIGN.md` §2).
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::error::Error;

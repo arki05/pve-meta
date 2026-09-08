@@ -1,10 +1,10 @@
 # Packaging notes for `PVE::API2::Ext::Meta` (package `pve-meta`)
 
 This directory (`perl/`) holds `PVE::API2::Ext::Meta` (`perl/PVE/API2/Ext/Meta.pm`),
-the native `/meta/...` API module described in `docs/DESIGN.md` §3. It ships in the
-`pve-meta` binary package (the same one as the CLI and UI dist), **not** as its own
-package and **not** as part of `libpve-meta-rs-perl` (that package is `PVE::RS::Meta`
-only, see `crates/pve-meta-perl/PACKAGING.md`).
+the native `/meta/...` API module described in `docs/DESIGN.md` §5. It ships in the
+`pve-meta` binary package (the same one as the UI dist), **not** as its own package and
+**not** as part of `libpve-meta-rs-perl` (that package is `PVE::RS::Meta` only, see
+`crates/pve-meta-perl/PACKAGING.md`).
 
 ## Install target
 
@@ -24,9 +24,26 @@ version constraint if the two packages' versions can drift; they are built from 
 same source package here, so an exact match is simplest) alongside its existing
 `Depends:` line, so the two packages install together.
 
+## The operator drop-directory
+
+`docs/DESIGN.md` §3 puts access-control data outside the documents, in two directories:
+
+* `/usr/share/pve-meta/operators/` — packaged registrations. **The `pve-meta` package
+  should ship this directory** (it may be empty; a missing directory is not an error)
+  and install `operators/*.yaml` into it. This repository's
+  `operators/example-traefik.yaml` documents the format rather than granting anything —
+  `svc@pve!traefik` does not exist until an administrator creates it — so packaging that
+  one file is optional, but the directory itself is the ecosystem seam: an operator's own
+  `.deb` drops its registration file in here.
+* `/etc/pve/meta.d/operators/` — cluster-wide overrides on pmxcfs, created by the
+  administrator (`mkdir -p /etc/pve/meta.d/operators`). Nothing packages this.
+
+A cluster file overrides the packaged file of the same name; both directories are read
+per request and neither is required to exist.
+
 ## Registration (handled by pve-ext, not this file)
 
-`docs/DESIGN.md` §5: `pve-meta` depends on `pve-ext`. `PVE::API2::Ext` (package
+`docs/DESIGN.md` §7: `pve-meta` depends on `pve-ext`. `PVE::API2::Ext` (package
 `pve-ext`, loaded via one dpkg-diverted `use PVE::API2::Ext;` line in
 `/usr/share/perl5/PVE/API2.pm`) scans `/usr/share/perl5/PVE/API2/Ext/*.pm` at
 pvedaemon/pveproxy startup, `require`s each file, and registers it in the API root at
@@ -42,7 +59,8 @@ Installed by hand on the lab node (`pvemeta-node1`, PVE 9.2.11) as
 and `pve-ext`'s `use PVE::API2::Ext;` line in a dpkg-diverted `PVE/API2.pm`, already
 existed from a separate `pve-ext` install), then `systemctl restart pvedaemon
 pveproxy`. `GET /api2/json/ext/modules` confirmed `PVE::API2::Ext::Meta` auto-loaded
-at path `meta`; the full `/meta/...` tree (version, access, guests, datacenter) was
-then exercised through the real pveproxy on port 8006 via
-`Authorization: PVEAPIToken=...` headers for both a full-access principal and a
-scoped one.
+at path `meta`; the full `/meta/...` tree (version, access, guests, datacenter,
+operators) was then exercised through the real pveproxy on port 8006 via
+`Authorization: PVEAPIToken=...` headers for both a full-access principal and a scoped
+one -- including the tag selector on and off, merge/replace/delete semantics, digest
+409, `dry_run`, an unparsable document and the GC (revision 5, 2026-09-08).

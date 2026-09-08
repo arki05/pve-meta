@@ -2,14 +2,14 @@
 //! documents, snapshots, and change-version polling.
 //!
 //! Root is `/etc/pve/meta` in production, a tempdir in tests. Documents are
-//! always YAML (`docs/DESIGN.md` §8): `<vmid>.yaml`, `datacenter.yaml`, and
+//! always YAML (`docs/DESIGN.md` §2): `<vmid>.yaml`, `datacenter.yaml`, and
 //! `<vmid>.<snapname>.yaml` for a guest's snapshot copies. All writes are
 //! atomic (write a hidden, node- and call-unique sibling, then `rename`),
 //! which pmxcfs supports.
 //!
 //! Serialising concurrent writers is *not* this layer's job: the API write
 //! handlers run the whole read-check-write cycle under
-//! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §8), and the digest
+//! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §4), and the digest
 //! precondition enforced here ([`MetaStore::put_raw`]'s `expected_digest`) is
 //! the single owner of the compare-and-swap rule.
 
@@ -25,9 +25,8 @@ use sha2::{Digest as _, Sha256};
 use crate::digest;
 use crate::error::{Error, Result};
 use crate::format::{self, Format};
-use crate::model::{Lint, Value};
+use crate::model::Value;
 use crate::patch::{self, Touched};
-use crate::path::Path;
 
 /// Warn threshold for document size (informational only; logged via
 /// `tracing`).
@@ -37,9 +36,8 @@ pub const WARN_BYTES: u64 = 256 * 1024;
 /// This is a **backstop, not the operative limit** for an API write: pveproxy
 /// rejects a request body of roughly this size before the request ever
 /// reaches us (measured on PVE 8: 520 000 bytes through, 530 000 bytes
-/// answered "for data too large", HTTP 501). It is the operative limit for
-/// the writers that do not go through pveproxy — `import_from_backup` and a
-/// hand-written or replicated file being rewritten — and it is what keeps a
+/// answered "for data too large", HTTP 501). It is the operative limit for a
+/// hand-written or replicated file being rewritten, and it is what keeps a
 /// single document from eating the pmxcfs size budget.
 pub const MAX_BYTES: u64 = 512 * 1024;
 
@@ -49,7 +47,7 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// dropped into `/etc/pve/meta` out of band (a bad rsync, a replicated file
 /// from a future version, a mistake) was read and SHA-256'd on every request
 /// that touched it — including `api::grants`, which reads `datacenter.yaml`
-/// on every single guest operation (review pass 3 §5, `store.rs:235`).
+/// on every request that touched it.
 ///
 /// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
 /// can ever reach it, so hitting it always means the file arrived out of
@@ -58,34 +56,8 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// lowered later.
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The one on-disk format (`docs/DESIGN.md` §8: "YAML only on disk").
+/// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
 pub const DISK_FORMAT: Format = Format::Yaml;
-
-/// How much validation [`MetaStore::put_raw`] applies to the text being
-/// stored.
-///
-/// The full document lint is the right gate for a caller handing over
-/// whole-document content it did not itself validate. It is the *wrong* gate
-/// for a scoped write, which is only allowed to touch one subtree: with it,
-/// one out-of-band bad key anywhere in a document blocked every write by
-/// everybody who could not replace the whole document, and the 400 rendered
-/// the offending path to a caller who could not read it (review pass 3 R6;
-/// `docs/DESIGN.md` §9, "strict lint runs only on the content being
-/// written").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteGate {
-    /// Parse and fully [`crate::model::lint`] the new text. Used by every
-    /// caller that supplies whole-document content: the lifecycle hooks, a
-    /// backup import, and any API write by a principal who may replace the
-    /// whole document.
-    Document,
-    /// Parse the new text and require a map at the top level, but leave the
-    /// content rules to the caller, which has already linted the subtree it
-    /// is writing (`crate::view::replace`/`crate::view::merge` lint the
-    /// payload at the path it lands on). Pre-existing findings elsewhere in
-    /// the document neither block the write nor appear in its error message.
-    CallerLinted,
-}
 
 /// Identifies a top-level document in the store (a guest's metadata, or the
 /// datacenter's). Snapshots are addressed separately, by `(vmid, name)`, via
@@ -131,7 +103,7 @@ pub struct Document {
     pub value: Value,
     /// `Some(message)` when the file's text is not valid YAML at all, in
     /// which case [`Document::value`] is the empty document
-    /// (`docs/DESIGN.md` §9, review pass 3 R1).
+    /// (`docs/DESIGN.md` §4).
     ///
     /// A *syntax* error used to propagate out of [`MetaStore::read`], which
     /// made a single tab or indentation slip in a hand-edited
@@ -272,8 +244,7 @@ impl MetaStore {
     }
 
     /// Reads and parses one document file. **Reads never lint, and never
-    /// fail on the document's own content** (`docs/DESIGN.md` §9, review
-    /// P2/R1).
+    /// fail on the document's own content** (`docs/DESIGN.md` §4).
     ///
     /// Every API write is already lint-gated, so invalid content can only
     /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
@@ -339,7 +310,7 @@ impl MetaStore {
     /// Reads `id`'s document. **Reads never lint and never fail on the
     /// document's own content**: text the YAML parser rejects is reported in
     /// [`Document::parse_error`], with the empty document as the value
-    /// (`docs/DESIGN.md` §9, review P2/R1).
+    /// (`docs/DESIGN.md` §4).
     ///
     /// # Errors
     /// [`Error::NotFound`] if it does not exist; [`Error::TooLarge`] if the
@@ -356,7 +327,7 @@ impl MetaStore {
     /// refuses to read — one above [`MAX_READ_BYTES`] — while still carrying
     /// a compare-and-swap precondition: the caller needs the digest, and the
     /// digest is the one thing about such a file that is cheap and safe to
-    /// compute (review pass 3 §5, `store.rs:235`).
+    /// compute.
     pub fn digest_of(&self, id: DocId) -> Result<Option<String>> {
         match fs::read(self.path_for(id)) {
             Ok(bytes) => Ok(Some(digest::digest(&bytes))),
@@ -365,8 +336,8 @@ impl MetaStore {
         }
     }
 
-    /// The digest precondition, enforced in exactly one place
-    /// (`docs/REVIEW-2026-09-07.md` F13): `None` means "no precondition";
+    /// The digest precondition, enforced in exactly one place: `None`
+    /// means "no precondition";
     /// `Some("")` matches a *missing* document (that is the digest
     /// `GET` reports for one, `docs/DESIGN.md` §2, so the documented
     /// GET-then-PUT create flow works); any other `Some(_)` must equal the
@@ -388,7 +359,7 @@ impl MetaStore {
     /// Checks the compare-and-swap precondition for `id` without writing
     /// anything — the same rule [`MetaStore::put_raw`] enforces, exposed so a
     /// `dry_run` can validate exactly what the real write validates
-    /// (`docs/DESIGN.md` §8, review F13/F14) without a second implementation
+    /// (`docs/DESIGN.md` §4) without a second implementation
     /// of the rule living in the API layer.
     ///
     /// # Errors
@@ -406,37 +377,23 @@ impl MetaStore {
     }
 
     /// Replaces `id`'s document with `text` verbatim (only normalized to end
-    /// with a single newline), creating it if it does not exist, applying the
-    /// full document lint to the new text ([`WriteGate::Document`]).
+    /// with a single newline), creating it if it does not exist.
+    ///
+    /// The *new* text is parsed and linted: nothing this store writes can
+    /// ever fail [`crate::model::lint`]. There is one gate, for every
+    /// caller — the privilege-narrowed variants revision 4 grew are gone
+    /// with the tower that needed them (`docs/DESIGN.md` §10).
     ///
     /// # Errors
     /// [`Error::Parse`] / [`Error::Lint`] if `text` does not parse as a valid
     /// document; [`Error::DigestMismatch`] if `expected_digest` is given and
     /// does not match (`Some("")` matches a missing document);
     /// [`Error::TooLarge`] if `text` exceeds [`MAX_BYTES`].
-    pub fn put_raw(&self, id: DocId, text: &str, expected_digest: Option<&str>) -> Result<PutResult> {
-        self.put_raw_gated(id, text, expected_digest, WriteGate::Document)
-    }
-
-    /// [`MetaStore::put_raw`] with an explicit [`WriteGate`].
-    ///
-    /// [`WriteGate::CallerLinted`] is for the API layer's scoped writes,
-    /// which lint the subtree they write and must not be blocked (or made to
-    /// disclose paths) by an out-of-band problem elsewhere in the document
-    /// (`docs/DESIGN.md` §9, review pass 3 R6). The text must still parse and
-    /// still be a map at the top level: that is the one rule about the
-    /// document *as a whole* rather than about its content, and losing it
-    /// would let a scoped write turn a document into something no scoped read
-    /// can address.
-    ///
-    /// # Errors
-    /// As [`MetaStore::put_raw`].
-    pub fn put_raw_gated(
+    pub fn put_raw(
         &self,
         id: DocId,
         text: &str,
         expected_digest: Option<&str>,
-        gate: WriteGate,
     ) -> Result<PutResult> {
         let path = self.path_for(id);
         let existing = match fs::read(&path) {
@@ -448,11 +405,10 @@ impl MetaStore {
 
         // The *old* content is only read to diff against, so it is parsed
         // leniently: an out-of-band edit that broke it must not stop an
-        // administrator from writing the repair (`docs/DESIGN.md` §9, review
-        // P2/R1). That now includes a *syntax* error — pass 2 made the lint
-        // lenient here and left the parse fatal, so `?` on this line was
-        // still the last thing standing between a tabbed-in `datacenter.yaml`
-        // and its repair. Unparseable old content diffs as the empty
+        // administrator from writing the repair (`docs/DESIGN.md` §4).
+        // That includes a *syntax* error: it is the last thing that would
+        // otherwise stand between a hand-edited document and its repair.
+        // Unparseable old content diffs as the empty
         // document: the repair reports everything it writes as newly set,
         // which is exactly true of a document that had no readable structure.
         let old_value = match &existing {
@@ -471,21 +427,9 @@ impl MetaStore {
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
-        // The write-time gate: the content being stored is validated as
-        // `gate` requires (never less than "parses, and is a map").
-        let new_value = match gate {
-            WriteGate::Document => format::parse(DISK_FORMAT, &normalized)?,
-            WriteGate::CallerLinted => {
-                let value = format::parse_raw(DISK_FORMAT, &normalized)?;
-                if !value.is_object() {
-                    return Err(Error::Lint(vec![Lint {
-                        path: Path::root(),
-                        msg: "top level must be an object".to_string(),
-                    }]));
-                }
-                value
-            }
-        };
+        // The write-time gate: the content being stored parses and passes
+        // the lint.
+        let new_value = format::parse(DISK_FORMAT, &normalized)?;
 
         self.write_atomic(&path, normalized.as_bytes())?;
 
@@ -508,8 +452,8 @@ impl MetaStore {
     }
 
     /// Deletes `id`'s document — **only** the current document. Snapshot
-    /// copies are owned by the lifecycle hooks (`docs/DESIGN.md` §8) and are
-    /// removed by [`MetaStore::destroy`], never by this.
+    /// copies are owned by the snapshot hooks (`docs/DESIGN.md` §6) and are
+    /// removed by [`MetaStore::purge`], never by this.
     ///
     /// # Errors
     /// [`Error::NotFound`] if it does not exist.
@@ -519,16 +463,17 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Every vmid that has a live document, sorted ascending (snapshot
-    /// copies, the datacenter document and temp files are not documents).
+    /// Every vmid the store holds *any* file for — a live document, a
+    /// snapshot copy, or both — sorted ascending. The datacenter document and
+    /// temp files are not guests.
     ///
-    /// Used to find **orphans**: documents whose guest is no longer in the
-    /// vmlist (`docs/DESIGN.md` §9). Perl owns the vmlist and does the
-    /// comparison; this is the store's half of it.
-    pub fn guest_ids(&self) -> Result<Vec<u32>> {
-        let mut out = Vec::new();
+    /// This is the store's half of the GC (`docs/DESIGN.md` §6): Perl passes
+    /// the vmlist, and every vmid here that is not in it is removed together
+    /// with its snapshot copies. There is no orphan concept in the API.
+    pub fn stored_vmids(&self) -> Result<Vec<u32>> {
+        let mut out = std::collections::BTreeSet::new();
         if !self.root.is_dir() {
-            return Ok(out);
+            return Ok(Vec::new());
         }
         let suffix = format!(".{}", DISK_FORMAT.ext());
         for entry in fs::read_dir(&self.root)? {
@@ -537,17 +482,23 @@ impl MetaStore {
             if name.starts_with('.') || !entry.file_type()?.is_file() {
                 continue;
             }
-            // `<vmid>.yaml` only: `<vmid>.<snapname>.yaml` still ends with
-            // the suffix, but its stem is not a bare number.
+            // `<vmid>.yaml` or `<vmid>.<snapname>.yaml`: the vmid is the
+            // first dot-separated component either way.
             let Some(stem) = name.strip_suffix(&suffix) else {
                 continue;
             };
-            if let Ok(vmid) = stem.parse::<u32>() {
-                out.push(vmid);
+            let (head, snap) = match stem.split_once('.') {
+                Some((head, snap)) => (head, Some(snap)),
+                None => (stem, None),
+            };
+            if snap.is_some_and(|s| !is_valid_snapshot_name(s)) {
+                continue;
+            }
+            if let Ok(vmid) = head.parse::<u32>() {
+                out.insert(vmid);
             }
         }
-        out.sort_unstable();
-        Ok(out)
+        Ok(out.into_iter().collect())
     }
 
     /// Lists a guest's snapshot names, sorted.
@@ -633,19 +584,22 @@ impl MetaStore {
     }
 
     /// Removes `vmid`'s document **and every snapshot copy** — the guest is
-    /// gone. Used only by the `on_destroy` lifecycle hook; the REST API's
-    /// `DELETE` uses [`MetaStore::delete`], which never touches snapshots
-    /// (`docs/DESIGN.md` §8).
+    /// gone. Used only by the GC (`docs/DESIGN.md` §6); the REST API's
+    /// `DELETE` uses [`MetaStore::delete`], which never touches snapshots.
     ///
-    /// Idempotent: a missing document is not an error.
-    pub fn destroy(&self, vmid: u32) -> Result<()> {
+    /// Returns the number of files removed. Idempotent: a missing document is
+    /// not an error.
+    pub fn purge(&self, vmid: u32) -> Result<usize> {
+        let mut removed = 0;
         if self.locate(DocId::Guest(vmid))?.is_some() {
             self.delete(DocId::Guest(vmid))?;
+            removed += 1;
         }
         for name in self.list_snapshots(vmid)? {
             self.delete_snapshot(vmid, &name)?;
+            removed += 1;
         }
-        Ok(())
+        Ok(removed)
     }
 
     /// A summary of the whole store's content, suitable for polling: the

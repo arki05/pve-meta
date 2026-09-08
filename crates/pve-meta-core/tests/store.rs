@@ -3,7 +3,7 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
-use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome, WriteGate, MAX_READ_BYTES};
+use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
@@ -50,7 +50,7 @@ fn put_raw_digest_mismatch() {
 
 #[test]
 fn put_raw_empty_digest_matches_a_missing_document() {
-    // Review F13: `GET` reports digest "" for a non-existent document, so
+    // `GET` reports digest "" for a non-existent document, so
     // the documented GET-then-PUT-with-digest create flow must work.
     let (_dir, store) = store();
     let result = store.put_raw(DocId::Guest(100), "a: 1\n", Some("")).unwrap();
@@ -128,9 +128,8 @@ fn delete_missing_is_not_found() {
 
 #[test]
 fn delete_leaves_snapshots_alone() {
-    // Review F19: `DELETE /meta/guests/{vmid}` has no concept of snapshots,
-    // so `delete` must never cascade into them. Only `destroy` (the
-    // `on_destroy` lifecycle hook) does.
+    // `DELETE /meta/guests/{vmid}` has no concept of snapshots, so `delete`
+    // must never cascade into them. Only `purge` (the GC) does.
     let (dir, store) = store();
     store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
@@ -140,12 +139,12 @@ fn delete_leaves_snapshots_alone() {
 }
 
 #[test]
-fn destroy_removes_the_document_and_every_snapshot() {
+fn purge_removes_the_document_and_every_snapshot() {
     let (dir, store) = store();
     store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
     store.snapshot(100, "snapB").unwrap();
-    store.destroy(100).unwrap();
+    assert_eq!(store.purge(100).unwrap(), 3);
     assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
     assert!(store.list_snapshots(100).unwrap().is_empty());
     assert!(!dir.path().join("100.snapA.yaml").exists());
@@ -153,20 +152,20 @@ fn destroy_removes_the_document_and_every_snapshot() {
 }
 
 #[test]
-fn destroy_is_idempotent_and_cleans_orphaned_snapshots() {
+fn purge_is_idempotent_and_cleans_left_behind_snapshots() {
     let (_dir, store) = store();
     store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.snapshot(100, "orphan").unwrap();
+    store.snapshot(100, "leftover").unwrap();
     store.delete(DocId::Guest(100)).unwrap();
     // No live document, but a snapshot survives the API delete.
-    store.destroy(100).unwrap();
+    assert_eq!(store.purge(100).unwrap(), 1);
     assert!(store.list_snapshots(100).unwrap().is_empty());
-    store.destroy(100).unwrap();
+    assert_eq!(store.purge(100).unwrap(), 0);
 }
 
 #[test]
 fn api_delete_then_rollback_does_not_lose_snapshot_metadata() {
-    // The forward propagation of review F19: a plain DELETE used to eat the
+    // The forward propagation of that rule: a plain DELETE that ate the
     // snapshot copies, after which `on_rollback` read "no snapshot" as
     // "there was no metadata" and deleted the freshly rewritten document.
     let (_dir, store) = store();
@@ -301,7 +300,7 @@ fn version_token_changes_on_write_not_on_read() {
 
 #[test]
 fn version_distinguishes_same_length_same_second_writes() {
-    // Review F25: `(mtime, len)` cannot tell two same-length writes within
+    // `(mtime, len)` cannot tell two same-length writes within
     // one pmxcfs mtime tick apart, so the token is always computed from the
     // files' actual content.
     let (_dir, store) = store();
@@ -341,7 +340,7 @@ fn version_token_returns_to_an_earlier_value_when_content_does() {
 
 #[test]
 fn reads_never_lint_but_writes_still_do() {
-    // Review P2 (`docs/DESIGN.md` §9). Out-of-band content -- a hand-edited
+    // `docs/DESIGN.md` §4. Out-of-band content -- a hand-edited
     // file, a restored backup, pmxcfs replication -- must stay readable, or
     // one bad key in `datacenter.yaml` denies every guest operation
     // cluster-wide and blocks the repair that would fix it.
@@ -378,13 +377,11 @@ fn reads_never_lint_but_writes_still_do() {
 
 #[test]
 fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
-    // Review pass 3 R1. Pass 2 moved the *lint* off the read path and left
-    // the *parse* fatal, which is the same cluster-wide outage one layer
-    // down: `api::grants` reads `datacenter.yaml` on every guest request, and
-    // both write handlers read the document before planning, so a tab or an
-    // indentation slip in a hand-edited file 400'd every endpoint for every
-    // principal -- root included -- and could not be repaired through the
-    // API. Each of these is a real YAML syntax failure, not a lint finding.
+    // `docs/DESIGN.md` §4: a parse failure is a *per-document* condition.
+    // Both write handlers read the document before planning, so a fatal parse
+    // here would make a tab or an indentation slip in a hand-edited file
+    // unrepairable through the API. Each of these is a real YAML syntax
+    // failure, not a lint finding.
     for broken in [
         "a: 1\n\tb: 2\n",            // a tab
         "a: &anc 1\nb: *anc\n",      // an anchor and an alias
@@ -423,7 +420,7 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
 
 #[test]
 fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
-    // Review pass 3 §5, `store.rs:235`: `MAX_BYTES` only ever applied to
+    // `MAX_BYTES` only ever applied to
     // writes, so a multi-megabyte file dropped in out of band was read and
     // SHA-256'd on every request that touched the document -- `datacenter.yaml`
     // on every guest operation, and every 5 s `version()` poll.
@@ -452,51 +449,46 @@ fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
 }
 
 #[test]
-fn the_caller_linted_write_gate_stores_content_the_document_lint_would_refuse() {
-    // Review pass 3 R6, the store's half: a scoped write lints the subtree it
-    // writes, so the store must not re-apply the whole-document lint (which
-    // would deny the write *and* render the offending path) for an
-    // out-of-band problem the caller neither made nor can see.
+fn there_is_one_write_gate_and_it_is_the_document_lint() {
+    // `docs/DESIGN.md` §10 deletes `WriteGate` and the privilege-narrowed
+    // lint variants: nothing this store writes can fail `model::lint`.
     let (dir, store) = store();
     std::fs::write(dir.path().join("100.yaml"), "bad key: 1\ntraefik:\n  host: a\n").unwrap();
 
-    let text = "bad key: 1\ntraefik:\n  host: b\n";
+    for (text, expect_lint) in [
+        ("bad key: 1\ntraefik:\n  host: b\n", true),
+        ("- 1\n- 2\n", true),
+        ("traefik:\n  host: b\n", false),
+    ] {
+        let result = store.put_raw(DocId::Guest(100), text, None);
+        assert_eq!(matches!(result, Err(Error::Lint(_))), expect_lint, "{text:?}");
+    }
     assert!(matches!(
-        store.put_raw(DocId::Guest(100), text, None),
-        Err(Error::Lint(_)),
-    ));
-    store
-        .put_raw_gated(DocId::Guest(100), text, None, WriteGate::CallerLinted)
-        .expect("a caller-linted write is not blocked by a pre-existing bad key");
-    assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
-
-    // The one whole-document rule the narrow gate keeps: it is still a map,
-    // and it still has to parse.
-    assert!(matches!(
-        store.put_raw_gated(DocId::Guest(100), "- 1\n- 2\n", None, WriteGate::CallerLinted),
-        Err(Error::Lint(_))
-    ));
-    assert!(matches!(
-        store.put_raw_gated(DocId::Guest(100), "a: [\n", None, WriteGate::CallerLinted),
+        store.put_raw(DocId::Guest(100), "a: [\n", None),
         Err(Error::Parse { .. })
     ));
 }
 
 #[test]
-fn guest_ids_lists_live_guest_documents_only() {
-    // The store's half of orphan detection (review P5): Perl compares this
-    // with the vmlist.
+fn stored_vmids_covers_documents_and_snapshot_copies() {
+    // The store's half of the GC (`docs/DESIGN.md` §6): Perl passes the
+    // vmlist, and everything here that is not in it is purged. A vmid whose
+    // *only* file is a snapshot copy has to be found too.
     let (dir, store) = store();
-    assert!(store.guest_ids().unwrap().is_empty());
+    assert!(store.stored_vmids().unwrap().is_empty());
 
     store.put_raw(DocId::Guest(999500), "a: 1\n", None).unwrap();
     store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
     store.put_raw(DocId::Datacenter, "a: 1\n", None).unwrap();
     store.snapshot(100, "before").unwrap();
+    // A guest whose document was deleted but whose snapshot copy survives.
+    store.put_raw(DocId::Guest(777), "a: 1\n", None).unwrap();
+    store.snapshot(777, "only").unwrap();
+    store.delete(DocId::Guest(777)).unwrap();
     std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
     std::fs::write(dir.path().join("notes.txt"), "junk").unwrap();
 
-    assert_eq!(store.guest_ids().unwrap(), vec![100, 999500]);
+    assert_eq!(store.stored_vmids().unwrap(), vec![100, 777, 999500]);
 }
 
 #[test]

@@ -1,0 +1,26 @@
+# An example operator registration (docs/DESIGN.md §3).
+#
+# Packaged registrations live in /usr/share/pve-meta/operators/<name>.yaml and
+# are dropped in by an operator's own .deb; a cluster-wide file of the same
+# name in /etc/pve/meta.d/operators/<name>.yaml overrides it. Nothing here is
+# required: pve-meta ships this file as documentation of the format, not as an
+# active grant -- `svc@pve!traefik` does not exist until an administrator
+# creates it.
+#
+# Files are parsed strictly and independently. A malformed file is skipped
+# with a warning and grants nothing; it never affects another operator's
+# grants.
+authid: svc@pve!traefik
+description: Traefik dynamic-configuration provider
+scopes:
+  - prefix: traefik            # any dotted path, nested allowed
+    mode: rw                   # ro | rw
+    selector: { all: true }    # or { tag: traefik }; room for { pool: name } later
+    grammar:                   # optional, PVE::JSONSchema dialect for the subtree
+      type: object
+      properties:
+        spec:
+          type: object
+          properties:
+            host: { type: string, description: Public host name }
+            port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }

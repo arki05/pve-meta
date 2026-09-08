@@ -18,12 +18,18 @@ needs from them rather than duplicating their contents.
     Package: libpve-meta-rs-perl
     Architecture: any
     Depends: ${shlibs:Depends}, ${misc:Depends}, ${perl:Depends}
-    Description: pve-meta guest lifecycle hooks for PVE (Rust, perlmod)
+    Description: pve-meta store bindings for PVE (Rust, perlmod)
      PVE::RS::Meta, a Perl binding (via perlmod) to pve-meta's guest metadata
-     store, exposing snapshot/rollback/delsnap/clone/destroy lifecycle hooks and
-     vzdump backup/restore export/import for use from PVE's own Perl code
-     (pve-container, qemu-server, pve-guest-common).
+     store: the snapshot/rollback/delsnap hooks called from
+     libpve-guest-common-perl, the store GC, and the api_* functions behind
+     PVE::API2::Ext::Meta.
     ```
+
+    (`debian/control` is owned by the packaging work, not by this crate; the
+    stanza above is what this crate's contents ask for. Revision 5 dropped the
+    clone, destroy and backup hooks, so `pve-container` and `qemu-server` are
+    no longer in the picture at all — one patched file in
+    `libpve-guest-common-perl` is.)
 
 * **Root `Makefile`**:
   * `build:` now also runs `$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release`

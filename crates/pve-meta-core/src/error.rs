@@ -24,7 +24,7 @@ pub enum Error {
         msg: String,
     },
 
-    /// The document model failed one or more lint rules (see [`crate::model::lint`]).
+    /// The document failed the lint (see [`crate::model::lint`]).
     #[error("document failed validation: {}", .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
     Lint(Vec<Lint>),
 
@@ -42,11 +42,6 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(DocId),
 
-    // There is no `Conflict` variant: it described "more than one format
-    // file exists for the same document id", which the YAML-only store
-    // (`docs/DESIGN.md` §8) cannot produce. It was never constructed after
-    // the multi-format store was removed, so it went with it rather than
-    // staying as a 409 arm nothing can reach (review §5).
     /// The document (or patch result) exceeds the configured maximum size.
     #[error("document too large: {size} bytes (max {max} bytes)")]
     TooLarge {
@@ -64,10 +59,10 @@ pub enum Error {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
-    /// The datacenter document's `scopes` map (or one of its entries) does
-    /// not have the shape [`crate::scopes::parse_scopes`] expects.
-    #[error("invalid scopes: {0}")]
-    InvalidScopes(String),
+    /// An operator registration file (`docs/DESIGN.md` §3) is malformed; see
+    /// [`crate::registry::parse`].
+    #[error("invalid registration: {0}")]
+    Registration(String),
 
     /// An underlying I/O operation failed.
     #[error(transparent)]

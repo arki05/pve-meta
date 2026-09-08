@@ -1,7 +1,7 @@
 //! The two supported serialization formats (YAML, JSON): canonical
 //! parse/dump, with format-specific validation.
 //!
-//! YAML is the *only* on-disk format (`docs/DESIGN.md` §8); JSON exists
+//! YAML is the *only* on-disk format (`docs/DESIGN.md` §2); JSON exists
 //! solely as a wire format for a view's `data` (`docs/DESIGN.md` §3). There
 //! is no TOML support: it was removed together with the unreachable
 //! format-preserving edit engine.
@@ -60,12 +60,12 @@ impl FromStr for Format {
     }
 }
 
-/// Parses `text` as `format` into a [`Value`], with no [`model::lint`]
-/// pass -- used directly by [`parse`] (which adds the full document lint)
-/// and by [`crate::view::parse`]/[`crate::view::parse_patch`] (which add
-/// [`model::lint_relaxed`]/[`crate::patch::lint_patch`] instead, since a
-/// view's value need not be an object at its own root, and a merge patch may
-/// contain `null` delete markers).
+/// Parses `text` as `format` into a [`Value`], with no [`model::lint`] pass.
+///
+/// Used by [`parse`] (which adds the lint), by the store's tolerant read, by
+/// [`crate::view::parse`]/[`crate::view::parse_patch`] (a view's payload is
+/// linted where it lands, as part of the planned document) and by
+/// [`crate::registry::parse`].
 ///
 /// # Errors
 /// [`Error::Parse`] on a syntax error (or a format-specific rejection: YAML
