@@ -106,6 +106,21 @@ eq('editor boolean', U.editorFor({ kind: 'boolean' }).xtype, 'proxmoxcheckbox');
 eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
 
+// A grammar's `minimum`/`maximum` reach the number editor, and its `format` is
+// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §8).
+let numEd = U.editorFor({ kind: 'number', minimum: 1, maximum: 65535 });
+eq('editor number honours minimum', numEd.minValue, 1);
+eq('editor number honours maximum', numEd.maxValue, 65535);
+eq('editor number without a range sets none', U.editorFor({ kind: 'number' }).minValue, undefined);
+eq('a zero minimum is not dropped as falsy', U.editorFor({ kind: 'number', minimum: 0 }).minValue, 0);
+eq('editor format -> vtype', U.editorFor({ kind: 'string', format: 'ipv4' }).vtype, 'IPAddress');
+eq('editor format cidr', U.editorFor({ kind: 'string', format: 'CIDR' }).vtype, 'IP64CIDRAddress');
+eq('an unknown format does not constrain the field',
+    U.editorFor({ kind: 'string', format: 'no-such-format' }).vtype, undefined);
+eq('no format, no vtype', U.editorFor({ kind: 'string' }).vtype, undefined);
+eq('enum wins over format', U.editorFor({ kind: 'string', format: 'ipv4', enumValues: ['a'] }).xtype,
+    'combobox');
+
 console.log('\n--- selector text (the Access tooltip) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
 eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');

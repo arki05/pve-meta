@@ -1899,7 +1899,9 @@ fn row_writes(
         (ValueKind::Map, false) => Some(json!({})),
         (kind, _) => {
             let text = edit::field_text(data.get("value"));
-            Some(edit::parse_value(kind, &text)?)
+            let parsed = edit::parse_value(kind, &text)?;
+            edit::check_constraints(&parsed, node.minimum, node.maximum, node.format.as_deref())?;
+            Some(parsed)
         }
     };
 

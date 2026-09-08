@@ -138,6 +138,157 @@ pub fn schema_enum(schema: &Value) -> Option<Vec<String>> {
     Some(list.iter().map(scalar_to_string).collect())
 }
 
+/// `minimum` of a schema node — the number editor's lower bound.
+pub fn schema_minimum(schema: &Value) -> Option<f64> {
+    schema.get("minimum")?.as_f64()
+}
+
+/// `maximum` of a schema node — the number editor's upper bound.
+pub fn schema_maximum(schema: &Value) -> Option<f64> {
+    schema.get("maximum")?.as_f64()
+}
+
+/// `format` of a schema node: a `PVE::JSONSchema` format name.
+pub fn schema_format(schema: &Value) -> Option<&str> {
+    schema.get("format")?.as_str()
+}
+
+/// Checks `value` against the `PVE::JSONSchema` format named `format`.
+///
+/// **An unrecognised format constrains nothing.** `PVE::JSONSchema` registers dozens of
+/// formats and this is a client-side affordance, not the authority — the server's one
+/// lint is (`docs/DESIGN.md` §4). A checker we are not sure of would reject input that is
+/// actually valid, which is strictly worse than not checking: the operator that owns the
+/// key is the one that ultimately validates it.
+///
+/// The set below is exactly the set `ui-extjs` maps onto proxmoxlib's own vtypes, so the
+/// two implementations accept and reject the same strings. Adding a format means adding
+/// it in both places.
+pub fn check_format(format: &str, value: &str) -> Result<(), String> {
+    let ok = match format {
+        "ipv4" => is_ipv4(value),
+        "ipv6" => is_ipv6(value),
+        "ip" => is_ipv4(value) || is_ipv6(value),
+        "CIDRv4" => is_cidr(value, true),
+        "CIDRv6" => is_cidr(value, false),
+        "CIDR" => is_cidr(value, true) || is_cidr(value, false),
+        "mac-addr" => is_mac(value),
+        "dns-name" => is_dns_name(value),
+        "address" => is_dns_name(value) || is_ipv4(value) || is_ipv6(value),
+        "email" => is_email(value),
+        _ => return Ok(()),
+    };
+    match ok {
+        true => Ok(()),
+        false => Err(format!("not a valid {format}")),
+    }
+}
+
+fn is_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.bytes().all(|b| b.is_ascii_digit())
+                // No leading zeros: "01" is not how an address is written, and some
+                // resolvers read it as octal.
+                && (p.len() == 1 || !p.starts_with('0'))
+                && p.parse::<u16>().is_ok_and(|n| n <= 255)
+        })
+}
+
+/// A deliberately permissive IPv6 check: group count and shape, one `::` at most, and an
+/// embedded IPv4 tail (`::ffff:192.0.2.1`) accepted — rejecting that would be the exact
+/// false negative this module must not produce.
+fn is_ipv6(s: &str) -> bool {
+    if s.matches("::").count() > 1 {
+        return false;
+    }
+    // Counts the 16-bit groups in one half, or `None` if any is malformed. A trailing
+    // IPv4 literal stands for two groups.
+    let groups = |part: &str| -> Option<usize> {
+        if part.is_empty() {
+            return Some(0);
+        }
+        let mut n = 0;
+        let fields: Vec<&str> = part.split(':').collect();
+        for (i, g) in fields.iter().enumerate() {
+            if i + 1 == fields.len() && g.contains('.') {
+                if !is_ipv4(g) {
+                    return None;
+                }
+                n += 2;
+                continue;
+            }
+            if g.is_empty() || g.len() > 4 || !g.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            n += 1;
+        }
+        Some(n)
+    };
+    match s.split_once("::") {
+        // Compressed: the two halves together must leave room for at least one zero group.
+        Some((head, tail)) => match (groups(head), groups(tail)) {
+            (Some(a), Some(b)) => a + b <= 7,
+            _ => false,
+        },
+        None => groups(s) == Some(8),
+    }
+}
+
+fn is_cidr(s: &str, v4: bool) -> bool {
+    let Some((addr, len)) = s.split_once('/') else {
+        return false;
+    };
+    let (addr_ok, max) = match v4 {
+        true => (is_ipv4(addr), 32),
+        false => (is_ipv6(addr), 128),
+    };
+    addr_ok
+        && !len.is_empty()
+        && len.bytes().all(|b| b.is_ascii_digit())
+        && len.parse::<u16>().is_ok_and(|n| n <= max)
+}
+
+fn is_mac(s: &str) -> bool {
+    let sep = match s.contains('-') {
+        true => '-',
+        false => ':',
+    };
+    let parts: Vec<&str> = s.split(sep).collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn is_dns_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+fn is_email(s: &str) -> bool {
+    match s.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && !local.bytes().any(|b| b.is_ascii_whitespace() || b == b'@')
+                && is_dns_name(domain)
+        }
+        None => false,
+    }
+}
+
 /// The key order a grammar declares for an object schema, if any.
 ///
 /// `data` is unordered on the wire and the tree sorts alphabetically (`docs/DESIGN.md`
@@ -255,6 +406,78 @@ mod tests {
 
         assert!(schema_at(&grammar, "spec.missing").is_none());
         assert!(schema_at(&grammar, "").is_some());
+    }
+
+    #[test]
+    fn schema_range_and_format_are_read_from_the_node() {
+        let schema = json!({"type": "integer", "minimum": 1, "maximum": 65535});
+        assert_eq!(schema_minimum(&schema), Some(1.0));
+        assert_eq!(schema_maximum(&schema), Some(65535.0));
+        assert_eq!(schema_format(&schema), None);
+        assert_eq!(
+            schema_format(&json!({"type": "string", "format": "ipv4"})),
+            Some("ipv4")
+        );
+        assert_eq!(schema_minimum(&json!({"type": "string"})), None);
+    }
+
+    #[test]
+    fn an_unrecognised_format_constrains_nothing() {
+        // The important direction: a format this UI does not know must never reject
+        // input the operator considers valid.
+        assert!(check_format("pve-storage-id", "anything at all").is_ok());
+        assert!(check_format("", "").is_ok());
+    }
+
+    #[test]
+    fn ipv4_and_cidr_formats() {
+        for good in ["0.0.0.0", "192.0.2.1", "255.255.255.255"] {
+            assert!(check_format("ipv4", good).is_ok(), "{good}");
+        }
+        for bad in ["1.2.3", "1.2.3.4.5", "256.0.0.1", "01.2.3.4", "1.2.3.a", ""] {
+            assert!(check_format("ipv4", bad).is_err(), "{bad}");
+        }
+        assert!(check_format("CIDRv4", "192.0.2.0/24").is_ok());
+        assert!(check_format("CIDRv4", "192.0.2.0/33").is_err());
+        assert!(check_format("CIDRv4", "192.0.2.0").is_err());
+        assert!(check_format("CIDR", "192.0.2.0/24").is_ok());
+        assert!(check_format("CIDR", "2001:db8::/32").is_ok());
+    }
+
+    #[test]
+    fn ipv6_accepts_compression_and_an_embedded_ipv4() {
+        for good in [
+            "::",
+            "::1",
+            "2001:db8::1",
+            "::ffff:192.0.2.1",
+            "2001:0db8:0000:0000:0000:0000:0000:0001",
+        ] {
+            assert!(check_format("ipv6", good).is_ok(), "{good}");
+        }
+        for bad in ["2001:db8", "2001::db8::1", "gggg::1", "1.2.3.4", "12345::1"] {
+            assert!(check_format("ipv6", bad).is_err(), "{bad}");
+        }
+        // `ip` takes either family.
+        assert!(check_format("ip", "192.0.2.1").is_ok());
+        assert!(check_format("ip", "2001:db8::1").is_ok());
+        assert!(check_format("ip", "not-an-address").is_err());
+    }
+
+    #[test]
+    fn mac_dns_address_and_email() {
+        assert!(check_format("mac-addr", "aa:bb:cc:dd:ee:ff").is_ok());
+        assert!(check_format("mac-addr", "AA-BB-CC-DD-EE-FF").is_ok());
+        assert!(check_format("mac-addr", "aa:bb:cc:dd:ee").is_err());
+        assert!(check_format("dns-name", "wiki.example.com").is_ok());
+        assert!(check_format("dns-name", "-bad.example.com").is_err());
+        assert!(check_format("dns-name", "a..b").is_err());
+        // `address` is either a name or an address.
+        assert!(check_format("address", "wiki.example.com").is_ok());
+        assert!(check_format("address", "192.0.2.1").is_ok());
+        assert!(check_format("address", "not a host").is_err());
+        assert!(check_format("email", "ops@example.com").is_ok());
+        assert!(check_format("email", "ops-at-example.com").is_err());
     }
 
     #[test]

@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 
 use crate::grammar::{
     Operator, OperatorScope, schema_at, schema_default, schema_description, schema_enum,
-    schema_order, schema_properties, schema_type,
+    schema_format, schema_maximum, schema_minimum, schema_order, schema_properties, schema_type,
 };
 use crate::model::{Access, Mode, is_comment_key};
 
@@ -138,6 +138,13 @@ pub struct Node {
     pub writable: bool,
     /// Whether a grammar declares this key.
     pub declared: bool,
+    /// The grammar's `minimum`/`maximum` for a numeric row, and its `format` for a string
+    /// one: the row editor's constraints (`crate::edit::check_constraints`). Advisory —
+    /// the server's one lint is the authority (`docs/DESIGN.md` §4); these exist so a
+    /// human typing into the tree gets told before the round trip, not after.
+    pub minimum: Option<f64>,
+    pub maximum: Option<f64>,
+    pub format: Option<String>,
 }
 
 impl Node {
@@ -155,6 +162,9 @@ impl Node {
             access: Vec::new(),
             writable: false,
             declared: false,
+            minimum: None,
+            maximum: None,
+            format: None,
         }
     }
 
@@ -355,6 +365,9 @@ fn build_map(
                     access: access_for(&child_path, applicable),
                     writable: ctx.access.may_write(&child_path),
                     declared: declared.schemas.contains_key(&key),
+                    minimum: schema.and_then(schema_minimum),
+                    maximum: schema.and_then(schema_maximum),
+                    format: schema.and_then(schema_format).map(str::to_string),
                     value: value.cloned(),
                     kind,
                     key,
@@ -622,9 +635,13 @@ mod tests {
                                 "properties": {
                                     "port": {
                                         "type": "integer", "default": 80, "optional": 1,
+                                        "minimum": 1, "maximum": 65535,
                                         "description": "Backend port",
                                     },
-                                    "host": { "type": "string", "description": "Public host name" },
+                                    "host": {
+                                        "type": "string", "format": "dns-name",
+                                        "description": "Public host name",
+                                    },
                                 },
                             },
                         },
@@ -661,6 +678,30 @@ mod tests {
 
     fn paths(rows: &[Row]) -> Vec<String> {
         flatten(rows).iter().map(|n| n.path.clone()).collect()
+    }
+
+    #[test]
+    fn a_grammars_range_and_format_reach_the_row() {
+        let data = json!({"traefik": {"spec": {"port": 80, "host": "a.example"}}});
+        let rows = build_for(&data, json!({"read": 1, "write": 1}), &["traefik"]);
+
+        let port = find(&rows, "traefik.spec.port").expect("port row");
+        assert_eq!(port.minimum, Some(1.0));
+        assert_eq!(port.maximum, Some(65535.0));
+        assert_eq!(port.format, None);
+
+        let host = find(&rows, "traefik.spec.host").expect("host row");
+        assert_eq!(host.format.as_deref(), Some("dns-name"));
+        assert_eq!(host.minimum, None);
+
+        // A key no grammar declares carries no constraints.
+        let data = json!({"mine": {"x": 1}});
+        let rows = build_for(&data, json!({"read": 1, "write": 1}), &["traefik"]);
+        let x = find(&rows, "mine.x").expect("x row");
+        assert_eq!(
+            (x.minimum, x.maximum, x.format.as_deref()),
+            (None, None, None)
+        );
     }
 
     #[test]

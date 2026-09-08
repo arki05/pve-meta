@@ -93,6 +93,30 @@ PVE.meta.Utils = {
         return kind === 'string' ? String(value) : Ext.encode(value);
     },
 
+    // A grammar's `format` is a PVE::JSONSchema format name, and proxmoxlib already
+    // ships the matching client-side validator as an ExtJS vtype -- so a format is
+    // wired to PVE's own checker, with PVE's own (translated) error message, rather
+    // than to a regex of ours. A format with no vtype (or one we do not know) simply
+    // does not constrain the field: an unknown constraint must never block an edit.
+    // This is exactly the set ui/src/grammar.rs's check_format() implements, so the two
+    // UIs accept and reject the same strings; adding a format means adding it in both.
+    FORMAT_VTYPES: {
+        'ip': 'IP64Address',
+        'ipv4': 'IPAddress',
+        'ipv6': 'IP6Address',
+        'CIDR': 'IP64CIDRAddress',
+        'CIDRv4': 'IPCIDRAddress',
+        'CIDRv6': 'IP6CIDRAddress',
+        'mac-addr': 'MacAddress',
+        'dns-name': 'DnsName',
+        'address': 'DnsOrIp',
+        'email': 'proxmoxMail',
+    },
+
+    vtypeFor: function (format) {
+        return (format && PVE.meta.Utils.FORMAT_VTYPES[format]) || undefined;
+    },
+
     // The inverse, for a committed row edit: field value -> the JSON value to send.
     parseValue: function (text, kind) {
         if (kind === 'boolean') {
@@ -128,9 +152,21 @@ PVE.meta.Utils = {
         } else if (d.kind === 'boolean') {
             return { xtype: 'proxmoxcheckbox' };
         } else if (d.kind === 'number') {
-            return { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
+            let f = { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
+            if (d.minimum !== undefined && d.minimum !== null) {
+                f.minValue = d.minimum;
+            }
+            if (d.maximum !== undefined && d.maximum !== null) {
+                f.maxValue = d.maximum;
+            }
+            return f;
         }
-        return { xtype: 'textfield', selectOnFocus: true };
+        let f = { xtype: 'textfield', selectOnFocus: true };
+        let vtype = PVE.meta.Utils.vtypeFor(d.format);
+        if (vtype) {
+            f.vtype = vtype;
+        }
+        return f;
     },
 
     // Human-readable form of a scope's selector, for the Access tooltip.
@@ -376,6 +412,9 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'expandedCls', type: 'string' }, // iconCls while this map row is open
         { name: 'defaultValue' },
         { name: 'enumValues' },
+        { name: 'minimum' }, // grammar `minimum`, honoured by the number editor
+        { name: 'maximum' }, // grammar `maximum`, honoured by the number editor
+        { name: 'format', type: 'string' }, // grammar `format` -> an ExtJS vtype
         { name: 'rawValue' },
     ],
 });
@@ -1363,6 +1402,15 @@ Ext.define('PVE.meta.TreePanel', {
                 if (ps.enum) {
                     child.enumValues = ps.enum;
                 }
+                if (ps.minimum !== undefined) {
+                    child.minimum = ps.minimum;
+                }
+                if (ps.maximum !== undefined) {
+                    child.maximum = ps.maximum;
+                }
+                if (ps.format !== undefined) {
+                    child.format = ps.format;
+                }
             });
         };
         walk(entry, schema);
@@ -1401,6 +1449,9 @@ Ext.define('PVE.meta.TreePanel', {
                         grammarDescription: c.grammarDescription || '',
                         defaultValue: c.defaultValue,
                         enumValues: c.enumValues,
+                        minimum: c.minimum,
+                        maximum: c.maximum,
+                        format: c.format,
                         rawValue: c.value,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         accessList: access,

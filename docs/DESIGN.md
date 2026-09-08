@@ -169,7 +169,15 @@ leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays as one text leaf); opened by Edit, double-click or Enter.
+  enums, arrays as one text leaf); opened by Edit, double-click or Enter. A grammar's
+  `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
+  format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
+  `mac-addr`, `dns-name`, `address`, `email` — the same set in both implementations,
+  wired to proxmoxlib's own vtypes in `ui-extjs`. **A format neither knows constrains
+  nothing**: this is an affordance so a human is told before the round trip, never an
+  authority — the server's one lint is that (§4), and an operator writing through the
+  API is not policed by it. There is deliberately no `pattern`/regex: a format is a
+  name PVE already defines and validates, a regex is one more dialect to own.
 * **Description**: the row's comment key (`k__`) if present, else nothing; the grammar
   description is the tooltip.
 * **Access**: every registration whose scope covers the row, `rw` ones by name, `ro` ones

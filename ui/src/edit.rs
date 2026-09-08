@@ -125,6 +125,46 @@ pub fn parse_value(kind: &ValueKind, input: &str) -> Result<Value, String> {
     }
 }
 
+/// Checks a parsed value against the constraints the grammar declares for the row it is
+/// going into: `minimum`/`maximum` for a number, `format` for a string.
+///
+/// Advisory, and deliberately so. The server's single lint is the authority
+/// (`docs/DESIGN.md` §4), and an operator writing through the API is not policed by it;
+/// the point is that a human typing into the tree is told before the round trip rather
+/// than after it. A format the UI does not recognise constrains nothing
+/// ([`crate::grammar::check_format`]).
+pub fn check_constraints(
+    value: &Value,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+    format: Option<&str>,
+) -> Result<(), String> {
+    if let Some(n) = value.as_f64() {
+        if let Some(min) = minimum {
+            if n < min {
+                return Err(format!("must be at least {}", number_text(min)));
+            }
+        }
+        if let Some(max) = maximum {
+            if n > max {
+                return Err(format!("must be at most {}", number_text(max)));
+            }
+        }
+    }
+    if let (Some(text), Some(name)) = (value.as_str(), format) {
+        crate::grammar::check_format(name, text)?;
+    }
+    Ok(())
+}
+
+/// A bound as it should read in a message: `65535`, never `65535.0`.
+fn number_text(n: f64) -> String {
+    match n.fract() == 0.0 && n.abs() < 1e15 {
+        true => format!("{}", n as i64),
+        false => format!("{n}"),
+    }
+}
+
 /// A document has no nulls (`docs/DESIGN.md` §2); refuse one here, where the message can
 /// still point at the field, instead of collecting a 400 from the store's lint.
 fn reject_nulls(value: Value) -> Result<Value, String> {
@@ -251,6 +291,35 @@ mod tests {
             delete_body("netbird.groups", "abc"),
             json!({"view": "netbird.groups", "digest": "abc"}),
         );
+    }
+
+    #[test]
+    fn a_grammars_range_and_format_are_checked_before_the_round_trip() {
+        // Range applies to numbers only.
+        assert!(check_constraints(&json!(80), Some(1.0), Some(65535.0), None).is_ok());
+        assert_eq!(
+            check_constraints(&json!(0), Some(1.0), Some(65535.0), None),
+            Err("must be at least 1".to_string()),
+        );
+        assert_eq!(
+            check_constraints(&json!(70000), Some(1.0), Some(65535.0), None),
+            Err("must be at most 65535".to_string()),
+        );
+        // Bounds read as integers, not as 65535.0.
+        assert!(
+            check_constraints(&json!(1.5), None, Some(1.0), None)
+                .unwrap_err()
+                .ends_with('1')
+        );
+
+        // Format applies to strings only.
+        assert!(check_constraints(&json!("192.0.2.1"), None, None, Some("ipv4")).is_ok());
+        assert!(check_constraints(&json!("nope"), None, None, Some("ipv4")).is_err());
+        // A number is not format-checked, and a string is not range-checked.
+        assert!(check_constraints(&json!(42), None, None, Some("ipv4")).is_ok());
+        assert!(check_constraints(&json!("x"), Some(1.0), None, None).is_ok());
+        // No constraints at all: everything passes.
+        assert!(check_constraints(&json!("anything"), None, None, None).is_ok());
     }
 
     #[test]
