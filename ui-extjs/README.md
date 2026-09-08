@@ -1,7 +1,7 @@
 # ui-extjs — the native ExtJS editor
 
-One file, `pve-meta-tree.js`, plain ES2017, no build step, plus `vendor/` (js-yaml, and
-Monaco once `make ui` has vendored it). It defines a panel (`xtype: pveMetaTreePanel`)
+One file, `pve-meta-tree.js`, plain ES2017, no build step, plus `vendor/` (js-yaml) and
+`monaco/` (fetched by `make ui`, gitignored). It defines a panel (`xtype: pveMetaTreePanel`)
 that pve-ext's page loader instantiates as a native tab inside the PVE guest and
 datacenter config panels.
 

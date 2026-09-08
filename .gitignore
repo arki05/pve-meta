@@ -9,4 +9,4 @@ node_modules/
 .venv
 __pycache__/
 # Monaco, vendored by `make ui` from npm (13 MB); shipped in the .deb, not in git.
-/ui-extjs/vendor/vs
+/ui-extjs/monaco

@@ -17,7 +17,7 @@ ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && car
 
 ```sh
 make build   # builds crates/pve-meta-perl in release mode
-make ui      # vendors Monaco into ui-extjs/vendor/vs (skipped, with a warning, without npm)
+make ui      # fetches Monaco into ui-extjs/monaco/vs (skipped, with a warning, without npm)
 make install DESTDIR=/some/root PREFIX=/usr
 ```
 

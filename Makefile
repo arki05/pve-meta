@@ -22,16 +22,21 @@ DESTDIR ?=
 PREFIX ?= /usr
 
 UI_DIR := ui-extjs
-MONACO := $(UI_DIR)/vendor/vs
+MONACO := $(UI_DIR)/monaco/vs
 
 .PHONY: build ui deb install clean check test
 
 build:
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
 
-# Vendors Monaco into ui-extjs/vendor/vs. The editor is a plain JS panel with no build
+# Fetches Monaco into ui-extjs/monaco/vs. The editor is a plain JS panel with no build
 # step of its own (see ui-extjs/README.md); the only thing to fetch is Monaco's minified
 # AMD tree, which ships *in the package* and is never loaded from a CDN.
+#
+# Deliberately NOT under ui-extjs/vendor/: that directory is committed third-party
+# source (js-yaml and its LICENSE) and `install` copies it wholesale, so a build-time
+# tree living there would be shipped twice -- once inside vendor/ and once at vs/.
+# It was, until the first real package build showed it.
 #
 # Tolerant of `npm` being absent: a package built without it simply has no Text card and
 # no diff dialog, which is a degraded editor rather than a failed build. `make deb` in CI

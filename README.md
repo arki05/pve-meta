@@ -211,7 +211,7 @@ Build host: Debian 13 (trixie) with a [rustup](https://rustup.rs/) toolchain und
 `~/.cargo/bin` (not the distro `cargo`/`rustc` packages), `libperl-dev` for the perlmod
 crate, and `npm` to vendor Monaco (only `pve-meta-core` builds on macOS — develop the
 rest on Linux and `rsync` over). `make build` builds `crates/pve-meta-perl`, `make ui`
-vendors Monaco into `ui-extjs/vendor/vs`, and `make deb` builds
+fetches Monaco into `ui-extjs/monaco/vs`, and `make deb` builds
 `pve-ext` (its own source package) plus `pve-meta` and `libpve-meta-rs-perl`, dropping
 all three `.deb`s next to each other in the parent directory. See `docs/BUILD.md` for
 the exact rsync/ssh incantation and the safe way to replace the installed `.so` on a
