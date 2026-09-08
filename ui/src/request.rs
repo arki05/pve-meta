@@ -97,19 +97,9 @@ impl RequestTracker {
         }
     }
 
-    /// The document the page is showing.
-    pub fn doc(&self) -> DocId {
-        self.inner.doc.get()
-    }
-
     /// The view the page is showing (empty for the whole document).
     pub fn view(&self) -> String {
         self.inner.view.borrow().clone()
-    }
-
-    /// True if the page is showing the whole document.
-    pub fn whole_document(&self) -> bool {
-        self.inner.view.borrow().is_empty()
     }
 
     /// Issue an id for a request about to go out on `channel`, superseding any earlier
@@ -257,7 +247,6 @@ mod tests {
         assert!(!tracker.accepts(&load));
         assert!(!tracker.accepts(&apply));
         assert_eq!(tracker.view(), "");
-        assert!(tracker.whole_document());
         assert!(!tracker.set_doc(DocId::Datacenter));
     }
 
@@ -272,6 +261,30 @@ mod tests {
         assert!(!tracker.accepts(&load));
         assert!(!tracker.accepts(&digest));
         assert_eq!(tracker.view(), "");
+    }
+
+    #[test]
+    fn a_reload_invalidates_a_stale_apply_or_digest_answer() {
+        // `docs/REVIEW-2026-09-08-pass2.md` P8: `Msg::Reload` neither changes doc nor
+        // view (so `set_doc`/`set_view` never fire to bump the epoch on their own), but
+        // it must still strand a request issued before it — otherwise a 409 for an Apply
+        // issued before the reload, or a digest check from the version poll, lands after
+        // the reload and is rendered over a document with nothing unapplied about it.
+        // `PveMetaEditor::update`'s `Msg::Reload` arm is `self.requests.invalidate()`
+        // then `send_reload()` (which issues a fresh `Channel::Load`); this test pins
+        // that sequence directly against `RequestTracker`, since `editor.rs` only
+        // compiles for `wasm32` and cannot be unit-tested natively.
+        let mut tracker = RequestTracker::new(DocId::Guest(200));
+        let apply = tracker.issue(Channel::Apply);
+        let digest = tracker.issue(Channel::Digest);
+
+        // The Reload handler.
+        tracker.invalidate();
+        let reload = tracker.issue(Channel::Load);
+
+        assert!(!tracker.accepts(&apply));
+        assert!(!tracker.accepts(&digest));
+        assert!(tracker.accepts(&reload));
     }
 
     #[test]

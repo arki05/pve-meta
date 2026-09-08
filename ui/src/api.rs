@@ -23,22 +23,6 @@ use proxmox_yew_comp::{http_get_auth, json_object_to_query};
 
 use crate::model::{Access, DocId};
 
-/// One entry of `GET /meta/guests`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct GuestEntry {
-    pub vmid: u32,
-    #[serde(default)]
-    pub node: String,
-    #[serde(default, rename = "type")]
-    pub guest_type: String,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub digest: String,
-    #[serde(default)]
-    pub keys: Vec<String>,
-}
-
 /// A document view rendered as text (`format=yaml`).
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct DocText {
@@ -82,11 +66,6 @@ pub async fn access(doc: DocId) -> Result<Access, Error> {
         DocId::Datacenter => json!({ "dc": 1 }),
     };
     get_json("/meta/access", Some(query)).await
-}
-
-/// Every guest in the vmlist, with the top-level keys visible to the caller.
-pub async fn guests() -> Result<Vec<GuestEntry>, Error> {
-    get_json("/meta/guests", None).await
 }
 
 /// A view of a document as YAML text. An empty `view` is the whole document.

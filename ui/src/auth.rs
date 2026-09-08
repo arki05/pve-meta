@@ -2,8 +2,8 @@
 //!
 //! The UI is now a plain static file under `/pve2/js/pve-meta-ui/` with no per-request
 //! server-side templating, so nothing injects a `window.Proxmox` global with a fresh
-//! `CSRFPreventionToken` for us the way a templated page would (see
-//! `docs/NATIVE-API-SPEC.md` "UI serving"). This module fills that gap itself:
+//! `CSRFPreventionToken` for us the way a templated page would (see `docs/DESIGN.md` §6,
+//! "The editor page"). This module fills that gap itself:
 //!
 //! 1. If embedded in a same-origin parent frame (the PVE web UI's own tab iframe),
 //!    copy `window.parent.PVE.CSRFPreventionToken` — cross-origin access throws, which

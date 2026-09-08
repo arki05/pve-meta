@@ -118,17 +118,6 @@ impl Access {
                 .any(|s| s.mode == Mode::Rw && Self::covers(&s.prefix, view))
     }
 
-    /// True if the caller may read anything of `view` of this document — either the whole
-    /// subtree (an ACL grant or a scope covering it) or a part of it (a scope *inside* it,
-    /// which a view-less read returns as the union of readable subtrees).
-    pub fn may_read(&self, view: &str) -> bool {
-        self.read
-            || self
-                .scopes
-                .iter()
-                .any(|s| Self::covers(&s.prefix, view) || Self::covers(view, &s.prefix))
-    }
-
     /// The prefixes the "View as" selector offers, whole document (the empty prefix)
     /// first, then the document's own top-level keys, then any scope prefix not already
     /// listed.
@@ -290,7 +279,7 @@ mod tests {
     fn read_and_write_are_separate_grants() {
         // F22: an auditor gets a readable, not an editable, document.
         let auditor: Access = serde_json::from_value(json!({"read": 1, "write": 0})).unwrap();
-        assert!(auditor.may_read(""));
+        assert!(auditor.read);
         assert!(!auditor.may_write(""));
 
         let admin: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
@@ -335,12 +324,9 @@ mod tests {
         assert!(access.may_write("traefik.spec"));
         assert!(access.may_write("traefik__"));
         assert!(!access.may_write("netbird"));
-        // The whole document is readable (the union of the readable subtrees) but never
-        // writable through a scope alone.
+        // A read-only scope never grants a write, and no scope alone ever grants the
+        // whole document (that's an ACL grant, `read`/`write`, checked above).
         assert!(!access.may_write(""));
-        assert!(access.may_read(""));
-        assert!(access.may_read("netbird"));
-        assert!(!access.may_read("other"));
     }
 
     #[test]

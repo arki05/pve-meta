@@ -44,7 +44,7 @@ use proxmox_yew_comp::{
     LoadableComponentScopeExt, LoadableComponentState,
 };
 
-use crate::api::{self, GuestEntry, WriteResult};
+use crate::api::{self, WriteResult};
 use crate::model::{Access, DocId, top_level_keys_from_yaml};
 use crate::monaco;
 use crate::request::{Channel, RequestId, RequestTracker};
@@ -66,10 +66,10 @@ pub struct Loaded {
     access: Option<Access>,
     /// Set instead of `access` when the grants could not be fetched at all.
     access_error: Option<String>,
-    /// Only on the first load — the guest's name and node, for the identity line.
-    guest: Option<GuestEntry>,
-    /// Top-level keys of the whole document, for the "View as" selector; `None` when the
-    /// whole-document read failed, in which case the known list is kept.
+    /// Top-level keys of the whole document, for the "View as" selector; only present
+    /// when this load's view was empty (a whole-document read), in which case the known
+    /// list is kept — a view switch never re-fetches it
+    /// (`docs/REVIEW-2026-09-08-pass2.md` P10).
     keys: Option<Vec<String>>,
     digest: String,
     text: String,
@@ -145,8 +145,6 @@ pub struct PveMetaEditor {
     access_for: Option<DocId>,
     /// Why the grants are unknown, if the endpoint refused to answer.
     access_error: Option<String>,
-    /// Guest name and node, for the identity line.
-    guest: Option<GuestEntry>,
     /// Top-level keys of the whole document, as parsed from its YAML text.
     keys: Vec<String>,
     /// The prefixes the "View as" selector offers.
@@ -202,15 +200,18 @@ impl PveMetaEditor {
         self.draft.is_some()
     }
 
-    /// Show `view` from now on: strand everything in flight, empty the buffer (the text
-    /// in it belongs to the view being left) and load the new one.
+    /// Show `view` from now on: strand everything in flight and load the new one.
+    ///
+    /// The buffer keeps showing the outgoing view's text until `Msg::Loaded` overwrites
+    /// it — `dirty()` is false throughout (the draft was just dropped), so nothing reads
+    /// it as belonging to the new view. Blanking it here just to have it refill a moment
+    /// later made every switch flash empty for the round trip
+    /// (`docs/REVIEW-2026-09-08-pass2.md` low findings, `editor.rs:205`).
     fn switch_view(&mut self, ctx: &LoadableComponentContext<Self>, view: String) {
         if !self.requests.set_view(view) {
             return;
         }
         self.draft = None;
-        self.loaded.clear();
-        self.digest.clear();
         self.stale = false;
         self.write_error = None;
         self.generation += 1;
@@ -241,11 +242,12 @@ impl PveMetaEditor {
                     Some("lxc") => "cube",
                     _ => "desktop",
                 };
-                let name = self.guest.as_ref().and_then(|g| g.name.clone());
-                match name {
-                    Some(name) if !name.is_empty() => (icon, format!("{vmid} {name}")),
-                    _ => (icon, vmid.to_string()),
-                }
+                // The guest's name would need either `GET /meta/guests` (an O(N) scan of
+                // every guest in the vmlist just to find this one's name, `docs/REVIEW-
+                // 2026-09-08-pass2.md` P10) or a name/node field the single-document GET
+                // does not carry (`docs/DESIGN.md` §3); the vmid on its own is enough to
+                // identify the document, and `props.node` already covers node.
+                (icon, vmid.to_string())
             }
         };
 
@@ -424,7 +426,6 @@ impl LoadableComponent for PveMetaEditor {
             access: Access::default(),
             access_for: None,
             access_error: None,
-            guest: None,
             keys: Vec::new(),
             views: Rc::new(vec![AttrValue::from(WHOLE_DOCUMENT)]),
             view_revision: 0,
@@ -450,12 +451,19 @@ impl LoadableComponent for PveMetaEditor {
 
     fn changed(&mut self, ctx: &LoadableComponentContext<Self>, _old: &Self::Properties) -> bool {
         // A different document is a different page: nothing loaded for the old one — its
-        // text, its digest, its grants, its keys — may survive into it.
+        // text, its digest, its grants, its keys — may survive into it. `app.rs` mounts
+        // one `MetaEditor` per navigation and never changes its `doc` prop in place, so
+        // this never fires with unapplied edits in the buffer; guard that assumption
+        // instead of silently discarding them the way pre-F5 code did
+        // (`docs/REVIEW-2026-09-08-pass2.md` low findings, `editor.rs:451`).
         if self.requests.set_doc(ctx.props().doc) {
+            debug_assert!(
+                !self.dirty(),
+                "pve-meta-ui: doc prop changed with unapplied edits in the buffer"
+            );
             self.access = Access::default();
             self.access_for = None;
             self.access_error = None;
-            self.guest = None;
             self.keys.clear();
             self.draft = None;
             self.loaded.clear();
@@ -478,7 +486,6 @@ impl LoadableComponent for PveMetaEditor {
         let doc = id.doc;
         let view = id.view.clone();
         let need_access = self.access_for != Some(doc);
-        let need_guest = matches!(doc, DocId::Guest(_)) && self.guest.is_none();
         let link = ctx.link().clone();
 
         Box::pin(async move {
@@ -495,35 +502,15 @@ impl LoadableComponent for PveMetaEditor {
                 false => (None, None),
             };
 
-            // The identity line wants the guest's name; a failure here is not worth
-            // failing the page over.
-            let guest = match need_guest {
-                true => api::guests()
-                    .await
-                    .map_err(|err| log::warn!("pve-meta-ui: failed to list guests: {err}"))
-                    .ok()
-                    .and_then(|list| {
-                        list.into_iter()
-                            .find(|entry| DocId::Guest(entry.vmid) == doc)
-                    }),
-                false => None,
-            };
-
-            // The whole document, for the top-level keys the "View as" selector offers.
-            // A view's own answer only carries the keys *inside* that view, so a selected
-            // view needs the document read as well. Never `format=json`: its `data` object
-            // is unordered on the wire (`docs/DESIGN.md` §8), and the selector is a list
-            // in document order.
-            let whole = match view.is_empty() {
-                true => None,
-                false => api::get_text(doc, "")
-                    .await
-                    .map_err(|err| {
-                        log::warn!("pve-meta-ui: failed to read the whole document: {err}")
-                    })
-                    .ok(),
-            };
-
+            // One GET, whatever the view: `docs/REVIEW-2026-09-08-pass2.md` P10 removed
+            // both the `GET /meta/guests` scan this load used to make solely to find the
+            // guest's name (an O(N) round trip over every guest in the vmlist for one
+            // field the header no longer shows) and the second `view=""` read this load
+            // used to make solely for the "View as" selector's top-level keys. A
+            // selected view's own answer only carries the keys *inside* that view
+            // (`docs/DESIGN.md` §3), so those keys come only from a whole-document read
+            // — the first load of a document is always one (`RequestTracker::new` starts
+            // at the empty view), and `self.keys` then survives every later view switch.
             let document = api::get_text(doc, &view).await;
 
             // Nothing past this point may touch the page unless it still wants this
@@ -539,17 +526,12 @@ impl LoadableComponent for PveMetaEditor {
             }
 
             let document = document?;
-
-            let keys = match &whole {
-                Some(whole) => Some(document_keys(whole)),
-                None => view.is_empty().then(|| document_keys(&document)),
-            };
+            let keys = view.is_empty().then(|| document_keys(&document));
 
             link.send_message(Msg::Loaded(Box::new(Loaded {
                 id,
                 access,
                 access_error,
-                guest,
                 keys,
                 digest: document.digest,
                 text: document.text,
@@ -566,7 +548,6 @@ impl LoadableComponent for PveMetaEditor {
                     id,
                     access,
                     access_error,
-                    guest,
                     keys,
                     digest,
                     text,
@@ -589,9 +570,6 @@ impl LoadableComponent for PveMetaEditor {
                     self.access = Access::default();
                     self.access_for = None;
                     self.access_error = Some(err);
-                }
-                if guest.is_some() {
-                    self.guest = guest;
                 }
                 if let Some(keys) = keys {
                     self.keys = keys;
@@ -711,7 +689,12 @@ impl LoadableComponent for PveMetaEditor {
             }
             Msg::Reload => {
                 // Confirmed by the caller (the toolbar's and the banner's Reload both ask
-                // when there is something to lose).
+                // when there is something to lose). Invalidate before reloading: an
+                // Apply/Diff/Digest request issued earlier must not have its late answer
+                // applied over the document this reload is about to fetch
+                // (`docs/REVIEW-2026-09-08-pass2.md` P8 — this channel was the one
+                // `RequestTracker::invalidate()` existed for but never got called).
+                self.requests.invalidate();
                 self.draft = None;
                 self.write_error = None;
                 self.generation += 1;
