@@ -333,6 +333,91 @@
         }
     }
 
+    // --- grammar findings -------------------------------------------------
+    //
+    // Two things the operator's grammar can say about the text: a squiggle under a
+    // line that violates it, and, on hover, what the key at that line is declared to
+    // be. Both are keyed by line number, computed by the caller against the text the
+    // server returned (crate::lint). Advisory only -- the server's lint is the
+    // authority -- so markers are warnings, never errors, and Apply is never blocked.
+    //
+    // The caller clears both the moment the buffer is dirty: the lines have moved and
+    // the findings describe a document the text no longer is.
+
+    // One hover provider for the language, serving whichever model is asking. Monaco
+    // registers providers per-language, not per-editor.
+    var hoverRegistered = false;
+
+    function entryForModel(model) {
+        for (var id in editors) {
+            var entry = editors[id];
+            if (entry && entry.editor && entry.editor.getModel() === model) {
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    function registerHover() {
+        if (hoverRegistered || !window.monaco || !monaco.languages) {
+            return;
+        }
+        hoverRegistered = true;
+        monaco.languages.registerHoverProvider('yaml', {
+            provideHover: function (model, position) {
+                var entry = entryForModel(model);
+                var text = entry && entry.hovers && entry.hovers[position.lineNumber];
+                if (!text) {
+                    return null;
+                }
+                return {
+                    range: new monaco.Range(
+                        position.lineNumber, 1,
+                        position.lineNumber, model.getLineMaxColumn(position.lineNumber),
+                    ),
+                    contents: [{ value: text }],
+                };
+            },
+        });
+    }
+
+    // `findings` is [{ line, message }]; an empty list clears the squiggles.
+    function setMarkers(id, findings) {
+        var entry = editors[id];
+        if (!entry || !entry.editor || !window.monaco) {
+            return;
+        }
+        var model = entry.editor.getModel();
+        if (!model) {
+            return;
+        }
+        var markers = (findings || []).map(function (f) {
+            return {
+                startLineNumber: f.line,
+                endLineNumber: f.line,
+                startColumn: 1,
+                endColumn: model.getLineMaxColumn(f.line),
+                message: f.message,
+                severity: monaco.MarkerSeverity.Warning,
+            };
+        });
+        monaco.editor.setModelMarkers(model, 'pve-meta', markers);
+    }
+
+    // `hovers` is [{ line, text }]; an empty list turns hovers off.
+    function setHovers(id, hovers) {
+        var entry = editors[id];
+        if (!entry) {
+            return;
+        }
+        registerHover();
+        var byLine = Object.create(null);
+        (hovers || []).forEach(function (h) {
+            byLine[h.line] = h.text;
+        });
+        entry.hovers = byLine;
+    }
+
     window.pveMetaMonaco = {
         mount: mount,
         mountDiff: mountDiff,
@@ -341,6 +426,8 @@
         setReadOnly: setReadOnly,
         setTheme: setTheme,
         onChange: onChange,
+        setMarkers: setMarkers,
+        setHovers: setHovers,
         dispose: dispose,
     };
 })();

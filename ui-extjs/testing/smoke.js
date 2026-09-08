@@ -17,6 +17,19 @@ const ctx = {
     Promise,
     gettext: (s) => s,
     Ext: {
+        // Just enough of the VTypes singleton for PVE.meta.Utils.checkFormat: the real
+        // validators live in proxmoxlib, and the point of that helper is that it calls
+        // whatever is registered rather than reimplementing it.
+        form: {
+            field: {
+                VTypes: {
+                    DnsName: (v) => /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(v),
+                    DnsNameText: 'not a valid dns-name',
+                    IPAddress: (v) => /^(\d{1,3}\.){3}\d{1,3}$/.test(v),
+                    IPAddressText: 'not a valid ipv4',
+                },
+            },
+        },
         ns(path) {
             let cur = ctx;
             path.split('.').forEach((p) => {
@@ -465,6 +478,108 @@ eq(
     panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
     'traefik',
 );
+
+console.log('\n--- grammar findings for the text editor (mirrors ui/src/lint.rs) ---');
+const L = ctx.PVE.meta.Lint;
+const GRAMMAR = [
+    [
+        'traefik',
+        {
+            type: 'object',
+            properties: {
+                spec: {
+                    type: 'object',
+                    properties: {
+                        host: { type: 'string', format: 'dns-name', description: 'Public host name' },
+                        port: { type: 'integer', minimum: 1, maximum: 65535, default: 80 },
+                        scheme: { type: 'string', enum: ['http', 'https'] },
+                        enabled: { type: 'boolean' },
+                    },
+                },
+            },
+        },
+    ],
+];
+
+eq('a clean document has no findings',
+    L.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } },
+        GRAMMAR),
+    []);
+
+eq('each rule is reported at its own path',
+    L.findings({ traefik: { spec: { port: 70000, scheme: 'ftp', enabled: 'yes' } } }, GRAMMAR)
+        .map((f) => f.path),
+    ['traefik.spec.enabled', 'traefik.spec.port', 'traefik.spec.scheme']);
+
+// DESIGN section 4: the JSON view renders booleans as 1/0; flagging those would put a
+// warning on every boolean in the store.
+eq('a boolean on the wire as 1 is not a finding',
+    L.findings({ traefik: { spec: { enabled: 1 } } }, GRAMMAR), []);
+eq('a boolean on the wire as 0 is not a finding',
+    L.findings({ traefik: { spec: { enabled: 0 } } }, GRAMMAR), []);
+eq('but 2 is', L.findings({ traefik: { spec: { enabled: 2 } } }, GRAMMAR).length, 1);
+
+eq('keys no grammar describes are left alone',
+    L.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }, GRAMMAR), []);
+eq('a prefix with nothing under it contributes nothing', L.findings({}, GRAMMAR), []);
+eq('a scope with no grammar contributes nothing',
+    L.applicable([{ prefix: 'netbird', mode: 'rw' }]), []);
+
+const YAML = [
+    'traefik:',
+    '  spec:',
+    '    host: a.example',
+    '    port: 80',
+    '  routers:',
+    '    - rule: Host(`a`)',
+    'netbird:',
+    '  groups:',
+    '    - lan',
+    '',
+].join('\n');
+const IDX = L.lineIndex(YAML);
+eq('line index: top level', IDX['traefik'], 1);
+eq('line index: nested', IDX['traefik.spec.host'], 3);
+eq('line index: sibling after a sequence', IDX['netbird.groups'], 8);
+eq('line index: sequence items are not keys', IDX['traefik.routers.rule'], undefined);
+
+const BLOCK = [
+    'compose:',
+    '  file: |',
+    '    services:',
+    '      web:',
+    '        image: nginx',
+    '  name: stack',
+    '',
+].join('\n');
+const BIDX = L.lineIndex(BLOCK);
+eq('block scalar: the key itself', BIDX['compose.file'], 2);
+eq('block scalar: the sibling after it', BIDX['compose.name'], 6);
+eq('block scalar: its body is not keys', BIDX['compose.file.services'], undefined);
+eq('block scalar: nor promoted to the parent', BIDX['compose.services'], undefined);
+
+const QIDX = L.lineIndex('---\n# c\nhost__: note\nhost: a.example\n"quoted: key": 1\n');
+eq('comment keys are ordinary keys', QIDX['host__'], 3);
+eq('markers and comments are skipped', QIDX['host'], 4);
+eq('a quoted key is unquoted', QIDX['quoted: key'], 5);
+
+eq('findings are placed on their lines',
+    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
+        L.lineIndex('traefik:\n  spec:\n    port: 70000\n')),
+    [{ line: 3, message: 'must be at most 65535' }]);
+eq('a finding the text does not carry is dropped, not misplaced',
+    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
+        L.lineIndex('unrelated: 1\n')),
+    []);
+
+const SCHEMAS = L.schemaIndex(GRAMMAR);
+eq('hover: type, range and default',
+    L.hoverText(SCHEMAS['traefik.spec.port']), 'integer \u00b7 1..65535 \u00b7 default: 80');
+eq('hover: type, format and description',
+    L.hoverText(SCHEMAS['traefik.spec.host']), 'string (dns-name) \u00b7 Public host name');
+eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
+    'string \u00b7 one of: http, https');
+eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document

@@ -10,6 +10,7 @@
 
 pub mod edit;
 pub mod grammar;
+pub mod lint;
 pub mod model;
 pub mod request;
 pub mod tree;

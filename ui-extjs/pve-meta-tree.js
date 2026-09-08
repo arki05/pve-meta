@@ -169,6 +169,30 @@ PVE.meta.Utils = {
         return f;
     },
 
+    // A scalar as the string a grammar's `enum` and a hover compare and show.
+    scalarText: function (value) {
+        return typeof value === 'string' ? value : Ext.encode(value);
+    },
+
+    // Runs the vtype a format maps to, and returns that vtype's own message on failure.
+    // Reusing proxmoxlib's validator rather than a second regex of ours is what keeps
+    // the marker and the row editor agreeing about the same string -- they are literally
+    // the same check. An unmapped format constrains nothing.
+    checkFormat: function (format, value) {
+        let vtype = PVE.meta.Utils.vtypeFor(format);
+        // Defensive down the whole chain: this runs before any form field has been
+        // instantiated, so nothing guarantees the VTypes singleton exists yet, and a
+        // validator we cannot reach must constrain nothing rather than throw.
+        let vtypes = Ext.form && Ext.form.field && Ext.form.field.VTypes;
+        if (!vtype || !vtypes || typeof vtypes[vtype] !== 'function') {
+            return null;
+        }
+        if (vtypes[vtype](value)) {
+            return null;
+        }
+        return vtypes[vtype + 'Text'] || gettext('invalid value');
+    },
+
     // Human-readable form of a scope's selector, for the Access tooltip.
     selectorText: function (selector) {
         let sel = selector || {};
@@ -255,6 +279,249 @@ PVE.meta.Yaml = {
                 document.head.appendChild(script);
             });
         return me.promise;
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Grammar findings for the text editor: what is wrong, and which line to underline.
+//
+// Mirrors ui/src/lint.rs exactly -- same rules, same messages, same line scan -- so
+// the two implementations say the same thing about the same document. Changing one
+// means changing the other.
+//
+// Two halves, kept apart on purpose. `findings()` answers *what is wrong*, from the
+// parsed document the panel already holds; `lineIndex()` answers *where to draw it*,
+// by scanning the YAML the server returned. The pairing only holds while the buffer
+// still is what the server sent, so the caller clears both once it is dirty.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Lint = {
+    // [prefix, schema] pairs, from the scopes the panel already resolved
+    // (`applicableScopes()`). A scope with no grammar contributes nothing: an operator
+    // that described no shape has claimed nothing.
+    applicable: function (scopes) {
+        let out = [];
+        (scopes || []).forEach(function (scope) {
+            if (scope.grammar) {
+                out.push([scope.prefix || '', scope.grammar]);
+            }
+        });
+        return out;
+    },
+
+    valueAt: function (data, path) {
+        let cur = data;
+        if (!path) {
+            return cur;
+        }
+        let parts = path.split('.');
+        for (let i = 0; i < parts.length; i++) {
+            if (!cur || typeof cur !== 'object' || Array.isArray(cur)) {
+                return undefined;
+            }
+            cur = Object.prototype.hasOwnProperty.call(cur, parts[i]) ? cur[parts[i]] : undefined;
+        }
+        return cur;
+    },
+
+    findings: function (data, applicable) {
+        let out = [];
+        (applicable || []).forEach(function ([prefix, schema]) {
+            let value = PVE.meta.Lint.valueAt(data, prefix);
+            if (value !== undefined) {
+                PVE.meta.Lint.walk(value, schema, prefix, out);
+            }
+        });
+        out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+        return out;
+    },
+
+    walk: function (value, schema, path, out) {
+        let message = PVE.meta.Lint.checkValue(schema, value);
+        if (message) {
+            out.push({ path: path, message: message });
+            return; // a value of the wrong shape says nothing useful about its children
+        }
+        let props = schema && schema.properties;
+        if (!props || !value || typeof value !== 'object' || Array.isArray(value)) {
+            return;
+        }
+        Object.keys(value).forEach(function (key) {
+            if (Object.prototype.hasOwnProperty.call(props, key)) {
+                let child = path ? path + '.' + key : key;
+                PVE.meta.Lint.walk(value[key], props[key], child, out);
+            }
+        });
+    },
+
+    // Only what the row editor also enforces, so the two never disagree.
+    checkValue: function (schema, value) {
+        if (!schema) {
+            return null;
+        }
+        if (schema.enum) {
+            let shown = PVE.meta.Utils.scalarText(value);
+            let allowed = schema.enum.map((v) => String(v));
+            return allowed.indexOf(shown) === -1
+                ? gettext('expected one of') + ': ' + allowed.join(', ')
+                : null;
+        }
+        if (schema.type && !PVE.meta.Lint.typeMatches(schema.type, value)) {
+            return gettext('expected') + ' ' + schema.type;
+        }
+        if (typeof value === 'number') {
+            if (schema.minimum !== undefined && value < schema.minimum) {
+                return gettext('must be at least') + ' ' + schema.minimum;
+            }
+            if (schema.maximum !== undefined && value > schema.maximum) {
+                return gettext('must be at most') + ' ' + schema.maximum;
+            }
+        }
+        if (typeof value === 'string' && schema.format) {
+            return PVE.meta.Utils.checkFormat(schema.format, value);
+        }
+        return null;
+    },
+
+    // A boolean arriving as 1/0 is the API's own wire convention (DESIGN section 4);
+    // flagging it would put a warning on every boolean in the store.
+    typeMatches: function (declared, value) {
+        switch (declared) {
+            case 'string':
+                return typeof value === 'string';
+            case 'integer':
+                return typeof value === 'number' && Number.isInteger(value);
+            case 'number':
+                return typeof value === 'number';
+            case 'boolean':
+                return typeof value === 'boolean' || value === 0 || value === 1;
+            case 'object':
+                return !!value && typeof value === 'object' && !Array.isArray(value);
+            case 'array':
+                return Array.isArray(value);
+            default:
+                return true;
+        }
+    },
+
+    // A scan, not a parser: the store dumps canonically (block style, two-space indent,
+    // one mapping key per line), so an indent stack resolves every key's path. Sequence
+    // items are not indexed (a view addresses through maps only) and a block scalar's
+    // body is skipped, so prose that reads `foo: bar` is never taken for a key.
+    lineIndex: function (yaml) {
+        let out = Object.create(null);
+        let stack = []; // [indent, key]
+        let blockAt = null;
+        String(yaml || '')
+            .split('\n')
+            .forEach(function (raw, i) {
+                let line = raw.trim();
+                let indent = raw.length - raw.replace(/^\s+/, '').length;
+                if (blockAt !== null) {
+                    if (line === '' || indent > blockAt) {
+                        return;
+                    }
+                    blockAt = null;
+                }
+                if (line === '' || line.charAt(0) === '#' || line === '---' || line === '...') {
+                    return;
+                }
+                if (line === '-' || line.slice(0, 2) === '- ') {
+                    return;
+                }
+                let split = PVE.meta.Lint.splitKey(line);
+                if (!split) {
+                    return;
+                }
+                while (stack.length && stack[stack.length - 1][0] >= indent) {
+                    stack.pop();
+                }
+                stack.push([indent, split.key]);
+                out[stack.map((e) => e[1]).join('.')] = i + 1;
+                let value = split.rest.trim();
+                if (value.charAt(0) === '|' || value.charAt(0) === '>') {
+                    blockAt = indent;
+                }
+            });
+        return out;
+    },
+
+    splitKey: function (line) {
+        if (line.charAt(0) === '"') {
+            let key = '';
+            for (let i = 1; i < line.length; i++) {
+                let c = line.charAt(i);
+                if (c === '\\') {
+                    key += line.charAt(++i);
+                } else if (c === '"') {
+                    let after = line.slice(i + 1);
+                    return after.charAt(0) === ':' ? { key: key, rest: after.slice(1) } : null;
+                } else {
+                    key += c;
+                }
+            }
+            return null;
+        }
+        let at = line.indexOf(':');
+        if (at <= 0) {
+            return null;
+        }
+        let key = line.slice(0, at).replace(/\s+$/, '');
+        return key ? { key: key, rest: line.slice(at + 1) } : null;
+    },
+
+    // Findings paired with the line to underline; one whose path the text does not
+    // carry is dropped, because a marker on the wrong line is worse than none.
+    placed: function (findings, index) {
+        let out = [];
+        (findings || []).forEach(function (f) {
+            if (index[f.path] !== undefined) {
+                out.push({ line: index[f.path], message: f.message });
+            }
+        });
+        return out;
+    },
+
+    // Every schema node the grammars declare, by document path -- the hover index.
+    schemaIndex: function (applicable) {
+        let out = Object.create(null);
+        let collect = function (schema, path) {
+            out[path] = schema;
+            let props = schema && schema.properties;
+            if (!props) {
+                return;
+            }
+            Object.keys(props).forEach((k) => collect(props[k], path ? path + '.' + k : k));
+        };
+        (applicable || []).forEach(([prefix, schema]) => collect(schema, prefix));
+        return out;
+    },
+
+    hoverText: function (schema) {
+        if (!schema) {
+            return null;
+        }
+        let parts = [];
+        if (schema.type) {
+            parts.push(schema.format ? schema.type + ' (' + schema.format + ')' : schema.type);
+        }
+        if (schema.enum) {
+            parts.push(gettext('one of') + ': ' + schema.enum.map((v) => String(v)).join(', '));
+        }
+        if (schema.minimum !== undefined && schema.maximum !== undefined) {
+            parts.push(schema.minimum + '..' + schema.maximum);
+        } else if (schema.minimum !== undefined) {
+            parts.push(gettext('at least') + ' ' + schema.minimum);
+        } else if (schema.maximum !== undefined) {
+            parts.push(gettext('at most') + ' ' + schema.maximum);
+        }
+        if (schema.default !== undefined) {
+            parts.push(gettext('default') + ': ' + PVE.meta.Utils.scalarText(schema.default));
+        }
+        if (schema.description) {
+            parts.push(schema.description);
+        }
+        return parts.length ? parts.join(' \u00b7 ') : null;
     },
 };
 
@@ -1427,6 +1694,9 @@ Ext.define('PVE.meta.TreePanel', {
     buildTree: function (data) {
         let me = this;
         let I = PVE.meta.Icons;
+        // Kept for text mode's grammar findings (annotateText): the parsed document the
+        // server returned, so nothing has to re-read the YAML to know what is in it.
+        me.docData = data;
         let scopes = me.applicableScopes();
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
@@ -1638,6 +1908,7 @@ Ext.define('PVE.meta.TreePanel', {
                 Proxmox.Utils.setErrorMask(me, false);
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
                     return;
                 }
                 me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
@@ -1648,6 +1919,12 @@ Ext.define('PVE.meta.TreePanel', {
                     minimap: { enabled: false },
                     scrollBeyondLastLine: false,
                 });
+                // Squiggles describe the text the server sent; typing moves the lines,
+                // so they are dropped on the first edit and come back on the next load.
+                me.textEditor.onDidChangeModelContent(function () {
+                    me.annotateText();
+                });
+                me.annotateText();
             },
             function (err) {
                 Proxmox.Utils.setErrorMask(me, false);
@@ -1770,6 +2047,82 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // Re-read the document and put it back in the buffer (after Apply, or Discard).
+    // Underline the lines the applicable grammars object to, and describe the key on
+    // each declared line on hover. Warnings only: the grammar is an affordance, the
+    // server's lint is the authority (DESIGN section 4), and Apply is never blocked.
+    //
+    // Cleared while the buffer is dirty or the view is JSON: the findings come from the
+    // document the server returned and the line index is a YAML scan, so neither
+    // describes what is on screen any more.
+    annotateText: function () {
+        let me = this;
+        if (!me.textEditor || !window.monaco) {
+            return;
+        }
+        let model = me.textEditor.getModel();
+        if (!model) {
+            return;
+        }
+        let markers = [];
+        let hovers = Object.create(null);
+        let clean = !me.textIsDirty() && me.textLang === 'yaml';
+        let applicable = clean ? PVE.meta.Lint.applicable(me.applicableScopes()) : [];
+        if (applicable.length) {
+            let index = PVE.meta.Lint.lineIndex(me.textOriginal);
+            markers = PVE.meta.Lint.placed(
+                PVE.meta.Lint.findings(me.docData || {}, applicable),
+                index,
+            ).map(function (f) {
+                return {
+                    startLineNumber: f.line,
+                    endLineNumber: f.line,
+                    startColumn: 1,
+                    endColumn: model.getLineMaxColumn(f.line),
+                    message: f.message,
+                    severity: monaco.MarkerSeverity.Warning,
+                };
+            });
+            let schemas = PVE.meta.Lint.schemaIndex(applicable);
+            Object.keys(schemas).forEach(function (path) {
+                let text = PVE.meta.Lint.hoverText(schemas[path]);
+                if (text && index[path] !== undefined) {
+                    hovers[index[path]] = text;
+                }
+            });
+        }
+        monaco.editor.setModelMarkers(model, 'pve-meta', markers);
+        me.textHovers = hovers;
+        me.registerTextHover();
+    },
+
+    // One hover provider for the language, reading whichever panel owns the model that
+    // is asking. Monaco registers providers per-language, not per-editor.
+    registerTextHover: function () {
+        let me = this;
+        if (PVE.meta.textHoverRegistered || !window.monaco || !monaco.languages) {
+            return;
+        }
+        PVE.meta.textHoverRegistered = true;
+        monaco.languages.registerHoverProvider('yaml', {
+            provideHover: function (model, position) {
+                let owner = me.textEditor && me.textEditor.getModel() === model ? me : null;
+                let text = owner && owner.textHovers && owner.textHovers[position.lineNumber];
+                if (!text) {
+                    return null;
+                }
+                return {
+                    range: new monaco.Range(
+                        position.lineNumber,
+                        1,
+                        position.lineNumber,
+                        model.getLineMaxColumn(position.lineNumber),
+                    ),
+                    contents: [{ value: text }],
+                };
+            },
+        });
+    },
+
     refreshText: function () {
         let me = this;
         me.request({
@@ -1781,6 +2134,7 @@ Ext.define('PVE.meta.TreePanel', {
                 me.textOriginal = d.text || '';
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
                 }
             },
         });

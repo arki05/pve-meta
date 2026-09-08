@@ -207,7 +207,13 @@ parent of a selected leaf, or the root), **Edit selection as text** (enabled wit
 selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
 and at the right end a **Tree | Text** toggle that swaps the panel body in place between
 the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
-digest) and Discard; leaving Text while dirty asks first. A muted "Scoped write access"
+digest) and Discard; leaving Text while dirty asks first. In Text, the applicable grammars
+underline the lines they object to (Monaco markers, **warning severity only** — Apply is
+never blocked) and describe the key on each declared line on hover: type, format, range,
+default, description. A document's own comment keys need no hover; they are ordinary
+lines in the YAML. Both are cleared while the buffer is dirty or the view is JSON — the
+findings come from the document the server returned and the line index is a YAML scan, so
+neither describes what is on screen once it is edited. A muted "Scoped write access"
 or "Read-only" label appears next to the toggle only when the caller is restricted. No
 per-row action icons. Editability is per row from `/meta/access`; a row edit is
 `PUT ?view=<path>&mode=replace` with the scalar, delete is `DELETE ?view=<path>`, the

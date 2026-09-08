@@ -70,6 +70,7 @@ use proxmox_yew_comp::{
 use crate::api::{self, WriteResult};
 use crate::edit::{self, Write};
 use crate::grammar::Operator;
+use crate::lint;
 use crate::model::{Access, DocId, GuestInfo, Mode};
 use crate::monaco;
 use crate::request::{Channel, RequestId, RequestTracker};
@@ -264,6 +265,15 @@ impl MonacoPane {
             }
         }
     }
+
+    /// Push the grammar's squiggles and hovers, or clear them with two empty lists.
+    fn annotate(&self, markers: &[(usize, String)], hovers: &[(usize, String)]) {
+        let Some(id) = &self.id else {
+            return;
+        };
+        monaco::set_markers(id, markers);
+        monaco::set_hovers(id, hovers);
+    }
 }
 
 /// Everything one load produces, plus the identity it was loaded for.
@@ -436,6 +446,34 @@ impl PveMetaTree {
 
     /// The text buffer on screen. The two never coexist: the "Edit selection as text"
     /// dialog is only reachable from the tree body.
+    /// What the applicable grammars have to say about the *loaded* text: the lines to
+    /// underline, and the per-line hover describing the key there.
+    ///
+    /// Empty whenever the pairing cannot hold — a dirty buffer (the findings describe the
+    /// document the server sent, and the lines have since moved), the JSON view (the line
+    /// index is a YAML scan), or a document with no grammars at all. The caller pushes the
+    /// result either way, so "nothing to say" clears whatever was there.
+    fn annotations(&self, text: &TextState) -> (Vec<(usize, String)>, Vec<(usize, String)>) {
+        if text.dirty() || text.format != TextFormat::Yaml {
+            return (Vec::new(), Vec::new());
+        }
+        let applicable = lint::applicable(
+            &self.operators,
+            &self.guest.tags,
+            self.requests.doc().scoped(),
+        );
+        if applicable.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let index = lint::line_index(text.loaded());
+        let markers = lint::placed(&lint::findings(&self.data, &applicable), &index);
+        let hovers = lint::schema_index(&applicable)
+            .iter()
+            .filter_map(|(path, schema)| Some((*index.get(path)?, lint::hover_text(schema)?)))
+            .collect();
+        (markers, hovers)
+    }
+
     fn edited_text(&self) -> Option<&TextState> {
         match self.body {
             Body::Tree => self.text.as_ref(),
@@ -1601,10 +1639,12 @@ impl LoadableComponent for PveMetaTree {
                 let read_only = !self.access.write;
                 let link = ctx.link().clone();
                 let dark_mode = self.dark_mode;
+                let (markers, hovers) = self.annotations(&text);
                 self.doc_pane
                     .sync(&text, read_only, dark_mode, move |input| {
                         link.send_message(Msg::TextInput(input))
                     });
+                self.doc_pane.annotate(&markers, &hovers);
                 self.doc_text = Some(text);
             }
         }

@@ -11,7 +11,7 @@
 //! closes; Monaco leaks a `ResizeObserver` and a model otherwise, and a buffer left over
 //! from another view is a buffer that can be applied to the wrong path.
 
-use js_sys::{Object, Reflect};
+use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 use web_sys::Element;
 
@@ -37,6 +37,12 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = onChange)]
     fn js_on_change(id: &str, callback: &JsValue);
+
+    #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setMarkers)]
+    fn js_set_markers(id: &str, findings: JsValue);
+
+    #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setHovers)]
+    fn js_set_hovers(id: &str, hovers: JsValue);
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = dispose)]
     fn js_dispose(id: &str);
@@ -95,6 +101,33 @@ pub fn on_change(id: &str, callback: impl Fn(String) + 'static) -> Closure<dyn F
     let closure = Closure::wrap(Box::new(callback) as Box<dyn Fn(String)>);
     js_on_change(id, closure.as_ref());
     closure
+}
+
+/// Underline the lines a grammar objects to (`crate::lint::placed`). Warnings, never
+/// errors: the grammar is an affordance and Apply is never blocked by one. An empty list
+/// clears them, which is what the caller does as soon as the buffer is dirty — the
+/// findings describe the text the server returned, not the one being typed.
+pub fn set_markers(id: &str, findings: &[(usize, String)]) {
+    js_set_markers(id, rows(findings, "message").into());
+}
+
+/// The hover text per line (`crate::lint::hover_text`): what the key on that line is
+/// declared to be. Cleared alongside the markers, for the same reason.
+pub fn set_hovers(id: &str, hovers: &[(usize, String)]) {
+    js_set_hovers(id, rows(hovers, "text").into());
+}
+
+/// `[{ line, <field>: text }]`, built with `js_sys` like [`mount`]'s options rather than
+/// through a serde bridge this crate does not otherwise need.
+fn rows(items: &[(usize, String)], field: &str) -> Array {
+    let out = Array::new();
+    for (line, text) in items {
+        let row = Object::new();
+        set(&row, "line", &JsValue::from_f64(*line as f64));
+        set(&row, field, &JsValue::from_str(text));
+        out.push(&row);
+    }
+    out
 }
 
 /// Destroy the editor and its model.
