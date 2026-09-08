@@ -1,6 +1,6 @@
 --- a/usr/share/perl5/PVE/AbstractConfig.pm
 +++ b/usr/share/perl5/PVE/AbstractConfig.pm
-@@ -12,6 +12,7 @@
+@@ -11,6 +11,7 @@
  use PVE::GuestHelpers qw(typesafe_ne);
  use PVE::ReplicationConfig;
  use PVE::Replication;
@@ -8,7 +8,37 @@
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -876,6 +877,9 @@
+@@ -266,6 +267,15 @@
+             $class->write_config($vmid, $conf);
+         },
+     );
++
++    # pve-meta: a genuinely new guest starts with no inherited metadata. Only when
++    # $allow_existing is false, i.e. when check_vmid_unused() above has just asserted
++    # this vmid was free -- a restore *over* an existing guest keeps its document,
++    # since a backup does not carry one and clearing it would be data loss.
++    if (!$allow_existing) {
++        eval { PVE::RS::Meta::on_create($vmid) };
++        warn "pve-meta: on_create($vmid) failed: $@" if $@;
++    }
+ }
+ 
+ # destroys configuration, only applicable for configs owned by the callers node.
+@@ -275,6 +285,13 @@
+ 
+     my $config_fn = $class->config_file($vmid, $nodename);
+     unlink $config_fn or die "failed to remove config file: $!\n";
++
++    # pve-meta: the config is gone, so the vmid is free -- drop its metadata with it.
++    # Every destroy path funnels through here (primary destroy, create/restore failure
++    # cleanup, clone failure cleanup, remote-migration abort), and this runs only after
++    # the unlink above succeeded: while the config still exists, so does the guest.
++    eval { PVE::RS::Meta::on_destroy($vmid) };
++    warn "pve-meta: on_destroy($vmid) failed: $@" if $@;
+ }
+ 
+ # moves configuration owned by calling node to the target node.
+@@ -873,6 +890,9 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
@@ -18,7 +48,7 @@
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1056,9 @@
+@@ -1049,6 +1069,9 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -28,7 +58,7 @@
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1221,9 @@
+@@ -1211,6 +1234,9 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);

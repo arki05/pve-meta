@@ -124,17 +124,19 @@ cluster ("Metadata" and "Metadata (ExtJS)") — `ui/` (pwt/Yew, same-origin ifra
 
 ## Lifecycle
 
-Metadata follows a guest through snapshot, rollback and delete-snapshot only: one
-patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), calling
-`PVE::RS::Meta::on_snapshot`/`on_rollback`/`on_delsnap`. There is no hook for destroy,
-clone or backup:
+Metadata follows a guest through create, destroy, snapshot, rollback and
+delete-snapshot: **one** patched file, `PVE/AbstractConfig.pm`
+(`libpve-guest-common-perl`), calling `PVE::RS::Meta::on_create`/`on_destroy`/
+`on_snapshot`/`on_rollback`/`on_delsnap`. Migration needs no hook — the document is
+flat and cluster-wide, so it does not move. Clone and backup are not carried:
 
-* **Destroy** is handled by a GC instead of a hook: `pve-meta-gc.timer` runs
-  `/usr/libexec/pve-meta/gc` hourly on every node (`OnBootSec=10min`,
-  `RandomizedDelaySec=10min`), under `PVE::Cluster::cfs_lock_domain('pve-meta-gc', ...)`,
-  removing any document (and its snapshot copies) whose vmid is no longer in the
-  vmlist. Check it with `systemctl status pve-meta-gc.timer` / `journalctl -u
-  pve-meta-gc.service`.
+* **Create and destroy** are hooks in the same patched file: `create_and_lock_config`
+  clears any metadata left at a vmid when PVE has just asserted it was unused (so a
+  recreated vmid never inherits the old guest's document), and `destroy_config` removes
+  the document and its snapshot copies once the guest config itself is gone. Both are
+  best-effort and warn; metadata never breaks a guest operation. `/usr/libexec/pve-meta/gc`
+  stays as a **manual** broom for a config removed out of band — nothing runs it on a
+  timer.
 * **Clone and backup are not carried.** Documented instead: metadata lives in
   `/etc/pve`, so back up `/etc/pve`. See `docs/LIFECYCLE-PATCHES.md` for the reasoning
   (a disk-having QEMU VM's backup path has no room for a third blob, so a partial
@@ -175,8 +177,8 @@ dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
 Installing/configuring `pve-meta` runs its `postinst`: `pve-ext-patch apply
 pve-meta-lifecycle` (dpkg-diverts `PVE/AbstractConfig.pm`, applies the diff, gates on
 `perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/operators` when `/etc/pve`
-is mounted, and restarts `pvedaemon`/`pveproxy`. `dh_installsystemd` enables and starts
-`pve-meta-gc.timer`. The API module and the UI tabs need no action — pve-ext discovers
+is mounted, and restarts `pvedaemon`/`pveproxy`. The API module and the UI tabs need no
+action — pve-ext discovers
 the API module at process startup and re-reads page manifests on every `/ext/pages`
 request; `pve-ext`'s own `postinst` applies the two-file manifest those two seams
 depend on. The patch step is best-effort and never fails install/configure; a trigger
@@ -187,7 +189,7 @@ applied with `pve-ext-patch status`.
 
 `dpkg -r pve-meta` runs `prerm`, which calls `pve-ext-patch remove pve-meta-lifecycle`
 **before** the package's own files are deleted, restoring the pristine file via
-`dpkg-divert --remove --rename`, and stops the GC timer/service. `/etc/pve/meta/*`
+`dpkg-divert --remove --rename`. `/etc/pve/meta/*`
 documents are left untouched — they're guest data, not package state.
 
 ## Permissions
@@ -220,14 +222,14 @@ live node.
 | Path | What |
 |---|---|
 | `crates/pve-meta-core` | Document model, views, registrations/scopes/selectors, lint, api layer, store, gc — pure Rust |
-| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: snapshot hooks, gc, the `api_*` functions |
+| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `operators/` | Packaged example registrations (none required) |
 | `ui/`, `ui-extjs/` | The two editor implementations, compared side by side |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/lifecycle/` | The one guest-lifecycle diff (snapshot/rollback/delete-snapshot) + `lifecycle.toml` manifest |
 | `pages/` | The "Metadata" and "Metadata (ExtJS)" tabs' page manifests |
-| `libexec/gc` | The GC script run hourly by `pve-meta-gc.timer` |
+| `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
 | `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `PERL-BINDINGS-SPEC.md` |
 | `scripts/apt-repo/` | Signed apt repo build/publish scripts (Cloudflare R2) |

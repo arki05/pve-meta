@@ -94,9 +94,11 @@ install:
 	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
-	# GC (see docs/DESIGN.md section 6, README.md): the script run hourly by
-	# pve-meta-gc.timer/pve-meta-gc.service (debian/pve-meta.pve-meta-gc.*,
-	# installed/enabled by dh_installsystemd -- see debian/rules).
+	# The manual GC broom (see docs/DESIGN.md section 6). Guest create and
+	# destroy now clear metadata themselves, so nothing runs this on a timer;
+	# it stays for the one case the hooks cannot cover -- a config removed
+	# out of band, or a destroy that never ran because its node was down --
+	# and an administrator runs it by hand.
 	install -D -m 0755 libexec/gc $(DESTDIR)$(PREFIX)/libexec/pve-meta/gc
 	# Packaged example operator registrations (docs/DESIGN.md section 3);
 	# none are required for pve-meta to work, so this directory may be

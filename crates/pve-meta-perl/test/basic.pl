@@ -85,18 +85,42 @@ is(PVE::RS::Meta::on_rollback(9001, 'gone'), 'removed',
 ok(!file_exists('9001.yaml'), 'document file is gone after rollback-removed');
 is(PVE::RS::Meta::on_rollback(9001, 'gone'), 'none', 'on_rollback is a no-op when nothing exists');
 
+# --- on_create / on_destroy ---------------------------------------------
+#
+# The two hooks patched into PVE::AbstractConfig (docs/DESIGN.md §6). Both clear a
+# vmid's document and every snapshot copy; only the call site differs.
+write_file('9300.yaml', "traefik:\n  host: old.example\n");
+PVE::RS::Meta::on_snapshot(9300, 'snapA');
+ok(file_exists('9300.yaml'), 'the doomed guest has a document');
+ok(file_exists('9300.snapA.yaml'), '... and a snapshot copy');
+
+is(PVE::RS::Meta::on_destroy(9300), 2, 'on_destroy removes the document and its snapshots');
+ok(!file_exists('9300.yaml'), '... the document is gone');
+ok(!file_exists('9300.snapA.yaml'), '... and so is the snapshot copy');
+is(PVE::RS::Meta::on_destroy(9300), 0, 'on_destroy is idempotent');
+
+# The reuse case a periodic sweep cannot see: the vmid comes straight back, so it is
+# never "missing from the vmlist" -- only a hook at creation clears the leftover.
+write_file('9301.yaml', "traefik:\n  host: stale.example\n");
+PVE::RS::Meta::on_snapshot(9301, 'snapB');
+is(PVE::RS::Meta::on_create(9301), 2, 'on_create clears a leftover document and its snapshots');
+ok(!file_exists('9301.yaml'), 'a guest created at a recycled vmid inherits nothing');
+ok(!file_exists('9301.snapB.yaml'), '... not even an old snapshot copy');
+is(PVE::RS::Meta::on_create(9301), 0, 'on_create on a clean vmid is a no-op');
+
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone.
-for my $gone (qw(on_clone on_destroy export_for_backup import_from_backup
+# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. `on_destroy`
+# is *not* in this list: it came back with the create/destroy hooks (§6), which is what
+# replaced the GC timer.
+for my $gone (qw(on_clone export_for_backup import_from_backup
                  list_snapshots has_document api_grants)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
-# =========================================================================
 # gc() -- what replaces the destroy hook and the whole orphan concept.
 # =========================================================================
 

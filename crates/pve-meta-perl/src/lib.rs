@@ -115,6 +115,35 @@ mod pve_rs_meta {
 
     // -- garbage collection (`docs/DESIGN.md` §6) --------------------------
 
+    /// Clears any metadata left at `$vmid` — the document and every snapshot copy.
+    /// Returns the number of files removed.
+    ///
+    /// Called from the patched `PVE::AbstractConfig::create_and_lock_config` **only when
+    /// that call asserted the vmid was unused** (`$allow_existing` false, i.e.
+    /// `PVE::Cluster::check_vmid_unused` has just passed). A genuinely new guest starts
+    /// with no inherited metadata; a restore *over* an existing guest keeps its document,
+    /// since a backup does not carry one and clearing would be data loss.
+    ///
+    /// This is what closes the vmid-reuse window a periodic sweep cannot: a guest
+    /// destroyed and recreated at the same vmid between two sweeps is never stale from
+    /// the sweep's point of view, because the vmid is back in the vmlist.
+    #[export]
+    pub fn on_create(vmid: u32) -> Result<usize, Error> {
+        Ok(open_store().purge(vmid)?)
+    }
+
+    /// Removes `$vmid`'s document and every snapshot copy. Returns the number of files
+    /// removed; idempotent, and 0 when there was nothing there.
+    ///
+    /// Called from the patched `PVE::AbstractConfig::destroy_config`, after the guest
+    /// config itself has been unlinked — so it runs on every destroy path there is
+    /// (primary destroy, create/restore failure cleanup, clone failure cleanup, remote
+    /// migration abort), all of which funnel through that one method.
+    #[export]
+    pub fn on_destroy(vmid: u32) -> Result<usize, Error> {
+        Ok(open_store().purge(vmid)?)
+    }
+
     /// The stale vmids: everything the store holds a file for that is not in
     /// `$vmids`, the vmlist the caller passes in as a native array ref.
     /// Removes nothing.

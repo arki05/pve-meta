@@ -61,12 +61,11 @@ grant list.
 
 All functions die with a readable message on error (`anyhow::Error` → Perl `die`).
 
-### Snapshot hooks
+### Lifecycle hooks
 
-The **only** lifecycle hooks (`DESIGN.md` §6). Called from one patched file,
-`PVE/AbstractConfig.pm` (package `libpve-guest-common-perl`). They run inside PVE's own
-guest locks and copy whole files; they do not consult grants. Their signatures are
-unchanged from revision 4.
+All of them (`DESIGN.md` §6), called from one patched file, `PVE/AbstractConfig.pm`
+(package `libpve-guest-common-perl`). They run inside PVE's own guest locks and move
+whole files; they do not consult grants.
 
 * `on_snapshot($vmid, $snapname)` → copies the document to the snapshot file; no-op if
   the guest has no document. Returns 1 if a copy was made, 0 otherwise.
@@ -75,14 +74,31 @@ unchanged from revision 4.
   removed (the guest had no metadata when the snapshot was taken). Returns a string:
   `restored`, `removed`, `none`.
 * `on_delsnap($vmid, $snapname)` → removes the snapshot copy. Returns 1/0.
+* `on_create($vmid)` → clears any document **and** snapshot copies left at `$vmid`.
+  Returns the number of files removed. Called from `create_and_lock_config`, and **only
+  when its `$allow_existing` is false** — that is when the `check_vmid_unused` inside it
+  has just asserted the vmid was free, so anything still there is a leftover. A restore
+  *over* an existing guest keeps its document: a backup does not carry one, so clearing
+  would be data loss.
+* `on_destroy($vmid)` → the same purge, called from `destroy_config` after the guest
+  config's own `unlink` succeeds. Returns the number of files removed; idempotent.
 
-**Removed in revision 5** (`DESIGN.md` §10): `on_clone`, `on_destroy`,
-`export_for_backup`, `import_from_backup`, `list_snapshots`, `has_document` and
-`api_grants`. Destroy is a GC; clone and backup are not carried ("metadata lives in
-`/etc/pve`; back up `/etc/pve`"); `list_snapshots`/`has_document` existed for the orphan
-machinery, which is gone with the orphan concept.
+The two are the same operation with different call sites, and are named separately so a
+warning says which path ran. `on_create` is the one a periodic sweep could never be: a
+vmid destroyed and recreated between two sweeps is never *missing* from the vmlist, so a
+sweep never nominates it and the new guest inherits the old document permanently.
 
-### Garbage collection
+**Removed in revision 5** (`DESIGN.md` §10): `on_clone`, `export_for_backup`,
+`import_from_backup`, `list_snapshots`, `has_document` and `api_grants`. Clone and backup
+are not carried ("metadata lives in `/etc/pve`; back up `/etc/pve`");
+`list_snapshots`/`has_document` existed for the orphan machinery, which is gone with the
+orphan concept.
+
+### Garbage collection (manual only)
+
+With create and destroy hooked, nothing runs this on a timer. It stays as the broom for
+the one case the hooks cannot see — a guest config removed out of band — and an
+administrator runs `/usr/libexec/pve-meta/gc` by hand.
 
 Rust never reads `/etc/pve/.vmlist` itself; the caller passes the vmlist in, as a native
 array ref of integers.
@@ -136,7 +152,7 @@ callback's `die` and re-raises it by assigning `$@`: wrapping the call in an `ev
 instead clears `$@` on the way out and swallows the failure silently. The outer check
 dies (a sweep that cannot take its own lock has done nothing); the inner one warns and
 moves to the next candidate, because one document whose write lock is busy must not stop
-the sweep from reaching the rest — the timer retries it next run.
+the sweep from reaching the rest — the next run picks it up.
 
 Nesting `"pve-meta-$vmid"` inside `'pve-meta-gc'` cannot deadlock: a writer only ever
 takes the per-document lock, never the GC one, so there is no lock-order cycle. The

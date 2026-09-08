@@ -3,19 +3,24 @@
 # pve-meta-gc: remove /etc/pve/meta documents (and their snapshot copies)
 # whose vmid is no longer in the cluster's vmlist.
 #
-# Run hourly by pve-meta-gc.timer (see debian/pve-meta.pve-meta-gc.service,
-# debian/pve-meta.pve-meta-gc.timer), installed at /usr/libexec/pve-meta/gc.
-# This is the replacement for the former on_destroy lifecycle hook: instead
-# of patching pve-container's and qemu-server's destroy paths to remove a
-# guest's metadata synchronously, a periodic sweep removes it within one
-# GC interval of the guest actually disappearing from the vmlist. There is
-# no orphan concept anywhere else in the API -- see docs/DESIGN.md section 6
-# and docs/LIFECYCLE-PATCHES.md.
+# Installed at /usr/libexec/pve-meta/gc. **Nothing runs this on a timer.**
+#
+# Guest create and destroy clear metadata themselves, through the two hooks
+# patched into PVE::AbstractConfig (docs/DESIGN.md section 6): destroy_config
+# removes a guest's document, and create_and_lock_config clears whatever is
+# left at a vmid PVE has just asserted was unused. Between them there is no
+# window for a stale document to be inherited, which a periodic sweep could
+# never close -- a vmid destroyed and recreated between two sweeps is never
+# "missing from the vmlist" at all.
+#
+# What is left for this script is the case the hooks cannot see: a guest
+# config removed out of band, so destroy_config never ran. An administrator
+# runs it by hand. There is no orphan concept anywhere else in the API.
 #
 # Two locks, two phases, because one lock is not enough:
 #
 #   * the outer PVE::Cluster::cfs_lock_domain('pve-meta-gc', ...) serialises
-#     GC runs against each other -- the timer fires on every node, and
+#     GC runs against each other -- it may be started on any node, and
 #     /etc/pve/meta is one pmxcfs directory shared by all of them;
 #   * an inner cfs_lock_domain("pve-meta-$vmid", ...) per stale vmid
 #     serialises the purge against *writes*, which is a different lock domain
@@ -40,7 +45,7 @@ my $LOCK_TIMEOUT = 30;
 
 # The vmlist, freshly refreshed. cfs_update() is not optional: a process that
 # has not refreshed the cached cluster filesystem state -- and this one is
-# freshly spawned by the timer -- sees an empty list, and an empty vmlist
+# freshly spawned for this run -- sees an empty list, and an empty vmlist
 # means "every guest is gone" to anything that consumes it.
 sub live_vmids {
     PVE::Cluster::cfs_update();
@@ -87,8 +92,8 @@ PVE::Cluster::cfs_lock_domain(
             if (my $err = $@) {
                 # Best-effort per candidate: one document whose write lock is
                 # held (a long PUT) or stuck must not stop the sweep from
-                # reaching the others. The timer re-runs, so a candidate
-                # skipped here is simply retried on the next pass -- whereas a
+                # reaching the others. A later run picks it up, so a candidate
+                # skipped here is reported and left for the next run -- whereas a
                 # die here would leave every later candidate unswept for as
                 # long as that one lock stays busy.
                 chomp(my $msg = $err);
@@ -112,7 +117,7 @@ if ($err) {
 syslog('info', "removed %d stale document(s)", $removed);
 syslog('info', "%d candidate(s) purged nothing (live again, or already gone)", $skipped)
     if $skipped;
-syslog('warning', "%d candidate(s) could not be locked and will be retried next run", $failed)
+syslog('warning', "%d candidate(s) could not be locked and were left in place", $failed)
     if $failed;
 closelog();
 

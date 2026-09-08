@@ -136,17 +136,35 @@ client-supplied `data` parameter is a JSON string, decoded once in Rust.
   `/etc/pve/meta/<vmid>.<snapname>.yaml` through one patched file,
   `PVE/AbstractConfig.pm` (package libpve-guest-common-perl), calling
   `PVE::RS::Meta::on_snapshot/on_rollback/on_delsnap`.
-* **Destroy**: no hook. A GC (`/usr/libexec/pve-meta/gc`, run by a systemd timer on
-  every node) removes documents and snapshot copies whose vmid is no longer in the
-  vmlist. There is no orphan concept in the API. It runs in **two phases under two
-  locks**: `PVE::RS::Meta::gc_candidates` nominates the stale vmids under
-  `cfs_lock_domain('pve-meta-gc')`, then each is purged individually by
-  `PVE::RS::Meta::gc_purge` under `cfs_lock_domain("pve-meta-<vmid>")` — the same lock a
-  write holds — re-validated against a vmlist read *inside* that lock. Without the
-  second phase a guest recreated at a freed vmid loses the metadata a `PUT` had already
-  stored, to a sweep whose vmlist read predates it. An empty vmlist is refused at both
-  phases: it means "every guest is gone", which is also what an unrefreshed pmxcfs
-  cache looks like.
+* **Create and destroy**: two hooks in the same patched file. `create_and_lock_config`
+  calls `PVE::RS::Meta::on_create($vmid)` — but **only when `$allow_existing` is false**,
+  i.e. when the `PVE::Cluster::check_vmid_unused` inside it has just asserted the vmid was
+  free — which clears any document and snapshot copies left at that vmid. `destroy_config`
+  calls `PVE::RS::Meta::on_destroy($vmid)` after the config's own `unlink` succeeds, which
+  removes the document and its snapshot copies. Both are `eval`-wrapped and warn: metadata
+  never breaks a guest operation.
+
+  Those two methods are the whole lifecycle. Every destroy path in `pve-container` and
+  `qemu-server` funnels through `destroy_config` (primary destroy, create/restore failure
+  cleanup, clone failure cleanup, remote-migration abort — 12 call sites), and every
+  creation path through `create_and_lock_config` (create, restore, clone target, CLI,
+  both remote-migration inbound paths — 6 call sites). Neither adds a patched *file*:
+  `AbstractConfig.pm` is already patched for the snapshot trio.
+
+  **The create hook is what a periodic sweep cannot be.** A sweep nominates vmids missing
+  from the vmlist, so a guest destroyed and recreated at the same vmid between two sweeps
+  is never stale from its point of view, and the new guest inherits the old document
+  permanently. Clearing on create closes that window rather than narrowing it, and doubles
+  as the backstop for a destroy that never ran because its node was down.
+
+  Migration needs nothing: `/etc/pve/meta/<vmid>.yaml` is flat and cluster-wide, like
+  `/etc/pve/firewall/<vmid>.fw`; only the guest config is node-scoped and gets
+  `move_config_to_node`'d.
+
+  A **manual broom** remains at `/usr/libexec/pve-meta/gc` (`PVE::RS::Meta::gc_candidates`
+  + `gc_purge`, two-phase under `cfs_lock_domain`) for the one case the hooks cannot see:
+  a config removed out of band. **Nothing runs it on a timer.** There is no orphan concept
+  in the API.
 * **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up
   `/etc/pve`". The QEMU backup command cannot embed foreign blobs, so a partial guarantee
   is not offered.
@@ -225,8 +243,9 @@ split; the per-request datacenter read for grants; `WriteGate`, `lint_at`/`lint_
 the lint-finding subset check; `may_name` and all message redaction; the `keys` wire
 field and the UI's YAML key scanner; the comment-key access machinery (`covers` aliasing
 beyond the one sibling rule, bare-`__` prefix rule, mid-path rejection, `filter`'s comment
-pass); orphan listing/deletion/access rules; the destroy, clone and backup hooks and
-their six diffs; JSON-string crossings for grants, guest lists and results
+pass); orphan listing/deletion/access rules; the clone and backup hooks and their diffs
+(destroy came back as a hook in `AbstractConfig`, §6, together with a new create
+hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for grants, guest lists and results
 (`_grants_json`, `_inflate_view`, `parse_grants`, `data_json`); the "View as" selector.
 
 ## 11. Deviations from DIRECTION.md, with reasons
