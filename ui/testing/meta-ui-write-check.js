@@ -35,7 +35,7 @@ const vmid = process.argv[3] || '201';
         const requests = [];
         page.on('request', (r) => {
             if (r.url().includes('/api2/json/meta/') && r.method() !== 'GET') {
-                requests.push({ method: r.method(), body: r.postData() });
+                requests.push({ method: r.method(), body: r.postData(), url: r.url() });
             }
         });
         await page.goto(L.url(host, `vmid=${vmid}&type=lxc&node=pvemeta-node1`), { waitUntil: 'networkidle2' });
@@ -116,10 +116,15 @@ const vmid = process.argv[3] || '201';
         stored = await L.doc(host, t, vmid);
         check('the row is gone', stored.data.traefik.spec.scheme === undefined,
             JSON.stringify(stored.data.traefik.spec));
-        const deletes = requests.filter((r) => r.method === 'DELETE').map((r) => JSON.parse(r.body));
-        check('the delete named the view and sent the digest',
+        // A DELETE carries its parameters in the query string: pveproxy answers a body on
+        // DELETE with "501 Unexpected content for method 'DELETE'".
+        const deletes = requests.filter((r) => r.method === 'DELETE')
+            .map((r) => Object.fromEntries(new URL(r.url).searchParams));
+        check('the delete named the view and sent the digest in the query string',
             deletes.some((b) => b.view === 'traefik.spec.scheme' && b.digest),
             JSON.stringify(deletes));
+        check('and sent no body with it',
+            requests.filter((r) => r.method === 'DELETE').every((r) => !r.body));
 
         check('no page errors', errors.length === 0, errors.join(' | '));
         await page.close();
