@@ -162,26 +162,39 @@ Both substitute the same placeholders; `requires` gating applies to both.
 
 ## 8. The UI: one tree of the document
 
-The page shows one tree of the document the caller can see: rows are the union of the
+The page shows one tree of the document the caller can see. Rows are the union of the
 keys present and the keys the applicable grammars declare (declared-but-unset rows are
-greyed with default and description and a "set" action). Columns: key, value (inline
-editor by type: string, integer/number, boolean, enum; arrays as one text leaf),
-owner (the registration whose scope covers the row, from `/meta/operators`, plus the
-selector). Comment keys are shown as the row description, not as rows. Editability is
-per row from `/meta/access`. A row edit is `PUT ?view=<path>&mode=replace` with the
-scalar; add is the same at a new path; delete is `DELETE ?view=<path>`. The digest is
-sent and 409 reloads. The version poll refreshes the tree and the grants.
+greyed with their default and a "set" action). No row icons; the expander alone.
+Columns:
 
-Monaco has two jobs: "edit subtree as text" (YAML/JSON toggle, presentation only) with
-diff-confirmed apply, and the diff dialog itself.
+* **Key**.
+* **Value**, edited through the row editor (textfield, number, checkbox, combobox for
+  enums, arrays as one text leaf); opened by Edit, double-click or Enter.
+* **Description**: the row's comment key (`k__`) if present, else nothing; the grammar
+  description is the tooltip.
+* **Access**: every registration whose scope covers the row, `rw` ones by name, `ro` ones
+  muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
+  "access" is about who writes and who subscribes, not ownership.
 
-Two implementations are built and compared on the lab cluster, then one is kept:
+Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
+parent of a selected leaf, or the root), **Edit selection as text** (enabled with a
+selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
+and at the right end a **Tree | Text** toggle that swaps the panel body in place between
+the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
+digest) and Discard; leaving Text while dirty asks first. A muted "Scoped write access"
+or "Read-only" label appears next to the toggle only when the caller is restricted. No
+per-row action icons. Editability is per row from `/meta/access`; a row edit is
+`PUT ?view=<path>&mode=replace` with the scalar, delete is `DELETE ?view=<path>`, the
+digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
+never while an editor is open.
 
-* `ui/` — pwt/Yew, `DataTable` over a `TreeStore` (the PDM pattern), same-origin iframe.
+Two implementations exist and are kept for now, both following the above:
+
 * `ui-extjs/` — plain JavaScript, `Ext.tree.Panel` with columns, a native tab through the
-  `script`/`xtype` manifest form; session, CSRF, theme and i18n come from the PVE UI.
-
-Both ship as page manifests ("Metadata", "Metadata (ExtJS)") during the comparison.
+  `script`/`xtype` manifest form; session, CSRF, theme and i18n come from the PVE UI;
+  YAML via a vendored js-yaml, the server stays the authority.
+* `ui/` — pwt/Yew, `DataTable` over a `TreeStore`, same-origin iframe, styled to match
+  the ExtJS grid's density and chrome.
 
 ## 9. Repository layout
 
