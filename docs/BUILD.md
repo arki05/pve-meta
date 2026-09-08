@@ -91,3 +91,9 @@ rsync --inplace ...
 
 `rsync` without `--inplace` and GNU `install`(1) (which unlinks the destination first) are
 also safe.
+
+Note on reloads: `deb-systemd-invoke reload-or-try-restart pveproxy.service` re-executes
+the master (it maps the new library immediately) and re-forks workers, but workers
+that are serving a request drain first and keep the old library mapped for a few
+seconds. Wait until `pgrep -f 'pveproxy worker'` shows only new PIDs before testing a
+freshly installed `.so`; `systemctl restart` skips the drain.
