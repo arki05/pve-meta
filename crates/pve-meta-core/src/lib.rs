@@ -34,7 +34,9 @@
 //! - [`scopes`] — [`scopes::Grants`] (a principal's effective access) and
 //!   [`scopes::parse_scopes`]/[`scopes::scopes_for`] (the datacenter
 //!   document's `scopes` map, validated strictly on write and read
-//!   leniently), implementing `docs/DESIGN.md` §2.
+//!   leniently — a read never fails), implementing `docs/DESIGN.md` §2 and
+//!   the `scopes` rules of §9 (admin-only writes, authid keys, non-empty
+//!   prefixes, opaque leaf).
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
 //!   alias) returned throughout this crate.
 //!

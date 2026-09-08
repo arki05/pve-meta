@@ -169,13 +169,13 @@ is($v1->{changed}, 0, 'api_version changed is 0 for an empty store');
 # api_grants returns a JSON-encoded string (see its doc comment), not a
 # decoded Perl structure -- decode it before comparing, same as callers
 # (PVE::API2::Ext::Meta) will.
-is_deeply(decode_json(PVE::RS::Meta::api_grants('svc@pve!x')), [], 'api_grants is empty without a datacenter document');
+is_deeply(decode_json(PVE::RS::Meta::api_grants('svc@pve!tok')), [], 'api_grants is empty without a datacenter document');
 
 PVE::RS::Meta::api_put(
     'datacenter', undef, 'json',
     encode_json({
         scopes => {
-            'svc@pve!x' => [
+            'svc@pve!tok' => [
                 { prefix => 'traefik', mode => 'rw' },
                 { prefix => 'netbird', mode => 'ro' },
             ],
@@ -184,7 +184,7 @@ PVE::RS::Meta::api_put(
     'replace', undef, 0, $FULL,
 );
 is_deeply(
-    decode_json(PVE::RS::Meta::api_grants('svc@pve!x')),
+    decode_json(PVE::RS::Meta::api_grants('svc@pve!tok')),
     [{ prefix => 'traefik', mode => 'rw' }, { prefix => 'netbird', mode => 'ro' }],
     'api_grants returns the scopes entry for the authid',
 );
@@ -433,7 +433,7 @@ PVE::RS::Meta::api_put(
 
 # 201 has no document at all; full-access grants still list it (digest "").
 my $full_rows = guest_list_json([200, $FULL], [201, $FULL]);
-my $listed = PVE::RS::Meta::api_list_guests($full_rows, undef);
+my $listed = PVE::RS::Meta::api_list_guests($full_rows, undef, 0);
 is(scalar(@$listed), 2, 'api_list_guests lists every guest the caller fully reads, with or without a document');
 my ($g200) = grep { $_->{vmid} == 200 } @$listed;
 my ($g201) = grep { $_->{vmid} == 201 } @$listed;
@@ -446,7 +446,7 @@ is_deeply($g201->{keys}, [], 'api_list_guests keys is empty for a guest with no 
 
 # A caller with no grant at all on a guest never sees it (docs/DESIGN.md section 8).
 is(
-    scalar(@{ PVE::RS::Meta::api_list_guests(guest_list_json([200, $FULL], [201, $NONE]), undef) }),
+    scalar(@{ PVE::RS::Meta::api_list_guests(guest_list_json([200, $FULL], [201, $NONE]), undef, 0) }),
     1,
     'api_list_guests omits a guest the caller can read nothing of',
 );
@@ -455,7 +455,7 @@ is(
 # and gets neither node nor name (no VM.Audit).
 my $scoped_traefik_only = grants_json(scopes => [{ prefix => 'traefik', mode => 'rw' }]);
 my $scoped_rows = guest_list_json([200, $scoped_traefik_only], [201, $scoped_traefik_only]);
-my $scoped_list = PVE::RS::Meta::api_list_guests($scoped_rows, undef);
+my $scoped_list = PVE::RS::Meta::api_list_guests($scoped_rows, undef, 0);
 is(scalar(@$scoped_list), 2, 'a scope on "traefik" makes every guest listed (the scope applies to every document)');
 my ($sg200) = grep { $_->{vmid} == 200 } @$scoped_list;
 is_deeply($sg200->{keys}, ['traefik'], 'api_list_guests keys is filtered to the scope for a scoped caller');
@@ -464,17 +464,17 @@ is($sg200->{name}, undef, 'api_list_guests hides the name without VM.Audit');
 
 # --has filters against the caller's own visible keys.
 is(
-    scalar(@{ PVE::RS::Meta::api_list_guests($full_rows, 'traefik.spec') }),
+    scalar(@{ PVE::RS::Meta::api_list_guests($full_rows, 'traefik.spec', 0) }),
     1,
     'api_list_guests --has traefik.spec matches the guest that has it',
 );
 is(
-    scalar(@{ PVE::RS::Meta::api_list_guests($full_rows, 'traefik.spec.port') }),
+    scalar(@{ PVE::RS::Meta::api_list_guests($full_rows, 'traefik.spec.port', 0) }),
     0,
     'api_list_guests --has traefik.spec.port does not match',
 );
 is(
-    scalar(@{ PVE::RS::Meta::api_list_guests($scoped_rows, 'netbird') }),
+    scalar(@{ PVE::RS::Meta::api_list_guests($scoped_rows, 'netbird', 0) }),
     0,
     '--has cannot see through a caller\'s own missing scope (netbird is not in $scoped_traefik_only)',
 );
@@ -493,13 +493,133 @@ like($@, qr/bad\@pve/, 'the 400 names the offending entry');
 
 # ... and a malformed entry already on disk never denies service to others
 # (the lenient per-principal read).
-write_file('datacenter.yaml', "scopes:\n  broken\@pve: not-a-list\n  good\@pve!t:\n  - prefix: traefik\n    mode: rw\n");
+write_file('datacenter.yaml', "scopes:\n  broken\@pve: not-a-list\n  good\@pve!tok:\n  - prefix: traefik\n    mode: rw\n");
 is_deeply(
-    decode_json(PVE::RS::Meta::api_grants('good@pve!t')),
+    decode_json(PVE::RS::Meta::api_grants('good@pve!tok')),
     [{ prefix => 'traefik', mode => 'rw' }],
     'a malformed entry for another principal is skipped, not fatal',
 );
 is_deeply(decode_json(PVE::RS::Meta::api_grants('root@pam')), [], 'an unrelated principal is unaffected too');
+
+# --- `scopes` is admin-only, whatever the scopes say (review P1) -----------
+write_file(
+    'datacenter.yaml',
+    "scopes:\n  good\@pve!tok:\n  - prefix: traefik\n    mode: rw\nother: 1\n",
+);
+my $before_scopes = read_file('datacenter.yaml');
+my $on_scopes = grants_json(scopes => [{ prefix => 'scopes', mode => 'rw' }]);
+for my $mode ('merge', 'replace') {
+    $res = eval {
+        PVE::RS::Meta::api_put(
+            'datacenter', 'scopes', 'json',
+            encode_json({ 'evil@pve' => [{ prefix => 'traefik', mode => 'rw' }] }),
+            $mode, undef, 0, $on_scopes,
+        )
+    };
+    ok(!defined($res), "an rw scope on 'scopes' cannot $mode the access-control map");
+    like($@, api_error_status(403), "that $mode is refused with 403:");
+}
+$res = eval { PVE::RS::Meta::api_delete('datacenter', 'scopes', undef, $on_scopes) };
+ok(!defined($res), 'an rw scope on "scopes" cannot delete the access-control map either');
+like($@, api_error_status(403), 'that delete is refused with 403:');
+is(read_file('datacenter.yaml'), $before_scopes, 'no scopes write got through');
+
+# --- a scope prefix must be non-empty (review P1 / DESIGN section 9) -------
+$res = eval {
+    PVE::RS::Meta::api_put(
+        'datacenter', 'scopes', 'json',
+        encode_json({ 'ok@pve' => [{ prefix => '', mode => 'rw' }] }),
+        'merge', undef, 0, $FULL,
+    )
+};
+ok(!defined($res), 'an empty scope prefix is refused at write time');
+like($@, api_error_status(400), 'the empty-prefix write is refused with 400:');
+like($@, qr/must not be empty/, 'the 400 says why');
+
+# ... and one already on disk grants nothing (a warning, not an outage).
+write_file('datacenter.yaml', "scopes:\n  broad\@pve:\n  - prefix: ''\n    mode: rw\n");
+is_deeply(decode_json(PVE::RS::Meta::api_grants('broad@pve')), [], 'an on-disk empty prefix grants nothing');
+
+# --- reads never lint (review P2) ------------------------------------------
+write_file(
+    'datacenter.yaml',
+    "scopes:\n  good\@pve!tok:\n  - prefix: traefik\n    mode: rw\nbad key: 1\nempty:\n",
+);
+is_deeply(
+    decode_json(PVE::RS::Meta::api_grants('good@pve!tok')),
+    [{ prefix => 'traefik', mode => 'rw' }],
+    'an out-of-band invalid key elsewhere in the document does not break the scope lookup',
+);
+my $broken_dc = PVE::RS::Meta::api_get('datacenter', undef, 'yaml', 1, $FULL);
+like($broken_dc->{text}, qr/bad key: 1/, 'an admin can read the invalid document to see what to fix');
+PVE::RS::Meta::api_put(
+    'datacenter', undef, 'yaml',
+    "scopes:\n  good\@pve!tok:\n  - prefix: traefik\n    mode: rw\n",
+    'replace', $broken_dc->{digest}, 0, $FULL,
+);
+is(
+    read_file('datacenter.yaml'),
+    "scopes:\n  good\@pve!tok:\n  - prefix: traefik\n    mode: rw\n",
+    'and repair it with a root-level replace',
+);
+
+# --- a non-map `scopes` grants nothing instead of 400-ing (review P3) ------
+write_file('datacenter.yaml', "scopes: oops\n");
+is_deeply(decode_json(PVE::RS::Meta::api_grants('good@pve!tok')), [], 'a non-map scopes key grants nothing');
+is_deeply(decode_json(PVE::RS::Meta::api_grants('root@pam')), [], '... for everybody else too');
+PVE::RS::Meta::api_delete('datacenter', undef, undef, $FULL);
+
+# --- the bare `__` map comment is not disclosed (review P4) ----------------
+PVE::RS::Meta::api_put(
+    '9400', undef, 'yaml',
+    "__: top level note - secret-ish\ntraefik__: about traefik\ntraefik:\n  host: x\nnetbird:\n  groups:\n  - lan\n",
+    'replace', undef, 0, $FULL,
+);
+my $traefik_only = grants_json(scopes => [{ prefix => 'traefik', mode => 'rw' }]);
+is(
+    PVE::RS::Meta::api_get('9400', undef, 'yaml', 1, $traefik_only)->{text},
+    "traefik__: about traefik\ntraefik:\n  host: x\n",
+    'a scoped read does not carry the document-root comment',
+);
+$res = eval { PVE::RS::Meta::api_get('9400', '__', 'yaml', 1, $traefik_only) };
+ok(!defined($res), 'and the explicit view of it is refused');
+like($@, api_error_status(403), 'that read is refused with 403:');
+PVE::RS::Meta::api_delete('9400', undef, undef, $FULL);
+
+# --- `scopes` is an opaque leaf for addressing (review P9) ------------------
+$res = eval { PVE::RS::Meta::api_get('datacenter', 'scopes.good@pve!tok', 'json', 1, $FULL) };
+ok(!defined($res), 'a single scopes entry is not path-addressable');
+like($@, api_error_status(400), 'that view is refused with 400:');
+like($@, qr/as a whole/, 'the 400 says to address the map as a whole');
+
+# ... while a dotted authid, which no view could ever address, is a valid key.
+PVE::RS::Meta::api_put(
+    'datacenter', 'scopes', 'json',
+    encode_json({ 'john.doe@pve' => [{ prefix => 'traefik', mode => 'ro' }] }),
+    'replace', undef, 0, $FULL,
+);
+is_deeply(
+    decode_json(PVE::RS::Meta::api_grants('john.doe@pve')),
+    [{ prefix => 'traefik', mode => 'ro' }],
+    'a dotted PVE authid can hold a scope',
+);
+PVE::RS::Meta::api_delete('datacenter', undef, undef, $FULL);
+
+# --- orphan documents (review P5) ------------------------------------------
+PVE::RS::Meta::api_put('999500', undef, 'json', encode_json({ traefik => { host => 'gone' } }), 'replace', undef, 0, $FULL);
+my $rows_without_it = guest_list_json([200, $FULL]);
+is(
+    scalar(grep { $_->{vmid} == 999500 } @{ PVE::RS::Meta::api_list_guests($rows_without_it, undef, 0) }),
+    0,
+    'without datacenter read, a document whose guest is gone stays invisible',
+);
+my ($orphan) =
+    grep { $_->{vmid} == 999500 } @{ PVE::RS::Meta::api_list_guests($rows_without_it, undef, 1) };
+ok(defined($orphan), 'with datacenter read, it is listed');
+is($orphan->{orphan}, 1, 'and marked as an orphan');
+is_deeply($orphan->{keys}, ['traefik'], 'with its top-level keys');
+PVE::RS::Meta::api_delete('999500', undef, undef, $FULL);
+is(PVE::RS::Meta::has_document(999500), 0, 'a datacenter writer can remove it');
 
 # --- the documented GET-then-PUT create flow (review F13) ------------------
 my $fresh = PVE::RS::Meta::api_get('9300', undef, 'json', 1, $FULL);

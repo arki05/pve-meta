@@ -6,8 +6,9 @@ store and API layer behind `pve-meta`. Its only consumer is `crates/pve-meta-per
 and no CLI. No networking, no async, no PVE-specific crates. Must build and pass tests on
 macOS and Linux.
 
-`docs/DESIGN.md` is the source of truth for behaviour; §8 records the decisions from the
-2026-09-07 review that this document was reconciled against.
+`docs/DESIGN.md` is the source of truth for behaviour; §8 and §9 record the binding
+decisions from the 2026-09-07 and 2026-09-08 reviews that this document was reconciled
+against.
 
 ## 1. Data model (`model.rs`)
 
@@ -19,7 +20,12 @@ macOS and Linux.
   2. no `null` anywhere (absent means unset);
   3. every object key must match `^[A-Za-z0-9_@!-]+$` — no dots (they separate path
      segments); `@` and `!` are allowed so a PVE authid (`user@realm!tokenid`) can be a
-     key, which the datacenter document's `scopes` map needs;
+     key, which the datacenter document's `scopes` map needs. Inside the **top-level
+     `scopes` map** a full PVE authid is accepted too (`model::is_authid`, dots
+     included): `PVE::AccessControl`'s `$userid_or_token_regex` transliterated,
+     `^[^\s:/]+@[A-Za-z][A-Za-z0-9.\-_]+(?:![A-Za-z][A-Za-z0-9.\-_]+)?$`. Lint only
+     *relaxes* there; the shape rule for a real `scopes` map is `parse_scopes`, at
+     write time (`docs/DESIGN.md` §9);
   4. **comment keys**: a key ending in `__` is a comment key. Its value must be a string.
      `__` alone documents the containing map; `foo__` documents sibling `foo` (the
      sibling need not exist).
@@ -34,6 +40,8 @@ macOS and Linux.
 * `pub fn get_path<'a>(doc: &'a Value, path: &Path) -> Option<&'a Value>`; arrays are
   indexed by numeric segments.
 * `pub const COMMENT_SUFFIX: &str = "__";` `pub fn is_comment_key(k: &str) -> bool`.
+* `pub const SCOPES_KEY: &str = "scopes";` `pub fn is_authid(k: &str) -> bool` — the one
+  reserved top-level key and the rule for its own keys.
 
 ## 2. Paths (`path.rs`)
 
@@ -116,8 +124,12 @@ scalar (`Error::InvalidPath` otherwise).
 * `remove(doc, prefix) -> Result<Vec<Touched>>` — deletes the subtree (empties the
   document at the root). This, not `replace` with `{}`, is what `DELETE` uses.
 * `filter(doc, readable_prefixes) -> Value` — the "no view" read: the union of the
-  prefixes, unstripped, in the document's own order, carrying each included key's comment
-  key along with it (in either authoring order).
+  prefixes, unstripped, in the document's own order, carrying along every comment key
+  the same prefixes cover (`scopes::covers`, i.e. exactly what `Grants::can_read`
+  answers, in either authoring order). A map's bare `__` documents the whole map and so
+  travels only where the map itself is readable; `p__` travels with a fully readable `p`
+  (`docs/DESIGN.md` §9). **Invariant:** `filter` never emits a comment key the same
+  grant's `can_read` refuses as a view.
 * `render(value, format) -> String`, `parse(text, format)` (a replace payload: no nulls),
   `parse_patch(text, format)` (a merge payload: `null` is the delete marker).
 
@@ -144,14 +156,24 @@ for).
 * `can_read(path)` / `can_write(path)` / `readable_prefixes()` / `check_write(&[Touched])`.
 * A scope on `p` also covers the sibling comment key `p__` at the same depth
   (`docs/DESIGN.md` §8: comment keys follow their subject). The bare `__` map comment has
-  no subject and is not aliased.
+  no subject and is not aliased: a scope on `p` covers `p`, `p__` and everything below
+  `p`, and nothing above it (`docs/DESIGN.md` §9). `covers` is `pub(crate)`, because
+  `view::filter` must give the same answer on the read side.
 * `check_write(&[])` is vacuously `Ok`, so it is **not** a security boundary on its own;
   see §9.
-* `parse_scopes(dc)` — the strict, whole-map parse used at *write* time: any malformed
-  entry is `Error::InvalidScopes` naming it.
-* `scopes_for(dc, authid)` — the lenient per-principal read: only `authid`'s own entry is
-  parsed; a malformed entry belonging to someone else is skipped with a `warn!`. One bad
-  entry can never deny service to anyone but its owner.
+* `check_write` treats the `scopes` map as **one path**: a touched path inside it is
+  checked, and reported, as `scopes` itself (`docs/DESIGN.md` §9), so a 403 never names
+  another principal's authid.
+* `parse_scopes(dc)` — the strict, whole-map parse used at *write* time: `Error::
+  InvalidScopes` naming the offender for a malformed entry, a key that is not a PVE
+  authid, an **empty prefix** (whole-document access comes from PVE ACLs, never from a
+  scope), or a prefix addressing inside `scopes` (it is an opaque leaf).
+* `scopes_for(dc, authid) -> Vec<Scope>` — the lenient per-principal read, which
+  **cannot fail**: a `scopes` value that is not a map, and any entry that `parse_scopes`
+  would reject (whoever owns it), is skipped with a `warn!` and grants nothing. This
+  lookup runs on every guest request, so an error here would be a cluster-wide outage
+  for every principal including the administrator who has to repair it
+  (`docs/DESIGN.md` §9).
 
 ## 8. Store (`store.rs`)
 
@@ -171,10 +193,20 @@ API (all synchronous, `Result<_, Error>`):
 * `locate(id) -> Option<PathBuf>`
 * `read(id) -> Document { id, path, raw, value, digest, mtime }` (`Error::NotFound` if
   absent). `value` is **unstripped** — comment stripping is the API layer's job.
+  **Reads never lint** (`docs/DESIGN.md` §9): the parse is `format::parse_raw`, so
+  whatever is on disk comes back. Only a syntax error is an error. Content can only be
+  invalid out of band (a hand-edited file, a restored backup, pmxcfs replication), and
+  linting it on the way in made one bad key in `datacenter.yaml` a cluster-wide outage
+  that also blocked its own repair.
+* `guest_ids() -> Vec<u32>` — every vmid with a live document, ascending (not snapshot
+  copies, not the datacenter document). The store's half of orphan detection; Perl owns
+  the vmlist and does the comparison (`docs/DESIGN.md` §9).
 * `check_precondition(id, expected_digest)` — the compare-and-swap rule, without writing.
 * `put_raw(id, text, expected_digest) -> PutResult { document, touched }` — full text
-  replace, creating the document if absent. Text is parsed and linted; `touched =
-  diff(old, new)`; text is stored as given (only normalised to end with a single newline).
+  replace, creating the document if absent. The *new* text is parsed and linted — this is
+  the write-time gate; the existing content is parsed leniently, since it is only read to
+  diff against and must not be able to block a repair. `touched = diff(old, new)`; text
+  is stored as given (only normalised to end with a single newline).
 * `delete(id)` — the **current document only**. `Error::NotFound` if absent.
 * `destroy(vmid)` — the document *and every snapshot copy*, idempotent. Only the
   `on_destroy` lifecycle hook calls this; the REST `DELETE` calls `delete`
@@ -188,6 +220,11 @@ API (all synchronous, `Result<_, Error>`):
   could never hit, and pmxcfs's mtime granularity cannot distinguish two same-length
   writes in one tick so it would be unsound if it did. Documents are tiny.
 * Size limits: `WARN_BYTES = 256 KiB`, `MAX_BYTES = 512 KiB` → `Error::TooLarge`.
+  `MAX_BYTES` is a **backstop, not the operative limit for an API write**: pveproxy
+  refuses a body of about that size first (measured: 520 000 B through, 530 000 B →
+  "for data too large", HTTP 501). It bounds the writers that do not go through
+  pveproxy — `import_from_backup`, and a hand-written or replicated file being
+  rewritten — and the pmxcfs size budget.
 
 The digest precondition is enforced **here and only here**: `check_digest` treats `None`
 as "no precondition" and `Some("")` as matching a *missing* document, which is what makes
@@ -204,7 +241,8 @@ the project's security boundary and must be unit-testable without `libperl-dev` 
 without a cluster. Every function takes a `&MetaStore`; the bindings supply one rooted at
 `$PVE_META_ROOT`.
 
-* `version(store)`, `grants(store, authid)`, `list_guests(store, guests_json, has)`,
+* `version(store)`, `grants(store, authid)`,
+  `list_guests(store, guests_json, has, orphans)`,
   `get_document(store, id, view, format, comments, grants_json)`,
   `put_document(store, id, view, format, payload, mode, digest, dry_run, grants_json)`,
   `delete_document(store, id, view, digest, grants_json)`.
@@ -219,9 +257,12 @@ diff:
 2. the mutation is planned against a **clone** and every path the plan touches is checked
    with `check_write`;
 3. the whole planned document is linted (so `dry_run` validates exactly what the write
-   validates), and a datacenter write that touches `scopes` is additionally validated with
-   `parse_scopes`;
-4. only then is the planned value written.
+   validates);
+4. a datacenter write that touches `scopes` additionally requires `full_write` — the
+   access-control map is admin-only whatever the scopes say, since `check_write` asks
+   only whether the *path* is covered and a scope covering `scopes` makes that true
+   (`docs/DESIGN.md` §9) — and is then validated with `parse_scopes`;
+5. only then is the planned value written.
 
 **Read authorization**: a caller with no readable prefix at all gets 403, not an empty
 document with the real digest (which would be a change-detection oracle). A caller with a
@@ -231,19 +272,28 @@ compare-and-swap PUTs.
 **403 messages** never name a path the caller cannot read: the offending path is included
 only when the caller has read access to its parent.
 
+**View addressing**: `scopes` is an opaque leaf. `?view=scopes` addresses the whole map;
+anything deeper is a 400 explaining why (its keys are authids, which may contain the path
+separator). Entries are added and removed by writing the map, `mode=merge` with `null` to
+delete one (`docs/DESIGN.md` §9).
+
 `list_guests` takes the vmlist rows *from Perl* (`[{vmid, node, type, name, grants}]`,
 `grants` a JSON string). This crate never opens `/etc/pve/.vmlist` or a guest config:
 there is one reader of each per request, and guest-config parsing is not re-implemented in
 a second language. `node` and `name` are returned only to a caller with `VM.Audit` on that
-guest.
+guest. With `orphans` (the caller has datacenter read) the list also contains every
+document whose vmid is *not* among those rows, marked `orphan: 1` and with no
+`node`/`type`/`name` — there is no guest to take them from (`docs/DESIGN.md` §9).
 
 ## 10. Errors (`error.rs`)
 
 `thiserror` enum `Error`: `Parse { format, msg }`, `Lint(Vec<Lint>)`,
-`DigestMismatch { expected, actual }`, `NotFound(DocId)`, `Conflict(String)`,
+`DigestMismatch { expected, actual }`, `NotFound(DocId)`,
 `TooLarge { size, max }`, `InvalidPath(String)`, `InvalidName(String)`,
 `InvalidScopes(String)`, `Io(#[from] std::io::Error)`, `Other(#[from] anyhow::Error)`.
-`Display` messages are suitable for an HTTP API response body.
+`Display` messages are suitable for an HTTP API response body. (There is no `Conflict`
+variant: it described a multi-format store that no longer exists, and was never
+constructed.)
 
 ## 11. Tests
 
@@ -259,14 +309,23 @@ scenarios:
   no-op `merge` mutates nothing at any depth; creating or removing an empty map still
   reports a touched path; `filter` keeps a comment key in either authoring order;
   `parse_patch` accepts `null` where `parse` rejects it;
-* scopes: a scope covers its own `p__` and nothing else's; a malformed entry for another
-  principal is skipped while the strict parse still rejects the document;
+* scopes: a scope covers its own `p__` and nothing else's; anything malformed — the
+  container, another principal's entry, the caller's own — is skipped by `scopes_for`
+  while the strict parse still rejects the document; an empty prefix, a prefix inside
+  `scopes`, and a non-authid key are all rejected by `parse_scopes`; `check_write`
+  collapses a path inside `scopes` to `scopes`;
 * store: create/put_raw/delete/destroy, digest mismatch, `Some("")` against a missing
   document, snapshots/rollback, `delete` leaves snapshots alone and `destroy` removes
   them, an api-delete-then-rollback end-to-end case, version token changes on write and
-  not on read and distinguishes same-length writes, no temp files left behind;
+  not on read and distinguishes same-length writes, no temp files left behind; an
+  out-of-band invalid document is still readable and still repairable while the
+  write-time lint is unchanged; `guest_ids` lists live documents only;
 * api: a zero-grant (and a wrongly-scoped) token cannot create structure through an empty
   merge or a `{}` replace at any prefix, cannot write the root view, and cannot learn
   values or key structure from a 403; `dry_run` and the real write agree; merge-with-null
   deletes end to end; malformed `scopes` are refused at write time; a no-grant read is
-  403; `keys` carries the document order.
+  403; `keys` carries the document order; **no scope of any breadth can write `scopes`**
+  (PUT, DELETE and `dry_run`, with a root-prefix and with a `scopes`-prefix rw scope);
+  a single `scopes` entry is not addressable as a view; an out-of-band invalid document
+  is readable and repairable by a full-ACL caller; a scoped read never carries a bare
+  `__`; orphan documents are listed only with datacenter read.

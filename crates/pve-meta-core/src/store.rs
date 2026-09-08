@@ -32,6 +32,14 @@ use crate::patch::{self, Touched};
 /// `tracing`).
 pub const WARN_BYTES: u64 = 256 * 1024;
 /// Hard limit for document size; exceeding it is [`Error::TooLarge`].
+///
+/// This is a **backstop, not the operative limit** for an API write: pveproxy
+/// rejects a request body of roughly this size before the request ever
+/// reaches us (measured on PVE 8: 520 000 bytes through, 530 000 bytes
+/// answered "for data too large", HTTP 501). It is the operative limit for
+/// the writers that do not go through pveproxy — `import_from_backup` and a
+/// hand-written or replicated file being rewritten — and it is what keeps a
+/// single document from eating the pmxcfs size budget.
 pub const MAX_BYTES: u64 = 512 * 1024;
 
 /// The one on-disk format (`docs/DESIGN.md` §8: "YAML only on disk").
@@ -207,11 +215,24 @@ impl MetaStore {
         Ok(())
     }
 
+    /// Reads and parses one document file. **Reads never lint**
+    /// (`docs/DESIGN.md` §9, review P2): the parse is
+    /// [`format::parse_raw`], so whatever is on disk comes back as it is.
+    ///
+    /// Every API write is already lint-gated, so invalid content can only
+    /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
+    /// backup, pmxcfs replication). Linting on the way *in* made one bad key
+    /// anywhere in `datacenter.yaml` a cluster-wide outage — `api::grants`
+    /// reads that document on every guest request — and, worse, blocked the
+    /// administrator's own repair, since they could neither read the document
+    /// to see the problem nor write over it. Strict validation belongs to the
+    /// content being written, and lives in [`MetaStore::put_raw`]'s parse of
+    /// the *new* text.
     fn read_document(&self, id: DocId, path: &std::path::Path) -> Result<Document> {
         let bytes = fs::read(path)?;
         let raw = String::from_utf8(bytes.clone())
             .map_err(|e| Error::Other(anyhow::anyhow!("{}: invalid utf-8: {e}", path.display())))?;
-        let value = format::parse(DISK_FORMAT, &raw)?;
+        let value = format::parse_raw(DISK_FORMAT, &raw)?;
         let dig = digest::digest(&bytes);
         let mtime = fs::metadata(path)?.modified()?;
         Ok(Document {
@@ -290,17 +311,22 @@ impl MetaStore {
         };
         Self::check_digest(existing.as_deref(), expected_digest)?;
 
+        // The *old* content is only read to diff against, so it is parsed
+        // leniently: an out-of-band edit that broke it must not stop an
+        // administrator from writing the repair (`docs/DESIGN.md` §9, review
+        // P2).
         let old_value = match &existing {
             Some(bytes) => {
                 let old_raw = String::from_utf8(bytes.clone())
                     .map_err(|e| Error::Other(anyhow::anyhow!("invalid utf-8: {e}")))?;
-                format::parse(DISK_FORMAT, &old_raw)?
+                format::parse_raw(DISK_FORMAT, &old_raw)?
             }
             None => Value::Object(serde_json::Map::new()),
         };
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
+        // The write-time gate: the content being stored is fully linted.
         let new_value = format::parse(DISK_FORMAT, &normalized)?;
 
         self.write_atomic(&path, normalized.as_bytes())?;
@@ -331,6 +357,37 @@ impl MetaStore {
         let path = self.locate(id)?.ok_or(Error::NotFound(id))?;
         fs::remove_file(&path)?;
         Ok(())
+    }
+
+    /// Every vmid that has a live document, sorted ascending (snapshot
+    /// copies, the datacenter document and temp files are not documents).
+    ///
+    /// Used to find **orphans**: documents whose guest is no longer in the
+    /// vmlist (`docs/DESIGN.md` §9). Perl owns the vmlist and does the
+    /// comparison; this is the store's half of it.
+    pub fn guest_ids(&self) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        if !self.root.is_dir() {
+            return Ok(out);
+        }
+        let suffix = format!(".{}", DISK_FORMAT.ext());
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !entry.file_type()?.is_file() {
+                continue;
+            }
+            // `<vmid>.yaml` only: `<vmid>.<snapname>.yaml` still ends with
+            // the suffix, but its stem is not a bare number.
+            let Some(stem) = name.strip_suffix(&suffix) else {
+                continue;
+            };
+            if let Ok(vmid) = stem.parse::<u32>() {
+                out.push(vmid);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
     }
 
     /// Lists a guest's snapshot names, sorted.

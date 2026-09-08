@@ -72,10 +72,23 @@ sub _scopes_for {
 
 # A guest's grants: `VM.Audit` / `VM.Config.Options` on `/vms/$vmid`, plus
 # the caller's scopes.
+#
+# `$orphan` is set when the vmid is *not* in the vmlist (`docs/DESIGN.md` §9):
+# the document is an orphan, or there is nothing there at all. There is no
+# guest, so the datacenter ACL grants the access too (Sys.Audit / Sys.Modify
+# on /, in addition to whatever /vms/$vmid still says), and scopes do not
+# apply -- a scope grants "the prefix on every guest document", and this
+# document has no guest. Callers that must not act on an orphan at all (PUT)
+# never get here; `_orphan_or_404` is the gate.
 sub _guest_grants_json {
-    my ($rpcenv, $authuser, $vmid, $scopes) = @_;
+    my ($rpcenv, $authuser, $vmid, $scopes, $orphan) = @_;
     my $full_read = $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1);
     my $full_write = $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options'], 1);
+    if ($orphan) {
+        $full_read ||= $rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
+        $full_write ||= $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
+        return _grants_json($full_read, $full_write, []);
+    }
     return _grants_json($full_read, $full_write, $scopes);
 }
 
@@ -159,6 +172,26 @@ sub _assert_guest_exists {
     my ($vmid) = @_;
     return if _vmlist_ids()->{$vmid};
     raise("guest '$vmid' does not exist\n", code => 404);
+}
+
+# The write-side vmlist bookkeeping for one guest id, in one place: is there a
+# guest, and if not, is this an orphan the caller may act on
+# (`docs/DESIGN.md` §9)?
+#
+# Returns 1 for an orphan (no vmlist entry, a document on disk, and the caller
+# has datacenter read); returns 0 for a live guest; raises 404 otherwise --
+# for a vmid that is neither a guest nor an orphan, and for an orphan the
+# caller cannot see, which is the same answer `GET /meta/guests` gives them.
+# F20 closed unbounded document creation and, with it, the only API path that
+# could ever remove such a document; this is that path, restricted to the
+# datacenter administrator (review P5).
+sub _orphan_or_404 {
+    my ($rpcenv, $authuser, $vmid) = @_;
+    return 0 if _vmlist_ids()->{$vmid};
+    raise("guest '$vmid' does not exist\n", code => 404)
+        if !PVE::RS::Meta::has_document($vmid)
+        || !$rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
+    return 1;
 }
 
 # Decodes an `api_get`/`api_put`/`api_delete` result's `data_json` (present
@@ -433,10 +466,13 @@ __PACKAGE__->register_method({
         description => "Anybody may call this; the list is filtered to guests the "
             . "caller can read anything of (full VM.Audit, or any datacenter-configured "
             . "scope, which applies to every guest). 'node' and 'name' are returned "
-            . "only for guests the caller has VM.Audit on.",
+            . "only for guests the caller has VM.Audit on. Orphan documents (whose "
+            . "guest is no longer in the vmlist) are listed with 'orphan' set, for "
+            . "callers with Sys.Audit on / only.",
         user => 'all',
     },
-    description => "Lists every guest in the vmlist the caller can read anything of.",
+    description => "Lists every guest in the vmlist the caller can read anything of, "
+        . "plus (with Sys.Audit on /) any orphan document whose guest is gone.",
     parameters => {
         additionalProperties => 0,
         properties => {
@@ -450,6 +486,9 @@ __PACKAGE__->register_method({
     },
     returns => {
         type => 'array',
+        # Open-shaped: `{ vmid, node, type, name, digest, keys }` per guest,
+        # plus `orphan => 1` on a document whose guest is gone
+        # (docs/DESIGN.md §9). Rust omits what the caller may not see.
         items => { type => 'object', additionalProperties => 1 },
     },
     code => sub {
@@ -483,7 +522,15 @@ __PACKAGE__->register_method({
             };
         }
 
-        return _call(\&PVE::RS::Meta::api_list_guests, encode_json($guests), $param->{has});
+        # Orphans (documents whose vmid left the vmlist) are the datacenter
+        # administrator's business: without this they are invisible to every
+        # listing while still replicated by pmxcfs and still waiting to be
+        # inherited by a future guest at that vmid (docs/DESIGN.md §9).
+        my $orphans = $rpcenv->check($authuser, '/', ['Sys.Audit'], 1) ? 1 : 0;
+
+        return _call(
+            \&PVE::RS::Meta::api_list_guests, encode_json($guests), $param->{has}, $orphans,
+        );
     },
 });
 
@@ -494,7 +541,10 @@ __PACKAGE__->register_method({
     permissions => {
         description => "The response is filtered to what the caller may read (full "
             . "VM.Audit, or a datacenter-configured scope). A caller with neither is "
-            . "refused with 403, as is a 'view' outside the caller's read access.",
+            . "refused with 403, as is a 'view' outside the caller's read access. "
+            . "For a vmid that is not in the vmlist (an orphan document, or nothing "
+            . "at all) Sys.Audit on / grants the read as well, and scopes do not "
+            . "apply -- there is no guest for them to apply to. GET never 404s.",
         user => 'all',
     },
     description => "Gets a guest's metadata document (or a view/prefix of it).",
@@ -515,17 +565,21 @@ __PACKAGE__->register_method({
         my $authuser = $rpcenv->get_user();
         my $vmid = $param->{vmid};
 
+        # One vmlist read, and it only decides *which* ACL answers: a GET
+        # never 404s on an unknown vmid (a missing document is the empty
+        # document, `docs/DESIGN.md` §2).
+        my $orphan = _vmlist_ids()->{$vmid} ? 0 : 1;
         my $grants_json =
-            _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
+            _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser), $orphan);
         return $get_view->("$vmid", $param, $grants_json);
     },
 });
 
 __PACKAGE__->register_method({
     name => 'put_guest',
+    protected => 1,
     path => 'guests/{vmid}',
     method => 'PUT',
-    protected => 1,
     permissions => {
         description => "Anybody may call this; the caller must be able to write the "
             . "named view (full VM.Config.Options, or a datacenter-configured rw "
@@ -561,9 +615,12 @@ __PACKAGE__->register_method({
         my $vmid = $param->{vmid};
 
         return _locked($vmid, sub {
+            # Unconditional: an orphan document is never written, only read
+            # or removed (`docs/DESIGN.md` §9). Writing one would resurrect
+            # exactly the unbounded-creation problem F20 closed.
             _assert_guest_exists($vmid);
             my $grants_json =
-                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
+                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser), 0);
             return $put_view->("$vmid", $param, $grants_json);
         });
     },
@@ -571,13 +628,15 @@ __PACKAGE__->register_method({
 
 __PACKAGE__->register_method({
     name => 'delete_guest',
+    protected => 1,
     path => 'guests/{vmid}',
     method => 'DELETE',
-    protected => 1,
     permissions => {
         description => "Anybody may call this; same write rules as PUT. Removes only "
             . "the current document -- snapshot copies belong to the guest lifecycle "
-            . "and are never touched from here.",
+            . "and are never touched from here. An orphan document (whose guest is "
+            . "no longer in the vmlist) may be removed with Sys.Audit + Sys.Modify "
+            . "on /; every other unknown vmid is 404, and no scope ever grants this.",
         user => 'all',
     },
     description => "Removes a guest's document, or the subtree at 'view'.",
@@ -598,9 +657,9 @@ __PACKAGE__->register_method({
         my $vmid = $param->{vmid};
 
         return _locked($vmid, sub {
-            _assert_guest_exists($vmid);
+            my $orphan = _orphan_or_404($rpcenv, $authuser, $vmid);
             my $grants_json =
-                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser));
+                _guest_grants_json($rpcenv, $authuser, $vmid, _scopes_for($authuser), $orphan);
             return $delete_view->("$vmid", $param, $grants_json);
         });
     },
@@ -640,9 +699,9 @@ __PACKAGE__->register_method({
 
 __PACKAGE__->register_method({
     name => 'put_datacenter',
+    protected => 1,
     path => 'datacenter',
     method => 'PUT',
-    protected => 1,
     permissions => {
         description => "Requires Sys.Modify on / for the view and every touched path, "
             . "'scopes' included (docs/DESIGN.md §2). A write that touches 'scopes' is "
@@ -682,9 +741,9 @@ __PACKAGE__->register_method({
 
 __PACKAGE__->register_method({
     name => 'delete_datacenter',
+    protected => 1,
     path => 'datacenter',
     method => 'DELETE',
-    protected => 1,
     permissions => {
         description => "Requires Sys.Modify on / for the view and every touched path, "
             . "same as PUT.",

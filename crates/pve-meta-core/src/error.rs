@@ -42,11 +42,11 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(DocId),
 
-    /// More than one format file exists on disk for the same document id
-    /// (or another uniqueness invariant of the store was violated).
-    #[error("conflict: {0}")]
-    Conflict(String),
-
+    // There is no `Conflict` variant: it described "more than one format
+    // file exists for the same document id", which the YAML-only store
+    // (`docs/DESIGN.md` §8) cannot produce. It was never constructed after
+    // the multi-format store was removed, so it went with it rather than
+    // staying as a 409 arm nothing can reach (review §5).
     /// The document (or patch result) exceeds the configured maximum size.
     #[error("document too large: {size} bytes (max {max} bytes)")]
     TooLarge {

@@ -33,7 +33,7 @@
 //! a vacuous `touched: []`. Correspondingly, a [`merge`] that touches
 //! nothing does not mutate `doc` at all: it creates no containers.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde_json::Map;
 
@@ -42,6 +42,7 @@ use crate::format::{self, Format};
 use crate::model::{self, Value};
 use crate::patch::{self, Op, Touched};
 use crate::path::Path;
+use crate::scopes;
 
 fn blocked(prefix: &Path) -> Error {
     Error::InvalidPath(format!(
@@ -129,7 +130,9 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
         return Ok(patch::diff(&old, doc));
     }
 
-    let lints = model::lint_relaxed(&subtree);
+    // Linted at the prefix, not at the payload's own root: the key rules are
+    // positional inside `scopes` (review P9, `model::lint_relaxed_at`).
+    let lints = model::lint_relaxed_at(&subtree, prefix);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
     }
@@ -180,7 +183,7 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
 /// [`Error::Lint`] if `patch` fails [`patch::lint_patch`].
 pub fn merge(doc: &mut Value, prefix: &Path, patch_value: &Value) -> Result<Vec<Touched>> {
-    let lints = patch::lint_patch(patch_value);
+    let lints = patch::lint_patch_at(patch_value, prefix);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
     }
@@ -290,6 +293,16 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
 /// this never errors: a prefix that runs through an array or a scalar simply
 /// never matches anything below that point (this is a read-only,
 /// best-effort union over whatever prefixes a caller happens to have).
+///
+/// **A comment key is emitted only when the same prefixes cover it**
+/// ([`crate::scopes::covers`], i.e. exactly what
+/// [`crate::scopes::Grants::can_read`] answers for that path — see the paired
+/// regression test). So `p__` travels with a readable `p`, while the bare
+/// `__` of a map — the note about the *whole* map, including the parts the
+/// caller has no grant for — is emitted only where the map itself is
+/// readable (`docs/DESIGN.md` §9, review P4). Before this, any scope on
+/// anything inside a map disclosed that map's bare `__` even though
+/// `?view=__` was a 403.
 pub fn filter(doc: &Value, readable_prefixes: &[Path]) -> Value {
     if readable_prefixes.iter().any(|p| p.is_root()) {
         return doc.clone();
@@ -327,27 +340,21 @@ fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<S
     }
 
     // Second pass: build the result in the map's own order, bringing along
-    // comment keys for included siblings (and the bare `__` map comment, if
-    // anything in this map survived).
+    // every comment key the caller's own prefixes cover.
     //
-    // The set of included base keys is snapshotted *before* the pass:
-    // `include` is drained as the pass consumes it, so testing it directly
-    // would drop `<key>__` whenever it follows its own key in document
-    // order — the natural authoring order (review F10).
-    let included_keys: HashSet<&str> = include.keys().copied().collect();
-    let any_included = !included_keys.is_empty();
+    // Deciding this from the grant rather than from the first pass's
+    // `include` map is what keeps read and write access to a comment key the
+    // same answer (review P4): a `<key>__` whose subject is only *partially*
+    // readable documents more than the caller may see, and the bare `__`
+    // documents the whole map. It also sidesteps review F10 entirely — the
+    // drained `include` map is never consulted for a comment key, so
+    // authoring order (`a` before `a__`, or after) cannot matter.
     let mut out = Map::new();
     for (k, v) in map.iter() {
         if model::is_comment_key(k) {
-            if k == model::COMMENT_SUFFIX {
-                if any_included {
-                    out.insert(k.clone(), v.clone());
-                }
-            } else {
-                let base = &k[..k.len() - model::COMMENT_SUFFIX.len()];
-                if included_keys.contains(base) {
-                    out.insert(k.clone(), v.clone());
-                }
+            let child_path = path.join(k.clone());
+            if readable.iter().any(|p| scopes::covers(p, &child_path)) {
+                out.insert(k.clone(), v.clone());
             }
         } else if let Some(val) = include.remove(k.as_str()) {
             out.insert(k.clone(), val);
@@ -363,21 +370,24 @@ pub fn render(value: &Value, format: Format) -> String {
     format::dump(format, value)
 }
 
-/// Parses `text` as `format` into a `mode=replace` payload: like
-/// [`format::parse`], but does not require the top level to be an object (a
-/// view's payload can legitimately be an array or a scalar).
+/// Parses `text` as `format` into a `mode=replace` payload for the view at
+/// `base`: like [`format::parse`], but does not require the top level to be
+/// an object (a view's payload can legitimately be an array or a scalar).
 ///
 /// `null` is rejected here — a replace payload is document content, and
 /// documents have no nulls. A `mode=merge` payload goes through
 /// [`parse_patch`] instead.
 ///
+/// `base` is where the payload will land, so it is linted in the document's
+/// coordinate system (`model::lint_relaxed_at`, review P9).
+///
 /// # Errors
 /// [`Error::Parse`] on a syntax error. [`Error::Lint`] if the parsed value
 /// otherwise fails the document-model rules (no nulls, valid keys, comment
 /// key values are strings).
-pub fn parse(text: &str, format: Format) -> Result<Value> {
+pub fn parse(text: &str, format: Format, base: &Path) -> Result<Value> {
     let value = format::parse_raw(format, text)?;
-    let lints = model::lint_relaxed(&value);
+    let lints = model::lint_relaxed_at(&value, base);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
     }
@@ -397,9 +407,9 @@ pub fn parse(text: &str, format: Format) -> Result<Value> {
 /// [`Error::Parse`] on a syntax error. [`Error::Lint`] if the patch is not
 /// an object at the top level, has invalid keys, or gives a comment key a
 /// non-string, non-null value.
-pub fn parse_patch(text: &str, format: Format) -> Result<Value> {
+pub fn parse_patch(text: &str, format: Format, base: &Path) -> Result<Value> {
     let value = format::parse_raw(format, text)?;
-    let lints = patch::lint_patch(&value);
+    let lints = patch::lint_patch_at(&value, base);
     if !lints.is_empty() {
         return Err(Error::Lint(lints));
     }
@@ -781,10 +791,86 @@ mod tests {
     }
 
     #[test]
-    fn filter_bare_map_comment_travels_only_when_something_included() {
-        let doc = json!({"__": "top doc", "a": 1, "b": 2});
-        assert_eq!(filter(&doc, &[p("a")]), json!({"__": "top doc", "a": 1}));
+    fn filter_never_emits_a_bare_map_comment_the_grant_cannot_read() {
+        // Review P4 (F11 residue), reproduced live with a zero-ACL scoped
+        // token: the document-root `__` documents the *whole* document, so a
+        // scope on one key must not disclose it -- `?view=__` is a 403, and
+        // the view-less read must agree.
+        let doc = json!({"__": "top level note - secret-ish", "a": 1, "b": 2});
+        assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1}));
         assert_eq!(filter(&doc, &[]), json!({}));
+        // A full reader (root prefix) still sees it.
+        assert_eq!(filter(&doc, &[Path::root()]), doc);
+
+        // The bare `__` *inside* a map travels exactly when that map does.
+        let nested = json!({"ns": {"__": "about ns", "x": 1, "y": 2}});
+        assert_eq!(filter(&nested, &[p("ns")]), nested);
+        assert_eq!(filter(&nested, &[p("ns.x")]), json!({"ns": {"x": 1}}));
+    }
+
+    #[test]
+    fn filter_emits_only_comment_keys_the_same_grant_can_read() {
+        // The paired invariant review P4 asks for, checked over a document
+        // that has a comment key at every interesting position: whatever
+        // `filter` emits, `Grants::can_read` must also allow as a view.
+        use crate::scopes::{Grants, Mode, Scope};
+
+        let doc = json!({
+            "__": "the whole document",
+            "a__": "about a (partially readable)",
+            "a": {"__": "about a's map", "b__": "about b", "b": {"deep": 1}, "c": 2},
+            "t__": "about t",
+            "t": {"__": "about t's map", "x": 1},
+            "u__": "about u",
+            "u": 3,
+        });
+
+        for prefixes in [
+            vec![p("t")],
+            vec![p("a.b")],
+            vec![p("a.b"), p("t")],
+            vec![p("u")],
+            vec![],
+        ] {
+            let grants = Grants {
+                scopes: prefixes
+                    .iter()
+                    .map(|prefix| Scope { prefix: prefix.clone(), mode: Mode::Ro })
+                    .collect(),
+                ..Default::default()
+            };
+            let filtered = filter(&doc, &prefixes);
+            let mut offenders = Vec::new();
+            collect_comment_paths(&filtered, &Path::root(), &mut offenders);
+            for path in offenders {
+                assert!(
+                    grants.can_read(&path),
+                    "filter({prefixes:?}) emitted {path}, which can_read refuses"
+                );
+            }
+        }
+    }
+
+    fn collect_comment_paths(value: &Value, path: &Path, out: &mut Vec<Path>) {
+        if let Value::Object(map) = value {
+            for (k, v) in map.iter() {
+                let child = path.join(k.clone());
+                if model::is_comment_key(k) {
+                    out.push(child);
+                } else {
+                    collect_comment_paths(v, &child, out);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn filter_drops_a_comment_key_whose_subject_is_only_partially_readable() {
+        // `a__` documents all of `a`; a scope on `a.b` alone must not see it
+        // (`covers` says no, so `?view=a__` is a 403 -- the two must agree).
+        let doc = json!({"a__": "about a", "a": {"b": 1, "secret": 2}});
+        assert_eq!(filter(&doc, &[p("a.b")]), json!({"a": {"b": 1}}));
+        assert_eq!(filter(&doc, &[p("a")]), doc);
     }
 
     #[test]
@@ -813,21 +899,21 @@ mod tests {
     fn render_and_parse_round_trip_non_object_values() {
         let value = json!(["prod", "web"]);
         let text = render(&value, Format::Yaml);
-        assert_eq!(parse(&text, Format::Yaml).unwrap(), value);
+        assert_eq!(parse(&text, Format::Yaml, &Path::root()).unwrap(), value);
 
         let scalar = json!("hello");
         let text2 = render(&scalar, Format::Json);
-        assert_eq!(parse(&text2, Format::Json).unwrap(), scalar);
+        assert_eq!(parse(&text2, Format::Json, &Path::root()).unwrap(), scalar);
     }
 
     #[test]
     fn parse_rejects_null_even_for_non_object_top_level() {
-        assert!(matches!(parse("[1, null]", Format::Yaml), Err(Error::Lint(_))));
+        assert!(matches!(parse("[1, null]", Format::Yaml, &Path::root()), Err(Error::Lint(_))));
     }
 
     #[test]
     fn parse_rejects_bad_syntax() {
-        assert!(matches!(parse("a: [", Format::Yaml), Err(Error::Parse { .. })));
+        assert!(matches!(parse("a: [", Format::Yaml, &Path::root()), Err(Error::Parse { .. })));
     }
 
     #[test]
@@ -835,7 +921,7 @@ mod tests {
         let value = json!({"host": "x", "port": 8080});
         for fmt in Format::ALL {
             let text = render(&value, fmt);
-            assert_eq!(parse(&text, fmt).unwrap(), value);
+            assert_eq!(parse(&text, fmt, &Path::root()).unwrap(), value);
         }
     }
 
@@ -853,10 +939,10 @@ mod tests {
             ("spec:\n  host: null\n", Format::Yaml),
         ] {
             assert!(
-                parse(text, fmt).is_err(),
+                parse(text, fmt, &Path::root()).is_err(),
                 "replace payload must still reject null: {text:?}"
             );
-            let patch = parse_patch(text, fmt)
+            let patch = parse_patch(text, fmt, &Path::root())
                 .unwrap_or_else(|e| panic!("merge payload must accept null: {text:?}: {e}"));
             assert!(patch.is_object());
         }
@@ -865,7 +951,7 @@ mod tests {
     #[test]
     fn parse_patch_deletes_end_to_end_through_merge() {
         let mut doc = json!({"traefik": {"spec": {"host": "x", "port": 1}}});
-        let patch = parse_patch("host: null\n", Format::Yaml).unwrap();
+        let patch = parse_patch("host: null\n", Format::Yaml, &Path::root()).unwrap();
         let touched = merge(&mut doc, &p("traefik.spec"), &patch).unwrap();
         assert_eq!(doc, json!({"traefik": {"spec": {"port": 1}}}));
         assert_eq!(touched, vec![Touched { path: p("traefik.spec.host"), op: Op::Delete }]);
@@ -873,21 +959,21 @@ mod tests {
 
     #[test]
     fn parse_patch_requires_an_object_and_checks_keys() {
-        assert!(matches!(parse_patch("[1, 2]", Format::Json), Err(Error::Lint(_))));
+        assert!(matches!(parse_patch("[1, 2]", Format::Json, &Path::root()), Err(Error::Lint(_))));
         assert!(matches!(
-            parse_patch("{\"bad key\": 1}", Format::Json),
+            parse_patch("{\"bad key\": 1}", Format::Json, &Path::root()),
             Err(Error::Lint(_))
         ));
         // A comment key may be deleted, but not set to a non-string.
-        assert!(parse_patch("{\"foo__\": null}", Format::Json).is_ok());
+        assert!(parse_patch("{\"foo__\": null}", Format::Json, &Path::root()).is_ok());
         assert!(matches!(
-            parse_patch("{\"foo__\": 5}", Format::Json),
+            parse_patch("{\"foo__\": 5}", Format::Json, &Path::root()),
             Err(Error::Lint(_))
         ));
     }
 
     #[test]
     fn parse_patch_rejects_bad_syntax() {
-        assert!(matches!(parse_patch("a: [", Format::Yaml), Err(Error::Parse { .. })));
+        assert!(matches!(parse_patch("a: [", Format::Yaml, &Path::root()), Err(Error::Parse { .. })));
     }
 }

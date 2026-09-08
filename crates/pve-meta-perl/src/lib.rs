@@ -181,6 +181,13 @@ mod pve_rs_meta {
     /// existing document for that vmid. The content is validated through the
     /// core parser/lint before being written; dies on invalid content.
     ///
+    /// **The store is YAML-only, the import is not** (`docs/DESIGN.md` §8,
+    /// review F26/§6): a blob is a *backup*, and a backup taken by an older
+    /// build may legitimately name another format in its header. Such a blob
+    /// is parsed in the format it declares and re-dumped as YAML, so the
+    /// asymmetry ends at the file: nothing but YAML is ever stored. Refusing
+    /// it instead would make an old archive unrestorable for no gain.
+    ///
     /// Failure is safe for the caller: the restore path in
     /// `PVE::API2::LXC`'s `create_vm` sets `$destroy_config_on_error = 1`
     /// unconditionally before the hook runs, so a die here leaves no
@@ -249,12 +256,18 @@ mod pve_rs_meta {
     /// Perl already has -- `[{vmid, node, type, name, grants}]`, where
     /// `grants` is that guest's grants as a JSON string. Rust never reads
     /// `.vmlist` or a guest config itself.
+    ///
+    /// `$orphans` (the caller has `Sys.Audit` on `/`) additionally lists
+    /// every document whose vmid is *not* among those rows, marked
+    /// `orphan => 1` (`docs/DESIGN.md` §9): the guest is gone, so there is no
+    /// `/vms/<vmid>` ACL to ask and the datacenter read is the permission.
     #[export]
     pub fn api_list_guests(
         guests_json: &str,
         has: Option<&str>,
+        orphans: bool,
     ) -> Result<Vec<api::GuestListEntry>, Error> {
-        api::list_guests(&open_store(), guests_json, has)
+        api::list_guests(&open_store(), guests_json, has, orphans)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid

@@ -4,7 +4,7 @@ use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
 use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome};
-use serde_json::json;
+use serde_json::{json, Value};
 use tempfile::tempdir;
 
 fn store() -> (tempfile::TempDir, MetaStore) {
@@ -337,6 +337,57 @@ fn version_token_returns_to_an_earlier_value_when_content_does() {
     let d2 = store.read(DocId::Guest(100)).unwrap().digest;
     store.put_raw(DocId::Guest(100), "a: 1\n", Some(&d2)).unwrap();
     assert_eq!(v1.token, store.version().unwrap().token);
+}
+
+#[test]
+fn reads_never_lint_but_writes_still_do() {
+    // Review P2 (`docs/DESIGN.md` §9). Out-of-band content -- a hand-edited
+    // file, a restored backup, pmxcfs replication -- must stay readable, or
+    // one bad key in `datacenter.yaml` denies every guest operation
+    // cluster-wide and blocks the repair that would fix it.
+    let (dir, store) = store();
+    let broken = "bad key: 1\nempty:\nlist:\n- ~\n";
+    std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+
+    let doc = store.read(DocId::Datacenter).unwrap();
+    assert_eq!(doc.raw, broken);
+    assert_eq!(doc.value["bad key"], json!(1));
+    assert_eq!(doc.value["empty"], Value::Null);
+
+    // The repair goes through, even though the *old* content would never
+    // pass lint (it used to be re-parsed strictly, just to compute a diff).
+    let good = "ok: 1\n";
+    let result = store.put_raw(DocId::Datacenter, good, Some(&doc.digest)).unwrap();
+    assert_eq!(result.document.raw, good);
+    assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+
+    // ... and the write-time gate is untouched.
+    assert!(matches!(
+        store.put_raw(DocId::Datacenter, "bad key: 1\n", None),
+        Err(Error::Lint(_))
+    ));
+    assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+
+    // Syntax errors are still errors on read: there is no value to return.
+    std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
+    assert!(matches!(store.read(DocId::Guest(100)), Err(Error::Parse { .. })));
+}
+
+#[test]
+fn guest_ids_lists_live_guest_documents_only() {
+    // The store's half of orphan detection (review P5): Perl compares this
+    // with the vmlist.
+    let (dir, store) = store();
+    assert!(store.guest_ids().unwrap().is_empty());
+
+    store.put_raw(DocId::Guest(999500), "a: 1\n", None).unwrap();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(DocId::Datacenter, "a: 1\n", None).unwrap();
+    store.snapshot(100, "before").unwrap();
+    std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "junk").unwrap();
+
+    assert_eq!(store.guest_ids().unwrap(), vec![100, 999500]);
 }
 
 #[test]

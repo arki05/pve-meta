@@ -26,6 +26,63 @@ pub(crate) fn is_valid_key(k: &str) -> bool {
     is_valid_segment(k)
 }
 
+/// The one reserved top-level key: the datacenter document's access-control
+/// map (`docs/DESIGN.md` §2). Its own keys are PVE authids rather than
+/// document keys, and it is an **opaque leaf** for path addressing
+/// (`docs/DESIGN.md` §9) — see [`is_authid`], [`crate::scopes::parse_scopes`]
+/// and `crate::api`'s view parsing.
+pub const SCOPES_KEY: &str = "scopes";
+
+/// `true` if `s` is a PVE realm (or token sub-id): `[A-Za-z][A-Za-z0-9.\-_]+`
+/// — `PVE::Auth::Plugin`'s `$realm_regex`, which also backs
+/// `PVE::AccessControl`'s `$token_subid_regex`.
+fn is_realm(s: &str) -> bool {
+    let mut chars = s.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let rest = chars.as_str();
+    !rest.is_empty()
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// `true` if `s` is a PVE authid: `user@realm`, optionally `!tokenid`.
+///
+/// This is `PVE::AccessControl`'s `$userid_or_token_regex` transliterated:
+/// `^[^\s:/]+@[A-Za-z][A-Za-z0-9.\-_]+(?:![A-Za-z][A-Za-z0-9.\-_]+)?$`. The
+/// user part deliberately permits **dots** (and `@`/`!`), which the document
+/// key charset cannot ([`crate::path::is_valid_segment`]: `.` is the path
+/// separator), so every LDAP/AD-synced `first.last@realm` can hold a scope
+/// (review P9). Since the user part may itself contain `@`, the split is
+/// tried from the right — the same answer Perl's greedy match gives.
+///
+/// PVE additionally caps the user part at 64 characters when *creating* a
+/// user (`PVE::Auth::Plugin::verify_username`); that is not a shape rule and
+/// is not mirrored here.
+pub fn is_authid(s: &str) -> bool {
+    for (at, _) in s.rmatch_indices('@') {
+        let (user, tail) = (&s[..at], &s[at + 1..]);
+        if user.is_empty()
+            || user
+                .chars()
+                .any(|c| c.is_whitespace() || c == ':' || c == '/')
+        {
+            continue;
+        }
+        // A realm cannot contain `!`, so the first one starts the token id.
+        let ok = match tail.split_once('!') {
+            Some((realm, subid)) => is_realm(realm) && is_realm(subid),
+            None => is_realm(tail),
+        };
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
 /// A single lint finding: `path` points at the offending location, `msg`
 /// describes the problem in human-readable terms.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +109,9 @@ impl fmt::Display for Lint {
 /// 2. no `null` anywhere (absent means unset);
 /// 3. every object key must match `^[A-Za-z0-9_@!-]+$` (the extra `@`/`!`
 ///    accommodate PVE authids used as keys, e.g. the datacenter document's
-///    `scopes` map);
+///    `scopes` map) — inside the top-level [`SCOPES_KEY`] map a full PVE
+///    authid ([`is_authid`], dots included) is accepted as well
+///    (`docs/DESIGN.md` §9);
 /// 4. a comment key's value must be a string;
 /// 5. numbers must be integers or finite floats (already guaranteed by
 ///    `serde_json::Value` without the `arbitrary_precision` feature, so this
@@ -76,9 +135,43 @@ pub fn lint(doc: &Value) -> Vec<Lint> {
 /// only [`lint`]'s recursive rules (no nulls, valid keys, comment key values
 /// are strings) apply.
 pub fn lint_relaxed(doc: &Value) -> Vec<Lint> {
+    lint_relaxed_at(doc, &Path::root())
+}
+
+/// [`lint_relaxed`] for a value that will live at `base` in the document.
+///
+/// A view's payload is linted before it is spliced in, so it has to be linted
+/// in the *document's* coordinate system, not its own: rule 3's `scopes`
+/// clause is positional, so `PUT ?view=scopes` with `{"john.doe@pve": …}`
+/// must see that key at `scopes.john.doe@pve` — as `lint` will once the write
+/// lands — rather than at the payload root (review P9). Reported paths are
+/// absolute for the same reason.
+pub fn lint_relaxed_at(doc: &Value, base: &Path) -> Vec<Lint> {
     let mut out = Vec::new();
-    walk(doc, &Path::root(), &mut out);
+    walk(doc, base, &mut out);
     out
+}
+
+/// The key rule for a key `k` in the map at `parent`: an ordinary document
+/// key, or — directly inside the top-level [`SCOPES_KEY`] map — a PVE authid
+/// ([`is_authid`], dots included; `docs/DESIGN.md` §9). `Some(msg)` describes
+/// the violation.
+///
+/// Shared with [`crate::patch::lint_patch_at`], so a merge payload and a
+/// replace payload answer the same question the same way.
+pub(crate) fn key_lint(parent: &Path, k: &str) -> Option<String> {
+    let authid_keys = parent.segments() == [SCOPES_KEY];
+    if is_valid_key(k) || (authid_keys && is_authid(k)) {
+        return None;
+    }
+    Some(if authid_keys {
+        format!(
+            "invalid key '{k}': 'scopes' keys must be PVE authids \
+             (user@realm, optionally !tokenid)"
+        )
+    } else {
+        format!("invalid key '{k}': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots")
+    })
 }
 
 fn walk(v: &Value, path: &Path, out: &mut Vec<Lint>) {
@@ -95,12 +188,10 @@ fn walk(v: &Value, path: &Path, out: &mut Vec<Lint>) {
         Value::Object(map) => {
             for (k, val) in map.iter() {
                 let child_path = path.join(k.clone());
-                if !is_valid_key(k) {
+                if let Some(msg) = key_lint(path, k) {
                     out.push(Lint {
                         path: child_path.clone(),
-                        msg: format!(
-                            "invalid key '{k}': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots"
-                        ),
+                        msg,
                     });
                 }
                 if is_comment_key(k) && !val.is_string() {
@@ -203,6 +294,64 @@ mod tests {
         // (`user@realm`, or `user@realm!tokenid`) -- see `docs/DESIGN.md` §2.
         let doc = json!({"scopes": {"svc@pve!traefik": [], "scoped@pve": []}});
         assert!(lint(&doc).is_empty());
+    }
+
+    #[test]
+    fn lint_accepts_dotted_authids_inside_scopes_and_nowhere_else() {
+        // Review P9: `john.doe@pve` and `svc@ldap.corp` are ordinary PVE
+        // authids and could never be granted a scope, because the *document*
+        // key charset has no dot (it is the path separator).
+        let doc = json!({
+            "scopes": {
+                "john.doe@pve": [],
+                "svc@ldap.corp!tok": [],
+                "svc@pve!traefik": [],
+                "__": "who gets what",
+                "john.doe@pve__": "the ldap-synced admin",
+            },
+        });
+        assert!(lint(&doc).is_empty(), "{:?}", lint(&doc));
+
+        // The relaxation is confined to the top-level `scopes` map ...
+        let elsewhere = json!({"other": {"john.doe@pve": 1}});
+        assert_eq!(lint(&elsewhere).len(), 1);
+        let deeper = json!({"scopes": {"a@pve": {"john.doe@pve": 1}}});
+        assert_eq!(lint(&deeper).len(), 1);
+        // ... and does not accept arbitrary junk even there.
+        let junk = json!({"scopes": {"not an authid": []}});
+        let lints = lint(&junk);
+        assert_eq!(lints.len(), 1);
+        assert!(lints[0].msg.contains("PVE authids"), "{}", lints[0].msg);
+    }
+
+    #[test]
+    fn is_authid_matches_pve_accesscontrols_shape() {
+        for good in [
+            "root@pam",
+            "svc@pve!traefik",
+            "john.doe@pve",
+            "svc@ldap.corp",
+            "first.last@ldap.corp!token-1",
+            "a-b_c@pve",
+            "weird@name@pve",
+        ] {
+            assert!(is_authid(good), "{good} should be an authid");
+        }
+        for bad in [
+            "root",           // no realm
+            "root@",          // empty realm
+            "root@p",         // realm needs at least two characters
+            "@pve",           // empty user
+            "root@1pve",      // realm must start with a letter
+            "root@pve!",      // empty token id
+            "root@pve!1t",    // token id must start with a letter
+            "ro ot@pve",      // no whitespace
+            "ro:ot@pve",      // no colon
+            "ro/ot@pve",      // no slash
+            "",
+        ] {
+            assert!(!is_authid(bad), "{bad} should not be an authid");
+        }
     }
 
     #[test]

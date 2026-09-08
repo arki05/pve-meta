@@ -1,8 +1,8 @@
 # libpve-meta-rs-perl — `PVE::RS::Meta` specification
 
 > **Scope.** This file specifies the *lifecycle* functions and the crate's build and
-> packaging. The `api_*` functions are specified by `DESIGN.md` §3 (and §8, the binding
-> decisions from the 2026-09-07 review); their implementation lives in
+> packaging. The `api_*` functions are specified by `DESIGN.md` §3 (and §8/§9, the binding
+> decisions from the 2026-09-07 and 2026-09-08 reviews); their implementation lives in
 > `pve_meta_core::api` and is specified by `crates/pve-meta-core/SPEC.md` §9. Where this
 > file and DESIGN.md disagree, DESIGN.md wins.
 
@@ -63,7 +63,14 @@ They run inside PVE's own guest locks and copy whole files; they do not consult 
 * `import_from_backup($vmid, $string)` → parses the header and writes the document,
   replacing any existing document for that vmid; validated through the core parser/lint
   first, dies on invalid content. A blob already in the on-disk format is restored
-  byte-for-byte; a blob from an older build naming another format is converted. Returns 1.
+  byte-for-byte; a blob from an older build naming another format is parsed in that
+  format and **re-dumped as YAML**. Returns 1.
+
+  That asymmetry is deliberate and is the only place a non-YAML format is still read
+  (`DESIGN.md` §8 is about the *store*: YAML only on disk). A blob is a backup, possibly
+  years old and written by a build that had TOML/JSON on disk; refusing it would make an
+  old archive unrestorable, while converting it ends the asymmetry at the file — nothing
+  but YAML is ever stored.
 
   A die here is safe for the caller: `PVE::API2::LXC::create_vm` sets
   `$destroy_config_on_error = 1` unconditionally before the restore hook runs
@@ -80,6 +87,12 @@ authorization rules and `DESIGN.md` §3 for the endpoints): `api_version`, `api_
 `api_list_guests`, `api_get`, `api_put`, `api_delete`. They die with
 `"NNN: message"` (an HTTP status prefix) which `PVE::API2::Ext::Meta::_call` turns into a
 `PVE::Exception`.
+
+`api_grants($authid)` never fails on a malformed `scopes` map: anything it cannot parse
+is skipped with a warning and grants nothing, because this lookup runs on every guest
+request (`DESIGN.md` §9). `api_list_guests($guests_json, $has, $orphans)` takes a third
+argument: with it (the caller has `Sys.Audit` on `/`) the result also lists documents
+whose vmid is not among the rows Perl passed in, marked `orphan => 1`.
 
 `api_put` and `api_delete` re-check the digest precondition, but only the caller's
 `PVE::Cluster::cfs_lock_domain("pve-meta-<id>", 10, …)` makes the read-modify-write atomic
@@ -98,8 +111,13 @@ across nodes (`DESIGN.md` §8) — the Perl API module is responsible for holdin
   sed-patched loader trick so it loads `target/{debug,release}/libpve_meta_rs.so`
   directly, sets `PVE_META_ROOT` to a temp dir, and exercises every function — the
   lifecycle hooks including the export/import round trip and `die` behaviour, and the
-  `api_*` contract including the review's regressions (no structure creation through an
+  `api_*` contract including the reviews' regressions (no structure creation through an
   empty merge, no path names in a 403 the caller cannot read, merge-with-null, `{}`
-  replace, write-time `scopes` validation, the empty-digest create flow).
+  replace, write-time `scopes` validation, the empty-digest create flow; and from the
+  2026-09-08 pass: no scope may write `scopes`, an empty scope prefix is refused on write
+  and grants nothing on disk, an out-of-band invalid document stays readable and
+  repairable, a non-map `scopes` grants nothing, a scoped read never carries the bare
+  `__`, a single `scopes` entry is not addressable while a dotted authid is a valid key,
+  and orphan documents are listed and deletable).
 * The Debian package `libpve-meta-rs-perl` is the second binary package of the `pve-meta`
   source package; see `crates/pve-meta-perl/PACKAGING.md`.

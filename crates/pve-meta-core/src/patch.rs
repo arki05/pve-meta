@@ -28,14 +28,21 @@ pub struct Touched {
 /// [`model::lint`]), except that `null` is permitted anywhere as a delete
 /// marker.
 pub fn lint_patch(patch: &Value) -> Vec<Lint> {
+    lint_patch_at(patch, &Path::root())
+}
+
+/// [`lint_patch`] for a patch that will be applied at `base` in the document
+/// — the merge-mode counterpart of [`model::lint_relaxed_at`], and for the
+/// same reason: the key rule is positional inside `scopes` (review P9).
+pub fn lint_patch_at(patch: &Value, base: &Path) -> Vec<Lint> {
     let mut out = Vec::new();
     if !patch.is_object() {
         out.push(Lint {
-            path: Path::root(),
+            path: base.clone(),
             msg: "patch must be an object".to_string(),
         });
     }
-    walk_patch(patch, &Path::root(), &mut out);
+    walk_patch(patch, base, &mut out);
     out
 }
 
@@ -44,12 +51,10 @@ fn walk_patch(v: &Value, path: &Path, out: &mut Vec<Lint>) {
         Value::Object(map) => {
             for (k, val) in map.iter() {
                 let child_path = path.join(k.clone());
-                if !model::is_valid_key(k) {
+                if let Some(msg) = model::key_lint(path, k) {
                     out.push(Lint {
                         path: child_path.clone(),
-                        msg: format!(
-                            "invalid key '{k}': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots"
-                        ),
+                        msg,
                     });
                 }
                 if model::is_comment_key(k) && !(val.is_string() || val.is_null()) {
