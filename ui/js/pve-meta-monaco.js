@@ -190,9 +190,10 @@
         return id;
     }
 
-    function mountDiff(el, original, modified) {
+    function mountDiff(el, original, modified, language) {
         var id = 'pve-meta-monaco-diff-' + nextId++;
         var entry = (editors[id] = { el: el, editor: null, diff: null });
+        language = language || 'yaml';
 
         loadMonaco()
             .then(function (monaco) {
@@ -210,8 +211,8 @@
                     fontFamily: 'monospace',
                 });
                 entry.diff.setModel({
-                    original: monaco.editor.createModel(original || '', 'yaml'),
-                    modified: monaco.editor.createModel(modified || '', 'yaml'),
+                    original: monaco.editor.createModel(original || '', language),
+                    modified: monaco.editor.createModel(modified || '', language),
                 });
             })
             .catch(function (err) {
@@ -231,6 +232,19 @@
             // setValue() resets the undo stack but keeps the viewport; that is what we
             // want for a Reload / view switch.
             entry.editor.setValue(text);
+        }
+    }
+
+    // The "Edit as text" dialog toggles between the YAML and the JSON rendering of the
+    // same subtree; the model's language has to follow, or JSON is highlighted as YAML.
+    function setLanguage(id, language) {
+        var entry = editors[id];
+        if (!entry || !entry.editor) {
+            return;
+        }
+        var model = entry.editor.getModel();
+        if (model && window.monaco) {
+            window.monaco.editor.setModelLanguage(model, language || 'yaml');
         }
     }
 
@@ -323,6 +337,7 @@
         mount: mount,
         mountDiff: mountDiff,
         setValue: setValue,
+        setLanguage: setLanguage,
         setReadOnly: setReadOnly,
         setTheme: setTheme,
         onChange: onChange,

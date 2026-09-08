@@ -1,4 +1,4 @@
-//! Typed wrappers over the native metadata API (`docs/DESIGN.md` §3), served by
+//! Typed wrappers over the native metadata API (`docs/DESIGN.md` §5), served by
 //! pveproxy/pvedaemon at `/api2/json/meta/...` on the same origin as the PVE web UI.
 //!
 //! This module talks to `fetch` (via `gloo-net`) rather than going through
@@ -16,36 +16,48 @@ use std::fmt;
 
 use anyhow::{Error, anyhow};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde_json::{Map, Value, json};
 
 use proxmox_yew_comp::{http_get_auth, json_object_to_query};
 
-use crate::model::{Access, DocId};
+use crate::edit::{Write, delete_body, put_body, put_text_body};
+use crate::grammar::Operator;
+use crate::model::{Access, DocId, GuestInfo};
 
-/// A document view rendered as text (`format=yaml`).
+/// A document view as JSON data (`format=json`).
+///
+/// `data` is an unordered object (`docs/DESIGN.md` §4: "Key order is preserved in the file
+/// and is not a wire contract; the UI sorts"), which is exactly what the tree wants — it
+/// derives its own order from the keys and the grammars (`crate::tree`).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct DocData {
+    #[serde(default)]
+    pub digest: String,
+    #[serde(default)]
+    pub data: Value,
+}
+
+/// A document view rendered as text (`format=yaml`) — the "Edit as text" dialog's input,
+/// and the only place the page ever looks at YAML.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct DocText {
     #[serde(default)]
     pub digest: String,
     #[serde(default)]
     pub text: String,
-    /// The view's top-level keys, in document order — the one ordered key list on the
-    /// wire (`docs/DESIGN.md` §8: `format=json`'s `data` object is not one).
+    /// Set when the stored file does not parse; the document is then only repairable
+    /// through a root replace (`docs/DESIGN.md` §4).
     #[serde(default)]
-    pub keys: Vec<String>,
+    pub parse_error: Option<String>,
 }
 
 /// The result of a write.
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct WriteResult {
+    /// The document's digest *after* the write — what the next write in a chain sends.
     #[serde(default)]
     pub digest: String,
-    /// The paths the write touched. Kept opaque on purpose: `docs/DESIGN.md` §3 spells
-    /// this as a list of paths while the API module answers `{op, path}` objects, and
-    /// the page displays neither — it reloads instead.
-    #[serde(default)]
-    pub touched: Vec<Value>,
 }
 
 /// `GET /meta/version` — a content hash over the store, to be polled.
@@ -55,11 +67,46 @@ pub struct VersionInfo {
     pub token: String,
 }
 
+/// One entry of `GET /meta/guests`.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct GuestEntry {
+    #[serde(default)]
+    pub vmid: u32,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default, rename = "type")]
+    pub guest_type: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// PVE tags, which decide which operator scopes apply to this guest
+    /// (`docs/DESIGN.md` §3). Only answered to a caller with `VM.Audit`.
+    #[serde(default, deserialize_with = "deserialize_tags")]
+    pub tags: Vec<String>,
+}
+
+/// Tags as either a JSON array or PVE's own `a;b;c` string.
+fn deserialize_tags<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        Value::String(text) => text
+            .split([';', ','])
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 /// The caller's effective grants **for one document** (`GET /meta/access?vmid=…`, or
-/// `?dc=1` for the datacenter document — `docs/DESIGN.md` §8).
+/// `?dc=1` for the datacenter document).
 ///
-/// Asking per document is what lets the page separate read from write: the answer's `read`
-/// and `write` are that document's ACL grants, not one audit-derived `full` flag.
+/// Asking per document is what lets the page decide editability per row: the answer's
+/// `scopes` are already resolved against this guest's selectors.
 pub async fn access(doc: DocId) -> Result<Access, Error> {
     let query = match doc {
         DocId::Guest(vmid) => json!({ "vmid": vmid }),
@@ -68,47 +115,85 @@ pub async fn access(doc: DocId) -> Result<Access, Error> {
     get_json("/meta/access", Some(query)).await
 }
 
-/// A view of a document as YAML text. An empty `view` is the whole document.
+/// `GET /meta/operators` — every registration, readable by any authenticated user.
 ///
-/// The page never asks for `format=json`: key order is guaranteed in the YAML rendering
-/// only (`docs/DESIGN.md` §8), so even the "View as" selector's key list is parsed out of
-/// this text (`crate::model::top_level_keys_from_yaml`).
+/// The tree needs these for the declared-but-unset rows and for the Owner column; it is
+/// never an access decision, so a page whose cluster has no registrations (or whose API
+/// predates the endpoint) simply shows no owners.
+pub async fn operators() -> Result<Vec<Operator>, Error> {
+    get_json("/meta/operators", None).await
+}
+
+/// This guest's entry in `GET /meta/guests` — its tags (for the scope selectors) and its
+/// name, for the identity line.
+pub async fn guest_info(vmid: u32) -> Result<Option<GuestInfo>, Error> {
+    let guests: Vec<GuestEntry> = get_json("/meta/guests", None).await?;
+    Ok(guests
+        .into_iter()
+        .find(|entry| entry.vmid == vmid)
+        .map(|entry| GuestInfo {
+            name: entry.name,
+            node: entry.node,
+            guest_type: entry.guest_type,
+            tags: entry.tags,
+        }))
+}
+
+/// A view of a document as JSON data. An empty `view` is the whole document.
+pub async fn get_data(doc: DocId, view: &str) -> Result<DocData, Error> {
+    get_json(&doc.api_path(), Some(view_query(view, "json"))).await
+}
+
+/// A view of a document as YAML text.
 pub async fn get_text(doc: DocId, view: &str) -> Result<DocText, Error> {
+    get_json(&doc.api_path(), Some(view_query(view, "yaml"))).await
+}
+
+fn view_query(view: &str, format: &str) -> Value {
     let mut query = Map::new();
-    query.insert("format".into(), json!("yaml"));
+    query.insert("format".into(), json!(format));
     if !view.is_empty() {
         query.insert("view".into(), json!(view));
     }
-    get_json(&doc.api_path(), Some(Value::Object(query))).await
-}
-
-/// Replace `view` of `doc` with `text`. `digest` pins optimistic concurrency: a 409
-/// means the document changed on the server since it was loaded.
-pub async fn put_text(
-    doc: DocId,
-    view: &str,
-    text: String,
-    digest: &str,
-) -> Result<WriteResult, Error> {
-    let mut body = Map::new();
-    // No `format` here: the write endpoint infers it from which payload parameter is
-    // sent — `text` is YAML, `data` is JSON — and rejects a `format` key outright.
-    body.insert("mode".into(), json!("replace"));
-    body.insert("text".into(), json!(text));
-    if !view.is_empty() {
-        body.insert("view".into(), json!(view));
-    }
-    // An empty digest means "no document yet" and must not be sent as an expected one.
-    if !digest.is_empty() {
-        body.insert("digest".into(), json!(digest));
-    }
-    send_json("PUT", &doc.api_path(), Value::Object(body)).await
+    Value::Object(query)
 }
 
 /// `GET /meta/version`. The native module answers immediately (no long poll), so this is
 /// polled on an interval.
 pub async fn version() -> Result<VersionInfo, Error> {
     get_json("/meta/version", None).await
+}
+
+/// Apply one row edit: the writes it consists of, in order, each one pinned to the digest
+/// the previous one returned.
+///
+/// Chaining the digest is what makes a two-step edit (a value and the comment key that
+/// documents it) safe without a transaction: the second write cannot be racing anything
+/// the first did not already see, and an intervening change by somebody else still 409s
+/// the first (`docs/DESIGN.md` §4).
+pub async fn apply(doc: DocId, writes: Vec<Write>, digest: &str) -> Result<WriteResult, Error> {
+    let mut current = digest.to_string();
+    let mut result = WriteResult {
+        digest: current.clone(),
+    };
+    for write in writes {
+        result = match &write {
+            Write::Put { view, value } => {
+                send_json("PUT", &doc.api_path(), put_body(view, value, &current)).await?
+            }
+            Write::PutText { view, text } => {
+                send_json("PUT", &doc.api_path(), put_text_body(view, text, &current)).await?
+            }
+            // A DELETE carries its parameters in the query string, never in a body:
+            // `PVE::APIServer::AnyEvent` answers a body on DELETE with
+            // "501 Unexpected content for method 'DELETE'".
+            Write::Delete { view } => {
+                send_empty("DELETE", &doc.api_path(), delete_body(view, &current)).await?
+            }
+        };
+        current = result.digest.clone();
+    }
+    Ok(result)
 }
 
 /// An API error carrying the actual HTTP status code (not a body-embedded one).
@@ -120,7 +205,7 @@ pub struct ApiError {
 
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The server message verbatim — `docs/DESIGN.md` §6 asks for exactly that.
+        // The server message verbatim — `docs/DESIGN.md` §4 asks for exactly that.
         f.write_str(&self.message)
     }
 }
@@ -130,6 +215,14 @@ impl std::error::Error for ApiError {}
 /// True if `err` is an HTTP 409: the document changed on the server since it was loaded.
 pub fn is_conflict(err: &Error) -> bool {
     status_of(err) == Some(409)
+}
+
+/// True if `err` is an HTTP 404 or 501: an endpoint this API revision does not serve.
+///
+/// `GET /meta/operators` is new in revision 5; a page talking to an older node must still
+/// render its document, just without grammars or owners.
+pub fn is_unimplemented(err: &Error) -> bool {
+    matches!(status_of(err), Some(404) | Some(501)) || err.to_string().contains("not implemented")
 }
 
 fn status_of(err: &Error) -> Option<u16> {
@@ -173,11 +266,7 @@ async fn send_json<T: DeserializeOwned>(method: &str, path: &str, body: Value) -
         _ => return Err(anyhow!("unsupported method {method}")),
     };
 
-    if let Some(auth) = http_get_auth() {
-        builder = builder.header("CSRFPreventionToken", &auth.csrfprevention_token);
-    } else {
-        log::warn!("pve-meta-ui: sending a {method} request with no known CSRF token");
-    }
+    builder = csrf(builder, method);
 
     let request = builder
         .header("content-type", "application/json")
@@ -185,6 +274,44 @@ async fn send_json<T: DeserializeOwned>(method: &str, path: &str, body: Value) -
         .map_err(|e| anyhow!("failed to build request: {e}"))?;
 
     send(request).await
+}
+
+/// A mutating request whose parameters ride in the query string and which sends no body.
+async fn send_empty<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    params: Value,
+) -> Result<T, Error> {
+    let mut url = format!("/api2/json{path}");
+    let query = json_object_to_query(params)?;
+    if !query.is_empty() {
+        url.push('?');
+        url.push_str(&query);
+    }
+
+    let mut builder = match method {
+        "DELETE" => gloo_net::http::Request::delete(&url),
+        _ => return Err(anyhow!("unsupported method {method}")),
+    };
+    builder = csrf(builder, method);
+
+    let request = builder
+        .build()
+        .map_err(|e| anyhow!("failed to build request: {e}"))?;
+
+    send(request).await
+}
+
+/// Attach the CSRF token every mutating call needs, read fresh so it survives a ticket
+/// refresh.
+fn csrf(builder: gloo_net::http::RequestBuilder, method: &str) -> gloo_net::http::RequestBuilder {
+    match http_get_auth() {
+        Some(auth) => builder.header("CSRFPreventionToken", &auth.csrfprevention_token),
+        None => {
+            log::warn!("pve-meta-ui: sending a {method} request with no known CSRF token");
+            builder
+        }
+    }
 }
 
 async fn send<T: DeserializeOwned>(request: gloo_net::http::Request) -> Result<T, Error> {

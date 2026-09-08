@@ -1,114 +1,207 @@
-//! The metadata editor page.
+//! The metadata page: one tree of one document (`docs/DESIGN.md` §8).
 //!
-//! One `LoadableComponent` for one document (`docs/DESIGN.md` §6), structured exactly
-//! like `proxmox_yew_comp::NotesView`: `load()` fetches a text document and its digest,
-//! `toolbar()` returns the standard three-class `Toolbar`, `main_view()` fills the
-//! remaining height, and `dialog_view()` returns the modals. Everything else — the
-//! outer column, the load-error strip, dialog stacking, off-screen refresh suspension —
-//! comes from `LoadableComponentMaster`.
+//! One `LoadableComponent` (`docs/design/PDM-DESIGN-LANGUAGE.md` §2), structured exactly
+//! like `proxmox_yew_comp::PermissionPanel` — the stack's own `DataTable`-over-`TreeStore`
+//! page: `load()` fetches, `main_view()` is the table, `toolbar()` is the standard
+//! three-class `Toolbar`, `dialog_view()` returns the modals. Everything else — the outer
+//! column, the load-error strip, dialog stacking, off-screen refresh suspension — comes
+//! from `LoadableComponentMaster`.
 //!
-//! The one deviation from the pwt stack is the editor itself: Monaco, mounted into a
-//! plain `Container` from `rendered()` through the glue in `js/pve-meta-monaco.js`
-//! (`crate::monaco`).
+//! **Rows are edited in an `EditWindow`, not in the cell.** That is what the Proxmox stack
+//! does for every key/value grid it has: `proxmox_yew_comp::ObjectGrid` (the widget behind
+//! the node and datacenter option pages) selects a row and opens an `EditWindow` on the
+//! Edit button, a double click or Space (`COMP/src/object_grid.rs:314-341,447-470`).
+//! There is no editable-cell support in pwt's `DataTable` at all — no cell editor, no
+//! commit/rollback, no per-cell validation state — so an inline field would be a bespoke
+//! widget living outside the design system, in the one place (a grid) where the system
+//! already has an answer. The dialog also has room for the row's *description*, which is a
+//! second key on the wire (the sibling comment key) and has nowhere to go in a cell.
+//!
+//! Monaco keeps exactly two jobs (§8): "Edit as text" for one subtree, and the diff that
+//! confirms applying it.
 //!
 //! Two disciplines run through this file, both from `docs/REVIEW-2026-09-07.md`:
 //!
 //! * **Every async result carries the identity it was requested for** (`crate::request`).
 //!   `LoadableComponentMaster` respawns a load per `Msg::Load` and cancels nothing, so an
-//!   answer for the view the user just left must be dropped, not applied — otherwise the
-//!   page shows (and Apply then writes) one view's text under another view's path (F4).
-//! * **Unapplied edits are never discarded without asking.** Reload and a view switch go
-//!   through the same confirmation the Discard button uses (F5).
+//!   answer for a document the page has left must be dropped, not applied (F4).
+//! * **A write is never made from stale state.** Every write sends the digest the tree was
+//!   built from; a 409 reloads and says so (§8).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
-use anyhow::Error;
+use anyhow::{Error, anyhow};
+use serde_json::{Value, json};
 use wasm_bindgen::prelude::Closure;
 use web_sys::Element;
 use yew::html::IntoPropValue;
-use yew::virtual_dom::{VComp, VNode};
+use yew::virtual_dom::{Key, VComp, VNode};
 
 use pwt::css::{AlignItems, ColorScheme, FlexFit, FontStyle, JustifyContent};
 use pwt::prelude::*;
-use pwt::state::ThemeObserver;
-use pwt::widget::form::Combobox;
+use pwt::props::ExtractPrimaryKey;
+use pwt::state::{Selection, SlabTree, SlabTreeNodeMut, ThemeObserver, TreeStore};
+use pwt::widget::data_table::{
+    DataTable, DataTableCellRenderArgs, DataTableColumn, DataTableHeader, DataTableMouseEvent,
+};
+use pwt::widget::form::{Checkbox, Combobox, Field, FormContext, Number, TextArea};
 use pwt::widget::{
-    Button, Column, ConfirmDialog, Container, Dialog, Fa, Row, Toolbar, error_message,
+    Button, Column, Container, Dialog, Fa, InputPanel, Row, SegmentedButton, Toolbar, error_message,
 };
 use pwt_macros::builder;
 
 use proxmox_yew_comp::{
-    ConfirmButton, LoadableComponent, LoadableComponentContext, LoadableComponentMaster,
-    LoadableComponentScopeExt, LoadableComponentState,
+    ConfirmButton, EditWindow, LoadableComponent, LoadableComponentContext,
+    LoadableComponentMaster, LoadableComponentScopeExt, LoadableComponentState,
 };
 
 use crate::api::{self, WriteResult};
-use crate::model::{Access, DocId, ViewOutcome, top_level_keys_from_yaml, view_outcome};
+use crate::edit::{self, Write};
+use crate::grammar::Operator;
+use crate::model::{Access, DocId, GuestInfo};
 use crate::monaco;
 use crate::request::{Channel, RequestId, RequestTracker};
+use crate::tree::{self, BuildContext, Node, Row as TreeRow, ValueKind};
 
-/// `GET /meta/version` is polled this often. Its token covers the whole store, so a
-/// change only triggers a digest check of this one document.
+/// `GET /meta/version` is polled this often. Its token covers the whole store, so a change
+/// reloads this document — cheap, and it is the only signal that a registration, a tag or
+/// a grant moved, none of which touch this document's own digest.
 const VERSION_POLL_MS: u32 = 5_000;
 
-/// The "View as" entry standing for the whole document (the empty prefix). A sentinel is
-/// needed because a `Combobox` cannot hold an empty value — the same trick PDM's
-/// `ViewSelector` uses for its `__dashboard__` entry.
-const WHOLE_DOCUMENT: &str = "__document__";
+/// Which text format the "Edit as text" dialog is showing. Presentation only (§8): the
+/// apply always sends `text`, and JSON is a subset of YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFormat {
+    Yaml,
+    Json,
+}
+
+impl TextFormat {
+    fn language(self) -> &'static str {
+        match self {
+            TextFormat::Yaml => "yaml",
+            TextFormat::Json => "json",
+        }
+    }
+}
+
+/// The "Edit as text" dialog's buffers.
+///
+/// Both renderings of the same subtree are kept, so the format toggle never has to throw
+/// away what was typed (there is no YAML parser in the page — the server renders YAML, the
+/// page renders JSON — so a toggle cannot convert one buffer into the other).
+struct TextState {
+    /// The subtree being edited; empty is the whole document.
+    path: String,
+    format: TextFormat,
+    yaml: Option<String>,
+    yaml_draft: Option<String>,
+    json: String,
+    json_draft: Option<String>,
+    /// Bumped whenever the text Monaco should show changes without the user typing it.
+    generation: u64,
+}
+
+impl TextState {
+    /// The pristine text of the shown format, as loaded.
+    fn loaded(&self) -> &str {
+        match self.format {
+            TextFormat::Yaml => self.yaml.as_deref().unwrap_or(""),
+            TextFormat::Json => &self.json,
+        }
+    }
+
+    /// The text on screen.
+    fn current(&self) -> &str {
+        match self.format {
+            TextFormat::Yaml => self
+                .yaml_draft
+                .as_deref()
+                .unwrap_or_else(|| self.yaml.as_deref().unwrap_or("")),
+            TextFormat::Json => self.json_draft.as_deref().unwrap_or(&self.json),
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        match self.format {
+            TextFormat::Yaml => self.yaml_draft.is_some(),
+            TextFormat::Json => self.json_draft.is_some(),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        match self.format {
+            TextFormat::Yaml => self.yaml.is_some(),
+            TextFormat::Json => true,
+        }
+    }
+}
 
 /// Everything one load produces, plus the identity it was loaded for.
 pub struct Loaded {
-    /// Which document, which view, which generation this answers.
     id: RequestId,
-    /// Only when the grants for this document have not been fetched yet.
-    access: Option<Access>,
-    /// Set instead of `access` when the grants could not be fetched at all.
-    access_error: Option<String>,
-    /// Top-level keys of the whole document, for the "View as" selector; present when
-    /// this load's view was empty (a whole-document read, `docs/REVIEW-2026-09-08-
-    /// pass2.md` P10 — a view switch otherwise never re-fetches it) or when a selected
-    /// view's own answer was ambiguous and `load()` fetched the whole document to
-    /// settle it (`docs/REVIEW-2026-09-08-pass3.md` R3).
-    keys: Option<Vec<String>>,
+    access: Result<Access, String>,
+    operators: Result<Vec<Operator>, String>,
+    guest: Option<GuestInfo>,
     digest: String,
-    text: String,
+    data: Value,
+    parse_error: Option<String>,
+    /// The store's version token as of this load, so a change *between* the load and the
+    /// first poll tick is a change the poll notices rather than swallows as its baseline.
+    version_token: Option<String>,
 }
 
 /// Modal states of the page.
-#[derive(PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewState {
-    /// The Apply confirmation: a diff of the loaded text against the edited one.
-    ConfirmApply,
-    /// "Discard all unapplied changes?" before leaving the edited view.
-    ConfirmSwitchView,
+    /// Edit (or set) the selected row.
+    EditRow,
+    /// Add a key under the selected map row.
+    AddRow,
+    /// The Monaco text editor for one subtree.
+    EditText,
+    /// The diff that confirms applying it.
+    ConfirmText,
 }
 
 pub enum Msg {
     Loaded(Box<Loaded>),
-    SelectView(String),
-    ConfirmSwitchView,
-    EditorInput(String),
-    ShowDiff,
-    CloseDialog,
-    Apply,
-    Applied(RequestId, Result<WriteResult, Error>),
-    Discard,
+    Select(Option<Key>),
+    /// Reload the document. Leaves the standing notice alone.
     Reload,
+    /// The Reload button: catch up *and* drop whatever the page was complaining about.
+    UserReload,
     VersionToken(String),
-    ServerDigest(RequestId, api::DocText),
-    /// `api::access(doc)` answered a re-fetch issued outside `load()`: `Msg::Reload`, or
-    /// a version-poll tick whose token changed (`docs/REVIEW-2026-09-08-pass4.md` Q2).
-    AccessRefreshed(RequestId, Result<Access, String>),
+    /// Open the row dialog for `path` (the Value column's "set" action, and a double
+    /// click).
+    EditRow(String),
+    OpenAdd,
+    OpenEdit,
+    RemoveRow,
+    /// A write issued outside a dialog (the Remove button) answered.
+    WriteFinished(RequestId, Result<WriteResult, Error>),
+    /// A dialog's submit succeeded.
+    WriteOk,
+    /// A dialog's submit failed: the server's message, and whether it was a 409.
+    WriteFailed(String, bool),
+    OpenText,
+    TextLoaded(RequestId, Result<String, String>),
+    TextFormat(TextFormat),
+    TextInput(String),
+    ShowTextDiff,
+    ApplyText,
+    CancelDiff,
+    CloseDialog,
     ThemeChanged(bool),
 }
 
-/// The metadata editor for one document.
+/// The metadata tree for one document.
 #[derive(Clone, PartialEq, Properties)]
 #[builder]
 pub struct MetaEditor {
-    /// Document to edit.
+    /// Document to show.
     pub doc: DocId,
 
     /// Guest type (`lxc` or `qemu`), as passed by the tab loader.
@@ -129,269 +222,441 @@ impl MetaEditor {
     }
 }
 
-/// A live Monaco instance, and the identity of the buffer it is showing.
-struct MountedEditor {
-    id: String,
-    doc: DocId,
-    view: String,
-    /// The load/discard generation whose text is in the buffer.
-    generation: u64,
+impl ExtractPrimaryKey for Node {
+    fn extract_key(&self) -> Key {
+        Key::from(self.path.as_str())
+    }
 }
 
 #[doc(hidden)]
-pub struct PveMetaEditor {
+pub struct PveMetaTree {
     state: LoadableComponentState<ViewState>,
     /// What the page is asking for, and what an answer must match to be applied.
     requests: RequestTracker,
+    store: TreeStore<Node>,
+    columns: Rc<Vec<DataTableHeader<Node>>>,
+    selection: Selection,
+    /// The selected row's path.
+    selected: Option<String>,
+
     /// The caller's effective grants for this document.
     access: Access,
-    /// The document the grants were fetched for; `None` while they are unknown.
-    access_for: Option<DocId>,
     /// Why the grants are unknown, if the endpoint refused to answer.
     access_error: Option<String>,
-    /// Top-level keys of the whole document, as parsed from its YAML text.
-    keys: Vec<String>,
-    /// The prefixes the "View as" selector offers.
-    views: Rc<Vec<AttrValue>>,
-    /// Bumped when a view selection is cancelled, to make the `Combobox` re-read the
-    /// value prop it is not otherwise controlled by (`PWT/src/widget/form/selector.rs`
-    /// only force-feeds the value when the prop itself changed).
-    view_revision: u64,
-    /// The view a pending confirmation would switch to.
-    pending_view: Option<String>,
-    /// Text and digest as loaded.
-    loaded: String,
+    /// Every registration; empty when `/meta/operators` is unavailable.
+    operators: Vec<Operator>,
+    /// Why the registrations are unknown. Not an error strip: the tree is complete
+    /// without them, only the declared rows and the Owner column are missing.
+    operators_error: Option<String>,
+    guest: GuestInfo,
+
+    data: Value,
     digest: String,
-    /// Live editor buffer; `None` while unmodified.
-    draft: Option<String>,
-    /// Bumped by every load, so `rendered()` knows when to push new text into Monaco.
-    generation: u64,
-    /// The last message of a failed write, shown verbatim under the editor.
+    rows: Vec<TreeRow>,
+    /// The document's own note (its bare `__` key).
+    description: Option<String>,
+    /// Set when the stored file does not parse: the tree is empty and only a root replace
+    /// through "Edit as text" can repair it (`docs/DESIGN.md` §4).
+    parse_error: Option<String>,
+
+    /// Mirrors the master's view state, which it does not expose.
+    dialog: Option<ViewState>,
+    /// A version-poll tick that arrived while a dialog was open.
+    pending_refresh: bool,
+    /// The last message of a failed write, shown verbatim under the tree.
     write_error: Option<String>,
-    /// A poll found this document's digest changed while there were unapplied edits,
-    /// or a write was refused with a 409.
-    stale: bool,
+    /// The standing "this document moved on the server" notice: set by a 409 and by a
+    /// poll tick that arrives while a dialog holds the page still. It deliberately
+    /// survives the reload it triggers — the reload is what makes the tree correct again,
+    /// and clearing the notice with it would leave the user with a page that silently
+    /// changed under them. A user-initiated Reload, or the next write that lands, clears
+    /// it.
+    notice: Option<String>,
     version_token: Option<String>,
-    editor_ref: NodeRef,
-    editor: Option<MountedEditor>,
+    /// True until the first load has expanded the tree once.
+    first_load: bool,
+
+    text: Option<TextState>,
+    text_ref: NodeRef,
+    text_editor: Option<String>,
+    /// The generation the mounted text editor is showing.
+    text_generation: u64,
     diff_ref: NodeRef,
     diff_id: Option<String>,
-    /// The identity the open diff was built for.
-    diff_request: Option<RequestId>,
-    dialog_open: bool,
-    /// Kept alive for as long as the editor exists.
+    /// Kept alive for as long as the text editor exists.
     on_change: Option<Closure<dyn Fn(String)>>,
     /// Kept alive so the `pwt-theme-changed` listeners stay registered.
     _theme_observer: ThemeObserver,
     dark_mode: bool,
 }
 
-pwt::impl_deref_mut_property!(PveMetaEditor, state, LoadableComponentState<ViewState>);
+pwt::impl_deref_mut_property!(PveMetaTree, state, LoadableComponentState<ViewState>);
 
-impl PveMetaEditor {
-    /// True if the caller may edit the selected view.
-    fn writable(&self, _ctx: &LoadableComponentContext<Self>) -> bool {
-        self.access.may_write(&self.requests.view())
+impl PveMetaTree {
+    /// The selected row, if it still exists.
+    fn selected_node(&self) -> Option<&Node> {
+        tree::find(&self.rows, self.selected.as_deref()?)
     }
 
-    /// The text the editor currently shows.
-    fn current_text(&self) -> &str {
-        self.draft.as_deref().unwrap_or(&self.loaded)
-    }
-
-    /// True while the editor holds changes that are not on the server.
-    fn dirty(&self) -> bool {
-        self.draft.is_some()
-    }
-
-    /// Recompute the "View as" selector's items from the current grants and keys.
-    ///
-    /// Called wherever either input changes: a load's answer (`Msg::Loaded`) and the
-    /// version poll's whole-document digest check (`Msg::ServerDigest`) both refresh
-    /// `self.keys`, and the dropdown should never lag one load behind what those two
-    /// already know (`docs/REVIEW-2026-09-08-pass3.md` R3). `Msg::AccessRefreshed`
-    /// refreshes `self.access` the same way, on Reload and on a token-changed poll tick
-    /// (Q2).
-    fn refresh_views(&mut self) {
-        self.views = Rc::new(
-            self.access
-                .view_options(&self.keys)
+    /// True if the caller may create a key somewhere in this document.
+    fn may_add(&self) -> bool {
+        self.access.write
+            || self
+                .access
+                .scopes
                 .iter()
-                .map(|option| match option.is_empty() {
-                    true => AttrValue::from(WHOLE_DOCUMENT),
-                    false => AttrValue::from(option.clone()),
-                })
-                .collect(),
+                .any(|scope| scope.mode == crate::model::Mode::Rw)
+    }
+
+    /// The subtree "Edit as text" acts on: the selected map, else the whole document.
+    fn text_target(&self) -> String {
+        match self.selected_node() {
+            Some(node) if node.kind.is_map() && node.is_set() => node.path.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Rebuild the row model and the store from the loaded document.
+    fn rebuild(&mut self) {
+        let rows = tree::build(
+            &self.data,
+            &BuildContext {
+                access: &self.access,
+                operators: &self.operators,
+                tags: &self.guest.tags,
+                scoped: self.requests.doc().scoped(),
+            },
         );
-    }
 
-    /// Re-fetch this document's grants outside `load()`.
-    ///
-    /// `load()` only fetches `api::access` once per document (`need_access`, editor.rs
-    /// `load()`), because the same grants cover every view of it. But they live in the
-    /// *datacenter* document's `scopes` map, so nothing about a guest document's own
-    /// digest or content ever signals that an admin changed them — a load, however
-    /// often it reruns, never notices a revoked scope. Called from `Msg::Reload` (an
-    /// explicit request to catch up) and from the version-poll tick whenever the store
-    /// token changed (the closest thing to a signal the poll has,
-    /// `docs/REVIEW-2026-09-08-pass4.md` Q2 — R3's own fix text asked for this and it was
-    /// never shipped). The answer feeds `refresh_views()`/`view_outcome()` exactly like
-    /// fresh `keys` already do.
-    fn refresh_access(&self, ctx: &LoadableComponentContext<Self>) {
-        let id = self.requests.issue(Channel::Access);
-        let doc = id.doc;
-        let link = ctx.link().clone();
-        ctx.link().spawn(async move {
-            let result = api::access(doc).await.map_err(|e| e.to_string());
-            link.send_message(Msg::AccessRefreshed(id, result));
-        });
-    }
-
-    /// Show `view` from now on: strand everything in flight and load the new one.
-    ///
-    /// The buffer keeps showing the outgoing view's text until `Msg::Loaded` overwrites
-    /// it — `dirty()` is false throughout (the draft was just dropped), so nothing reads
-    /// it as belonging to the new view. Blanking it here just to have it refill a moment
-    /// later made every switch flash empty for the round trip
-    /// (`docs/REVIEW-2026-09-08-pass2.md` low findings, `editor.rs:205`).
-    fn switch_view(&mut self, ctx: &LoadableComponentContext<Self>, view: String) {
-        if !self.requests.set_view(view) {
-            return;
+        let expand = self.first_load;
+        let mut slab: SlabTree<Node> = SlabTree::new();
+        {
+            let mut root = slab.set_root(Node::root());
+            root.set_expanded(true);
+            append_rows(&mut root, &rows, expand);
         }
-        self.draft = None;
-        self.stale = false;
-        self.write_error = None;
-        self.generation += 1;
-        self.close_dialog(ctx);
-        ctx.link().send_reload();
+        // `update_root_tree` re-applies whatever the user had expanded, so a reload — and
+        // the version poll fires one every 5 s — never collapses the tree underneath them.
+        self.store.write().update_root_tree(slab);
+
+        self.description = tree::document_description(&self.data);
+        self.rows = rows;
+        self.first_load = false;
+
+        // A row that no longer exists cannot stay selected: the toolbar's Edit/Remove act
+        // on the selection, and acting on a path that is gone is exactly the write this
+        // page must never make.
+        let selected = self
+            .selected
+            .as_deref()
+            .filter(|path| tree::find(&self.rows, path).is_some())
+            .map(str::to_string);
+        if selected != self.selected {
+            match &selected {
+                Some(path) => self.selection.select(Key::from(path.as_str())),
+                None => self.selection.clear(),
+            }
+            self.selected = selected;
+        }
     }
 
-    /// Close whichever modal is open, dropping the diff editor with it.
+    fn open_dialog(&mut self, ctx: &LoadableComponentContext<Self>, state: ViewState) {
+        self.dialog = Some(state);
+        ctx.link().change_view(Some(state));
+    }
+
+    /// Close whichever modal is open, dropping the Monaco instances with it.
     fn close_dialog(&mut self, ctx: &LoadableComponentContext<Self>) {
-        if self.pending_view.take().is_some() {
-            // The selector already shows the view the user picked; make it re-read the
-            // one that is actually loaded.
-            self.view_revision += 1;
-        }
-        self.dialog_open = false;
+        self.dialog = None;
+        self.text = None;
+        self.dispose_text();
         self.dispose_diff();
         ctx.link().change_view(None);
+        if self.pending_refresh {
+            // The store moved while the dialog held the page still.
+            self.pending_refresh = false;
+            ctx.link().send_message(Msg::Reload);
+        }
     }
 
-    /// The document identity line, e.g. `200 traefik` + `(lxc, node1)`.
-    fn header(&self, ctx: &LoadableComponentContext<Self>) -> Row {
+    fn dispose_text(&mut self) {
+        if let Some(id) = self.text_editor.take() {
+            monaco::dispose(&id);
+        }
+        self.on_change = None;
+    }
+
+    fn dispose_diff(&mut self) {
+        if let Some(id) = self.diff_id.take() {
+            monaco::dispose(&id);
+        }
+    }
+
+    /// The document identity line: `200 test-ct-200 (lxc, node1)`, plus the document's own
+    /// note when it has one.
+    fn header(&self, ctx: &LoadableComponentContext<Self>) -> Column {
         let props = ctx.props();
 
         let (icon, title) = match props.doc {
             DocId::Datacenter => ("building", tr!("Datacenter")),
             DocId::Guest(vmid) => {
-                let icon = match props.guest_type.as_deref() {
+                let icon = match self
+                    .guest
+                    .guest_type
+                    .as_deref()
+                    .or(props.guest_type.as_deref())
+                {
                     Some("lxc") => "cube",
                     _ => "desktop",
                 };
-                // The guest's name would need either `GET /meta/guests` (an O(N) scan of
-                // every guest in the vmlist just to find this one's name, `docs/REVIEW-
-                // 2026-09-08-pass2.md` P10) or a name/node field the single-document GET
-                // does not carry (`docs/DESIGN.md` §3); the vmid on its own is enough to
-                // identify the document, and `props.node` already covers node.
-                (icon, vmid.to_string())
+                let title = match &self.guest.name {
+                    Some(name) => format!("{vmid} {name}"),
+                    None => vmid.to_string(),
+                };
+                (icon, title)
             }
         };
 
         let mut details: Vec<String> = Vec::new();
-        if let Some(guest_type) = props.guest_type.as_deref() {
+        if let Some(guest_type) = self
+            .guest
+            .guest_type
+            .as_deref()
+            .or(props.guest_type.as_deref())
+        {
             details.push(guest_type.to_string());
         }
-        if let Some(node) = props.node.as_deref() {
+        if let Some(node) = self.guest.node.as_deref().or(props.node.as_deref()) {
             details.push(node.to_string());
         }
+        if !self.guest.tags.is_empty() {
+            details.push(self.guest.tags.join(", "));
+        }
 
-        Row::new()
-            .class(AlignItems::Baseline)
+        Column::new()
             .class("pwt-border-bottom")
             .padding(2)
-            .gap(2)
-            .with_child(Fa::new(icon))
+            .gap(1)
             .with_child(
-                Container::from_tag("span")
-                    .class(FontStyle::TitleMedium)
-                    .with_child(title),
+                Row::new()
+                    .class(AlignItems::Baseline)
+                    .gap(2)
+                    .with_child(Fa::new(icon))
+                    .with_child(
+                        Container::from_tag("span")
+                            .class(FontStyle::TitleMedium)
+                            .with_child(title),
+                    )
+                    .with_optional_child((!details.is_empty()).then(|| {
+                        Container::from_tag("span")
+                            .class("pwt-color-on-neutral-alt")
+                            .with_child(format!("({})", details.join(", ")))
+                    })),
             )
-            .with_optional_child((!details.is_empty()).then(|| {
+            .with_optional_child(self.description.as_deref().map(|note| {
                 Container::from_tag("span")
                     .class("pwt-color-on-neutral-alt")
-                    .with_child(format!("({})", details.join(", ")))
+                    .with_child(note.to_string())
             }))
     }
 
-    /// The Reload button. With unapplied edits it asks first — a reload throws them away
-    /// just as the Discard button next to it does, so it uses the same confirmation.
-    ///
-    /// Both branches dispatch `Msg::Reload` rather than the framework's own
-    /// `LoadableComponentScope::send_reload()` directly: that helper only sends the
-    /// master's `Msg::Load`, bypassing `PveMetaEditor::update`'s `Msg::Reload` arm
-    /// entirely — which is where `self.requests.invalidate()` (P8) and the grants
-    /// re-fetch (`refresh_access`, Q2) live. A clean Reload (no draft to confirm) is by
-    /// far the common case, so routing it around `Msg::Reload` would have left both of
-    /// those unexercised for everyday use.
-    fn reload_button(&self, ctx: &LoadableComponentContext<Self>) -> Html {
-        let link = ctx.link().clone();
-        let loading = self.loading();
-
-        if !self.dirty() {
-            return Button::refresh(loading)
-                .on_activate(link.callback(|_| Msg::Reload))
-                .into();
-        }
-
-        let icon_class = match loading {
-            true => "fa fa-fw fa-refresh fa-spin",
-            false => "fa fa-fw fa-refresh",
-        };
-
-        ConfirmButton::new_icon(icon_class)
-            .aria_label(tr!("Refresh"))
-            .dangerous(true)
-            .disabled(loading)
-            .confirm_message(tr!("Discard all unapplied changes?"))
-            .on_activate(link.callback(|_| Msg::Reload))
-            .into()
+    /// The non-modal "changed on the server" notice.
+    fn stale_banner(&self, ctx: &LoadableComponentContext<Self>, message: &str) -> Row {
+        Row::new()
+            .padding(2)
+            .gap(2)
+            .class(AlignItems::Center)
+            .class(ColorScheme::WarningContainer)
+            .class("pwt-default-colors")
+            .class("pwt-border-bottom")
+            .with_child(Fa::new("exclamation-triangle"))
+            .with_child(message.to_string())
+            .with_flex_spacer()
+            .with_child(
+                Button::refresh(self.loading())
+                    .on_activate(ctx.link().callback(|_| Msg::UserReload)),
+            )
     }
 
-    /// The non-modal "changed on the server" notice.
-    fn stale_banner(&self, ctx: &LoadableComponentContext<Self>) -> Column {
+    /// The unparsable-file notice: the tree cannot be built, only a root replace repairs it.
+    fn parse_error_banner(&self, ctx: &LoadableComponentContext<Self>, message: &str) -> Column {
         Column::new()
             .padding(2)
             .gap(1)
-            .class(ColorScheme::WarningContainer)
+            .class(ColorScheme::ErrorContainer)
             .class("pwt-default-colors")
             .class("pwt-border-bottom")
             .with_child(
                 Row::new()
                     .gap(2)
                     .class(AlignItems::Center)
-                    .with_child(Fa::new("exclamation-triangle"))
+                    .with_child(Fa::new("exclamation-circle"))
                     .with_child(tr!(
-                        "This document was changed on the server since it was loaded."
+                        "This document is not valid YAML and cannot be shown as a tree."
                     ))
                     .with_flex_spacer()
-                    .with_child(self.reload_button(ctx)),
+                    .with_child(
+                        Button::new(tr!("Edit as text"))
+                            .disabled(!self.access.write)
+                            .on_activate(ctx.link().callback(|_| Msg::OpenText)),
+                    ),
             )
-            .with_optional_child(self.dirty().then(|| {
-                Container::from_tag("span").with_child(tr!(
-                    "Your unapplied changes are kept until you reload or discard them."
-                ))
-            }))
+            .with_child(Container::from_tag("span").with_child(message.to_string()))
     }
 
-    /// The Apply confirmation: a Monaco diff of the loaded text against the edited one.
+    /// The row editor. One `EditWindow` per row, the `ObjectGrid` pattern.
+    fn row_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Option<Html> {
+        let node = self.selected_node()?.clone();
+        let doc = ctx.props().doc;
+        let digest = self.digest.clone();
+        let link = ctx.link().clone();
+
+        let title = match node.is_set() {
+            true => tr!("Edit") + ": " + &node.path,
+            false => tr!("Set") + ": " + &node.path,
+        };
+
+        let had_description = node.note.is_some();
+
+        Some(
+            EditWindow::new(title)
+                .width(560)
+                .edit(node.is_set())
+                .inline_error(true)
+                .on_done(link.callback(|_| Msg::CloseDialog))
+                .renderer({
+                    let node = node.clone();
+                    move |_form_ctx: &FormContext| row_form(&node)
+                })
+                .on_submit({
+                    let node = node.clone();
+                    move |form_ctx: FormContext| {
+                        let link = link.clone();
+                        let digest = digest.clone();
+                        let built = row_writes(&node, &form_ctx, had_description);
+                        async move {
+                            let writes = built.map_err(|err| anyhow!(err))?;
+                            submit(doc, writes, digest, link).await
+                        }
+                    }
+                })
+                .into(),
+        )
+    }
+
+    /// The Add dialog: a key, a type and a value, under the selected map row.
+    fn add_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let doc = ctx.props().doc;
+        let digest = self.digest.clone();
+        let link = ctx.link().clone();
+        let parent = match self.selected_node() {
+            Some(node) if node.kind.is_map() => node.path.clone(),
+            Some(node) => parent_path(&node.path),
+            None => String::new(),
+        };
+
+        let title = match parent.is_empty() {
+            true => tr!("Add") + ": " + &tr!("Key"),
+            false => tr!("Add") + ": " + &parent,
+        };
+
+        EditWindow::new(title)
+            .width(560)
+            .inline_error(true)
+            .on_done(link.callback(|_| Msg::CloseDialog))
+            .renderer(move |_form_ctx: &FormContext| add_form())
+            .on_submit({
+                let parent = parent.clone();
+                move |form_ctx: FormContext| {
+                    let link = link.clone();
+                    let digest = digest.clone();
+                    let built = add_writes(&parent, &form_ctx);
+                    async move {
+                        let writes = built.map_err(|err| anyhow!(err))?;
+                        submit(doc, writes, digest, link).await
+                    }
+                }
+            })
+            .into()
+    }
+
+    /// The "Edit as text" dialog: Monaco over one subtree, YAML or JSON.
+    fn text_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link();
+        let text = self.text.as_ref();
+        let format = text.map(|t| t.format).unwrap_or(TextFormat::Yaml);
+        let path = text.map(|t| t.path.clone()).unwrap_or_default();
+        let writable = self.access.may_write(&path) || (path.is_empty() && self.access.write);
+
+        let title = match path.is_empty() {
+            true => tr!("Edit as text") + ": " + &tr!("Whole document"),
+            false => tr!("Edit as text") + ": " + &path,
+        };
+
+        let toggle = |label: String, value: TextFormat| {
+            let active = format == value;
+            Button::new(label)
+                .pressed(active)
+                .class(active.then_some(ColorScheme::Primary))
+                .on_activate(link.callback(move |_| Msg::TextFormat(value)))
+        };
+
+        Dialog::new(title)
+            .width(900)
+            .height(600)
+            .resizable(true)
+            .on_close(link.callback(|_| Msg::CloseDialog))
+            .with_child(
+                Row::new()
+                    .padding(2)
+                    .gap(2)
+                    .class(AlignItems::Center)
+                    .class("pwt-border-bottom")
+                    .with_child(
+                        SegmentedButton::new()
+                            .aria_label(tr!("Format"))
+                            .with_button(toggle(tr!("YAML"), TextFormat::Yaml))
+                            .with_button(toggle(tr!("JSON"), TextFormat::Json)),
+                    )
+                    .with_flex_spacer()
+                    .with_optional_child((!writable).then(|| {
+                        Container::from_tag("span")
+                            .class("pwt-color-on-neutral-alt")
+                            .with_child(tr!("Read-only"))
+                    })),
+            )
+            .with_child(
+                Container::new()
+                    .class(FlexFit)
+                    .class("pve-meta-monaco-host")
+                    .into_html_with_ref(self.text_ref.clone()),
+            )
+            .with_child(
+                Row::new()
+                    .padding(2)
+                    .gap(2)
+                    .class(JustifyContent::FlexEnd)
+                    .class("pwt-border-top")
+                    .with_child(
+                        Button::new(tr!("Cancel")).on_activate(link.callback(|_| Msg::CloseDialog)),
+                    )
+                    .with_child(
+                        Button::new(tr!("Apply"))
+                            .disabled(!writable || !text.is_some_and(TextState::dirty))
+                            .on_activate(link.callback(|_| Msg::ShowTextDiff)),
+                    ),
+            )
+            .into()
+    }
+
+    /// The diff that confirms a text apply.
     fn diff_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
         let link = ctx.link();
         Dialog::new(tr!("Apply") + ": " + &tr!("Changes"))
             .width(900)
             .height(600)
             .resizable(true)
-            .on_close(link.callback(|_| Msg::CloseDialog))
+            .on_close(link.callback(|_| Msg::CancelDiff))
             .with_child(
                 Container::new()
                     .class(FlexFit)
@@ -405,53 +670,27 @@ impl PveMetaEditor {
                     .class(JustifyContent::FlexEnd)
                     .class("pwt-border-top")
                     .with_child(
-                        Button::new(tr!("Cancel")).on_activate(link.callback(|_| Msg::CloseDialog)),
+                        Button::new(tr!("Back")).on_activate(link.callback(|_| Msg::CancelDiff)),
                     )
                     .with_child(
                         Button::new(tr!("Apply"))
                             .class(ColorScheme::Primary)
-                            .on_activate(link.callback(|_| Msg::Apply)),
+                            .on_activate(link.callback(|_| Msg::ApplyText)),
                     ),
             )
             .into()
     }
-
-    /// The same confirmation the Discard button raises, before a view switch drops the
-    /// edits made in the view being left.
-    fn switch_view_dialog(&self, ctx: &LoadableComponentContext<Self>) -> Html {
-        let link = ctx.link();
-        ConfirmDialog::new(tr!("Confirm"), tr!("Discard all unapplied changes?"))
-            .dangerous(true)
-            .on_confirm(link.callback(|_| Msg::ConfirmSwitchView))
-            .on_close(link.callback(|_| Msg::CloseDialog))
-            .into()
-    }
-
-    fn dispose_diff(&mut self) {
-        self.diff_request = None;
-        if let Some(id) = self.diff_id.take() {
-            monaco::dispose(&id);
-        }
-    }
-
-    /// Drop the mounted editor, its model and its change listener.
-    fn dispose_editor(&mut self) {
-        if let Some(editor) = self.editor.take() {
-            monaco::dispose(&editor.id);
-        }
-        self.on_change = None;
-    }
 }
 
-impl Drop for PveMetaEditor {
+impl Drop for PveMetaTree {
     fn drop(&mut self) {
         // Monaco leaks a ResizeObserver and a model otherwise.
-        self.dispose_editor();
+        self.dispose_text();
         self.dispose_diff();
     }
 }
 
-impl LoadableComponent for PveMetaEditor {
+impl LoadableComponent for PveMetaTree {
     type Properties = MetaEditor;
     type Message = Msg;
     type ViewState = ViewState;
@@ -460,6 +699,14 @@ impl LoadableComponent for PveMetaEditor {
         let theme_observer =
             ThemeObserver::new(ctx.link().callback(|(_, dark)| Msg::ThemeChanged(dark)));
         let dark_mode = theme_observer.dark_mode();
+
+        let store: TreeStore<Node> = TreeStore::new().view_root(false);
+        let columns = Rc::new(columns(&store, ctx.link().clone()));
+
+        let selection = Selection::new().on_select({
+            let link = ctx.link().clone();
+            move |selection: Selection| link.send_message(Msg::Select(selection.selected_key()))
+        });
 
         // The store's content hash, polled on an interval — the native module answers
         // `GET /meta/version` immediately, there is no long poll. The future runs in the
@@ -478,26 +725,32 @@ impl LoadableComponent for PveMetaEditor {
         Self {
             state: LoadableComponentState::new(),
             requests: RequestTracker::new(ctx.props().doc),
+            store,
+            columns,
+            selection,
+            selected: None,
             access: Access::default(),
-            access_for: None,
             access_error: None,
-            keys: Vec::new(),
-            views: Rc::new(vec![AttrValue::from(WHOLE_DOCUMENT)]),
-            view_revision: 0,
-            pending_view: None,
-            loaded: String::new(),
+            operators: Vec::new(),
+            operators_error: None,
+            guest: GuestInfo::default(),
+            data: json!({}),
             digest: String::new(),
-            draft: None,
-            generation: 0,
+            rows: Vec::new(),
+            description: None,
+            parse_error: None,
+            dialog: None,
+            pending_refresh: false,
             write_error: None,
-            stale: false,
+            notice: None,
             version_token: None,
-            editor_ref: NodeRef::default(),
-            editor: None,
+            first_load: true,
+            text: None,
+            text_ref: NodeRef::default(),
+            text_editor: None,
+            text_generation: 0,
             diff_ref: NodeRef::default(),
             diff_id: None,
-            diff_request: None,
-            dialog_open: false,
             on_change: None,
             _theme_observer: theme_observer,
             dark_mode,
@@ -505,27 +758,21 @@ impl LoadableComponent for PveMetaEditor {
     }
 
     fn changed(&mut self, ctx: &LoadableComponentContext<Self>, _old: &Self::Properties) -> bool {
-        // A different document is a different page: nothing loaded for the old one — its
-        // text, its digest, its grants, its keys — may survive into it. `app.rs` mounts
-        // one `MetaEditor` per navigation and never changes its `doc` prop in place, so
-        // this never fires with unapplied edits in the buffer; guard that assumption
-        // instead of silently discarding them the way pre-F5 code did
-        // (`docs/REVIEW-2026-09-08-pass2.md` low findings, `editor.rs:451`).
+        // A different document is a different page: nothing loaded for the old one may
+        // survive into it.
         if self.requests.set_doc(ctx.props().doc) {
-            debug_assert!(
-                !self.dirty(),
-                "pve-meta-ui: doc prop changed with unapplied edits in the buffer"
-            );
             self.access = Access::default();
-            self.access_for = None;
             self.access_error = None;
-            self.keys.clear();
-            self.draft = None;
-            self.loaded.clear();
+            self.guest = GuestInfo::default();
+            self.data = json!({});
             self.digest.clear();
-            self.stale = false;
+            self.rows.clear();
+            self.selected = None;
+            self.selection.clear();
+            self.notice = None;
             self.write_error = None;
-            self.generation += 1;
+            self.parse_error = None;
+            self.first_load = true;
             self.close_dialog(ctx);
             ctx.link().send_reload();
         }
@@ -539,93 +786,67 @@ impl LoadableComponent for PveMetaEditor {
         let tracker = self.requests.clone();
         let id = tracker.issue(Channel::Load);
         let doc = id.doc;
-        let view = id.view.clone();
-        let need_access = self.access_for != Some(doc);
         let link = ctx.link().clone();
 
         Box::pin(async move {
-            let (access, access_error) = match need_access {
-                true => match api::access(doc).await {
-                    Ok(access) => (Some(access), None),
-                    // A page that cannot ask for its grants stays usable and read-only
-                    // rather than failing outright: `/meta/access` parses the whole
-                    // `scopes` map, so one malformed entry can 400 it for everyone
-                    // (`docs/REVIEW-2026-09-07.md` F7) — and this document may be exactly
-                    // the one that has to be edited to fix that.
-                    Err(err) => (None, Some(err.to_string())),
+            // Grants, registrations and the guest's tags are all re-read on every load:
+            // none of them lives inside this document, so nothing about its digest ever
+            // signals that one moved (`docs/REVIEW-2026-09-08-pass4.md` Q2), and the
+            // version poll reloads on any store change anyway.
+            let access = api::access(doc).await.map_err(|err| err.to_string());
+            let operators = api::operators().await.map_err(|err| {
+                if api::is_unimplemented(&err) {
+                    tr!("this node's API does not serve operator registrations")
+                } else {
+                    err.to_string()
+                }
+            });
+            let guest = match doc {
+                DocId::Guest(vmid) => match api::guest_info(vmid).await {
+                    Ok(info) => info,
+                    Err(err) => {
+                        log::warn!("pve-meta-ui: could not read the guest list: {err}");
+                        None
+                    }
                 },
-                false => (None, None),
+                DocId::Datacenter => None,
             };
 
-            // One GET, whatever the view: `docs/REVIEW-2026-09-08-pass2.md` P10 removed
-            // both the `GET /meta/guests` scan this load used to make solely to find the
-            // guest's name (an O(N) round trip over every guest in the vmlist for one
-            // field the header no longer shows) and the second `view=""` read this load
-            // used to make solely for the "View as" selector's top-level keys. A
-            // selected view's own answer only carries the keys *inside* that view
-            // (`docs/DESIGN.md` §3), so those keys come only from a whole-document read
-            // — the first load of a document is always one (`RequestTracker::new` starts
-            // at the empty view), and `self.keys` then survives every later view switch.
-            let document = api::get_text(doc, &view).await;
+            let version = api::version().await.ok().map(|info| info.token);
+            let document = api::get_data(doc, "").await;
 
             // Nothing past this point may touch the page unless it still wants this
-            // answer: the user may have switched view or document while this was in
-            // flight, and `LoadableComponentMaster` cancels nothing (F4).
+            // answer: the document may have changed while this was in flight, and
+            // `LoadableComponentMaster` cancels nothing (F4).
             if !tracker.accepts(&id) {
-                log::debug!(
-                    "pve-meta-ui: dropping a stale load of {}, view '{}'",
-                    doc.label(),
-                    view,
-                );
+                log::debug!("pve-meta-ui: dropping a stale load of {}", doc.label());
                 return Ok(());
             }
 
-            let document = document?;
-
-            // A selected (non-empty) view whose own answer carries no top-level keys is
-            // ambiguous: `view::extract` (`crates/pve-meta-core/src/api.rs`) hands back
-            // the same empty object whether the key still exists and simply has no
-            // content, or has been deleted since the view was last listed
-            // (`docs/REVIEW-2026-09-08-pass3.md` R3 — the invariant P10's fold-in-one-GET
-            // change broke). Settle it with one extra whole-document read, paid only in
-            // this rare case — an ordinary load, whatever it answers, never pays it — so
-            // the "is the selected view still an option" check below sees the document's
-            // current top-level keys rather than whatever `self.keys` last held.
-            let keys = if view.is_empty() {
-                Some(document_keys(&document))
-            } else if document_keys(&document).is_empty() {
-                match api::get_text(doc, "").await {
-                    Ok(whole) => {
-                        if !tracker.accepts(&id) {
-                            log::debug!(
-                                "pve-meta-ui: dropping a stale load of {}, view '{}'",
-                                doc.label(),
-                                view,
-                            );
-                            return Ok(());
+            let (digest, data, parse_error) = match document {
+                Ok(document) => (document.digest, document.data, None),
+                Err(err) => {
+                    // An unparsable file 422s as JSON but still answers as text, with the
+                    // parse error (`docs/DESIGN.md` §4) — show that rather than an empty
+                    // page, so it can be repaired through "Edit as text".
+                    match api::get_text(doc, "").await {
+                        Ok(text) if text.parse_error.is_some() => {
+                            (text.digest, json!({}), text.parse_error)
                         }
-                        Some(document_keys(&whole))
-                    }
-                    Err(err) => {
-                        log::warn!(
-                            "pve-meta-ui: failed to validate an empty answer for {} view \
-                             '{view}': {err}",
-                            doc.label(),
-                        );
-                        None
+                        _ => return Err(err),
                     }
                 }
-            } else {
-                None
             };
 
             link.send_message(Msg::Loaded(Box::new(Loaded {
                 id,
                 access,
-                access_error,
-                keys,
-                digest: document.digest,
-                text: document.text,
+                operators,
+                guest,
+                digest,
+                data,
+                parse_error,
+                version_token: version,
             })));
 
             Ok(())
@@ -638,10 +859,12 @@ impl LoadableComponent for PveMetaEditor {
                 let Loaded {
                     id,
                     access,
-                    access_error,
-                    keys,
+                    operators,
+                    guest,
                     digest,
-                    text,
+                    data,
+                    parse_error,
+                    version_token,
                 } = *loaded;
 
                 // The future checked this before sending; check it again here, where the
@@ -650,268 +873,250 @@ impl LoadableComponent for PveMetaEditor {
                     return false;
                 }
 
-                if let Some(access) = access {
-                    self.access = access;
-                    self.access_for = Some(id.doc);
-                    self.access_error = None;
-                }
-                if let Some(err) = access_error {
-                    // No grants until the endpoint answers: the page stays read-only and
-                    // says why. `access_for` stays unset, so a Reload retries.
-                    self.access = Access::default();
-                    self.access_for = None;
-                    self.access_error = Some(err);
-                }
-                if let Some(keys) = keys {
-                    self.keys = keys;
-                }
-                self.refresh_views();
-
-                // The selected prefix is gone (deleted, or no longer granted). `keys`
-                // above is fresh whenever it mattered — `load()` fetches a whole-document
-                // read to settle exactly this whenever the answered view itself carried
-                // no top-level keys (`docs/REVIEW-2026-09-08-pass3.md` R3) — so this
-                // reads the document's *current* state, not whatever `self.keys` last
-                // held before P10 folded the key list into the single document GET.
-                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
-                    ViewOutcome::Keep => {}
-                    ViewOutcome::FallBack => {
-                        // Fall back to the whole document — and load *it*: the text in
-                        // hand is the answer for a view that no longer exists, not for
-                        // the one now selected.
-                        self.switch_view(ctx, String::new());
-                        return true;
+                match access {
+                    Ok(access) => {
+                        self.access = access;
+                        self.access_error = None;
                     }
-                    ViewOutcome::ConfirmFallBack => {
-                        // There is a draft against the vanished view — the same question
-                        // a manual switch would ask (F5), not a silent discard.
-                        self.pending_view = Some(String::new());
-                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
-                        return true;
+                    // A page that cannot ask for its grants stays usable and read-only
+                    // rather than failing outright.
+                    Err(err) => {
+                        self.access = Access::default();
+                        self.access_error = Some(err);
                     }
                 }
-
-                self.loaded = text;
-                self.digest = digest;
-                self.draft = None;
-                self.stale = false;
-                self.write_error = None;
-                self.generation += 1;
-                // Whatever the diff dialog was showing was a picture of the text that
-                // just moved.
-                self.close_dialog(ctx);
-            }
-            Msg::SelectView(view) => {
-                let view = match view.as_str() {
-                    WHOLE_DOCUMENT => String::new(),
-                    other => other.to_string(),
-                };
-                if view == self.requests.view() {
-                    return false;
-                }
-                // Leaving an edited view throws the edits away, so ask first — the same
-                // question, in the same dialog, as the Discard button (F5).
-                if self.dirty() {
-                    self.pending_view = Some(view);
-                    ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
-                    return true;
-                }
-                self.switch_view(ctx, view);
-            }
-            Msg::ConfirmSwitchView => {
-                let Some(view) = self.pending_view.take() else {
-                    return false;
-                };
-                ctx.link().change_view(None);
-                self.switch_view(ctx, view);
-            }
-            Msg::EditorInput(text) => {
-                self.draft = (text != self.loaded).then_some(text);
-            }
-            Msg::ShowDiff => {
-                self.dialog_open = true;
-                self.diff_request = Some(self.requests.issue(Channel::Diff));
-                ctx.link().change_view(Some(ViewState::ConfirmApply));
-            }
-            Msg::CloseDialog => {
-                self.close_dialog(ctx);
-            }
-            Msg::Apply => {
-                self.close_dialog(ctx);
-
-                let id = self.requests.issue(Channel::Apply);
-                let doc = id.doc;
-                let view = id.view.clone();
-                let text = self.current_text().to_string();
-                let digest = self.digest.clone();
-                let link = ctx.link().clone();
-                ctx.link().spawn(async move {
-                    let result = api::put_text(doc, &view, text, &digest).await;
-                    link.send_message(Msg::Applied(id, result));
-                });
-            }
-            Msg::Applied(id, result) => {
-                // The write went out for one view of one document. If the page has moved
-                // on, its outcome says nothing about what is on screen now — the version
-                // poll will pick the change up.
-                if !self.requests.accepts(&id) {
-                    log::warn!(
-                        "pve-meta-ui: dropping the result of a write to {}, view '{}': \
-                         the page moved on",
-                        id.doc.label(),
-                        id.view,
-                    );
-                    return false;
-                }
-                match result {
-                    Ok(_) => {
-                        self.write_error = None;
-                        ctx.link().send_reload();
+                match operators {
+                    Ok(operators) => {
+                        self.operators = operators;
+                        self.operators_error = None;
                     }
                     Err(err) => {
-                        // A 409 is not an error the user can act on by reading it — it
-                        // means the document moved underneath, so show the notice that
-                        // offers a reload.
-                        self.stale = api::is_conflict(&err);
-                        // Everything else is the server's own message, shown verbatim.
-                        self.write_error = Some(err.to_string());
+                        self.operators = Vec::new();
+                        self.operators_error = Some(err);
                     }
                 }
+                self.guest = guest.unwrap_or_default();
+                if version_token.is_some() {
+                    self.version_token = version_token;
+                }
+                self.digest = digest;
+                self.data = data;
+                self.parse_error = parse_error;
+                self.rebuild();
             }
-            Msg::Discard => {
-                self.draft = None;
-                self.write_error = None;
-                // Force `rendered()` to put the loaded text back into the editor.
-                self.generation += 1;
+            Msg::Select(key) => {
+                let selected = key.map(|key| key.to_string());
+                if selected == self.selected {
+                    return false;
+                }
+                self.selected = selected;
             }
             Msg::Reload => {
-                // Confirmed by the caller (the toolbar's and the banner's Reload both ask
-                // when there is something to lose). Invalidate before reloading: an
-                // Apply/Diff/Digest request issued earlier must not have its late answer
-                // applied over the document this reload is about to fetch
-                // (`docs/REVIEW-2026-09-08-pass2.md` P8 — this channel was the one
-                // `RequestTracker::invalidate()` existed for but never got called).
+                // Invalidate before reloading: a write issued earlier must not have its
+                // late answer applied over the document this reload is about to fetch
+                // (`docs/REVIEW-2026-09-08-pass2.md` P8).
                 self.requests.invalidate();
-                self.draft = None;
-                self.write_error = None;
-                self.generation += 1;
-                // The datacenter document's scopes are invisible to this document's own
-                // digest, so an explicit reload is also the only other place (besides a
-                // token-changed poll tick) that ever catches up on a revoked or widened
-                // scope (Q2).
-                self.refresh_access(ctx);
                 ctx.link().send_reload();
+            }
+            Msg::UserReload => {
+                self.notice = None;
+                self.write_error = None;
+                ctx.link().send_message(Msg::Reload);
             }
             Msg::VersionToken(token) => {
                 if self.version_token.as_deref() == Some(token.as_str()) {
                     return false;
                 }
+                // No "first tick is only a baseline" case: `load()` reads the token
+                // alongside the document, so a change between the two is a change this
+                // tick has to act on, not one it may adopt as its starting point.
                 self.version_token = Some(token);
-                // The datacenter document's scopes live outside this one, so a change to
-                // them never moves this document's own digest — the store token changing
-                // at all is the only signal available, so re-fetch grants on every tick
-                // that reaches here rather than only when this document also moved (Q2).
-                self.refresh_access(ctx);
-                // The store token covers every document, so it only says "something,
-                // somewhere, moved". Ask this one whether it was this document — always
-                // for the *whole* document, never just the selected view: `get_document`
-                // (`crates/pve-meta-core/src/api.rs`) reads the whole document and takes
-                // its digest before filtering, so it is the same one request either way,
-                // and it doubles as a refresh of the "View as" key list on every poll
-                // tick, instead of only on the next whole-document load
-                // (`docs/REVIEW-2026-09-08-pass3.md` R3).
-                let id = self.requests.issue(Channel::Digest);
-                let doc = id.doc;
-                let link = ctx.link().clone();
-                ctx.link().spawn(async move {
-                    match api::get_text(doc, "").await {
-                        Ok(document) => link.send_message(Msg::ServerDigest(id, document)),
-                        Err(err) => log::warn!("pve-meta-ui: digest check failed: {err}"),
-                    }
-                });
-                return false;
-            }
-            Msg::ServerDigest(id, document) => {
-                // A digest read for a view the page has left says nothing about the one
-                // it now shows.
-                if !self.requests.accepts(&id) {
-                    return false;
-                }
-                // Always the whole document (see above): fresh top-level keys,
-                // regardless of whether the digest moved — keep `self.keys` (and the
-                // "View as" items built from it) from going stale between whole-document
-                // loads (R3).
-                self.keys = document_keys(&document);
-                self.refresh_views();
-
-                // React to the selected view disappearing the moment fresh keys say so,
-                // rather than waiting for a follow-up load to rediscover it: cheaper (no
-                // detour through an ambiguous, now-stale answer for a view that is
-                // already known to be gone) and exactly the same decision `Msg::Loaded`
-                // makes for the same reason.
-                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
-                    ViewOutcome::Keep => {}
-                    ViewOutcome::FallBack => {
-                        self.switch_view(ctx, String::new());
-                        return true;
-                    }
-                    ViewOutcome::ConfirmFallBack => {
-                        self.pending_view = Some(String::new());
-                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
-                        return true;
-                    }
-                }
-
-                if document.digest == self.digest {
+                if self.dialog.is_some() {
+                    // Never reload the tree out from under an open editor (§8: the poll
+                    // does not refresh while a cell is being edited). Say the document
+                    // moved and catch up when the dialog closes; a write from that dialog
+                    // still carries the digest it was opened with, so it 409s rather than
+                    // silently overwriting whatever moved.
+                    self.pending_refresh = true;
+                    self.notice = Some(tr!(
+                        "This document was changed on the server since it was loaded."
+                    ));
                     return true;
                 }
-                // Never throw away unapplied edits: say so and offer the reload instead.
-                if self.dirty() {
-                    self.stale = true;
-                } else {
-                    ctx.link().send_reload();
+                // Nothing is being edited, so catching up *is* the answer: no notice.
+                self.notice = None;
+                ctx.link().send_message(Msg::Reload);
+                return false;
+            }
+            Msg::EditRow(path) => {
+                self.selection.select(Key::from(path.as_str()));
+                self.selected = Some(path);
+                self.open_dialog(ctx, ViewState::EditRow);
+            }
+            Msg::OpenAdd => self.open_dialog(ctx, ViewState::AddRow),
+            Msg::OpenEdit => {
+                if self.selected_node().is_none() {
                     return false;
                 }
+                self.open_dialog(ctx, ViewState::EditRow);
             }
-            Msg::AccessRefreshed(id, result) => {
-                // An answer for a document/view the page has since left says nothing
-                // about the one it now shows — same discipline as every other channel.
+            Msg::RemoveRow => {
+                let Some(node) = self.selected_node() else {
+                    return false;
+                };
+                let path = node.path.clone();
+                let comment = node.comment_path().to_string();
+                let has_note = node.note.is_some();
+                let mut writes = vec![Write::Delete { view: path }];
+                if has_note && !comment.starts_with(&format!("{}.", node.path)) {
+                    // The row's own note is a sibling key; a map's own `__` goes away
+                    // with the subtree that holds it.
+                    writes.push(Write::Delete { view: comment });
+                }
+
+                let id = self.requests.issue(Channel::Apply);
+                let doc = id.doc;
+                let digest = self.digest.clone();
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let result = api::apply(doc, writes, &digest).await;
+                    link.send_message(Msg::WriteFinished(id, result));
+                });
+            }
+            Msg::WriteFinished(id, result) => {
                 if !self.requests.accepts(&id) {
+                    log::warn!("pve-meta-ui: dropping a write result; the page moved on");
                     return false;
                 }
                 match result {
-                    Ok(access) => {
-                        self.access = access;
-                        self.access_for = Some(id.doc);
-                        self.access_error = None;
+                    Ok(_) => {
+                        self.write_error = None;
+                        self.notice = None;
+                        ctx.link().send_message(Msg::Reload);
                     }
                     Err(err) => {
-                        // No grants until the endpoint answers again: the page stays
-                        // read-only and says why, exactly like a failed `load()` fetch.
-                        self.access = Access::default();
-                        self.access_for = None;
-                        self.access_error = Some(err);
-                    }
-                }
-                self.refresh_views();
-
-                // The freshly re-fetched grants may no longer cover the selected view
-                // (a scope was narrowed or revoked) — the same fallback `Msg::Loaded`
-                // and `Msg::ServerDigest` apply when fresh `keys` say a view is gone
-                // (`docs/REVIEW-2026-09-08-pass4.md` Q2).
-                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
-                    ViewOutcome::Keep => {}
-                    ViewOutcome::FallBack => {
-                        self.switch_view(ctx, String::new());
-                        return true;
-                    }
-                    ViewOutcome::ConfirmFallBack => {
-                        self.pending_view = Some(String::new());
-                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
-                        return true;
+                        self.write_error = Some(err.to_string());
+                        if api::is_conflict(&err) {
+                            self.notice = Some(conflict_notice());
+                            ctx.link().send_message(Msg::Reload);
+                        }
                     }
                 }
             }
+            Msg::WriteOk => {
+                self.write_error = None;
+                self.notice = None;
+                ctx.link().send_message(Msg::Reload);
+                return false;
+            }
+            Msg::WriteFailed(message, conflict) => {
+                self.write_error = Some(message);
+                if conflict {
+                    // §8: 409 → reload and say so. The dialog keeps what was typed and
+                    // shows the server's message inline, so nothing typed is lost.
+                    self.notice = Some(conflict_notice());
+                    ctx.link().send_message(Msg::Reload);
+                }
+            }
+            Msg::OpenText => {
+                let path = self.text_target();
+                let subtree = subtree_at(&self.data, &path);
+                self.text = Some(TextState {
+                    path: path.clone(),
+                    format: TextFormat::Yaml,
+                    yaml: None,
+                    yaml_draft: None,
+                    json: serde_json::to_string_pretty(&subtree).unwrap_or_default(),
+                    json_draft: None,
+                    generation: 0,
+                });
+                self.open_dialog(ctx, ViewState::EditText);
+
+                let id = self.requests.issue(Channel::Text);
+                let doc = id.doc;
+                let link = ctx.link().clone();
+                ctx.link().spawn(async move {
+                    let result = api::get_text(doc, &path)
+                        .await
+                        .map(|document| document.text)
+                        .map_err(|err| err.to_string());
+                    link.send_message(Msg::TextLoaded(id, result));
+                });
+            }
+            Msg::TextLoaded(id, result) => {
+                if !self.requests.accepts(&id) {
+                    return false;
+                }
+                let Some(text) = self.text.as_mut() else {
+                    return false;
+                };
+                match result {
+                    Ok(yaml) => {
+                        text.yaml = Some(yaml);
+                        text.generation += 1;
+                    }
+                    Err(err) => {
+                        // Fall back to the JSON rendering, which needs no round trip.
+                        text.format = TextFormat::Json;
+                        text.generation += 1;
+                        self.write_error = Some(err);
+                    }
+                }
+            }
+            Msg::TextFormat(format) => {
+                let Some(text) = self.text.as_mut() else {
+                    return false;
+                };
+                if text.format == format {
+                    return false;
+                }
+                text.format = format;
+                text.generation += 1;
+            }
+            Msg::TextInput(input) => {
+                let Some(text) = self.text.as_mut() else {
+                    return false;
+                };
+                match text.format {
+                    TextFormat::Yaml => {
+                        text.yaml_draft =
+                            (Some(input.as_str()) != text.yaml.as_deref()).then_some(input)
+                    }
+                    TextFormat::Json => text.json_draft = (input != text.json).then_some(input),
+                }
+                // Only the Apply button's enabled state depends on this.
+            }
+            Msg::ShowTextDiff => {
+                self.dispose_text();
+                self.open_dialog(ctx, ViewState::ConfirmText);
+            }
+            Msg::CancelDiff => {
+                self.dispose_diff();
+                self.open_dialog(ctx, ViewState::EditText);
+                if let Some(text) = self.text.as_mut() {
+                    // The editor is remounted from scratch; make it show the draft.
+                    text.generation += 1;
+                }
+            }
+            Msg::ApplyText => {
+                let Some(text) = self.text.as_ref() else {
+                    return false;
+                };
+                let writes = vec![Write::PutText {
+                    view: text.path.clone(),
+                    text: text.current().to_string(),
+                }];
+                let id = self.requests.issue(Channel::Apply);
+                let doc = id.doc;
+                let digest = self.digest.clone();
+                let link = ctx.link().clone();
+                self.close_dialog(ctx);
+                ctx.link().spawn(async move {
+                    let result = api::apply(doc, writes, &digest).await;
+                    link.send_message(Msg::WriteFinished(id, result));
+                });
+            }
+            Msg::CloseDialog => self.close_dialog(ctx),
             Msg::ThemeChanged(dark) => {
                 self.dark_mode = dark;
                 monaco::set_theme(dark);
@@ -923,77 +1128,89 @@ impl LoadableComponent for PveMetaEditor {
 
     fn toolbar(&self, ctx: &LoadableComponentContext<Self>) -> Option<Html> {
         let link = ctx.link();
-        let dirty = self.dirty();
-        let writable = self.writable(ctx);
-        let view = self.requests.view();
-
-        let selected = match view.is_empty() {
-            true => AttrValue::from(WHOLE_DOCUMENT),
-            false => AttrValue::from(view.clone()),
-        };
-
-        let view_as = Combobox::new()
-            // A cancelled switch maps the selection back to the value the field already
-            // had, which a `Selector` does not re-assert on its own; a changed key makes
-            // it start over from the `value` prop.
-            .key(format!("view-as:{}:{}", self.view_revision, view))
-            .aria_label(tr!("View as"))
-            // Not clearable: an empty value has no meaning here, and `required` is what
-            // suppresses the field's clear trigger (`PWT/src/widget/form/selector.rs`).
-            .required(true)
-            .items(self.views.clone())
-            .value(selected)
-            .render_value(|value: &AttrValue| match value.as_str() {
-                WHOLE_DOCUMENT => html! {{ tr!("Whole document") }},
-                other => html! {{ other }},
-            })
-            .on_change(link.callback(Msg::SelectView));
+        let node = self.selected_node();
+        let writable = node.is_some_and(|node| node.writable);
+        let removable = writable && node.is_some_and(Node::is_set);
 
         Some(
             Toolbar::new()
                 .class("pwt-w-100")
                 .class("pwt-overflow-hidden")
                 .class("pwt-border-bottom")
-                .with_child(Container::from_tag("span").with_child(tr!("View as") + ":"))
-                .with_child(view_as)
+                .with_child(
+                    Button::new(tr!("Add"))
+                        .disabled(!self.may_add())
+                        .on_activate(link.callback(|_| Msg::OpenAdd)),
+                )
                 .with_spacer()
                 .with_child(
-                    Button::new(tr!("Apply"))
-                        .disabled(!dirty || !writable)
-                        .on_activate(link.callback(|_| Msg::ShowDiff)),
+                    Button::new(tr!("Edit"))
+                        .disabled(!writable)
+                        .on_activate(link.callback(|_| Msg::OpenEdit)),
                 )
                 .with_child(
-                    ConfirmButton::new(tr!("Discard"))
+                    ConfirmButton::new(tr!("Remove"))
                         .dangerous(true)
-                        .disabled(!dirty)
-                        .confirm_message(tr!("Discard all unapplied changes?"))
-                        .on_activate(link.callback(|_| Msg::Discard)),
+                        .disabled(!removable)
+                        .confirm_message(match node {
+                            Some(node) => {
+                                tr!(
+                                    "Are you sure you want to remove entry {0}",
+                                    node.path.clone()
+                                )
+                            }
+                            None => tr!("Are you sure you want to remove this entry?"),
+                        })
+                        .on_activate(link.callback(|_| Msg::RemoveRow)),
+                )
+                .with_spacer()
+                .with_child(
+                    Button::new(tr!("Edit as text")).on_activate(link.callback(|_| Msg::OpenText)),
                 )
                 .with_flex_spacer()
-                .with_optional_child((!writable).then(|| {
-                    Container::from_tag("span")
-                        .class("pwt-color-on-neutral-alt")
-                        .with_child(tr!("Read-only"))
-                }))
-                .with_child(self.reload_button(ctx))
+                .with_optional_child((!self.access.write && self.access.scopes.is_empty()).then(
+                    || {
+                        Container::from_tag("span")
+                            .class("pwt-color-on-neutral-alt")
+                            .with_child(tr!("Read-only"))
+                    },
+                ))
+                .with_child(
+                    Button::refresh(self.loading()).on_activate(link.callback(|_| Msg::UserReload)),
+                )
                 .into(),
         )
     }
 
     fn main_view(&self, ctx: &LoadableComponentContext<Self>) -> Html {
+        let link = ctx.link().clone();
+
         Column::new()
             .class(FlexFit)
             .with_child(self.header(ctx).key("header"))
             .with_optional_child(
-                self.stale
-                    .then(|| self.stale_banner(ctx).key("stale-banner")),
+                self.notice
+                    .as_deref()
+                    .map(|message| self.stale_banner(ctx, message).key("stale-banner")),
+            )
+            .with_optional_child(
+                self.parse_error
+                    .as_deref()
+                    .map(|err| self.parse_error_banner(ctx, err).key("parse-error")),
             )
             .with_child(
-                Container::new()
-                    .key("editor")
+                DataTable::new(Rc::clone(&self.columns), self.store.clone())
+                    .key("tree")
                     .class(FlexFit)
-                    .class("pve-meta-monaco-host")
-                    .into_html_with_ref(self.editor_ref.clone()),
+                    .selection(self.selection.clone())
+                    .striped(false)
+                    .hover(true)
+                    // Rows carry a description line, so their height varies; virtual
+                    // scrolling assumes a uniform one. Documents are small.
+                    .virtual_scroll(false)
+                    .on_row_dblclick(move |event: &mut DataTableMouseEvent| {
+                        link.send_message(Msg::EditRow(event.record_key.to_string()));
+                    }),
             )
             .with_optional_child(self.access_error.as_deref().map(|err| {
                 error_message(&tr!(
@@ -1003,6 +1220,20 @@ impl LoadableComponent for PveMetaEditor {
                 ))
                 .key("access-error")
                 .class("pwt-border-top")
+            }))
+            .with_optional_child(self.operators_error.as_deref().map(|err| {
+                Row::new()
+                    .key("operators-error")
+                    .padding(2)
+                    .gap(2)
+                    .class(AlignItems::Center)
+                    .class("pwt-border-top")
+                    .class("pwt-color-on-neutral-alt")
+                    .with_child(Fa::new("info-circle"))
+                    .with_child(tr!(
+                        "Declared keys and owners are unavailable: {0}",
+                        err.to_string()
+                    ))
             }))
             .with_optional_child(self.write_error.as_deref().map(|err| {
                 error_message(err)
@@ -1018,93 +1249,426 @@ impl LoadableComponent for PveMetaEditor {
         view_state: &Self::ViewState,
     ) -> Option<Html> {
         match view_state {
-            ViewState::ConfirmApply => Some(self.diff_dialog(ctx)),
-            ViewState::ConfirmSwitchView => Some(self.switch_view_dialog(ctx)),
+            ViewState::EditRow => self.row_dialog(ctx),
+            ViewState::AddRow => Some(self.add_dialog(ctx)),
+            ViewState::EditText => Some(self.text_dialog(ctx)),
+            ViewState::ConfirmText => Some(self.diff_dialog(ctx)),
         }
     }
 
     fn rendered(&mut self, ctx: &LoadableComponentContext<Self>, _first_render: bool) {
-        let doc = ctx.props().doc;
-        let view = self.requests.view();
-        let read_only = !self.writable(ctx);
-        let generation = self.generation;
-
-        // An editor belongs to the buffer it was mounted for: its model, its undo stack
-        // and its change listener are all that view's. Never carry one across.
-        let stale_editor = self
-            .editor
-            .as_ref()
-            .is_some_and(|editor| editor.doc != doc || editor.view != view);
-        if stale_editor {
-            self.dispose_editor();
+        // The text editor belongs to the dialog it was mounted in; nothing else may keep
+        // it alive (Monaco leaks a ResizeObserver and a model).
+        if self.dialog != Some(ViewState::EditText) {
+            self.dispose_text();
+        }
+        if self.dialog != Some(ViewState::ConfirmText) {
+            self.dispose_diff();
         }
 
-        match &mut self.editor {
-            None => {
-                if let Some(el) = self.editor_ref.cast::<Element>() {
-                    let id = monaco::mount(
-                        &el,
-                        &monaco::MountOptions {
-                            value: &self.loaded,
-                            language: "yaml",
-                            read_only,
-                            theme: if self.dark_mode { "dark" } else { "light" },
-                        },
-                    );
-                    let link = ctx.link().clone();
-                    self.on_change = Some(monaco::on_change(&id, move |text| {
-                        link.send_message(Msg::EditorInput(text))
-                    }));
-                    self.editor = Some(MountedEditor {
-                        id,
-                        doc,
-                        view,
-                        generation,
-                    });
+        if self.dialog == Some(ViewState::EditText) {
+            let (value, language, generation, read_only) = match self.text.as_ref() {
+                Some(text) if text.ready() => (
+                    text.current().to_string(),
+                    text.format.language(),
+                    text.generation,
+                    !self.access.may_write(&text.path)
+                        && !(text.path.is_empty() && self.access.write),
+                ),
+                _ => (String::new(), "yaml", 0, true),
+            };
+
+            match &self.text_editor {
+                None => {
+                    if let Some(el) = self.text_ref.cast::<Element>() {
+                        let id = monaco::mount(
+                            &el,
+                            &monaco::MountOptions {
+                                value: &value,
+                                language,
+                                read_only,
+                                theme: if self.dark_mode { "dark" } else { "light" },
+                            },
+                        );
+                        let link = ctx.link().clone();
+                        self.on_change = Some(monaco::on_change(&id, move |text| {
+                            link.send_message(Msg::TextInput(text))
+                        }));
+                        self.text_editor = Some(id);
+                        self.text_generation = generation;
+                    }
                 }
-            }
-            Some(editor) => {
-                // Never write over the buffer the user is typing in: only a load, a
-                // discard or a view switch bumps the generation.
-                if editor.generation != generation {
-                    monaco::set_value(&editor.id, &self.loaded);
-                    editor.generation = generation;
+                Some(id) => {
+                    // Never write over what the user is typing: only a load or a format
+                    // switch bumps the generation.
+                    if self.text_generation != generation {
+                        monaco::set_language(id, language);
+                        monaco::set_value(id, &value);
+                        self.text_generation = generation;
+                    }
+                    monaco::set_read_only(id, read_only);
                 }
-                monaco::set_read_only(&editor.id, read_only);
             }
         }
 
-        if self.dialog_open && self.diff_id.is_none() {
-            // The diff pictures one document, one view, one loaded text. If any of those
-            // moved since the dialog opened, it is on its way out — do not fill it.
-            let current = self
-                .diff_request
-                .as_ref()
-                .is_some_and(|id| self.requests.accepts(id));
-            if current {
-                if let Some(el) = self.diff_ref.cast::<Element>() {
-                    self.diff_id = Some(monaco::mount_diff(&el, &self.loaded, self.current_text()));
-                }
+        if self.dialog == Some(ViewState::ConfirmText) && self.diff_id.is_none() {
+            if let (Some(text), Some(el)) = (self.text.as_ref(), self.diff_ref.cast::<Element>()) {
+                self.diff_id = Some(monaco::mount_diff(
+                    &el,
+                    text.loaded(),
+                    text.current(),
+                    text.format.language(),
+                ));
             }
         }
     }
 }
 
-/// The top-level keys of a whole-document read, in document order.
-///
-/// The server sends them as an ordered `keys` array; the YAML text is the fallback for a
-/// server that does not (the same text, parsed — never `format=json`, whose object arrives
-/// reordered, `docs/DESIGN.md` §8).
-fn document_keys(document: &api::DocText) -> Vec<String> {
-    match document.keys.is_empty() {
-        true => top_level_keys_from_yaml(&document.text),
-        false => document.keys.clone(),
+/// Append `rows` under `parent`, expanding every map node when `expand` is set.
+fn append_rows(parent: &mut SlabTreeNodeMut<'_, Node>, rows: &[TreeRow], expand: bool) {
+    for row in rows {
+        let mut child = parent.append(row.node.clone());
+        if row.children.is_empty() {
+            // A map with no children yet must still read as a map, not as a leaf.
+            child.set_leaf_node(!row.node.kind.is_map());
+        } else {
+            child.set_expanded(expand);
+            append_rows(&mut child, &row.children, expand);
+        }
+    }
+}
+
+/// The three columns of `docs/DESIGN.md` §8: key, value, owner.
+fn columns(
+    store: &TreeStore<Node>,
+    link: yew::html::Scope<LoadableComponentMaster<PveMetaTree>>,
+) -> Vec<DataTableHeader<Node>> {
+    vec![
+        DataTableColumn::new(tr!("Key"))
+            .width("340px")
+            .tree_column(store.clone())
+            .render_cell(|args: &mut DataTableCellRenderArgs<Node>| {
+                let node = args.record();
+                let icon = match (&node.kind, node.is_set()) {
+                    (ValueKind::Map, _) => "folder-o",
+                    (ValueKind::Array, _) => "list",
+                    _ => "file-text-o",
+                };
+                let mut key = Row::new()
+                    .class(AlignItems::Baseline)
+                    .gap(1)
+                    .with_child(Fa::new(icon).fixed_width())
+                    .with_child(Container::from_tag("span").with_child(node.key.clone()));
+                if !node.is_set() {
+                    key.add_class("pwt-opacity-50");
+                }
+                Column::new()
+                    .with_child(key)
+                    .with_optional_child(node.description.as_deref().map(|note| {
+                        Container::from_tag("span")
+                            .class("pwt-font-label-small")
+                            .class("pwt-color-on-neutral-alt")
+                            .with_child(note.to_string())
+                    }))
+                    .into()
+            })
+            .into(),
+        DataTableColumn::new(tr!("Value"))
+            .flex(1)
+            .render_cell(move |args: &mut DataTableCellRenderArgs<Node>| {
+                let node = args.record();
+                if node.is_set() {
+                    return Container::from_tag("span")
+                        .class("pwt-font-monospace")
+                        .with_child(node.display_value())
+                        .into();
+                }
+                // A declared-but-unset row: its default, greyed, plus the "set" action.
+                let default = node.default_text().unwrap_or_default();
+                let path = node.path.clone();
+                let link = link.clone();
+                Row::new()
+                    .class(AlignItems::Baseline)
+                    .gap(2)
+                    .with_child(
+                        Container::from_tag("span")
+                            .class("pwt-font-monospace")
+                            .class("pwt-opacity-50")
+                            .with_child(match default.is_empty() {
+                                true => tr!("not set"),
+                                false => default,
+                            }),
+                    )
+                    .with_optional_child(node.writable.then(|| {
+                        Container::from_tag("a")
+                            .class("pwt-pointer")
+                            .attribute("role", "button")
+                            .attribute("tabindex", "0")
+                            .onclick(move |event: MouseEvent| {
+                                event.stop_propagation();
+                                link.send_message(Msg::EditRow(path.clone()));
+                            })
+                            .with_child(tr!("Set"))
+                    }))
+                    .into()
+            })
+            .into(),
+        DataTableColumn::new(tr!("Owner"))
+            .width("220px")
+            .render_cell(
+                |args: &mut DataTableCellRenderArgs<Node>| match &args.record().owner {
+                    Some(owner) => Container::from_tag("span")
+                        .attribute("title", owner.detail())
+                        .with_child(owner.label())
+                        .into(),
+                    None => html! {},
+                },
+            )
+            .into(),
+    ]
+}
+
+/// The form of the row dialog: one field of the row's type, plus its description.
+fn row_form(node: &Node) -> Html {
+    let mut panel = InputPanel::new().padding(4).width("auto");
+
+    let text = edit::field_text(node.value.as_ref().or(node.default.as_ref()));
+    let label = tr!("Value");
+
+    match &node.kind {
+        ValueKind::Map => {
+            panel.add_field(
+                label,
+                Field::new()
+                    .name("value")
+                    .disabled(true)
+                    .placeholder(tr!("a map — edit its keys, or use \"Edit as text\"")),
+            );
+        }
+        ValueKind::Boolean => {
+            let checked = node
+                .value
+                .as_ref()
+                .or(node.default.as_ref())
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            panel.add_field(label, Checkbox::new().name("value").default(checked));
+        }
+        ValueKind::Integer => {
+            panel.add_field(
+                label,
+                Number::<i64>::new()
+                    .name("value")
+                    .default(text.parse::<i64>().ok()),
+            );
+        }
+        ValueKind::Number => {
+            panel.add_field(
+                label,
+                Number::<f64>::new()
+                    .name("value")
+                    .default(text.parse::<f64>().ok()),
+            );
+        }
+        ValueKind::Enum(values) => {
+            let items: Rc<Vec<AttrValue>> =
+                Rc::new(values.iter().map(|v| AttrValue::from(v.clone())).collect());
+            panel.add_field(
+                label,
+                Combobox::new()
+                    .name("value")
+                    .required(true)
+                    .items(items)
+                    .default(text),
+            );
+        }
+        ValueKind::Array => {
+            panel.add_large_field(
+                false,
+                false,
+                label,
+                TextArea::new()
+                    .name("value")
+                    .default(text)
+                    .attribute("rows", "4"),
+            );
+        }
+        ValueKind::Text => {
+            panel.add_field(
+                label,
+                Field::new().name("value").default(text).autofocus(true),
+            );
+        }
+    }
+
+    // The row's note is the sibling comment key (`docs/DESIGN.md` §2) — a second key on
+    // the wire, which is why it belongs in a dialog rather than in a cell.
+    panel.add_field(
+        tr!("Description"),
+        Field::new()
+            .name("description")
+            .default(node.note.clone().unwrap_or_default())
+            .placeholder(tr!("stored as {0}", node.comment_path())),
+    );
+
+    panel.into()
+}
+
+/// The writes the row dialog's submit performs.
+fn row_writes(
+    node: &Node,
+    form_ctx: &FormContext,
+    had_description: bool,
+) -> Result<Vec<Write>, String> {
+    let data = form_ctx.get_submit_data();
+    let description = data
+        .get("description")
+        .map(|value| edit::field_text(Some(value)))
+        .unwrap_or_default();
+
+    let value = match (&node.kind, node.is_set()) {
+        // A map row's value is its children; setting one only creates the empty map.
+        (ValueKind::Map, true) => None,
+        (ValueKind::Map, false) => Some(json!({})),
+        (kind, _) => {
+            let text = edit::field_text(data.get("value"));
+            Some(edit::parse_value(kind, &text)?)
+        }
+    };
+
+    let writes = edit::row_writes(
+        &node.path,
+        node.comment_path(),
+        value,
+        Some(&description),
+        had_description,
+    );
+    match writes.is_empty() {
+        true => Err(tr!("nothing changed")),
+        false => Ok(writes),
+    }
+}
+
+/// The form of the Add dialog.
+fn add_form() -> Html {
+    let types: Rc<Vec<AttrValue>> = Rc::new(
+        ["string", "integer", "number", "boolean", "array", "object"]
+            .iter()
+            .map(|t| AttrValue::from(*t))
+            .collect(),
+    );
+
+    InputPanel::new()
+        .padding(4)
+        .width("auto")
+        .with_field(
+            tr!("Key"),
+            Field::new().name("key").required(true).autofocus(true),
+        )
+        .with_field(
+            tr!("Type"),
+            Combobox::new()
+                .name("type")
+                .required(true)
+                .items(types)
+                .default("string"),
+        )
+        .with_field(tr!("Value"), Field::new().name("value"))
+        .with_field(tr!("Description"), Field::new().name("description"))
+        .into()
+}
+
+/// The writes the Add dialog's submit performs.
+fn add_writes(parent: &str, form_ctx: &FormContext) -> Result<Vec<Write>, String> {
+    let data = form_ctx.get_submit_data();
+    let key = edit::field_text(data.get("key"));
+    edit::validate_key(&key)?;
+
+    let kind = match edit::field_text(data.get("type")).as_str() {
+        "integer" => ValueKind::Integer,
+        "number" => ValueKind::Number,
+        "boolean" => ValueKind::Boolean,
+        "array" => ValueKind::Array,
+        "object" => ValueKind::Map,
+        _ => ValueKind::Text,
+    };
+
+    let text = edit::field_text(data.get("value"));
+    let value = match (&kind, text.trim().is_empty()) {
+        (ValueKind::Map, true) => json!({}),
+        (ValueKind::Array, true) => json!([]),
+        _ => edit::parse_value(&kind, &text)?,
+    };
+
+    let description = edit::field_text(data.get("description"));
+    let path = tree::join(parent, &key);
+    let comment = format!("{path}__");
+    Ok(edit::row_writes(
+        &path,
+        &comment,
+        Some(value),
+        Some(&description),
+        false,
+    ))
+}
+
+/// Run a dialog's writes, reporting the outcome to the page.
+async fn submit(
+    doc: DocId,
+    writes: Vec<Write>,
+    digest: String,
+    link: yew::html::Scope<LoadableComponentMaster<PveMetaTree>>,
+) -> Result<(), Error> {
+    match api::apply(doc, writes, &digest).await {
+        Ok(_) => {
+            link.send_message(Msg::WriteOk);
+            Ok(())
+        }
+        Err(err) => {
+            // The page reloads and shows the notice; the dialog keeps what was typed and
+            // shows the server's own message inline.
+            link.send_message(Msg::WriteFailed(err.to_string(), api::is_conflict(&err)));
+            Err(err)
+        }
+    }
+}
+
+/// The standing notice a 409 leaves behind.
+fn conflict_notice() -> String {
+    tr!(
+        "This document changed on the server, so your change was not applied. The tree \
+         below has been reloaded."
+    )
+}
+
+/// The subtree at a dotted path, or `{}` if it is not there.
+fn subtree_at(data: &Value, path: &str) -> Value {
+    if path.is_empty() {
+        return data.clone();
+    }
+    data.pointer(&pointer_of(path))
+        .cloned()
+        .unwrap_or(json!({}))
+}
+
+/// A dotted key path as a JSON pointer (`traefik.spec` → `/traefik/spec`).
+fn pointer_of(path: &str) -> String {
+    path.split('.')
+        .map(|segment| format!("/{}", segment.replace('~', "~0").replace('/', "~1")))
+        .collect()
+}
+
+/// `traefik.spec.host` → `traefik.spec`.
+fn parent_path(path: &str) -> String {
+    match path.rfind('.') {
+        Some(dot) => path[..dot].to_string(),
+        None => String::new(),
     }
 }
 
 impl From<MetaEditor> for VNode {
     fn from(val: MetaEditor) -> Self {
-        let comp = VComp::new::<LoadableComponentMaster<PveMetaEditor>>(Rc::new(val), None);
+        let comp = VComp::new::<LoadableComponentMaster<PveMetaTree>>(Rc::new(val), None);
         VNode::from(comp)
     }
 }

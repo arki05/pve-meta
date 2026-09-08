@@ -27,7 +27,7 @@
  * into the document as a <script> tag (once per URL, cached), and once
  * its xtype resolves to a defined class (waitForXtype() below - verified
  * against real ExtJS 7 classic that this needs the "widget." alias
- * lookup, not a bare Ext.ClassManager.getNameByAlias("widget." + xtype)), the tab
+ * lookup, not a bare Ext.ClassManager.isCreated(xtype)), the tab
  * instantiates "{ xtype, ...config }" in place of the iframe, with vmid/
  * type/node/dc passed as config properties (see buildInstanceConfig()).
  * PVE::API2::Ext validates that a manifest declares exactly one of the

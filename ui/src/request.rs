@@ -1,22 +1,27 @@
 //! Request identity: what an async result was asked for, and whether that is still what
 //! the page wants.
 //!
-//! Every asynchronous thing the editor does — a load, an apply, the diff confirmation, the
-//! version poll's digest check — is issued *for* one document, one view and one generation
-//! of the page. `LoadableComponentMaster` spawns a fresh `load()` per `Msg::Load` with no
-//! cancellation (`COMP/src/loadable_component.rs`, `Msg::Load`), so two loads for two
-//! different views can be in flight at once and finish in either order. Applying the
-//! second-to-last answer over the last one is how a view switch ends up writing view A's
-//! text into view B's path (`docs/REVIEW-2026-09-07.md` F4).
+//! Every asynchronous thing the page does — a load, a row write, the "Edit as text"
+//! subtree fetch — is issued *for* one document and one generation of the page. `LoadableComponentMaster` spawns a fresh `load()` per
+//! `Msg::Load` with no cancellation (`COMP/src/loadable_component.rs`, `Msg::Load`), so
+//! two loads can be in flight at once and finish in either order. Applying the
+//! second-to-last answer over the last one is how a page ends up showing — and then
+//! writing — state that belongs to a document it has already left
+//! (`docs/REVIEW-2026-09-07.md` F4).
 //!
-//! The rule this module implements: **name the thing you are matching against, and check it
-//! at the point of use.** A result carries the [`RequestId`] it was requested for; the page
-//! drops it unless [`RequestTracker::accepts`] still recognises it.
+//! The rule this module implements: **name the thing you are matching against, and check
+//! it at the point of use.** A result carries the [`RequestId`] it was requested for; the
+//! page drops it unless [`RequestTracker::accepts`] still recognises it.
+//!
+//! What a request is *about* — the row path being written, the subtree being fetched as
+//! text — travels in the message payload rather than in the identity: the tree always
+//! shows the whole document, so a per-channel sequence plus the document and the epoch is
+//! the whole of "is this still the answer we want".
 //!
 //! Pure module: no `web-sys`/`wasm-bindgen`, so it is unit-tested natively
 //! (`cargo test --lib`) without a browser.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::model::DocId;
@@ -24,36 +29,26 @@ use crate::model::DocId;
 /// The independent streams of asynchronous work the page runs.
 ///
 /// Each has its own issue counter, so a background digest check never invalidates an
-/// in-flight apply and vice versa — only a *newer request of the same channel*, or a
-/// change of document/view, does.
+/// in-flight write and vice versa — only a *newer request of the same channel*, a change
+/// of document, or an explicit invalidation does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Channel {
-    /// `load()`: the document text, digest, keys and (once) the grants.
+    /// `load()`: the document, its digest, the grants, the registrations, the guest.
     Load,
-    /// `PUT`: applying the edited text.
+    /// A row write (`PUT`/`DELETE`), or the text dialog's apply.
     Apply,
-    /// The apply confirmation's diff of the loaded text against the edited one.
-    Diff,
-    /// The digest re-read triggered by a `GET /meta/version` token change.
-    Digest,
-    /// A grants re-fetch outside `load()`: Reload, and a version-poll tick whose token
-    /// changed. The datacenter document's `scopes` live outside every guest document, so
-    /// nothing about *this* document's digest or content ever signals a scope change —
-    /// this is the only channel that keeps `self.access` from going stale for as long as
-    /// a document stays open (`docs/REVIEW-2026-09-08-pass4.md` Q2).
-    Access,
+    /// The "Edit as text" dialog's fetch of one subtree as YAML.
+    Text,
 }
 
 impl Channel {
-    const COUNT: usize = 5;
+    const COUNT: usize = 3;
 
     fn index(self) -> usize {
         match self {
             Channel::Load => 0,
             Channel::Apply => 1,
-            Channel::Diff => 2,
-            Channel::Digest => 3,
-            Channel::Access => 4,
+            Channel::Text => 2,
         }
     }
 }
@@ -65,10 +60,8 @@ pub struct RequestId {
     pub channel: Channel,
     /// The document as it was when the request went out.
     pub doc: DocId,
-    /// The view (key-path prefix, empty for the whole document) it was asked for.
-    pub view: String,
-    /// Bumped whenever the page changes document or view: everything issued before is
-    /// answering a question the page is no longer asking.
+    /// Bumped whenever the page changes document or explicitly invalidates: everything
+    /// issued before is answering a question the page is no longer asking.
     pub epoch: u64,
     /// Per-channel issue counter: a newer request on the same channel supersedes this one.
     pub seq: u64,
@@ -76,7 +69,6 @@ pub struct RequestId {
 
 struct Inner {
     doc: Cell<DocId>,
-    view: RefCell<String>,
     epoch: Cell<u64>,
     seq: [Cell<u64>; Channel::COUNT],
 }
@@ -92,21 +84,20 @@ pub struct RequestTracker {
 }
 
 impl RequestTracker {
-    /// A tracker for `doc`, whole document, generation zero.
+    /// A tracker for `doc`, generation zero.
     pub fn new(doc: DocId) -> Self {
         Self {
             inner: Rc::new(Inner {
                 doc: Cell::new(doc),
-                view: RefCell::new(String::new()),
                 epoch: Cell::new(0),
                 seq: Default::default(),
             }),
         }
     }
 
-    /// The view the page is showing (empty for the whole document).
-    pub fn view(&self) -> String {
-        self.inner.view.borrow().clone()
+    /// The document the page is showing.
+    pub fn doc(&self) -> DocId {
+        self.inner.doc.get()
     }
 
     /// Issue an id for a request about to go out on `channel`, superseding any earlier
@@ -119,7 +110,6 @@ impl RequestTracker {
         RequestId {
             channel,
             doc: self.inner.doc.get(),
-            view: self.inner.view.borrow().clone(),
             epoch: self.inner.epoch.get(),
             seq: seq.get(),
         }
@@ -129,29 +119,16 @@ impl RequestTracker {
     pub fn accepts(&self, id: &RequestId) -> bool {
         id.epoch == self.inner.epoch.get()
             && id.doc == self.inner.doc.get()
-            && *self.inner.view.borrow() == id.view
             && id.seq == self.inner.seq[id.channel.index()].get()
     }
 
-    /// Show `view` from now on. Returns false (and changes nothing) if it is already the
-    /// selected one; otherwise everything in flight becomes stale.
-    pub fn set_view(&mut self, view: String) -> bool {
-        if *self.inner.view.borrow() == view {
-            return false;
-        }
-        *self.inner.view.borrow_mut() = view;
-        self.bump_epoch();
-        true
-    }
-
-    /// Show `doc` from now on, back at the whole document. Returns false if it is already
-    /// the shown one.
+    /// Show `doc` from now on. Returns false if it is already the shown one; otherwise
+    /// everything in flight becomes stale.
     pub fn set_doc(&mut self, doc: DocId) -> bool {
         if self.inner.doc.get() == doc {
             return false;
         }
         self.inner.doc.set(doc);
-        self.inner.view.borrow_mut().clear();
         self.bump_epoch();
         true
     }
@@ -176,45 +153,6 @@ mod tests {
         let id = tracker.issue(Channel::Load);
 
         assert_eq!(id.doc, DocId::Guest(200));
-        assert_eq!(id.view, "");
-        assert!(tracker.accepts(&id));
-    }
-
-    #[test]
-    fn a_view_switch_strands_the_load_it_replaced() {
-        // The F4 race: a slow load for the whole document, then a switch to `traefik`,
-        // then the slow answer arrives. It must not be applied.
-        let mut tracker = RequestTracker::new(DocId::Guest(200));
-        let slow = tracker.issue(Channel::Load);
-
-        assert!(tracker.set_view("traefik".to_string()));
-        let fresh = tracker.issue(Channel::Load);
-
-        assert!(!tracker.accepts(&slow));
-        assert!(tracker.accepts(&fresh));
-        assert_eq!(slow.view, "");
-        assert_eq!(fresh.view, "traefik");
-    }
-
-    #[test]
-    fn a_switch_back_does_not_resurrect_the_stranded_load() {
-        // Same view string, but a different generation of the page: the answer in flight
-        // was requested against a digest and a buffer that are both gone.
-        let mut tracker = RequestTracker::new(DocId::Guest(200));
-        let stranded = tracker.issue(Channel::Load);
-
-        tracker.set_view("traefik".to_string());
-        tracker.set_view(String::new());
-
-        assert!(!tracker.accepts(&stranded));
-    }
-
-    #[test]
-    fn selecting_the_shown_view_changes_nothing() {
-        let mut tracker = RequestTracker::new(DocId::Datacenter);
-        let id = tracker.issue(Channel::Load);
-
-        assert!(!tracker.set_view(String::new()));
         assert!(tracker.accepts(&id));
     }
 
@@ -230,42 +168,30 @@ mod tests {
 
     #[test]
     fn channels_do_not_invalidate_each_other() {
-        // A background digest poll (or a re-render's diff) must never make the answer to
-        // an in-flight write look stale.
+        // A reload triggered by the version poll must never make the answer to an
+        // in-flight write look stale, nor the text dialog's fetch strand the load beside
+        // it.
         let tracker = RequestTracker::new(DocId::Guest(200));
         let apply = tracker.issue(Channel::Apply);
 
-        let _ = tracker.issue(Channel::Digest);
-        let _ = tracker.issue(Channel::Load);
-        let _ = tracker.issue(Channel::Diff);
-        let _ = tracker.issue(Channel::Access);
+        let load = tracker.issue(Channel::Load);
+        let text = tracker.issue(Channel::Text);
 
+        assert!(tracker.accepts(&apply));
+        assert!(tracker.accepts(&load));
+        assert!(tracker.accepts(&text));
+
+        let text2 = tracker.issue(Channel::Text);
+        assert!(!tracker.accepts(&text));
+        assert!(tracker.accepts(&text2));
+        // A newer text fetch supersedes the older one, but the write beside it is
+        // untouched.
         assert!(tracker.accepts(&apply));
     }
 
     #[test]
-    fn an_access_refresh_does_not_strand_other_channels_and_vice_versa() {
-        // Q2: the poll-tick access re-fetch and an in-flight load/apply/digest must be
-        // independent of each other, exactly like every other channel pair.
-        let tracker = RequestTracker::new(DocId::Guest(200));
-        let load = tracker.issue(Channel::Load);
-        let access = tracker.issue(Channel::Access);
-
-        assert!(tracker.accepts(&load));
-        assert!(tracker.accepts(&access));
-
-        let access2 = tracker.issue(Channel::Access);
-        assert!(!tracker.accepts(&access));
-        assert!(tracker.accepts(&access2));
-        // A newer access request supersedes the older one, but the load beside it is
-        // untouched.
-        assert!(tracker.accepts(&load));
-    }
-
-    #[test]
-    fn a_document_switch_strands_everything_and_resets_the_view() {
+    fn a_document_switch_strands_everything() {
         let mut tracker = RequestTracker::new(DocId::Guest(200));
-        tracker.set_view("traefik".to_string());
         let load = tracker.issue(Channel::Load);
         let apply = tracker.issue(Channel::Apply);
 
@@ -273,7 +199,7 @@ mod tests {
 
         assert!(!tracker.accepts(&load));
         assert!(!tracker.accepts(&apply));
-        assert_eq!(tracker.view(), "");
+        assert_eq!(tracker.doc(), DocId::Datacenter);
         assert!(!tracker.set_doc(DocId::Datacenter));
     }
 
@@ -281,48 +207,43 @@ mod tests {
     fn invalidate_strands_everything_in_flight() {
         let mut tracker = RequestTracker::new(DocId::Guest(200));
         let load = tracker.issue(Channel::Load);
-        let digest = tracker.issue(Channel::Digest);
+        let text = tracker.issue(Channel::Text);
 
         tracker.invalidate();
 
         assert!(!tracker.accepts(&load));
-        assert!(!tracker.accepts(&digest));
-        assert_eq!(tracker.view(), "");
+        assert!(!tracker.accepts(&text));
     }
 
     #[test]
-    fn a_reload_invalidates_a_stale_apply_or_digest_answer() {
-        // `docs/REVIEW-2026-09-08-pass2.md` P8: `Msg::Reload` neither changes doc nor
-        // view (so `set_doc`/`set_view` never fire to bump the epoch on their own), but
-        // it must still strand a request issued before it — otherwise a 409 for an Apply
-        // issued before the reload, or a digest check from the version poll, lands after
-        // the reload and is rendered over a document with nothing unapplied about it.
-        // `PveMetaEditor::update`'s `Msg::Reload` arm is `self.requests.invalidate()`
-        // then `send_reload()` (which issues a fresh `Channel::Load`); this test pins
-        // that sequence directly against `RequestTracker`, since `editor.rs` only
-        // compiles for `wasm32` and cannot be unit-tested natively.
+    fn a_reload_invalidates_a_stale_write_answer() {
+        // `docs/REVIEW-2026-09-08-pass2.md` P8: `Msg::Reload` does not change the
+        // document (so `set_doc` never fires to bump the epoch on its own), but it must
+        // still strand a request issued before it — otherwise a 409 for a write issued
+        // before the reload lands after it and is rendered over a tree with nothing
+        // pending about it.
         let mut tracker = RequestTracker::new(DocId::Guest(200));
         let apply = tracker.issue(Channel::Apply);
-        let digest = tracker.issue(Channel::Digest);
+        let text = tracker.issue(Channel::Text);
 
         // The Reload handler.
         tracker.invalidate();
         let reload = tracker.issue(Channel::Load);
 
         assert!(!tracker.accepts(&apply));
-        assert!(!tracker.accepts(&digest));
+        assert!(!tracker.accepts(&text));
         assert!(tracker.accepts(&reload));
     }
 
     #[test]
     fn a_clone_sees_the_same_state() {
-        // The clone that travels into the async block must observe the switch that
+        // The clone that travels into the async block must observe the change that
         // happened while it was awaiting.
         let mut tracker = RequestTracker::new(DocId::Guest(200));
         let in_flight = tracker.clone();
         let id = in_flight.issue(Channel::Load);
 
-        tracker.set_view("netbird".to_string());
+        tracker.set_doc(DocId::Datacenter);
 
         assert!(!in_flight.accepts(&id));
     }

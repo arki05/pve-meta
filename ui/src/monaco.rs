@@ -21,10 +21,13 @@ extern "C" {
     fn js_mount(el: &Element, opts: &JsValue) -> String;
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = mountDiff)]
-    fn js_mount_diff(el: &Element, original: &str, modified: &str) -> String;
+    fn js_mount_diff(el: &Element, original: &str, modified: &str, language: &str) -> String;
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setValue)]
     fn js_set_value(id: &str, text: &str);
+
+    #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setLanguage)]
+    fn js_set_language(id: &str, language: &str);
 
     #[wasm_bindgen(js_namespace = pveMetaMonaco, js_name = setReadOnly)]
     fn js_set_read_only(id: &str, read_only: bool);
@@ -62,13 +65,18 @@ pub fn mount(el: &Element, options: &MountOptions) -> String {
 }
 
 /// Create a read-only side-by-side diff editor inside `el` and return its id.
-pub fn mount_diff(el: &Element, original: &str, modified: &str) -> String {
-    js_mount_diff(el, original, modified)
+pub fn mount_diff(el: &Element, original: &str, modified: &str, language: &str) -> String {
+    js_mount_diff(el, original, modified, language)
 }
 
 /// Replace the editor's text (a no-op when it already matches).
 pub fn set_value(id: &str, text: &str) {
     js_set_value(id, text);
+}
+
+/// Re-tag the editor's model, so the YAML/JSON toggle highlights what it shows.
+pub fn set_language(id: &str, language: &str) {
+    js_set_language(id, language);
 }
 
 /// Enable or disable editing.
