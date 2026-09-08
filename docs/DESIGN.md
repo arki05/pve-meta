@@ -83,6 +83,7 @@ Grants for a caller on a guest document:
 
 ## 4. Documents on the wire
 
+* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a grammar's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
 * Reads: `data` (JSON object, unordered) or `text` (YAML, the file's own text for the
   root view, a canonical dump for a sub-view). Key order is preserved in the file and is
   not a wire contract; the UI sorts.
