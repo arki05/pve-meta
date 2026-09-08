@@ -303,13 +303,24 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
 /// readable (`docs/DESIGN.md` §9, review P4). Before this, any scope on
 /// anything inside a map disclosed that map's bare `__` even though
 /// `?view=__` was a 403.
+///
+/// **A document that is not a map at the top level is the empty document
+/// here** (review pass 3 R2). A prefix addresses only through maps, so no
+/// non-root prefix can cover any part of a list- or scalar-rooted document:
+/// the honest union of those prefixes is nothing. The catch-all used to
+/// return the value unchanged, which was unreachable only for as long as the
+/// store linted on read — once P2 made reads lenient, a document rewritten
+/// out of band as a list was handed in full to a scope-only caller (through
+/// the view-less GET, and as a content oracle through `?has=`). A full-read
+/// caller holds the root prefix and still gets it verbatim, from the early
+/// return above.
 pub fn filter(doc: &Value, readable_prefixes: &[Path]) -> Value {
     if readable_prefixes.iter().any(|p| p.is_root()) {
         return doc.clone();
     }
     match doc {
         Value::Object(map) => Value::Object(filter_map(map, &Path::root(), readable_prefixes)),
-        other => other.clone(),
+        _ => Value::Object(Map::new()),
     }
 }
 
@@ -658,6 +669,36 @@ mod tests {
     }
 
     #[test]
+    fn merge_never_stores_a_nested_delete_marker_as_a_literal_null() {
+        // Review pass 3 R7, through the view layer: `view::merge` did the
+        // empty-scratch trick for the value at the prefix itself, but
+        // `patch::apply_obj`'s fallback spliced a nested patch object in
+        // verbatim, nulls and all -- so a legal merge payload produced a
+        // document the whole-document lint refused.
+        let mut absent = json!({"traefik": {"host": "x"}});
+        let touched = merge(&mut absent, &p("traefik"), &json!({"sub": {"gone": null}})).unwrap();
+        assert_eq!(absent, json!({"traefik": {"host": "x"}}));
+        assert!(touched.is_empty(), "a merge that touches nothing changes nothing");
+
+        let mut mixed = json!({"traefik": {"host": "x"}});
+        let touched2 = merge(&mut mixed, &p("traefik"), &json!({"sub": {"port": 1, "gone": null}})).unwrap();
+        assert_eq!(mixed, json!({"traefik": {"host": "x", "sub": {"port": 1}}}));
+        assert_eq!(paths(&touched2), vec!["traefik.sub".to_string()]);
+
+        // Whatever a merge produces must pass the document lint, or the API
+        // layer rejects a write it accepted as a patch.
+        for (prefix, patch) in [
+            ("traefik", json!({"sub": {"gone": null}})),
+            ("traefik", json!({"host": {"deep": null}})),
+            ("nope", json!({"gone": null})),
+        ] {
+            let mut doc = json!({"traefik": {"host": "x"}});
+            merge(&mut doc, &p(prefix), &patch).unwrap();
+            assert!(model::lint(&doc).is_empty(), "{prefix} + {patch}: {doc}");
+        }
+    }
+
+    #[test]
     fn merge_over_a_scalar_replaces_it_with_a_map() {
         let mut doc = json!({"a": "scalar"});
         let touched = merge(&mut doc, &p("a"), &json!({"x": 1})).unwrap();
@@ -885,6 +926,29 @@ mod tests {
     fn filter_through_array_never_matches() {
         let doc = json!({"a": [1, 2, 3]});
         assert_eq!(filter(&doc, &[p("a.0")]), json!({}));
+    }
+
+    #[test]
+    fn filter_of_a_document_that_is_not_a_map_is_empty_for_a_scoped_reader() {
+        // Review pass 3 R2, a regression the P2 fix made reachable: the
+        // catch-all arm returned the value unchanged without ever consulting
+        // the prefixes, so a document rewritten out of band as a list or a
+        // scalar was handed in full to a scope-only caller. Before P2 the
+        // store linted on read and rule 1 turned such a document into a 400,
+        // so nothing exercised the arm.
+        for doc in [
+            json!([1, 2, 3]),
+            json!(["a"]),
+            json!("just a string"),
+            json!(42),
+            json!(true),
+        ] {
+            assert_eq!(filter(&doc, &[p("a")]), json!({}), "{doc} leaked to a scope on `a`");
+            assert_eq!(filter(&doc, &[p("a.b"), p("traefik")]), json!({}), "{doc} leaked");
+            assert_eq!(filter(&doc, &[]), json!({}), "{doc} leaked to a zero grant");
+            // A full reader holds the root prefix and still gets it verbatim.
+            assert_eq!(filter(&doc, &[Path::root()]), doc);
+        }
     }
 
     #[test]

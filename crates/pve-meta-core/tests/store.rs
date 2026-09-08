@@ -3,7 +3,7 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
-use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome};
+use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome, WriteGate, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
@@ -368,9 +368,118 @@ fn reads_never_lint_but_writes_still_do() {
     ));
     assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
 
-    // Syntax errors are still errors on read: there is no value to return.
+    // A syntax error is reported *per document*, not raised: see
+    // `a_syntax_error_is_reported_per_document_and_never_blocks_a_repair`.
     std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
-    assert!(matches!(store.read(DocId::Guest(100)), Err(Error::Parse { .. })));
+    let unparseable = store.read(DocId::Guest(100)).unwrap();
+    assert!(unparseable.parse_error.is_some());
+    assert_eq!(unparseable.value, json!({}));
+}
+
+#[test]
+fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
+    // Review pass 3 R1. Pass 2 moved the *lint* off the read path and left
+    // the *parse* fatal, which is the same cluster-wide outage one layer
+    // down: `api::grants` reads `datacenter.yaml` on every guest request, and
+    // both write handlers read the document before planning, so a tab or an
+    // indentation slip in a hand-edited file 400'd every endpoint for every
+    // principal -- root included -- and could not be repaired through the
+    // API. Each of these is a real YAML syntax failure, not a lint finding.
+    for broken in [
+        "a: 1\n\tb: 2\n",            // a tab
+        "a: &anc 1\nb: *anc\n",      // an anchor and an alias
+        "a: 1\n  b: 2\n",            // an indentation slip
+        "a: !!str 1\n",              // an explicit tag
+        "a: [\n",                    // an unterminated flow sequence
+        "? [1, 2]\n: v\n",           // a complex key
+    ] {
+        let (dir, store) = store();
+        std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+
+        let doc = store.read(DocId::Datacenter).unwrap();
+        assert!(doc.parse_error.is_some(), "{broken:?} parsed after all");
+        // The empty document, the real bytes, the real digest.
+        assert_eq!(doc.value, json!({}));
+        assert_eq!(doc.raw, broken);
+        assert_eq!(doc.digest, digest(broken.as_bytes()));
+
+        // The repair goes through, with the compare-and-swap precondition
+        // intact -- `put_raw`'s parse of the *old* bytes used to be the last
+        // thing standing between the file and its own fix.
+        let good = "ok: 1\n";
+        store
+            .put_raw(DocId::Datacenter, good, Some(&doc.digest))
+            .unwrap_or_else(|e| panic!("{broken:?}: repair refused: {e}"));
+        assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+
+        // A stale digest is still a 409-shaped refusal, not a free pass.
+        std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+        assert!(matches!(
+            store.put_raw(DocId::Datacenter, good, Some("deadbeef")),
+            Err(Error::DigestMismatch { .. })
+        ));
+    }
+}
+
+#[test]
+fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
+    // Review pass 3 §5, `store.rs:235`: `MAX_BYTES` only ever applied to
+    // writes, so a multi-megabyte file dropped in out of band was read and
+    // SHA-256'd on every request that touched the document -- `datacenter.yaml`
+    // on every guest operation, and every 5 s `version()` poll.
+    let (dir, store) = store();
+    let big = format!("a: \"{}\"\n", "x".repeat(MAX_READ_BYTES as usize));
+    std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
+
+    match store.read(DocId::Guest(100)).unwrap_err() {
+        Error::TooLarge { size, max } => {
+            assert_eq!(max, MAX_READ_BYTES);
+            assert!(size > MAX_READ_BYTES);
+        }
+        other => panic!("expected TooLarge, got {other:?}"),
+    }
+
+    // A document that was legally written is always readable back: the read
+    // cap is eight times the write cap on purpose.
+    let legal = format!("a: \"{}\"\n", "x".repeat(400 * 1024));
+    store.put_raw(DocId::Guest(101), &legal, None).unwrap();
+    assert!(store.read(DocId::Guest(101)).is_ok());
+
+    // ... and the oversized one can still be replaced with something sane
+    // (the repair path does not depend on reading the old content).
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    assert_eq!(store.read(DocId::Guest(100)).unwrap().value, json!({"a": 1}));
+}
+
+#[test]
+fn the_caller_linted_write_gate_stores_content_the_document_lint_would_refuse() {
+    // Review pass 3 R6, the store's half: a scoped write lints the subtree it
+    // writes, so the store must not re-apply the whole-document lint (which
+    // would deny the write *and* render the offending path) for an
+    // out-of-band problem the caller neither made nor can see.
+    let (dir, store) = store();
+    std::fs::write(dir.path().join("100.yaml"), "bad key: 1\ntraefik:\n  host: a\n").unwrap();
+
+    let text = "bad key: 1\ntraefik:\n  host: b\n";
+    assert!(matches!(
+        store.put_raw(DocId::Guest(100), text, None),
+        Err(Error::Lint(_)),
+    ));
+    store
+        .put_raw_gated(DocId::Guest(100), text, None, WriteGate::CallerLinted)
+        .expect("a caller-linted write is not blocked by a pre-existing bad key");
+    assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
+
+    // The one whole-document rule the narrow gate keeps: it is still a map,
+    // and it still has to parse.
+    assert!(matches!(
+        store.put_raw_gated(DocId::Guest(100), "- 1\n- 2\n", None, WriteGate::CallerLinted),
+        Err(Error::Lint(_))
+    ));
+    assert!(matches!(
+        store.put_raw_gated(DocId::Guest(100), "a: [\n", None, WriteGate::CallerLinted),
+        Err(Error::Parse { .. })
+    ));
 }
 
 #[test]

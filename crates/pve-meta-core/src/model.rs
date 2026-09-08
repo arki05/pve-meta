@@ -26,11 +26,22 @@ pub(crate) fn is_valid_key(k: &str) -> bool {
     is_valid_segment(k)
 }
 
-/// The one reserved top-level key: the datacenter document's access-control
-/// map (`docs/DESIGN.md` §2). Its own keys are PVE authids rather than
-/// document keys, and it is an **opaque leaf** for path addressing
-/// (`docs/DESIGN.md` §9) — see [`is_authid`], [`crate::scopes::parse_scopes`]
-/// and `crate::api`'s view parsing.
+/// The one reserved top-level key, in **every** document
+/// (`docs/DESIGN.md` §9): the datacenter document's access-control map
+/// (`docs/DESIGN.md` §2). Its own keys are PVE authids rather than document
+/// keys, and it is an **opaque leaf** for path addressing — see
+/// [`is_authid`], [`crate::scopes::parse_scopes`] and `crate::api`'s view
+/// parsing.
+///
+/// The name is reserved everywhere rather than only in the datacenter
+/// document, so that one document's key rule, view addressing, scope-prefix
+/// rule and `touched` reporting cannot disagree with another's (review pass 3
+/// §5, `api.rs:173`). Only the datacenter document's `scopes` map *means*
+/// anything — [`crate::scopes::scopes_for`] reads that one and no other — so
+/// only there is a write to it additionally gated on `full_write`
+/// (`crate::api`'s `check_scopes_write`). In a guest document `scopes` is
+/// ordinary user data that happens to be addressed as a whole and to accept
+/// authid-shaped keys.
 pub const SCOPES_KEY: &str = "scopes";
 
 /// `true` if `s` is a PVE realm (or token sub-id): `[A-Za-z][A-Za-z0-9.\-_]+`
@@ -149,6 +160,40 @@ pub fn lint_relaxed(doc: &Value) -> Vec<Lint> {
 pub fn lint_relaxed_at(doc: &Value, base: &Path) -> Vec<Lint> {
     let mut out = Vec::new();
     walk(doc, base, &mut out);
+    out
+}
+
+/// Lints `value` **as it sits at `path`** in the document: [`lint_relaxed_at`]
+/// plus the two rules that belong to `path`'s own last segment, which are
+/// checked in the *parent* map and would otherwise be checked nowhere.
+///
+/// [`lint`] sees every key from its parent, so it applies the key rule and
+/// the comment-key rule to `traefik__` as well as to everything below it. A
+/// caller linting only the subtree it wrote (`crate::api`'s scoped write
+/// path, review pass 3 R6) starts one level too deep: `lint_relaxed_at(5,
+/// "traefik__")` walks a number and finds nothing, so `PUT ?view=traefik__`
+/// with `5` would store a comment key whose value is not a string. This is
+/// the same rule set, anchored at the parent.
+///
+/// Root has no parent and no key of its own, so it is exactly
+/// [`lint_relaxed_at`] there.
+pub fn lint_at(value: &Value, path: &Path) -> Vec<Lint> {
+    let mut out = Vec::new();
+    if let (Some(parent), Some(key)) = (path.parent(), path.last()) {
+        if let Some(msg) = key_lint(&parent, key) {
+            out.push(Lint {
+                path: path.clone(),
+                msg,
+            });
+        }
+        if is_comment_key(key) && !value.is_string() {
+            out.push(Lint {
+                path: path.clone(),
+                msg: "comment key value must be a string".to_string(),
+            });
+        }
+    }
+    out.extend(lint_relaxed_at(value, path));
     out
 }
 

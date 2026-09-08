@@ -74,21 +74,33 @@ sub _scopes_for {
 # the caller's scopes.
 #
 # `$orphan` is set when the vmid is *not* in the vmlist (`docs/DESIGN.md` §9):
-# the document is an orphan, or there is nothing there at all. There is no
-# guest, so the datacenter ACL grants the access too (Sys.Audit / Sys.Modify
-# on /, in addition to whatever /vms/$vmid still says), and scopes do not
-# apply -- a scope grants "the prefix on every guest document", and this
-# document has no guest. Callers that must not act on an orphan at all (PUT)
-# never get here; `_orphan_or_404` is the gate.
+# the document is an orphan, or there is nothing there at all. Then the
+# permission is the *datacenter* ACL and nothing else -- `Sys.Audit` /
+# `Sys.Modify` on `/` -- and scopes do not apply, because a scope grants "the
+# prefix on every guest document" and this document has no guest.
+#
+# `/vms/$vmid` is deliberately not consulted for an orphan (review pass 3 §5,
+# `Meta.pm:86`). PVE permits ACLs on `/vms/<n>` with no guest behind them, and
+# the orphan scenarios are exactly the ones where `remove_vm_access` never ran
+# -- a guest destroyed while its node was down, a config removed by hand -- so
+# a stale grant could otherwise delete an orphan or partially write it through
+# `DELETE ?view=<prefix>`. `docs/DESIGN.md` §9 and `delete_guest`'s own
+# permission text both say datacenter write; this is that, for read and write
+# alike, and it is the same answer `GET /meta/access?vmid=<orphan>` gives.
+#
+# Callers that must not act on an orphan at all (PUT) never get here;
+# `_orphan_or_404` is the gate.
 sub _guest_grants_json {
     my ($rpcenv, $authuser, $vmid, $scopes, $orphan) = @_;
+    if ($orphan) {
+        return _grants_json(
+            $rpcenv->check($authuser, '/', ['Sys.Audit'], 1),
+            $rpcenv->check($authuser, '/', ['Sys.Modify'], 1),
+            [],
+        );
+    }
     my $full_read = $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1);
     my $full_write = $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options'], 1);
-    if ($orphan) {
-        $full_read ||= $rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
-        $full_write ||= $rpcenv->check($authuser, '/', ['Sys.Modify'], 1);
-        return _grants_json($full_read, $full_write, []);
-    }
     return _grants_json($full_read, $full_write, $scopes);
 }
 
@@ -188,8 +200,14 @@ sub _assert_guest_exists {
 sub _orphan_or_404 {
     my ($rpcenv, $authuser, $vmid) = @_;
     return 0 if _vmlist_ids()->{$vmid};
+    # `int()`: `has_document` takes a `u32` through perlmod, which refuses a
+    # string scalar ("invalid type: string, expected u32"). A `{vmid}` *path*
+    # parameter arrives numified, but `/meta/access?vmid=` is an ordinary
+    # optional parameter and does not -- so the same helper answered
+    # correctly for DELETE and died for GET until this call site existed to
+    # show it.
     raise("guest '$vmid' does not exist\n", code => 404)
-        if !PVE::RS::Meta::has_document($vmid)
+        if !PVE::RS::Meta::has_document(int($vmid))
         || !$rpcenv->check($authuser, '/', ['Sys.Audit'], 1);
     return 1;
 }
@@ -298,6 +316,22 @@ my $VIEW_RETURNS = {
         },
         data => { type => 'object', optional => 1, description => "Present when format=json (unordered)." },
         text => { type => 'string', optional => 1, description => "Present when format=yaml (ordered)." },
+        parse_error => {
+            type => 'string',
+            optional => 1,
+            description => "Present only when the stored document is not valid YAML "
+                . "(docs/DESIGN.md §9): the parser's message. 'data'/'text' then describe "
+                . "the empty document and 'keys' is empty, but 'digest' is the real digest "
+                . "of the bytes on disk, so the document can be repaired with a "
+                . "whole-document PUT (no 'view', mode=replace) or removed with DELETE.",
+        },
+        raw => {
+            type => 'string',
+            optional => 1,
+            description => "The document's raw text. Present only alongside 'parse_error', "
+                . "and only for a caller who may read the whole document (VM.Audit / "
+                . "Sys.Audit) -- it is what they need to write the repair.",
+        },
     },
 };
 
@@ -407,6 +441,11 @@ __PACKAGE__->register_method({
         . "VM.Config.Options with 'vmid'; Sys.Audit / Sys.Modify with 'dc'), and "
         . "'scopes' lists the caller's datacenter-configured prefix scopes, which "
         . "apply to every guest document but never to the datacenter document. "
+        . "For an orphan vmid (a document whose guest is no longer in the vmlist) "
+        . "'read'/'write' are Sys.Audit / Sys.Modify on / and 'scopes' is empty, "
+        . "matching what a GET/DELETE of that document actually allows "
+        . "(docs/DESIGN.md §9); a vmid that is neither a guest nor a visible "
+        . "orphan is 404. "
         . "With neither parameter, 'read'/'write' describe the datacenter document. "
         . "Used by the editor UI to decide what to offer and whether to enable Apply.",
     parameters => {
@@ -438,7 +477,21 @@ __PACKAGE__->register_method({
             if defined($param->{vmid}) && $param->{dc};
 
         if (defined(my $vmid = $param->{vmid})) {
-            _assert_guest_exists($vmid);
+            # An orphan is a document the same caller can list, GET and
+            # DELETE, so answering 404 here made the one document a
+            # datacenter admin most needs to clean up open read-only in the
+            # editor (which treats any failure of this call as the malformed-
+            # scopes case). Same gate as `delete_guest`, same answer as
+            # `_guest_grants_json`'s orphan branch: datacenter ACL only, no
+            # scopes -- there is no guest for a scope to apply to
+            # (`docs/DESIGN.md` §9, review pass 3 R8).
+            my $orphan = _orphan_or_404($rpcenv, $authuser, $vmid);
+            return {
+                read => $rpcenv->check($authuser, '/', ['Sys.Audit'], 1) ? 1 : 0,
+                write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
+                scopes => [],
+            } if $orphan;
+
             return {
                 read => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1) ? 1 : 0,
                 write => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options'], 1) ? 1 : 0,
@@ -543,8 +596,10 @@ __PACKAGE__->register_method({
             . "VM.Audit, or a datacenter-configured scope). A caller with neither is "
             . "refused with 403, as is a 'view' outside the caller's read access. "
             . "For a vmid that is not in the vmlist (an orphan document, or nothing "
-            . "at all) Sys.Audit on / grants the read as well, and scopes do not "
-            . "apply -- there is no guest for them to apply to. GET never 404s.",
+            . "at all) the permission is Sys.Audit on / alone -- a stale /vms/<vmid> "
+            . "ACL left behind by a destroy is not consulted, and scopes do not "
+            . "apply, since there is no guest for either to apply to "
+            . "(docs/DESIGN.md §9). GET never 404s.",
         user => 'all',
     },
     description => "Gets a guest's metadata document (or a view/prefix of it).",

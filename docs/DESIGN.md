@@ -57,7 +57,7 @@ PVE conventions (form/JSON parameters; nested values are JSON-encoded strings).
 | Method | Path | Params | Returns |
 |---|---|---|---|
 | GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller], orphan }]` — every guest in the vmlist the caller can read something of, `digest: ""` when no document; `node`/`name` only with `VM.Audit`; documents whose vmid is no longer in the vmlist are listed with `orphan: 1` (and `node`/`type`/`name` null) for callers with datacenter read |
-| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object |
+| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object. A document whose stored text does not parse answers 200 with `parse_error` (the parser's message), empty `data`/`text`, no `keys`, its real `digest`, and — for a caller with full read — `raw`, the text to repair from (§9) |
 | PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
@@ -195,14 +195,48 @@ These resolve the under-specified corners the review found (`REVIEW-2026-09-07.m
 * **`scopes` keys are PVE authids** (validated with the authid rule, dots allowed) and the
   `scopes` map is an opaque leaf for path addressing: a view may target `scopes` as a
   whole, never a single entry. Entries are added or removed by writing the map.
-* **Reads never lint.** The store reads and returns what is on disk; strict lint runs only
-  on the content being written. A malformed `scopes` container or entry is skipped with
-  a warning and grants nothing.
+* **Reads never lint, and never fail on a document's own content.** The store reads and
+  returns what is on disk. Text that does not parse as YAML at all is reported *per
+  document* — `parse_error` plus the empty value, and `raw` for a caller with full read —
+  never as an error, because `api::grants` reads `datacenter.yaml` on every guest request
+  and both write handlers read a document before planning: a fatal parse was a
+  cluster-wide 400 for every principal, root included, that also blocked its own repair.
+  An unparseable (or oversized) document is repaired by replacing it whole — `PUT` with no
+  `view` and `mode=replace`, or `DELETE` — and every narrower write against it is refused
+  with 400, since the value planned against is the empty document and a narrower write
+  would silently discard the file. A malformed `scopes` container or entry, and an
+  unparseable `datacenter.yaml`, are skipped with a warning and grant nothing.
+* **Strict lint runs only on the content being written.** A caller who may replace the
+  whole document is gated on the whole document; anyone else is gated on the subtree
+  their view writes, so one out-of-band bad key elsewhere denies nobody. A 400 from lint
+  obeys the same disclosure rule as a 403: findings the caller may read are named, the
+  rest are counted.
+* **A document that is not a map at the top level is the empty document for a scope-only
+  reader** and is returned as-is to a full reader; the write gate refuses to store it
+  again. A view prefix addresses only through maps, so no scope covers any part of such
+  a document.
+* **`scopes` is a reserved top-level key in every document**, not only the datacenter one:
+  one key rule (PVE authids, dots allowed), one addressing rule (an opaque leaf — `touched`
+  reports `scopes`, never `scopes.<authid>`), one scope-prefix rule, everywhere. Only the
+  datacenter document's `scopes` map *means* anything, and only there does a write to it
+  additionally require `Sys.Modify`.
+* **A scope prefix is non-empty, never inside `scopes`, and never a bare `__`** — checked
+  both where the datacenter document is written and where a `grants` value crosses into
+  the core. A bare `__` documents the map it sits in and is readable only where that map
+  is; `prefix: a__` (the note about `a`) stays legal.
+* **Documents have a read size cap** (4 MiB, eight times the write limit): a larger file
+  is refused with a clear error rather than parsed and hashed on every request, and can
+  still be replaced or deleted whole.
 * **The bare `__` comment of a map is visible only when the map itself is readable**
   (a scope on `p` covers `p`, `p__` and everything below `p`, nothing above it).
 * **Orphans** (documents whose vmid is no longer in the vmlist) are listed by
   `GET /meta/guests` with `orphan: true` for callers with datacenter read, and may be
-  deleted by callers with datacenter write. Nothing else may write them.
+  deleted by callers with datacenter write. Nothing else may write them. An orphan's
+  read/write authority is computed **purely from `/`** (`Sys.Audit` / `Sys.Modify`): there
+  is no guest, so a `/vms/<vmid>` ACL left behind by a destroy that never ran
+  `remove_vm_access` confers nothing, and scopes do not apply. `GET /meta/access?vmid=`
+  answers for an orphan with exactly those two flags and an empty `scopes` — the same
+  answer its GET and DELETE act on — rather than 404.
 * **`GET /meta/access` and the single-document GET** are documented as implemented:
   `{ read, write, scopes }` with optional `vmid`/`dc`; documents return `id`, `view`,
   `digest`, ordered `keys`, and `data` or `text`. `GET /meta/version` returns

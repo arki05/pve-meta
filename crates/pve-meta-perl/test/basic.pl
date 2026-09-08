@@ -647,4 +647,201 @@ is_deeply(
 
 PVE::RS::Meta::api_delete('200', undef, undef, $FULL);
 
+# --- an unparseable document denies nobody (pass 3 R1) ---------------------
+#
+# Pass 2 moved the *lint* off the read path and left the *parse* fatal, which
+# is the same cluster-wide outage one layer down: `api_grants` reads
+# `datacenter.yaml` on every guest request, and both write handlers read the
+# document before planning, so one tab in a hand-edited file 400'd every
+# endpoint for every principal -- root included -- and could not be repaired
+# through the API.
+my $SCOPED = grants_json(scopes => [{ prefix => 'traefik', mode => 'rw' }]);
+PVE::RS::Meta::api_put('9500', undef, 'json', encode_json({ traefik => { host => 'x' } }), 'replace', undef, 0, $FULL);
+
+for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: [\n") {
+    (my $label = $broken) =~ s/\n/\\n/g;
+    write_file('datacenter.yaml', $broken);
+
+    is_deeply(decode_json(PVE::RS::Meta::api_grants('svc@pve!tok')), [],
+        "[$label] the scope lookup grants nothing instead of failing");
+    is_deeply(decode_json(PVE::RS::Meta::api_grants('root@pam')), [],
+        "[$label] ... for the administrator too");
+
+    ok(defined(eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', 1, $FULL) }),
+        "[$label] an unrelated guest read still works");
+    ok(defined(eval {
+            PVE::RS::Meta::api_put('9500', 'traefik', 'json', '{"host":"y"}', 'replace', undef, 0, $SCOPED)
+        }),
+        "[$label] an unrelated scoped guest write still works");
+
+    my $dc = PVE::RS::Meta::api_get('datacenter', undef, 'yaml', 1, $FULL);
+    ok(defined($dc->{parse_error}), "[$label] the document itself answers with parse_error");
+    is($dc->{raw}, $broken, "[$label] a full reader gets the raw text to repair from");
+    is($dc->{text}, "{}\n", "[$label] ... and no data, since nothing parsed");
+    is_deeply($dc->{keys}, [], "[$label] ... and no keys");
+    isnt($dc->{digest}, '', "[$label] ... but the real digest");
+
+    my $scoped_dc = PVE::RS::Meta::api_get(
+        'datacenter', undef, 'json', 1, grants_json(scopes => [{ prefix => 'traefik', mode => 'ro' }]),
+    );
+    ok(defined($scoped_dc->{parse_error}), "[$label] a scoped reader is told why it is empty");
+    is($scoped_dc->{raw}, undef, "[$label] ... and never gets the bytes");
+
+    # A narrower write would plan against the empty document and silently
+    # drop the file's whole content: refused.
+    $res = eval { PVE::RS::Meta::api_put('datacenter', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
+    ok(!defined($res), "[$label] a view write against it is refused");
+    like($@, api_error_status(400), "[$label] that write is refused with 400:");
+    like($@, qr/repaired as a whole/, "[$label] the 400 says how to repair it");
+    is(read_file('datacenter.yaml'), $broken, "[$label] and nothing was written");
+
+    # The documented repair: a root-level replace, digest and all.
+    PVE::RS::Meta::api_put(
+        'datacenter', undef, 'yaml',
+        "scopes:\n  svc\@pve!tok:\n  - prefix: traefik\n    mode: rw\n",
+        'replace', $dc->{digest}, 0, $FULL,
+    );
+    is_deeply(
+        decode_json(PVE::RS::Meta::api_grants('svc@pve!tok')),
+        [{ prefix => 'traefik', mode => 'rw' }],
+        "[$label] a root-level replace repairs it",
+    );
+
+    # ... and a root DELETE is the other repair shape.
+    write_file('datacenter.yaml', $broken);
+    PVE::RS::Meta::api_delete('datacenter', undef, undef, $FULL);
+    ok(!file_exists('datacenter.yaml'), "[$label] a root DELETE removes it");
+}
+
+# --- a non-map document is empty for a scoped reader (pass 3 R2) -----------
+#
+# `view::filter`'s catch-all returned the whole value without consulting the
+# prefixes; before pass 2 made reads lenient, lint rule 1 made that arm
+# unreachable.
+for my $text ("- a\n- secret\n", "just a scalar\n") {
+    (my $label = $text) =~ s/\n/\\n/g;
+    write_file('9501.yaml', $text);
+
+    is(PVE::RS::Meta::api_get('9501', undef, 'yaml', 1, $SCOPED)->{text}, "{}\n",
+        "[$label] a scope-only reader gets nothing");
+    is_deeply(PVE::RS::Meta::api_get('9501', undef, 'yaml', 1, $SCOPED)->{keys}, [],
+        "[$label] ... and no keys");
+    is(PVE::RS::Meta::api_get('9501', undef, 'yaml', 1, $FULL)->{text}, $text,
+        "[$label] a full reader still sees exactly what is on disk");
+    is(
+        scalar(@{ PVE::RS::Meta::api_list_guests(encode_json([{ vmid => 9501, grants => $SCOPED }]), 'traefik', 0) }),
+        0,
+        "[$label] ?has= is not a content oracle over it either",
+    );
+
+    # The write gate refuses to store it again.
+    $res = eval { PVE::RS::Meta::api_put('9501', undef, 'yaml', $text, 'replace', undef, 0, $FULL) };
+    ok(!defined($res), "[$label] storing it again is refused");
+    like($@, api_error_status(400), "[$label] that write is refused with 400:");
+    is(read_file('9501.yaml'), $text, "[$label] and nothing was written");
+}
+unlink("$root/9501.yaml");
+
+# --- a lint 400 never names an unreadable path (pass 3 R6) -----------------
+write_file('9502.yaml', "traefik:\n  host: x\nsecret_area:\n  customer name: acme\n");
+ok(
+    defined(eval {
+        PVE::RS::Meta::api_put('9502', 'traefik', 'json', '{"host":"y"}', 'replace', undef, 0, $SCOPED)
+    }),
+    'an out-of-band bad key elsewhere does not block a scoped write',
+);
+like(read_file('9502.yaml'), qr/customer name/, 'and the scoped write did not drop it either');
+
+$res = eval { PVE::RS::Meta::api_put('9502', 'traefik', 'json', '{"my bad":1}', 'replace', undef, 0, $SCOPED) };
+ok(!defined($res), 'a scoped writer\'s own bad key is still refused');
+like($@, api_error_status(400), 'that write is refused with 400:');
+like($@, qr/my bad/, 'and the 400 names the key the caller wrote');
+unlike($@, qr/customer name|secret_area/, 'but never a key the caller cannot read');
+
+$res = eval { PVE::RS::Meta::api_put('9502', 'traefik', 'json', '{"host":"z"}', 'replace', undef, 0, $FULL) };
+ok(!defined($res), 'a full-write caller is still gated on the whole document');
+like($@, qr/customer name/, 'and does get the offending path spelled out');
+
+# Narrowing the *scope* of the lint must not narrow its *rules*: every one of
+# these was caught by the whole-document lint before, including the
+# comment-key-value rule, which lives in the view's parent map.
+for my $case (
+    ['traefik__', 'replace', '5', qr/comment key value must be a string/],
+    ['traefik', 'replace', '{"bad key":1}', qr/invalid key/],
+    ['traefik', 'replace', '{"deep":{"a.b":1}}', qr/no dots/],
+    ['traefik', 'replace', '{"list":[{"bad key":1}]}', qr/invalid key/],
+    ['traefik', 'merge', '{"x__":5}', qr/comment key value must be a string/],
+    ['traefik', 'replace', '{"nul":null}', qr/null values are not allowed/],
+) {
+    my ($view, $mode, $payload, $re) = @$case;
+    $res = eval { PVE::RS::Meta::api_put('9502', $view, 'json', $payload, $mode, undef, 0, $SCOPED) };
+    ok(!defined($res), "a scoped write of $payload at $view is still refused");
+    like($@, $re, "... with the rule the whole-document lint used to report");
+}
+ok(
+    defined(eval {
+        PVE::RS::Meta::api_put('9502', 'traefik__', 'json', '"the ingress config"', 'replace', undef, 0, $SCOPED)
+    }),
+    'a legitimate comment-key write still goes through',
+);
+unlink("$root/9502.yaml");
+
+# --- a nested delete marker is applied, not stored (pass 3 R7) -------------
+PVE::RS::Meta::api_put('9503', undef, 'json', encode_json({ traefik => { host => 'x' } }), 'replace', undef, 0, $FULL);
+my $noop = PVE::RS::Meta::api_put('9503', 'traefik', 'json', '{"sub":{"gone":null}}', 'merge', undef, 0, $SCOPED);
+is_deeply($noop->{touched}, [], 'a nested delete of a not-yet-existing container touches nothing');
+is_deeply(
+    decode_json(PVE::RS::Meta::api_get('9503', 'traefik', 'json', 1, $FULL)->{data_json}),
+    { host => 'x' },
+    'and creates nothing',
+);
+PVE::RS::Meta::api_put('9503', 'traefik', 'json', '{"sub":{"port":1,"gone":null}}', 'merge', undef, 0, $SCOPED);
+is_deeply(
+    decode_json(PVE::RS::Meta::api_get('9503', 'traefik', 'json', 1, $FULL)->{data_json}),
+    { host => 'x', sub => { port => 1 } },
+    'a combined set+delete against an absent container stores only the set',
+);
+PVE::RS::Meta::api_delete('9503', undef, undef, $FULL);
+
+# --- `touched` collapses a path inside `scopes` (pass 3 section 5) ---------
+PVE::RS::Meta::api_put(
+    'datacenter', 'scopes', 'json',
+    encode_json({ 'john.doe@pve' => [{ prefix => 'traefik', mode => 'ro' }] }),
+    'replace', undef, 0, $FULL,
+);
+is_deeply(
+    PVE::RS::Meta::api_put(
+        'datacenter', 'scopes', 'json',
+        encode_json({ 'a.b@pve' => [{ prefix => 'netbird', mode => 'ro' }] }),
+        'merge', undef, 0, $FULL,
+    )->{touched},
+    [{ path => 'scopes', op => 'set' }],
+    'a write inside the scopes map reports the map, not another principal\'s authid',
+);
+PVE::RS::Meta::api_delete('datacenter', undef, undef, $FULL);
+
+# --- an invalid scope prefix is refused at the wire boundary (section 5) ---
+for my $bad ('', 'scopes.other@pve', '__') {
+    my $g = grants_json(scopes => [{ prefix => $bad, mode => 'rw' }]);
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'json', 1, $g) };
+    ok(!defined($res), "a scope prefix '$bad' is refused at the grants boundary");
+    like($@, api_error_status(400), "that request is refused with 400:");
+}
+
+# --- a document above the read cap is refused, not hashed (section 5) ------
+write_file('9504.yaml', "a: \"" . ('x' x (4 * 1024 * 1024)) . "\"\n");
+$res = eval { PVE::RS::Meta::api_get('9504', undef, 'json', 1, $FULL) };
+ok(!defined($res), 'a document above the read cap is refused');
+like($@, api_error_status(400), 'that read is refused with 400:');
+like($@, qr/too large/, 'and says why');
+# It is still replaceable: the repair does not depend on reading it.
+PVE::RS::Meta::api_put('9504', undef, 'json', encode_json({ a => 1 }), 'replace', undef, 0, $FULL);
+is_deeply(
+    decode_json(PVE::RS::Meta::api_get('9504', undef, 'json', 1, $FULL)->{data_json}),
+    { a => 1 },
+    'and a root replace still repairs it',
+);
+PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
+PVE::RS::Meta::api_delete('9500', undef, undef, $FULL);
+
 done_testing();

@@ -150,16 +150,84 @@ impl Grants {
         }
         Ok(())
     }
+
+    /// Applies [`parse_scopes`]'s prefix rules to a [`Grants`] that arrived
+    /// over the wire (`grants_json`), rather than out of the datacenter
+    /// document.
+    ///
+    /// The two parses are independent: `parse_entry` is the *document's*
+    /// gate, and the derived `Deserialize` below is the *boundary's*. Without
+    /// this, `{"prefix": ""}` deserialized straight to [`Path::root`] — a
+    /// scope covering every path of every document, including `scopes`, which
+    /// is exactly what review P1 rejected one layer up. `PVE::API2::Ext::Meta`
+    /// only ever forwards what `api_grants` produced, so this is defence in
+    /// depth; it is also the invariant a second caller of `api_put` would
+    /// otherwise break in silence (review pass 3 §5, `scopes.rs:55`).
+    ///
+    /// # Errors
+    /// [`Error::InvalidScopes`] naming the offending entry's index.
+    pub fn validate(&self) -> Result<()> {
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if let Err(msg) = check_prefix(&scope.prefix) {
+                return Err(Error::InvalidScopes(format!("scopes.{i}: {msg}")));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `scopes.<authid>[...]` collapsed to `scopes`; every other path unchanged
-/// (`docs/DESIGN.md` §9: the `scopes` map is an opaque leaf).
-fn opaque_scopes_path(path: &Path) -> Path {
+/// (`docs/DESIGN.md` §9: the `scopes` map is an opaque leaf, in every
+/// document — see [`crate::model::SCOPES_KEY`]).
+pub(crate) fn opaque_scopes_path(path: &Path) -> Path {
     if path.segments().len() > 1 && path.segments()[0] == model::SCOPES_KEY {
         Path::new(vec![model::SCOPES_KEY.to_string()])
     } else {
         path.clone()
     }
+}
+
+/// The rules a scope prefix must satisfy, in one place: shared by the
+/// document's own gate ([`parse_scopes`], via `parse_entry`), by the lenient
+/// read ([`scopes_for`]) and by the wire boundary ([`Grants::validate`]).
+/// `Err(message)` describes the violation without naming a principal.
+fn check_prefix(prefix: &Path) -> std::result::Result<(), String> {
+    // An empty prefix would be "everything below the root", i.e. write
+    // access to every document including `scopes` itself. Full access is
+    // granted through PVE ACLs and nowhere else (`docs/DESIGN.md` §9,
+    // review P1).
+    if prefix.is_root() {
+        return Err("'prefix' must not be empty (a scope covers a key-path prefix; \
+                    whole-document access comes from PVE ACLs, not from a scope)"
+            .to_string());
+    }
+    // `scopes` is an opaque leaf: a scope may cover the whole map, never
+    // one entry of it (`docs/DESIGN.md` §9, review P9).
+    if prefix.segments().len() > 1 && prefix.segments()[0] == model::SCOPES_KEY {
+        return Err(format!(
+            "invalid prefix '{prefix}': the 'scopes' map is addressed as a whole, \
+             never one entry of it"
+        ));
+    }
+    // A bare `__` documents the map it sits in, so it is readable exactly
+    // where that map is (`docs/DESIGN.md` §9, review P4) -- a rule `covers`
+    // and `view::filter` both enforce for a *scope's* paths, and which a
+    // scope whose own prefix ends in `__` would walk straight around:
+    // `prefix: __` grants read and write on the document's own bare comment
+    // and nothing else. `prefix: a__` stays legal (review pass 3 §5,
+    // `scopes.rs:246`): that is the note about `a`, which travels with `a`.
+    if prefix
+        .segments()
+        .iter()
+        .any(|s| s == model::COMMENT_SUFFIX)
+    {
+        return Err(format!(
+            "invalid prefix '{prefix}': '{}' documents the map it sits in and is readable \
+             only where that map is; scope the map itself instead",
+            model::COMMENT_SUFFIX
+        ));
+    }
+    Ok(())
 }
 
 /// Parses the datacenter document's `scopes` map: authid -> list of
@@ -183,9 +251,10 @@ fn opaque_scopes_path(path: &Path) -> Path {
 /// [`scopes_for`], which never fails at all.
 ///
 /// Keys must be PVE authids ([`model::is_authid`]) rather than plain document
-/// keys, and a prefix must be **non-empty** and must not address inside
-/// `scopes` itself (`docs/DESIGN.md` §9): full access comes from PVE ACLs
-/// only, and the access-control map is an opaque leaf.
+/// keys, and a prefix must satisfy `check_prefix`: **non-empty** (full access
+/// comes from PVE ACLs only), never addressing inside `scopes` (an opaque
+/// leaf), and never a bare `__` segment (the note about a whole map, readable
+/// only where the map is) — `docs/DESIGN.md` §9.
 ///
 /// # Errors
 /// [`Error::InvalidScopes`] if `scopes` (or one of its keys or entries) does
@@ -226,24 +295,8 @@ fn parse_entry(authid: &str, entries: &Value) -> Result<Vec<Scope>> {
         let prefix = Path::parse(prefix_str).map_err(|_| {
             Error::InvalidScopes(format!("scopes.{authid}.{i}: invalid prefix '{prefix_str}'"))
         })?;
-        // An empty prefix would be "everything below the root", i.e. write
-        // access to every document including `scopes` itself. Full access is
-        // granted through PVE ACLs and nowhere else (`docs/DESIGN.md` §9,
-        // review P1).
-        if prefix.is_root() {
-            return Err(Error::InvalidScopes(format!(
-                "scopes.{authid}.{i}: 'prefix' must not be empty (a scope covers a key-path \
-                 prefix; whole-document access comes from PVE ACLs, not from a scope)"
-            )));
-        }
-        // `scopes` is an opaque leaf: a scope may cover the whole map, never
-        // one entry of it (`docs/DESIGN.md` §9, review P9).
-        if prefix.segments().len() > 1 && prefix.segments()[0] == model::SCOPES_KEY {
-            return Err(Error::InvalidScopes(format!(
-                "scopes.{authid}.{i}: invalid prefix '{prefix_str}': the 'scopes' map is \
-                 addressed as a whole, never one entry of it"
-            )));
-        }
+        check_prefix(&prefix)
+            .map_err(|msg| Error::InvalidScopes(format!("scopes.{authid}.{i}: {msg}")))?;
         let mode_str = entry
             .get("mode")
             .and_then(Value::as_str)
@@ -267,9 +320,10 @@ fn parse_entry(authid: &str, entries: &Value) -> Result<Vec<Scope>> {
 /// **A read never fails and never lints** (`docs/DESIGN.md` §9, review
 /// P2/P3): a `scopes` value that is not a map, a malformed entry (whoever it
 /// belongs to), and an entry that is syntactically fine but not permitted —
-/// an empty prefix, or one addressing inside `scopes` — are each skipped with
-/// a `warn!` and simply grant nothing. Only [`parse_scopes`], the write gate,
-/// rejects them, which is where a misconfiguration can still be fixed.
+/// an empty prefix, one addressing inside `scopes`, one with a bare `__`
+/// segment — are each skipped with a `warn!` and simply grant nothing. Only
+/// [`parse_scopes`], the write gate, rejects them, which is where a
+/// misconfiguration can still be fixed.
 ///
 /// This is deliberately the *whole* lookup path's failure policy: `scopes`
 /// lives inside the datacenter document and is consulted on every guest
@@ -589,6 +643,62 @@ mod tests {
         let err = parse_scopes(&bogus).unwrap_err();
         assert!(err.to_string().contains("not a valid PVE authid"), "{err}");
         assert_eq!(scopes_for(&bogus, "not-an-authid"), Vec::<Scope>::new());
+    }
+
+    #[test]
+    fn parse_scopes_rejects_a_bare_comment_key_as_a_prefix() {
+        // Review pass 3 §5, `scopes.rs:246`: a bare `__` documents the map it
+        // sits in, so `covers`/`filter_map` grant read *and* write on the
+        // document-root map comment while granting nothing else -- exactly
+        // the disclosure `docs/DESIGN.md` §9 forbids, reached through a legal
+        // scope instead of through `filter`.
+        for prefix in ["__", "a.__"] {
+            let dc = json!({"scopes": {"a@pve": [{"prefix": prefix, "mode": "ro"}]}});
+            let err = parse_scopes(&dc).unwrap_err();
+            assert!(err.to_string().contains("documents the map it sits in"), "{prefix}: {err}");
+            assert_eq!(scopes_for(&dc, "a@pve"), Vec::<Scope>::new(), "{prefix}");
+        }
+
+        // `a__` -- the note *about* `a` -- stays legal: it travels with `a`,
+        // which is the rule `covers` implements.
+        let ok = json!({"scopes": {"a@pve": [{"prefix": "a__", "mode": "ro"}]}});
+        assert_eq!(
+            parse_scopes(&ok).unwrap()["a@pve"],
+            vec![Scope { prefix: p("a__"), mode: Mode::Ro }]
+        );
+    }
+
+    #[test]
+    fn grants_validate_applies_the_same_prefix_rules_at_the_wire_boundary() {
+        // Review pass 3 §5, `scopes.rs:55`: `parse_entry` is the *document's*
+        // gate; the derived `Deserialize` was nobody's, so `{"prefix": ""}`
+        // arrived as `Path::root()` -- a scope covering every path of every
+        // document, `scopes` included.
+        for bad in ["", "scopes.other@pve", "__", "a.__"] {
+            let g: Grants = serde_json::from_value(json!({
+                "full_read": false, "full_write": false,
+                "scopes": [{"prefix": bad, "mode": "rw"}],
+            }))
+            .unwrap();
+            let err = g.validate().unwrap_err();
+            assert!(matches!(err, Error::InvalidScopes(_)), "{bad}: {err}");
+        }
+
+        // An empty prefix parsed to the root path, which is what made it
+        // dangerous: assert the shape the check has to catch.
+        let broad: Grants = serde_json::from_value(json!({"scopes": [{"prefix": "", "mode": "rw"}]})).unwrap();
+        assert!(broad.scopes[0].prefix.is_root());
+        assert!(broad.can_write(&p("scopes")));
+
+        // Everything legal still validates, including a comment-key scope.
+        let good: Grants = serde_json::from_value(json!({
+            "full_read": true, "full_write": true,
+            "scopes": [{"prefix": "traefik", "mode": "rw"}, {"prefix": "a__", "mode": "ro"},
+                       {"prefix": "scopes", "mode": "ro"}],
+        }))
+        .unwrap();
+        assert_eq!(good.validate().map_err(|e| e.to_string()), Ok(()));
+        assert_eq!(Grants::default().validate().map_err(|e| e.to_string()), Ok(()));
     }
 
     #[test]

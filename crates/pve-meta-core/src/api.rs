@@ -68,7 +68,7 @@ use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
 use crate::scopes::{self, Grants};
-use crate::store::{DocId, MetaStore, DISK_FORMAT};
+use crate::store::{DocId, MetaStore, WriteGate, DISK_FORMAT};
 use crate::view;
 
 fn unix_secs(t: SystemTime) -> u64 {
@@ -131,12 +131,28 @@ fn forbidden(grants: &Grants, path: &DocPath) -> anyhow::Error {
         // Reveals nothing: the caller asked for the whole document.
         return anyhow::anyhow!("403: not permitted: the whole document");
     }
-    let parent_readable = path.parent().is_some_and(|p| grants.can_read(&p));
-    if parent_readable {
+    if may_name(grants, path) {
         anyhow::anyhow!("403: not permitted: {path}")
     } else {
         anyhow::anyhow!("403: not permitted")
     }
+}
+
+/// The one predicate deciding whether an error message may spell out `path`:
+/// only when the caller could have discovered it with a plain `GET`, i.e.
+/// when they may read its parent (`docs/DESIGN.md` §8).
+///
+/// Shared by [`forbidden`] (403) and [`lint_error`] (400). The 400 path used
+/// its own answer — "always" — which turned a lint finding anywhere in the
+/// document into a spelling of that key for any principal who could attempt a
+/// write (review pass 3 R6). The root path names nothing document-specific
+/// and is always allowed, and so is a path the caller may read *itself*: a
+/// scoped writer holds `traefik`, so "traefik__ must be a string" tells them
+/// only what their own payload already said.
+fn may_name(grants: &Grants, path: &DocPath) -> bool {
+    path.is_root()
+        || grants.can_read(path)
+        || path.parent().is_some_and(|p| grants.can_read(&p))
 }
 
 /// Parses an API `id` (a vmid, or the literal `"datacenter"`) into a
@@ -192,31 +208,111 @@ fn parse_view_format(name: &str) -> Result<Format, anyhow::Error> {
 }
 
 fn parse_grants(grants_json: &str) -> Result<Grants, anyhow::Error> {
-    serde_json::from_str(grants_json).map_err(|e| bad_request(format!("invalid grants: {e}")))
+    let grants: Grants =
+        serde_json::from_str(grants_json).map_err(|e| bad_request(format!("invalid grants: {e}")))?;
+    // The wire boundary applies the same prefix rules as the datacenter
+    // document's own gate (review pass 3 §5, `scopes.rs:55`): an empty prefix
+    // deserialized to `Path::root()` and covered every path of every
+    // document, `scopes` included.
+    grants.validate().map_err(api_err)?;
+    Ok(grants)
+}
+
+/// What one document read gave us: the parsed value (the *empty* document if
+/// the stored text does not parse), the digest of the bytes actually on disk,
+/// and the parse failure if there was one.
+struct Stored {
+    value: Value,
+    digest: String,
+    parse_error: Option<String>,
+    /// The bytes behind `digest`, kept from the *same* read so a caller that
+    /// hands them out cannot pair them with a different digest.
+    raw: String,
 }
 
 /// Reads `id`'s document, or the empty document with digest `""` if it does
 /// not exist (`docs/DESIGN.md` §2: "a non-existent document is an empty
 /// document ... there is no explicit create").
-fn read_or_empty(store: &MetaStore, id: DocId) -> Result<(Value, String), anyhow::Error> {
+///
+/// A document whose text does not parse is *not* an error here (review pass 3
+/// R1): it comes back as the empty document with its real digest and a
+/// `parse_error`, because both write handlers read before they plan, so a
+/// fatal read made a hand-edit typo unrepairable through the API — the one
+/// thing the P2 fix set out to prevent. Readers and writers each decide what
+/// to do with it; the real digest is what lets a repairing write still carry
+/// a compare-and-swap precondition.
+fn read_or_empty(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
     match store.read(id) {
-        Ok(doc) => Ok((doc.value, doc.digest)),
-        Err(CoreError::NotFound(_)) => Ok((Value::Object(Map::new()), String::new())),
+        Ok(doc) => Ok(Stored {
+            value: doc.value,
+            digest: doc.digest,
+            parse_error: doc.parse_error,
+            raw: doc.raw,
+        }),
+        Err(CoreError::NotFound(_)) => Ok(Stored {
+            value: Value::Object(Map::new()),
+            digest: String::new(),
+            parse_error: None,
+            raw: String::new(),
+        }),
         Err(e) => Err(api_err(e)),
     }
 }
 
+/// [`read_or_empty`] for every caller that must not be taken down by *one*
+/// unreadable document: the two write handlers, and [`list_guests`].
+///
+/// A `GET` of a document above the store's read cap is a plain `400` naming
+/// the size — that is the cap doing its job, and it names the document the
+/// caller actually asked for. Everything else must degrade instead of
+/// failing, or the cap becomes R1 with a different message:
+///
+/// * a **write** would leave the file unrepairable through the API — too big
+///   to read, too big to rewrite, removable only with `rm` as root;
+/// * a **listing** would 400 for every principal because of one oversized
+///   file belonging to one guest, which is the cluster-wide blast radius R1
+///   is about.
+///
+/// It is handled like unparseable content — the empty value plus a
+/// `parse_error` — with the digest hashed straight off the disk, so
+/// [`check_repairable`] lets through the same two whole-file shapes and
+/// nothing narrower, and a listing shows the document with no keys.
+fn read_tolerant(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
+    match store.read(id) {
+        Err(e @ CoreError::TooLarge { .. }) => Ok(Stored {
+            value: Value::Object(Map::new()),
+            digest: store.digest_of(id).map_err(api_err)?.unwrap_or_default(),
+            parse_error: Some(e.to_string()),
+            raw: String::new(),
+        }),
+        _ => read_or_empty(store, id),
+    }
+}
+
+/// Renders a touched list for the wire, collapsing anything inside the
+/// `scopes` map to `scopes` itself and de-duplicating the result.
+///
+/// [`Grants::check_write`] and `parse_view` both treat that map as an opaque
+/// leaf (`docs/DESIGN.md` §9); this is the one place the client saw it, and
+/// it did not — a `PUT ?view=scopes` reported `scopes.john.doe@pve`, which is
+/// not a valid view, cannot be parsed back into its segments, and is
+/// indistinguishable from a three-segment path (review pass 3 §5,
+/// `api.rs:209`).
 fn touched_out(touched: &[Touched]) -> Vec<ApiTouched> {
-    touched
-        .iter()
-        .map(|t| ApiTouched {
-            path: t.path.to_string(),
+    let mut out: Vec<ApiTouched> = Vec::with_capacity(touched.len());
+    for t in touched {
+        let entry = ApiTouched {
+            path: scopes::opaque_scopes_path(&t.path).to_string(),
             op: match t.op {
                 Op::Set => "set".to_string(),
                 Op::Delete => "delete".to_string(),
             },
-        })
-        .collect()
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -241,7 +337,7 @@ pub struct GuestListEntry {
     pub orphan: Option<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApiTouched {
     pub path: String,
     pub op: String,
@@ -262,6 +358,26 @@ pub struct ApiViewDocument {
     pub data_json: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Present only when the *stored* document is not valid YAML
+    /// (`docs/DESIGN.md` §9, review pass 3 R1): the parser's message. `data`
+    /// / `text` then describe the empty document and `keys` is empty — there
+    /// is no structure to report — but `digest` is the real digest of the
+    /// bytes on disk, so a full-write caller can repair the document with a
+    /// compare-and-swap root replace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
+    /// The document's raw text, present only alongside `parse_error` and only
+    /// for a caller with `full_read`.
+    ///
+    /// A caller who may read the whole document learns nothing from the bytes
+    /// they could not already read — and needs them, because "repair the
+    /// document" means editing text no view can render (review P2's own
+    /// remit: "a full-ACL admin cannot GET the document to see what to fix").
+    /// A scoped caller gets `parse_error` alone: a document nobody can parse
+    /// has no key structure to filter, so there is no honest subset of it to
+    /// return.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
 }
 
 /// `api_put`/`api_delete`'s result.
@@ -310,12 +426,37 @@ pub fn version(store: &MetaStore) -> Result<ApiVersion, anyhow::Error> {
 /// without lint, so an unrelated out-of-band edit elsewhere in
 /// `datacenter.yaml` cannot deny service either.
 ///
+/// **A `datacenter.yaml` that does not parse at all, or that is too large to
+/// read, grants nothing and warns** (review pass 3 R1). This function runs on
+/// every guest GET/PUT/DELETE, `/meta/guests`, `/meta/access` and
+/// `/meta/datacenter`, so any error it returns is a cluster-wide outage for
+/// every principal — including the administrator who has to repair the file.
+/// Guest operations for ACL holders keep working; scope holders lose their
+/// grants until the document is fixed, which is the same failure mode as a
+/// malformed entry.
+///
 /// # Errors
-/// `500:` only if the datacenter document cannot be read or parsed at all.
+/// `500:` only if the datacenter document cannot be read from the disk at all
+/// (an I/O failure).
 pub fn grants(store: &MetaStore, authid: &str) -> Result<String, anyhow::Error> {
     let dc_value = match store.read(DocId::Datacenter) {
-        Ok(doc) => doc.value,
+        Ok(doc) => {
+            if let Some(err) = &doc.parse_error {
+                tracing::warn!(
+                    error = %err,
+                    "datacenter.yaml does not parse: every scope grants nothing until it is repaired"
+                );
+            }
+            doc.value
+        }
         Err(CoreError::NotFound(_)) => Value::Object(Map::new()),
+        Err(e @ CoreError::TooLarge { .. }) => {
+            tracing::warn!(
+                error = %e,
+                "datacenter.yaml is too large to read: every scope grants nothing until it is repaired"
+            );
+            Value::Object(Map::new())
+        }
         Err(e) => return Err(api_err(e)),
     };
     let scopes = scopes::scopes_for(&dc_value, authid);
@@ -362,8 +503,8 @@ pub fn list_guests(
             continue;
         }
 
-        let (value, digest) = read_or_empty(store, DocId::Guest(guest.vmid))?;
-        let visible = view::filter(&value, &readable);
+        let stored = read_tolerant(store, DocId::Guest(guest.vmid))?;
+        let visible = view::filter(&stored.value, &readable);
 
         if !matches_has(&visible) {
             continue;
@@ -374,7 +515,7 @@ pub fn list_guests(
             node: grants.full_read.then(|| guest.node.clone()).flatten(),
             kind: guest.kind.clone(),
             name: grants.full_read.then(|| guest.name.clone()).flatten(),
-            digest,
+            digest: stored.digest,
             keys: model::top_level_keys(&visible),
             orphan: None,
         });
@@ -386,8 +527,8 @@ pub fn list_guests(
             if known.contains(&vmid) {
                 continue;
             }
-            let (value, digest) = read_or_empty(store, DocId::Guest(vmid))?;
-            if !matches_has(&value) {
+            let stored = read_tolerant(store, DocId::Guest(vmid))?;
+            if !matches_has(&stored.value) {
                 continue;
             }
             // No guest means no `/vms/<vmid>` ACL to consult and no vmlist
@@ -398,8 +539,8 @@ pub fn list_guests(
                 node: None,
                 kind: None,
                 name: None,
-                digest,
-                keys: model::top_level_keys(&value),
+                digest: stored.digest,
+                keys: model::top_level_keys(&stored.value),
                 orphan: Some(1),
             });
         }
@@ -420,9 +561,15 @@ pub fn list_guests(
 /// they may not see. Callers with a *partial* grant still get the whole
 /// document's digest — scoped writers need it for compare-and-swap PUTs.
 ///
+/// A document whose stored text does not parse is answered, not refused
+/// (review pass 3 R1): `200` with an empty value, no `keys`, the real digest
+/// and a `parse_error` describing the syntax failure — plus the raw text for
+/// a `full_read` caller, who needs it to write the repair and could have read
+/// it anyway.
+///
 /// # Errors
-/// `400:` invalid id/view/format/grants. `403:` no read grant, or a `view`
-/// that is not readable.
+/// `400:` invalid id/view/format/grants, or a stored document above the read
+/// size cap. `403:` no read grant, or a `view` that is not readable.
 pub fn get_document(
     store: &MetaStore,
     id: &str,
@@ -444,12 +591,12 @@ pub fn get_document(
         return Err(forbidden(&grants, &view_path));
     }
 
-    let (value, digest) = read_or_empty(store, doc_id)?;
+    let stored = read_or_empty(store, doc_id)?;
 
     let mut result_value = if view.is_some() {
-        view::extract(&value, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
+        view::extract(&stored.value, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
     } else {
-        view::filter(&value, &readable)
+        view::filter(&stored.value, &readable)
     };
 
     if !comments {
@@ -465,14 +612,74 @@ pub fn get_document(
         Format::Yaml => (None, Some(view::render(&result_value, Format::Yaml))),
     };
 
+    // The raw text of an unparseable document goes only to a caller who may
+    // read the whole document anyway (see `ApiViewDocument::raw`), and comes
+    // from the same read as `digest`, so the two always describe one state of
+    // the file.
+    let raw = match (&stored.parse_error, grants.full_read) {
+        (Some(_), true) => Some(stored.raw),
+        _ => None,
+    };
+
     Ok(ApiViewDocument {
         id: id_str(doc_id),
         view: view_out(view),
-        digest,
+        digest: stored.digest,
         keys,
         data_json,
         text,
+        parse_error: stored.parse_error,
+        raw,
     })
+}
+
+/// Which [`crate::store::WriteGate`] a caller's write is stored under: the full
+/// document lint for a caller who may replace the whole document, the
+/// caller-linted gate for everybody else (see [`plan_write`]).
+///
+/// This must stay in step with `plan_write`'s choice, or the store would
+/// re-apply a lint the API layer deliberately narrowed — and re-leak the
+/// paths it deliberately withheld.
+fn write_gate(grants: &Grants) -> WriteGate {
+    if grants.full_write {
+        WriteGate::Document
+    } else {
+        WriteGate::CallerLinted
+    }
+}
+
+/// Refuses every write against a document whose content could not be
+/// recovered — it does not parse, or it is above the store's read cap —
+/// except the two that *replace the file whole*: a root `replace` and a root
+/// `DELETE` (review pass 3 R1).
+///
+/// The value planned against is the empty document (nothing else can be
+/// recovered), so any narrower write would silently discard everything the
+/// file contains — a scoped `PUT ?view=traefik` would turn the whole
+/// document into `{traefik: …}`. `authorize_view_write` has already
+/// established that a root view requires `full_write`, so this is the
+/// documented repair path and nothing else: read the document (`parse_error`
+/// plus, for a full reader, its raw text), fix it, `PUT` it whole with the
+/// digest — or delete it.
+///
+/// The parser's own message is included: it is positional ("did not find
+/// expected key at line 4 column 1"), never a quotation of the document, so
+/// it teaches a scoped caller nothing about content they may not read.
+fn check_repairable(
+    stored: &Stored,
+    view_path: &DocPath,
+    is_merge: bool,
+) -> Result<(), anyhow::Error> {
+    let Some(err) = &stored.parse_error else {
+        return Ok(());
+    };
+    if view_path.is_root() && !is_merge {
+        return Ok(());
+    }
+    Err(bad_request(format!(
+        "the stored document cannot be read back and can only be repaired as a whole: \
+         replace it with a full document (no 'view', mode=replace) or delete it ({err})"
+    )))
 }
 
 /// Every write's up-front, request-shaped authorization gate
@@ -493,14 +700,32 @@ fn authorize_view_write(grants: &Grants, view_path: &DocPath) -> Result<(), anyh
 }
 
 /// Runs the planned mutation against `planned` (already a clone of the
-/// stored document) and validates it as a whole.
+/// stored document) and validates it.
 ///
-/// The whole-document lint lives here, *before* the `dry_run` branch, so a
-/// dry run validates exactly what the write validates (review F14): the
-/// per-view lint inside [`view::replace`]/[`view::merge`] only sees the
-/// subtree.
+/// The lint lives here, *before* the `dry_run` branch, so a dry run validates
+/// exactly what the write validates (review F14): the per-view lint inside
+/// [`view::replace`]/[`view::merge`] only sees the payload.
+///
+/// **How much of the document is linted depends on how much of it the caller
+/// may write** (`docs/DESIGN.md` §9: "strict lint runs only on the content
+/// being written", review pass 3 R6):
+///
+/// * a caller with `full_write` is offered the whole document, so the whole
+///   document is linted — a root replace is the shape that repairs it, and
+///   they can perform one;
+/// * anyone else may only write inside `view_path`, so only the subtree at
+///   `view_path` is linted. Before this, one out-of-band bad key anywhere
+///   blocked every write by everybody who could not replace the whole
+///   document, and the 400 named the offending key to a caller who could not
+///   read it. The store's own gate is narrowed to match
+///   ([`crate::store::WriteGate`]), since it would otherwise re-apply the whole-
+///   document lint — and the same message — one layer down.
+///
+/// Either way the rendered message names only paths the caller may read; see
+/// [`lint_error`].
 fn plan_write(
     doc_id: DocId,
+    view_path: &DocPath,
     planned: &mut Value,
     grants: &Grants,
     mutate: impl FnOnce(&mut Value) -> Result<Vec<Touched>, anyhow::Error>,
@@ -511,13 +736,60 @@ fn plan_write(
         return Err(forbidden(grants, &denied));
     }
 
-    let lints = model::lint(planned);
+    let lints = if grants.full_write {
+        model::lint(planned)
+    } else {
+        // The written subtree, in the document's own coordinates. `None`
+        // means the plan wrote nothing there (a no-op merge), which has
+        // nothing to lint.
+        match view::extract(planned, view_path) {
+            // `lint_at`, not `lint_relaxed_at`: the key rule and the
+            // comment-key-value rule for the view's *own* segment live in its
+            // parent map, so a subtree-only lint would drop them (see
+            // `model::lint_at`).
+            Some(subtree) => model::lint_at(&subtree, view_path),
+            None => Vec::new(),
+        }
+    };
     if !lints.is_empty() {
-        return Err(api_err(CoreError::Lint(lints)));
+        return Err(lint_error(grants, lints));
     }
 
     check_scopes_write(doc_id, planned, &touched, grants)?;
     Ok(touched)
+}
+
+/// Renders lint findings into a `400` that names only what the caller may
+/// read (`docs/DESIGN.md` §8, review pass 3 R6).
+///
+/// `forbidden()` has always applied this filter to 403s; the 400 path joined
+/// every finding's absolute path verbatim, so a principal holding one prefix
+/// could learn the existence and exact spelling of keys in subtrees they
+/// cannot read by attempting a write. Findings they may read are reported as
+/// before — the message has to stay actionable — and the rest collapse into
+/// one path-free sentence.
+fn lint_error(grants: &Grants, lints: Vec<model::Lint>) -> anyhow::Error {
+    let (visible, hidden): (Vec<_>, Vec<_>) =
+        lints.into_iter().partition(|l| may_name(grants, &l.path));
+    let shown = visible
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let elsewhere = match hidden.len() {
+        0 => String::new(),
+        1 => "1 further problem in a part of the document you cannot read".to_string(),
+        n => format!("{n} further problems in parts of the document you cannot read"),
+    };
+    let detail = match (shown.is_empty(), elsewhere.is_empty()) {
+        (false, true) => shown,
+        (false, false) => format!("{shown}; and {elsewhere}"),
+        (true, false) => elsewhere,
+        // `lints` is never empty at the call site; keep a sane message
+        // rather than an assertion in the request path.
+        (true, true) => "the document failed validation".to_string(),
+    };
+    bad_request(format!("document failed validation: {detail}"))
 }
 
 /// The two rules for a write that touches the datacenter document's `scopes`
@@ -605,12 +877,13 @@ pub fn put_document(
     };
 
     store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let (value, _current_digest) = read_or_empty(store, doc_id)?;
+    let stored = read_tolerant(store, doc_id)?;
+    check_repairable(&stored, &view_path, is_merge)?;
 
     // (2) Plan the mutation against a *copy*; the stored document is only
     //     touched once the plan has passed every check.
-    let mut planned = value.clone();
-    let touched = plan_write(doc_id, &mut planned, &grants, |v| {
+    let mut planned = stored.value.clone();
+    let touched = plan_write(doc_id, &view_path, &mut planned, &grants, |v| {
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(api_err)
         } else {
@@ -625,7 +898,7 @@ pub fn put_document(
         crate::digest::digest(text.as_bytes())
     } else {
         store
-            .put_raw(doc_id, &text, digest)
+            .put_raw_gated(doc_id, &text, digest, write_gate(&grants))
             .map_err(api_err)?
             .document
             .digest
@@ -664,10 +937,13 @@ pub fn delete_document(
     authorize_view_write(&grants, &view_path)?;
 
     store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let (value, _current_digest) = read_or_empty(store, doc_id)?;
+    let stored = read_tolerant(store, doc_id)?;
+    // A root DELETE removes the file whole, so it repairs an unparseable
+    // document exactly like a root replace does.
+    check_repairable(&stored, &view_path, false)?;
 
-    let mut planned = value.clone();
-    let touched = plan_write(doc_id, &mut planned, &grants, |v| {
+    let mut planned = stored.value.clone();
+    let touched = plan_write(doc_id, &view_path, &mut planned, &grants, |v| {
         view::remove(v, &view_path).map_err(api_err)
     })?;
 
@@ -680,7 +956,7 @@ pub fn delete_document(
     } else if exists {
         let text = format::dump(DISK_FORMAT, &planned);
         store
-            .put_raw(doc_id, &text, digest)
+            .put_raw_gated(doc_id, &text, digest, write_gate(&grants))
             .map_err(api_err)?
             .document
             .digest
@@ -1092,7 +1368,11 @@ mod tests {
         seed(&store, "datacenter", "scopes:\n  good@pve:\n  - prefix: traefik\n    mode: rw\nother: 1\n");
         let before = read_raw(&store, "datacenter").unwrap();
 
-        let broad = grants_json(false, false, json!([{"prefix": "", "mode": "rw"}]));
+        // The broadest scope that is legal at all: an empty prefix is now
+        // refused at the wire boundary itself (see
+        // `an_empty_scope_prefix_is_refused_at_the_wire_boundary`), which is
+        // the P1 hole closed one layer earlier.
+        let broad = grants_json(false, false, json!([{"prefix": "scopes", "mode": "rw"}, {"prefix": "other", "mode": "rw"}]));
         let on_scopes = grants_json(false, false, json!([{"prefix": "scopes", "mode": "rw"}]));
         let payload = "{\"evil@pve\": [{\"prefix\": \"traefik\", \"mode\": \"rw\"}]}";
 
@@ -1250,6 +1530,365 @@ mod tests {
             .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
         assert!(err.to_string().contains("bad key"), "{err}");
+    }
+
+    #[test]
+    fn an_unparseable_document_denies_nobody_and_is_repairable_through_the_api() {
+        // Review pass 3 R1, the critical: a tab, an anchor or an indentation
+        // slip in a hand-edited `datacenter.yaml` used to 400 *every*
+        // endpoint for *every* principal, root included, and could not be
+        // repaired through the API -- `put_document`/`delete_document` both
+        // read the document before planning, so the outer read failed before
+        // `put_raw`'s lenient old-bytes parse was ever reached.
+        for broken in ["a: 1\n\tb: 2\n", "a: &x 1\nb: *x\n", "a: 1\n  b: 2\n", "a: [\n"] {
+            let (dir, store) = store();
+            let full = grants_json(true, true, json!([]));
+            let scoped = rw_traefik();
+            std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+            seed(&store, "100", "traefik:\n  host: x\n");
+
+            // (1) The grants lookup -- which runs on every guest request --
+            //     grants nothing instead of failing.
+            assert_eq!(grants(&store, "scoped@pve!t1").unwrap(), "[]");
+            assert_eq!(grants(&store, "root@pam").unwrap(), "[]");
+
+            // (2) Unrelated guest operations keep working, for both an ACL
+            //     holder and a scope holder.
+            assert!(get_document(&store, "100", None, "yaml", true, &full).is_ok(), "{broken:?}");
+            put_document(&store, "100", Some("traefik"), "json", "{\"host\":\"y\"}", "replace", None, false, &scoped)
+                .unwrap_or_else(|e| panic!("{broken:?}: guest write refused: {e}"));
+
+            // (2b) ... and so does the listing, with the broken document
+            //      shown as having no keys rather than 400-ing the whole
+            //      list for everybody.
+            std::fs::write(dir.path().join("101.yaml"), broken).unwrap();
+            let rows = json!([
+                {"vmid": 100, "node": "n1", "type": "lxc", "name": "ok", "grants": full},
+                {"vmid": 101, "node": "n1", "type": "lxc", "name": "broken", "grants": full},
+            ])
+            .to_string();
+            let listed = list_guests(&store, &rows, None, true).unwrap();
+            assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101], "{broken:?}");
+            assert!(listed[1].keys.is_empty());
+            assert!(!listed[1].digest.is_empty());
+            std::fs::remove_file(dir.path().join("101.yaml")).unwrap();
+
+            // (3) The document itself answers 200 with `parse_error`, the
+            //     real digest and no data. A full reader also gets the raw
+            //     text -- they may read the whole document anyway, and need
+            //     it to write the repair.
+            let got = get_document(&store, "datacenter", None, "yaml", true, &full).unwrap();
+            assert!(got.parse_error.is_some(), "{broken:?}");
+            assert_eq!(got.raw.as_deref(), Some(broken));
+            assert_eq!(got.text.as_deref(), Some("{}\n"));
+            assert!(got.keys.is_empty());
+            assert!(!got.digest.is_empty());
+
+            // A scope-only reader gets the diagnosis but never the bytes.
+            let dc_scoped = grants_json(false, false, json!([{"prefix": "traefik", "mode": "ro"}]));
+            let scoped_got = get_document(&store, "datacenter", None, "json", true, &dc_scoped).unwrap();
+            assert!(scoped_got.parse_error.is_some());
+            assert_eq!(scoped_got.raw, None, "{broken:?} leaked its bytes to a scoped reader");
+            assert_eq!(scoped_got.data_json.as_deref(), Some("{}"));
+
+            // (4) A root replace repairs it, with the digest precondition.
+            let fixed = "scopes:\n  svc@pve!tok:\n  - prefix: traefik\n    mode: rw\n";
+            put_document(&store, "datacenter", None, "yaml", fixed, "replace", Some(&got.digest), false, &full)
+                .unwrap_or_else(|e| panic!("{broken:?}: repair refused: {e}"));
+            assert_eq!(read_raw(&store, "datacenter").unwrap(), fixed);
+            assert_eq!(
+                grants(&store, "svc@pve!tok").unwrap(),
+                "[{\"prefix\":\"traefik\",\"mode\":\"rw\"}]"
+            );
+
+            // (5) ... and a root DELETE is the other repair shape.
+            std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+            delete_document(&store, "datacenter", None, None, &full)
+                .unwrap_or_else(|e| panic!("{broken:?}: delete refused: {e}"));
+            assert!(read_raw(&store, "datacenter").is_none());
+        }
+    }
+
+    #[test]
+    fn a_narrow_write_against_an_unparseable_document_is_refused_not_silently_destructive() {
+        // The other half of R1: the value planned against is the *empty*
+        // document, so any write narrower than "replace the file whole" would
+        // quietly drop everything the file contains. Only the two documented
+        // repair shapes are allowed through.
+        let (dir, store) = store();
+        let full = grants_json(true, true, json!([]));
+        let broken = "traefik:\n\thost: x\nnetbird: {}\n";
+        std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+
+        for (view, mode) in [
+            (Some("traefik"), "replace"),
+            (Some("traefik"), "merge"),
+            (None, "merge"), // a root *merge* would drop the rest just the same
+        ] {
+            let err = put_document(&store, "datacenter", view, "json", "{\"host\":\"y\"}", mode, None, false, &full)
+                .expect_err("must be refused");
+            assert_eq!(status(&err), 400, "{view:?}/{mode}: {err}");
+            assert!(err.to_string().contains("repaired as a whole"), "{view:?}/{mode}: {err}");
+            assert_eq!(read_raw(&store, "datacenter").unwrap(), broken, "{view:?}/{mode} wrote anyway");
+        }
+        let err = delete_document(&store, "datacenter", Some("traefik"), None, &full).unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert_eq!(read_raw(&store, "datacenter").unwrap(), broken);
+    }
+
+    #[test]
+    fn a_document_above_the_read_cap_is_refused_on_read_and_repairable_on_write() {
+        // Review pass 3 §5, `store.rs:235`: `MAX_BYTES` applied only to
+        // writes, so a multi-megabyte out-of-band file was read and hashed on
+        // every request that touched it -- and, with the cap alone, would
+        // have become unreadable *and* unwritable, i.e. removable only with
+        // `rm` as root. The read refuses loudly; the write keeps the two
+        // whole-file repair shapes.
+        let (dir, store) = store();
+        let full = grants_json(true, true, json!([]));
+        let big = format!("a: \"{}\"\n", "x".repeat(4 * 1024 * 1024));
+        std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
+
+        let err = get_document(&store, "100", None, "json", true, &full).unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(err.to_string().contains("too large"), "{err}");
+
+        // ... but one oversized document may not take the *listing* down for
+        // everybody -- that is R1's blast radius with a different message.
+        seed(&store, "101", "traefik:\n  host: x\n");
+        let rows = json!([
+            {"vmid": 100, "node": "n1", "type": "lxc", "name": "big", "grants": full},
+            {"vmid": 101, "node": "n1", "type": "lxc", "name": "ok", "grants": full},
+        ])
+        .to_string();
+        let listed = list_guests(&store, &rows, None, true).unwrap();
+        assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
+        assert!(listed[0].keys.is_empty(), "an unreadable document has no keys to show");
+        assert!(!listed[0].digest.is_empty(), "but it still reports its real digest");
+        assert_eq!(listed[1].keys, vec!["traefik"]);
+
+        // A narrow write is refused (it would drop the file's content) ...
+        let err = put_document(&store, "100", Some("traefik"), "json", "{\"a\":1}", "replace", None, false, &full)
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(err.to_string().contains("repaired as a whole"), "{err}");
+
+        // ... and the root replace goes through, with a digest precondition
+        // that still works even though nothing could read the document.
+        let stale = put_document(&store, "100", None, "yaml", "a: 1\n", "replace", Some("deadbeef"), false, &full)
+            .unwrap_err();
+        assert_eq!(status(&stale), 409, "{stale}");
+        put_document(&store, "100", None, "yaml", "a: 1\n", "replace", None, false, &full).unwrap();
+        assert_eq!(read_raw(&store, "100").unwrap(), "a: 1\n");
+
+        // A root DELETE is the other shape.
+        std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
+        delete_document(&store, "100", None, None, &full).unwrap();
+        assert!(read_raw(&store, "100").is_none());
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_map_is_empty_for_a_scoped_reader() {
+        // Review pass 3 R2, at the API level: `view::filter`'s catch-all used
+        // to hand the whole value to a scope-only caller, through the
+        // view-less GET and as a content oracle through `?has=`.
+        let (dir, store) = store();
+        let scoped = rw_traefik();
+        let full = grants_json(true, true, json!([]));
+
+        for (text, rendered) in [("- a\n- secret\n", "- a\n- secret\n"), ("just a scalar\n", "just a scalar\n")] {
+            std::fs::write(dir.path().join("100.yaml"), text).unwrap();
+
+            let got = get_document(&store, "100", None, "yaml", true, &scoped).unwrap();
+            assert_eq!(got.text.as_deref(), Some("{}\n"), "{text:?} leaked");
+            assert!(got.keys.is_empty());
+            // An explicit view of it is nothing, not the value.
+            let view = get_document(&store, "100", Some("traefik"), "json", true, &scoped).unwrap();
+            assert_eq!(view.data_json.as_deref(), Some("{}"));
+
+            // `?has=` cannot be used as an oracle over it either.
+            let rows = json!([{"vmid": 100, "grants": scoped}]).to_string();
+            assert!(list_guests(&store, &rows, Some("traefik"), false).unwrap().is_empty());
+            let listed = list_guests(&store, &rows, None, false).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert!(listed[0].keys.is_empty(), "{text:?} leaked its keys");
+
+            // A full reader still sees exactly what is on disk.
+            let root = get_document(&store, "100", None, "yaml", true, &full).unwrap();
+            assert_eq!(root.text.as_deref(), Some(rendered), "{text:?}");
+
+            // ... and the write gate refuses to store it again: only a root
+            // replace with a real document repairs it.
+            let err = put_document(&store, "100", None, "yaml", text, "replace", None, false, &full).unwrap_err();
+            assert_eq!(status(&err), 400, "{text:?}: {err}");
+            let err = put_document(&store, "100", Some("traefik"), "json", "{\"a\":1}", "replace", None, false, &scoped)
+                .unwrap_err();
+            assert_eq!(status(&err), 400, "a scoped write through a non-map root: {err}");
+            assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_lint_400_never_names_a_path_the_caller_cannot_read() {
+        // Review pass 3 R6. `plan_write` linted the whole document and
+        // rendered every finding verbatim, so a principal holding one prefix
+        // learned the existence and exact spelling of keys in subtrees they
+        // cannot read -- the filter `forbidden()` applies to every 403 was
+        // simply missing from the 400 path.
+        let (dir, store) = store();
+        let scoped = rw_traefik();
+        std::fs::write(
+            dir.path().join("100.yaml"),
+            "traefik:\n  host: x\nsecret_area:\n  customer name: acme\n",
+        )
+        .unwrap();
+        let before = read_raw(&store, "100").unwrap();
+
+        // (a) Availability: the scoped writer's own subtree is all that is
+        //     linted, so an out-of-band bad key elsewhere denies nobody.
+        put_document(&store, "100", Some("traefik"), "json", "{\"host\":\"y\"}", "replace", None, false, &scoped)
+            .expect("an unrelated out-of-band bad key must not block a scoped write");
+        assert!(read_raw(&store, "100").unwrap().contains("customer name"), "the bad key was dropped");
+
+        // (b) Disclosure: their own bad payload is still named ...
+        let err = put_document(&store, "100", Some("traefik"), "json", "{\"my bad\":1}", "replace", None, false, &scoped)
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(err.to_string().contains("my bad"), "{err}");
+
+        // ... and a full-write caller still gets the whole document's
+        // findings, spelled out, because they can read it all.
+        let full = grants_json(true, true, json!([]));
+        let err = put_document(&store, "100", Some("traefik"), "json", "{\"host\":\"z\"}", "replace", None, false, &full)
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(err.to_string().contains("customer name"), "{err}");
+
+        // A write-only principal (Sys.Modify without Sys.Audit) gets the
+        // count, not the spelling.
+        let blind = grants_json(false, true, json!([]));
+        let err = put_document(&store, "100", Some("traefik"), "json", "{\"host\":\"z\"}", "replace", None, false, &blind)
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(!err.to_string().contains("customer name"), "leaked: {err}");
+        assert!(err.to_string().contains("cannot read"), "{err}");
+
+        assert_eq!(
+            read_raw(&store, "100").unwrap(),
+            before.replace("host: x", "host: y"),
+            "a refused write must not have written"
+        );
+    }
+
+    #[test]
+    fn the_narrowed_lint_still_refuses_everything_inside_the_written_subtree() {
+        // The invariant R6's fix must not give up: narrowing the *scope* of
+        // the lint may not narrow the *rules*. Every one of these is a
+        // finding the whole-document lint used to catch on a scoped write --
+        // including the comment-key-value rule, which lives in the view's
+        // parent map and is invisible to a plain subtree lint.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: x\n");
+        let scoped = rw_traefik();
+        let before = read_raw(&store, "100").unwrap();
+
+        for (view, mode, payload, expect) in [
+            (Some("traefik__"), "replace", "5", "comment key value must be a string"),
+            (Some("traefik"), "replace", "{\"bad key\": 1}", "invalid key"),
+            (Some("traefik"), "replace", "{\"a.b\": 1}", "no dots"),
+            (Some("traefik"), "replace", "{\"deep\": {\"bad key\": 1}}", "invalid key"),
+            (Some("traefik"), "replace", "{\"list\": [{\"bad key\": 1}]}", "invalid key"),
+            (Some("traefik"), "replace", "{\"x__\": 5}", "comment key value must be a string"),
+            (Some("traefik"), "merge", "{\"x__\": 5}", "comment key value must be a string"),
+            (Some("traefik"), "replace", "{\"nul\": null}", "null values are not allowed"),
+        ] {
+            let err = put_document(&store, "100", view, "json", payload, mode, None, false, &scoped)
+                .map(|ok| panic!("{view:?}/{payload} was accepted: {ok:?}"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with("400: "), "{payload}: {err}");
+            assert!(err.contains(expect), "{payload}: {err}");
+            assert_eq!(read_raw(&store, "100").unwrap(), before, "{payload} wrote anyway");
+        }
+
+        // ... and a legitimate comment-key write still goes through.
+        put_document(&store, "100", Some("traefik__"), "json", "\"the ingress config\"", "replace", None, false, &scoped)
+            .expect("a string comment value is fine");
+    }
+
+    #[test]
+    fn a_touched_path_inside_the_scopes_map_is_reported_as_the_map() {
+        // Review pass 3 §5, `api.rs:209`: `check_write` and `parse_view` both
+        // treat `scopes` as an opaque leaf; `touched` -- the one place the
+        // client sees a path -- reported `scopes.john.doe@pve`, which is not
+        // a valid view and cannot be parsed back into its segments.
+        let (_dir, store) = store();
+        let full = grants_json(true, true, json!([]));
+        seed(&store, "datacenter", "scopes:\n  a@pve:\n  - prefix: traefik\n    mode: rw\n");
+
+        let r = put_document(
+            &store,
+            "datacenter",
+            Some("scopes"),
+            "json",
+            "{\"john.doe@pve\": [{\"prefix\": \"netbird\", \"mode\": \"ro\"}], \"a@pve\": null}",
+            "merge",
+            None,
+            false,
+            &full,
+        )
+        .unwrap();
+        assert_eq!(
+            r.touched,
+            vec![
+                ApiTouched { path: "scopes".to_string(), op: "set".to_string() },
+                ApiTouched { path: "scopes".to_string(), op: "delete".to_string() },
+            ],
+            "collapsed to the map, de-duplicated, and still distinguishing set from delete"
+        );
+        // Every reported path is addressable as a view again.
+        for t in &r.touched {
+            assert!(parse_view(Some(&t.path)).is_ok(), "{} is not a valid view", t.path);
+        }
+
+        // A whole-map replace reports the map once, not one entry per authid.
+        let r2 = put_document(
+            &store,
+            "datacenter",
+            Some("scopes"),
+            "json",
+            "{\"x@pve\": [{\"prefix\": \"a\", \"mode\": \"ro\"}], \"y@pve\": [{\"prefix\": \"b\", \"mode\": \"ro\"}]}",
+            "replace",
+            None,
+            false,
+            &full,
+        )
+        .unwrap();
+        assert_eq!(r2.touched.iter().filter(|t| t.op == "set").count(), 1);
+        assert!(r2.touched.iter().all(|t| t.path == "scopes"));
+    }
+
+    #[test]
+    fn an_empty_scope_prefix_is_refused_at_the_wire_boundary() {
+        // Review pass 3 §5, `scopes.rs:55`: P1 rejected the empty prefix in
+        // the *document*; `grants_json` still deserialized it straight to
+        // `Path::root()`, i.e. write access to every path of every document.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: x\n");
+        let before = read_raw(&store, "100").unwrap();
+
+        for bad in ["", "scopes.other@pve", "__"] {
+            let grants = grants_json(false, false, json!([{"prefix": bad, "mode": "rw"}]));
+            for r in [
+                get_document(&store, "100", None, "json", true, &grants).map(|_| ()),
+                put_document(&store, "100", Some("x"), "json", "1", "replace", None, false, &grants).map(|_| ()),
+                delete_document(&store, "100", Some("traefik"), None, &grants).map(|_| ()),
+            ] {
+                let err = r.expect_err("an invalid scope prefix must be refused at the boundary");
+                assert_eq!(status(&err), 400, "{bad}: {err}");
+            }
+        }
+        assert_eq!(read_raw(&store, "100").unwrap(), before);
     }
 
     #[test]

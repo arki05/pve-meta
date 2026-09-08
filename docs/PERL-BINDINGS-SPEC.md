@@ -88,9 +88,13 @@ authorization rules and `DESIGN.md` §3 for the endpoints): `api_version`, `api_
 `"NNN: message"` (an HTTP status prefix) which `PVE::API2::Ext::Meta::_call` turns into a
 `PVE::Exception`.
 
-`api_grants($authid)` never fails on a malformed `scopes` map: anything it cannot parse
-is skipped with a warning and grants nothing, because this lookup runs on every guest
-request (`DESIGN.md` §9). `api_list_guests($guests_json, $has, $orphans)` takes a third
+`api_grants($authid)` never fails on a malformed `scopes` map — or on a `datacenter.yaml`
+that does not parse as YAML at all, or is above the store's read cap: anything it cannot
+parse is skipped with a warning and grants nothing, because this lookup runs on every
+guest request (`DESIGN.md` §9). `api_get` reports a document it could not parse as a
+`parse_error` field (with `raw`, the file's text, for a caller with full read) rather than
+dying, and `api_put`/`api_delete` accept only a whole-document replace or delete against
+such a document. `api_list_guests($guests_json, $has, $orphans)` takes a third
 argument: with it (the caller has `Sys.Audit` on `/`) the result also lists documents
 whose vmid is not among the rows Perl passed in, marked `orphan => 1`.
 
@@ -118,6 +122,14 @@ across nodes (`DESIGN.md` §8) — the Perl API module is responsible for holdin
   and grants nothing on disk, an out-of-band invalid document stays readable and
   repairable, a non-map `scopes` grants nothing, a scoped read never carries the bare
   `__`, a single `scopes` entry is not addressable while a dotted authid is a valid key,
-  and orphan documents are listed and deletable).
+  and orphan documents are listed and deletable; and from the 2026-09-08 pass 3: an
+  unparseable document denies no endpoint and no principal and is repaired by a root
+  replace or DELETE while every narrower write against it is refused, a list- or
+  scalar-rooted document is empty for a scope-only reader and refused by the write gate,
+  a lint 400 never names a path the caller cannot read and an out-of-band bad key does not
+  block a scoped write, a nested `null` delete marker is applied rather than stored,
+  `touched` collapses a path inside `scopes`, an invalid scope prefix is refused where
+  `grants_json` is parsed, and a document above the read cap is refused on read and still
+  replaceable).
 * The Debian package `libpve-meta-rs-perl` is the second binary package of the `pve-meta`
   source package; see `crates/pve-meta-perl/PACKAGING.md`.

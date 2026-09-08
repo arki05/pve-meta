@@ -41,7 +41,11 @@ against.
   indexed by numeric segments.
 * `pub const COMMENT_SUFFIX: &str = "__";` `pub fn is_comment_key(k: &str) -> bool`.
 * `pub const SCOPES_KEY: &str = "scopes";` `pub fn is_authid(k: &str) -> bool` — the one
-  reserved top-level key and the rule for its own keys.
+  reserved top-level key and the rule for its own keys. It is reserved in **every**
+  document, not only the datacenter one (`docs/DESIGN.md` §9): one key rule, one
+  addressing rule (opaque leaf), one scope-prefix rule and one `touched` rendering,
+  everywhere. Only the datacenter document's map *means* anything (`scopes_for` reads that
+  one and no other), so only there is a write to it additionally gated on `full_write`.
 
 ## 2. Paths (`path.rs`)
 
@@ -73,7 +77,11 @@ Merge-patch semantics (RFC 7386) with explicit delete:
   values (including arrays, which are atomic) → `Set`.
 * `pub fn lint_patch(patch: &Value) -> Vec<Lint>` — the document key rules, except that
   `null` is allowed anywhere as the delete marker (and as a comment key's value, meaning
-  "delete this note").
+  "delete this note"). **Invariant:** nothing `lint_patch` accepts may produce a document
+  `lint` rejects. An object patch value is therefore always *applied*, never stored
+  verbatim: against an absent container a patch of nothing but deletes is a no-op that
+  creates nothing, and against an existing scalar or array the value becomes a map (a
+  change in itself, reported at the container's own path).
 
 There is no `make_patch`: nothing in the API or the lifecycle hooks builds a patch from
 two documents.
@@ -128,8 +136,11 @@ scalar (`Error::InvalidPath` otherwise).
   the same prefixes cover (`scopes::covers`, i.e. exactly what `Grants::can_read`
   answers, in either authoring order). A map's bare `__` documents the whole map and so
   travels only where the map itself is readable; `p__` travels with a fully readable `p`
-  (`docs/DESIGN.md` §9). **Invariant:** `filter` never emits a comment key the same
-  grant's `can_read` refuses as a view.
+  (`docs/DESIGN.md` §9). A document that is **not a map at the top level** is the empty
+  document here: a prefix addresses only through maps, so no non-root prefix covers any
+  part of it (a root prefix, i.e. full read, returns it unchanged from the early return).
+  **Invariants:** `filter` never emits a comment key the same grant's `can_read` refuses
+  as a view, and never emits anything at all for a value no prefix can address.
 * `render(value, format) -> String`, `parse(text, format)` (a replace payload: no nulls),
   `parse_patch(text, format)` (a merge payload: `null` is the delete marker).
 
@@ -167,7 +178,14 @@ for).
 * `parse_scopes(dc)` — the strict, whole-map parse used at *write* time: `Error::
   InvalidScopes` naming the offender for a malformed entry, a key that is not a PVE
   authid, an **empty prefix** (whole-document access comes from PVE ACLs, never from a
-  scope), or a prefix addressing inside `scopes` (it is an opaque leaf).
+  scope), a prefix addressing inside `scopes` (it is an opaque leaf), or a prefix with a
+  bare `__` segment (the note about a whole map, readable only where that map is —
+  `prefix: a__` stays legal). The three prefix rules live in one `check_prefix`, shared
+  with `scopes_for` and with `Grants::validate()`.
+* `Grants::validate()` — the same prefix rules at the **wire boundary**, called from
+  `api::parse_grants`. The derived `Deserialize` turned `{"prefix": ""}` into
+  `Path::root()`, i.e. a scope covering every path of every document including `scopes`;
+  `parse_entry` is the datacenter document's gate and was never this one.
 * `scopes_for(dc, authid) -> Vec<Scope>` — the lenient per-principal read, which
   **cannot fail**: a `scopes` value that is not a map, and any entry that `parse_scopes`
   would reject (whoever owns it), is skipped with a `warn!` and grants nothing. This
@@ -191,22 +209,34 @@ pmxcfs directory shared by every node.
 API (all synchronous, `Result<_, Error>`):
 
 * `locate(id) -> Option<PathBuf>`
-* `read(id) -> Document { id, path, raw, value, digest, mtime }` (`Error::NotFound` if
-  absent). `value` is **unstripped** — comment stripping is the API layer's job.
-  **Reads never lint** (`docs/DESIGN.md` §9): the parse is `format::parse_raw`, so
-  whatever is on disk comes back. Only a syntax error is an error. Content can only be
-  invalid out of band (a hand-edited file, a restored backup, pmxcfs replication), and
-  linting it on the way in made one bad key in `datacenter.yaml` a cluster-wide outage
-  that also blocked its own repair.
+* `read(id) -> Document { id, path, raw, value, parse_error, digest, mtime }`
+  (`Error::NotFound` if absent, `Error::TooLarge` above `MAX_READ_BYTES`). `value` is
+  **unstripped** — comment stripping is the API layer's job. **Reads never lint and never
+  fail on the document's own content** (`docs/DESIGN.md` §9): the parse is
+  `format::parse_raw`, and text it rejects yields `parse_error: Some(msg)` with the empty
+  document as `value` and the file's real bytes and digest. Content can only be invalid
+  out of band (a hand-edited file, a restored backup, pmxcfs replication), and failing on
+  it — whether by lint (pass 2) or by parse (pass 3) — made one typo in `datacenter.yaml`
+  a cluster-wide outage that also blocked its own repair.
+* `digest_of(id) -> Option<String>` — the content digest without parsing (or keeping) the
+  document, so a write can still carry a compare-and-swap precondition against a file
+  `read` refuses to read.
 * `guest_ids() -> Vec<u32>` — every vmid with a live document, ascending (not snapshot
   copies, not the datacenter document). The store's half of orphan detection; Perl owns
   the vmlist and does the comparison (`docs/DESIGN.md` §9).
 * `check_precondition(id, expected_digest)` — the compare-and-swap rule, without writing.
 * `put_raw(id, text, expected_digest) -> PutResult { document, touched }` — full text
   replace, creating the document if absent. The *new* text is parsed and linted — this is
-  the write-time gate; the existing content is parsed leniently, since it is only read to
-  diff against and must not be able to block a repair. `touched = diff(old, new)`; text
-  is stored as given (only normalised to end with a single newline).
+  the write-time gate; the existing content is parsed leniently (a syntax error, or a file
+  above the read cap, diffs as the empty document), since it is only read to diff against
+  and must not be able to block a repair. `touched = diff(old, new)`; text is stored as
+  given (only normalised to end with a single newline).
+* `put_raw_gated(id, text, expected_digest, WriteGate)` — the same with an explicit gate.
+  `WriteGate::Document` is `put_raw`'s full lint. `WriteGate::CallerLinted` parses and
+  requires a map at the top level, leaving the content rules to a caller that has already
+  linted what it writes: the API layer's scoped writes, which must not be blocked — or
+  made to disclose a path — by an out-of-band problem elsewhere in the document
+  (`docs/DESIGN.md` §9).
 * `delete(id)` — the **current document only**. `Error::NotFound` if absent.
 * `destroy(vmid)` — the document *and every snapshot copy*, idempotent. Only the
   `on_destroy` lifecycle hook calls this; the REST `DELETE` calls `delete`
@@ -219,7 +249,11 @@ API (all synchronous, `Result<_, Error>`):
   There is no `(mtime, len)` cache: the bindings build a fresh store per request so it
   could never hit, and pmxcfs's mtime granularity cannot distinguish two same-length
   writes in one tick so it would be unsound if it did. Documents are tiny.
-* Size limits: `WARN_BYTES = 256 KiB`, `MAX_BYTES = 512 KiB` → `Error::TooLarge`.
+* Size limits: `WARN_BYTES = 256 KiB`, `MAX_BYTES = 512 KiB` (writes) and
+  `MAX_READ_BYTES = 4 MiB` (reads) → `Error::TooLarge`. The read cap bounds what an
+  out-of-band file can cost on a path that runs per request; it is eight times the write
+  cap, so nothing this store wrote can ever hit it. A file above it is never parsed —
+  neither on read nor as `put_raw`'s old content — and stays replaceable.
   `MAX_BYTES` is a **backstop, not the operative limit for an API write**: pveproxy
   refuses a body of about that size first (measured: 520 000 B through, 530 000 B →
   "for data too large", HTTP 501). It bounds the writers that do not go through
@@ -252,12 +286,21 @@ without a cluster. Every function takes a `&MetaStore`; the bindings supply one 
 **Write authorization** (`docs/DESIGN.md` §8) — decided from the request, never from a
 diff:
 
+0. a write against a document whose content could not be recovered (it does not parse, or
+   it is above the read cap) is refused with 400 unless it *replaces the file whole* — a
+   root `replace` or a root `DELETE`, both of which already require `full_write`. The
+   value planned against is the empty document, so anything narrower would silently
+   discard the file;
 1. `can_write(view)` must hold before anything is computed, and a caller without
    `full_write` may not write the root view at all;
 2. the mutation is planned against a **clone** and every path the plan touches is checked
    with `check_write`;
-3. the whole planned document is linted (so `dry_run` validates exactly what the write
-   validates);
+3. the plan is linted (so `dry_run` validates exactly what the write validates) — the
+   *whole* document for a caller with `full_write`, who is offered the whole document and
+   can repair it, and only the subtree at the view for anyone else, whose write is stored
+   under `WriteGate::CallerLinted` for the same reason (`docs/DESIGN.md` §9: strict lint
+   runs only on the content being written). A 400 from lint names only findings the caller
+   may read, counting the rest — the same disclosure rule 403s obey;
 4. a datacenter write that touches `scopes` additionally requires `full_write` — the
    access-control map is admin-only whatever the scopes say, since `check_write` asks
    only whether the *path* is covered and a scope covering `scopes` makes that true
@@ -269,6 +312,17 @@ document with the real digest (which would be a change-detection oracle). A call
 *partial* grant does get the whole document's digest — scoped writers need it for
 compare-and-swap PUTs.
 
+**Unparseable documents** answer 200 with `parse_error` (the parser's message), an empty
+`data`/`text`, no `keys` and the real digest; `raw` (the file's text) is added only for a
+caller with `full_read`, who may read the whole document anyway and needs it to write the
+repair. `grants` treats an unparseable — or oversized — `datacenter.yaml` as an empty
+`scopes` map with a `warn!`, so guest operations for ACL holders keep working
+(`docs/DESIGN.md` §9).
+
+**`touched` paths** are rendered through the same opaque-leaf rule `check_write` and
+`parse_view` apply: anything inside `scopes` is reported as `scopes`, de-duplicated, so
+every path a client is handed is addressable as a view again.
+
 **403 messages** never name a path the caller cannot read: the offending path is included
 only when the caller has read access to its parent.
 
@@ -276,6 +330,12 @@ only when the caller has read access to its parent.
 anything deeper is a 400 explaining why (its keys are authids, which may contain the path
 separator). Entries are added and removed by writing the map, `mode=merge` with `null` to
 delete one (`docs/DESIGN.md` §9).
+
+One unreadable document never denies a *listing*: `list_guests` reads
+tolerantly, so a guest whose document does not parse (or is above the read cap)
+is listed with its real digest and no keys, rather than 400-ing
+`GET /meta/guests` for every principal (`docs/DESIGN.md` §9). A `GET` of that
+one document still answers with `parse_error`, or 400 for the size.
 
 `list_guests` takes the vmlist rows *from Perl* (`[{vmid, node, type, name, grants}]`,
 `grants` a JSON string). This crate never opens `/etc/pve/.vmlist` or a guest config:
@@ -319,7 +379,11 @@ scenarios:
   them, an api-delete-then-rollback end-to-end case, version token changes on write and
   not on read and distinguishes same-length writes, no temp files left behind; an
   out-of-band invalid document is still readable and still repairable while the
-  write-time lint is unchanged; `guest_ids` lists live documents only;
+  write-time lint is unchanged; a document whose *syntax* is broken (a tab, an anchor, an
+  indentation slip, an unterminated flow) reads as `parse_error` + the empty value + the
+  real digest and is still repairable; a file above the read cap is `TooLarge` on read and
+  still replaceable; `WriteGate::CallerLinted` stores what the document lint would refuse
+  but still requires a parseable map; `guest_ids` lists live documents only;
 * api: a zero-grant (and a wrongly-scoped) token cannot create structure through an empty
   merge or a `{}` replace at any prefix, cannot write the root view, and cannot learn
   values or key structure from a 403; `dry_run` and the real write agree; merge-with-null
@@ -328,4 +392,11 @@ scenarios:
   (PUT, DELETE and `dry_run`, with a root-prefix and with a `scopes`-prefix rw scope);
   a single `scopes` entry is not addressable as a view; an out-of-band invalid document
   is readable and repairable by a full-ACL caller; a scoped read never carries a bare
-  `__`; orphan documents are listed only with datacenter read.
+  `__`; orphan documents are listed only with datacenter read; an unparseable document
+  denies no endpoint and no principal and is repaired by a root replace or DELETE while
+  every narrower write against it is refused; a list- or scalar-rooted document is empty
+  for a scope-only caller through both the view-less GET and `?has=`; a lint 400 names no
+  path the caller cannot read and a scoped write is not blocked by an out-of-band key
+  elsewhere; a nested `null` delete marker is applied, never stored; `touched` collapses
+  a path inside `scopes`; an invalid scope prefix is refused where `grants_json` is
+  parsed.

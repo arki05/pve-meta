@@ -88,6 +88,13 @@ fn walk_patch(v: &Value, path: &Path, out: &mut Vec<Lint>) {
 /// root path; setting a key to the value it already has yields nothing;
 /// deleting a missing key yields nothing.
 ///
+/// An object patch value always *applies* — it is never stored verbatim — so
+/// its `null` delete markers delete rather than being written into the
+/// document (review pass 3 R7). Against an absent container that means a
+/// patch of nothing but deletes is a no-op and creates no container; against
+/// an existing scalar or array it means the value becomes a map (a change in
+/// itself, reported at the container's own path).
+///
 /// Both `doc` and `patch` are expected to have an object at the top level;
 /// if either does not, this is a no-op.
 pub fn apply_patch(doc: &mut Value, patch: &Value) -> Vec<Touched> {
@@ -121,6 +128,38 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
             Value::Object(_) if matches!(doc_map.get(k), Some(Value::Object(_))) => {
                 let child = doc_map.get_mut(k).expect("checked above");
                 apply_obj(child, v, &child_path, touched);
+            }
+            // A *non-empty* object patch over a target that is absent or is
+            // not an object. Applying it verbatim spliced the patch's own
+            // `null` delete markers into the document as literal nulls, which
+            // `model::lint` then rejected — so the documented combined
+            // set+delete patch shape (`{"sub": {"x": 1, "gone": null}}`) was
+            // unusable against a container that did not exist yet, even
+            // though `lint_patch_at` deliberately accepts those nulls (review
+            // pass 3 R7). It is applied to an empty scratch map instead —
+            // the same trick `view::merge` already used for the value at the
+            // view prefix itself, one level down.
+            Value::Object(patch_map) if !patch_map.is_empty() => {
+                // Not an object (the arm above matched that case), so this is
+                // "the key is absent" vs. "the key holds a scalar or array".
+                let existed = doc_map.contains_key(k);
+                let mut scratch = Value::Object(serde_json::Map::new());
+                let mut sub = Vec::new();
+                apply_obj(&mut scratch, v, &child_path, &mut sub);
+                // Replacing an existing scalar/array with a map is a change
+                // in itself, even if the patch body wrote no leaves; creating
+                // a container the patch then writes nothing into is not (a
+                // merge that touches nothing changes nothing,
+                // `docs/DESIGN.md` §8). Either way the *container's* path is
+                // what is reported, keeping this arm's "replacing a whole
+                // subtree yields its root path" convention.
+                if existed || !sub.is_empty() {
+                    doc_map.insert(k.clone(), scratch);
+                    touched.push(Touched {
+                        path: child_path,
+                        op: Op::Set,
+                    });
+                }
             }
             _ => {
                 if doc_map.get(k) != Some(v) {
@@ -286,6 +325,64 @@ mod tests {
         let new = json!({"a": [1, 2, 3]});
         let touched = diff(&old, &new);
         assert_eq!(touched, vec![Touched{path: Path::parse("a").unwrap(), op: Op::Set}]);
+    }
+
+    #[test]
+    fn a_nested_delete_marker_is_applied_not_spliced_into_the_document() {
+        // Review pass 3 R7: the catch-all arm inserted the patch value
+        // verbatim when the target key was absent or not an object, so a
+        // nested `null` landed in the document as a literal null and the
+        // whole-document lint then rejected the write -- making the
+        // documented combined set+delete shape unusable against a container
+        // that does not exist yet. `lint_patch_at` accepts those nulls on
+        // purpose, so nothing it accepts may trip `model::lint`.
+
+        // (a) Absent container, nothing but deletes: a no-op that creates
+        //     nothing and touches nothing.
+        let mut doc = json!({"a": 1});
+        let touched = apply_patch(&mut doc, &json!({"sub": {"gone": null}}));
+        assert_eq!(doc, json!({"a": 1}));
+        assert!(touched.is_empty());
+
+        // ... at any depth.
+        let mut deep = json!({});
+        assert!(apply_patch(&mut deep, &json!({"a": {"b": {"gone": null}}})).is_empty());
+        assert_eq!(deep, json!({}));
+
+        // (b) Absent container, a set and a delete: the set lands, the
+        //     delete deletes nothing, no null is stored.
+        let mut doc2 = json!({});
+        let touched2 = apply_patch(&mut doc2, &json!({"sub": {"x": 1, "gone": null}}));
+        assert_eq!(doc2, json!({"sub": {"x": 1}}));
+        assert_eq!(touched2, vec![Touched { path: Path::parse("sub").unwrap(), op: Op::Set }]);
+
+        // (c) Over a scalar: the scalar becomes a map, which is a change in
+        //     itself and is reported at the container's own path.
+        let mut doc3 = json!({"a": "scalar"});
+        let touched3 = apply_patch(&mut doc3, &json!({"a": {"x": 1, "y": null}}));
+        assert_eq!(doc3, json!({"a": {"x": 1}}));
+        assert_eq!(touched3, vec![Touched { path: Path::parse("a").unwrap(), op: Op::Set }]);
+
+        let mut doc4 = json!({"a": "scalar"});
+        let touched4 = apply_patch(&mut doc4, &json!({"a": {"deep": null}}));
+        assert_eq!(doc4, json!({"a": {}}));
+        assert_eq!(touched4, vec![Touched { path: Path::parse("a").unwrap(), op: Op::Set }]);
+
+        // Nothing `lint_patch` accepts may produce a document `lint` rejects.
+        for patch in [
+            json!({"sub": {"gone": null}}),
+            json!({"sub": {"x": 1, "gone": null}}),
+            json!({"a": {"deep": null}}),
+            json!({"a": {"b": {"c": null}}}),
+        ] {
+            assert!(lint_patch(&patch).is_empty(), "{patch} should be a legal patch");
+            let mut target = json!({"a": "scalar", "keep": 1});
+            apply_patch(&mut target, &patch);
+            assert!(
+                model::lint(&target).is_empty(),
+                "{patch} produced a document the lint refuses: {target}"
+            );
+        }
     }
 
     #[test]

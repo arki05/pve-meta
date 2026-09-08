@@ -25,8 +25,9 @@ use sha2::{Digest as _, Sha256};
 use crate::digest;
 use crate::error::{Error, Result};
 use crate::format::{self, Format};
-use crate::model::Value;
+use crate::model::{Lint, Value};
 use crate::patch::{self, Touched};
+use crate::path::Path;
 
 /// Warn threshold for document size (informational only; logged via
 /// `tracing`).
@@ -42,8 +43,49 @@ pub const WARN_BYTES: u64 = 256 * 1024;
 /// single document from eating the pmxcfs size budget.
 pub const MAX_BYTES: u64 = 512 * 1024;
 
+/// Hard limit for what [`MetaStore::read`] will read off the disk at all.
+///
+/// [`MAX_BYTES`] only ever applied to *writes*, so a multi-megabyte file
+/// dropped into `/etc/pve/meta` out of band (a bad rsync, a replicated file
+/// from a future version, a mistake) was read and SHA-256'd on every request
+/// that touched it — including `api::grants`, which reads `datacenter.yaml`
+/// on every single guest operation (review pass 3 §5, `store.rs:235`).
+///
+/// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
+/// can ever reach it, so hitting it always means the file arrived out of
+/// band, and the slack means a document that was legally written can always
+/// still be read back (and therefore repaired) even if the write limit is
+/// lowered later.
+pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+
 /// The one on-disk format (`docs/DESIGN.md` §8: "YAML only on disk").
 pub const DISK_FORMAT: Format = Format::Yaml;
+
+/// How much validation [`MetaStore::put_raw`] applies to the text being
+/// stored.
+///
+/// The full document lint is the right gate for a caller handing over
+/// whole-document content it did not itself validate. It is the *wrong* gate
+/// for a scoped write, which is only allowed to touch one subtree: with it,
+/// one out-of-band bad key anywhere in a document blocked every write by
+/// everybody who could not replace the whole document, and the 400 rendered
+/// the offending path to a caller who could not read it (review pass 3 R6;
+/// `docs/DESIGN.md` §9, "strict lint runs only on the content being
+/// written").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteGate {
+    /// Parse and fully [`crate::model::lint`] the new text. Used by every
+    /// caller that supplies whole-document content: the lifecycle hooks, a
+    /// backup import, and any API write by a principal who may replace the
+    /// whole document.
+    Document,
+    /// Parse the new text and require a map at the top level, but leave the
+    /// content rules to the caller, which has already linted the subtree it
+    /// is writing (`crate::view::replace`/`crate::view::merge` lint the
+    /// payload at the path it lands on). Pre-existing findings elsewhere in
+    /// the document neither block the write nor appear in its error message.
+    CallerLinted,
+}
 
 /// Identifies a top-level document in the store (a guest's metadata, or the
 /// datacenter's). Snapshots are addressed separately, by `(vmid, name)`, via
@@ -83,10 +125,24 @@ pub struct Document {
     pub path: PathBuf,
     /// The raw file text.
     pub raw: String,
-    /// The parsed value. **Unstripped**: comment keys are still present;
-    /// stripping them is the caller's (API layer's) job via
-    /// [`crate::model::strip_comments`].
+    /// The parsed value, or the **empty document** when [`Document::parse_error`]
+    /// is set. **Unstripped**: comment keys are still present; stripping them
+    /// is the caller's (API layer's) job via [`crate::model::strip_comments`].
     pub value: Value,
+    /// `Some(message)` when the file's text is not valid YAML at all, in
+    /// which case [`Document::value`] is the empty document
+    /// (`docs/DESIGN.md` §9, review pass 3 R1).
+    ///
+    /// A *syntax* error used to propagate out of [`MetaStore::read`], which
+    /// made a single tab or indentation slip in a hand-edited
+    /// `datacenter.yaml` a cluster-wide 400 for every principal, root
+    /// included — and unrepairable through the API, because every write
+    /// reads the document before planning. The file is still on disk, still
+    /// carries its real [`Document::digest`], and can still be replaced;
+    /// callers decide what to do with a document they cannot parse. The
+    /// digest is over the file's actual bytes either way, so the
+    /// compare-and-swap precondition of a repairing write is unaffected.
+    pub parse_error: Option<String>,
     /// The lowercase hex SHA-256 digest of the raw file bytes.
     pub digest: String,
     /// The file's last-modified time.
@@ -215,9 +271,9 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Reads and parses one document file. **Reads never lint**
-    /// (`docs/DESIGN.md` §9, review P2): the parse is
-    /// [`format::parse_raw`], so whatever is on disk comes back as it is.
+    /// Reads and parses one document file. **Reads never lint, and never
+    /// fail on the document's own content** (`docs/DESIGN.md` §9, review
+    /// P2/R1).
     ///
     /// Every API write is already lint-gated, so invalid content can only
     /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
@@ -228,30 +284,85 @@ impl MetaStore {
     /// to see the problem nor write over it. Strict validation belongs to the
     /// content being written, and lives in [`MetaStore::put_raw`]'s parse of
     /// the *new* text.
+    ///
+    /// Pass 2 moved the *lint* off this path and left the *parse* fatal,
+    /// which is the same outage one layer down: a tab, an indentation slip,
+    /// an anchor or an explicit tag still 400'd every endpoint for everyone.
+    /// A syntax error is now reported per document, in
+    /// [`Document::parse_error`], with the empty document as the value — the
+    /// caller decides (`api::grants` grants nothing and warns; a read answers
+    /// with `parse_error` and no data; a full-write caller may replace the
+    /// whole document to repair it).
+    ///
+    /// # Errors
+    /// [`Error::TooLarge`] if the file exceeds [`MAX_READ_BYTES`], and I/O
+    /// errors. Never [`Error::Parse`] or [`Error::Lint`].
     fn read_document(&self, id: DocId, path: &std::path::Path) -> Result<Document> {
+        let meta = fs::metadata(path)?;
+        // Checked from the metadata, before the bytes are read: the point is
+        // not to pull a multi-megabyte file into memory (and hash it) on
+        // every request that touches this document.
+        Self::check_read_size(meta.len())?;
+        let mtime = meta.modified()?;
         let bytes = fs::read(path)?;
         let raw = String::from_utf8(bytes.clone())
             .map_err(|e| Error::Other(anyhow::anyhow!("{}: invalid utf-8: {e}", path.display())))?;
-        let value = format::parse_raw(DISK_FORMAT, &raw)?;
+        let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
+            Ok(value) => (value, None),
+            Err(e) => {
+                tracing::warn!(document = %id, error = %e, "stored document is not valid YAML; reading it as empty");
+                (Value::Object(serde_json::Map::new()), Some(e.to_string()))
+            }
+        };
         let dig = digest::digest(&bytes);
-        let mtime = fs::metadata(path)?.modified()?;
         Ok(Document {
             id,
             path: path.to_path_buf(),
             raw,
             value,
+            parse_error,
             digest: dig,
             mtime,
         })
     }
 
-    /// Reads `id`'s document.
+    fn check_read_size(size: u64) -> Result<()> {
+        if size > MAX_READ_BYTES {
+            return Err(Error::TooLarge {
+                size,
+                max: MAX_READ_BYTES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads `id`'s document. **Reads never lint and never fail on the
+    /// document's own content**: text the YAML parser rejects is reported in
+    /// [`Document::parse_error`], with the empty document as the value
+    /// (`docs/DESIGN.md` §9, review P2/R1).
     ///
     /// # Errors
-    /// [`Error::NotFound`] if it does not exist.
+    /// [`Error::NotFound`] if it does not exist; [`Error::TooLarge`] if the
+    /// file is bigger than [`MAX_READ_BYTES`].
     pub fn read(&self, id: DocId) -> Result<Document> {
         let path = self.locate(id)?.ok_or(Error::NotFound(id))?;
         self.read_document(id, &path)
+    }
+
+    /// `id`'s current content digest without parsing (or even keeping) the
+    /// document, or `None` if it does not exist.
+    ///
+    /// This is what lets a write repair a document [`MetaStore::read`]
+    /// refuses to read — one above [`MAX_READ_BYTES`] — while still carrying
+    /// a compare-and-swap precondition: the caller needs the digest, and the
+    /// digest is the one thing about such a file that is cheap and safe to
+    /// compute (review pass 3 §5, `store.rs:235`).
+    pub fn digest_of(&self, id: DocId) -> Result<Option<String>> {
+        match fs::read(self.path_for(id)) {
+            Ok(bytes) => Ok(Some(digest::digest(&bytes))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The digest precondition, enforced in exactly one place
@@ -295,7 +406,8 @@ impl MetaStore {
     }
 
     /// Replaces `id`'s document with `text` verbatim (only normalized to end
-    /// with a single newline), creating it if it does not exist.
+    /// with a single newline), creating it if it does not exist, applying the
+    /// full document lint to the new text ([`WriteGate::Document`]).
     ///
     /// # Errors
     /// [`Error::Parse`] / [`Error::Lint`] if `text` does not parse as a valid
@@ -303,6 +415,29 @@ impl MetaStore {
     /// does not match (`Some("")` matches a missing document);
     /// [`Error::TooLarge`] if `text` exceeds [`MAX_BYTES`].
     pub fn put_raw(&self, id: DocId, text: &str, expected_digest: Option<&str>) -> Result<PutResult> {
+        self.put_raw_gated(id, text, expected_digest, WriteGate::Document)
+    }
+
+    /// [`MetaStore::put_raw`] with an explicit [`WriteGate`].
+    ///
+    /// [`WriteGate::CallerLinted`] is for the API layer's scoped writes,
+    /// which lint the subtree they write and must not be blocked (or made to
+    /// disclose paths) by an out-of-band problem elsewhere in the document
+    /// (`docs/DESIGN.md` §9, review pass 3 R6). The text must still parse and
+    /// still be a map at the top level: that is the one rule about the
+    /// document *as a whole* rather than about its content, and losing it
+    /// would let a scoped write turn a document into something no scoped read
+    /// can address.
+    ///
+    /// # Errors
+    /// As [`MetaStore::put_raw`].
+    pub fn put_raw_gated(
+        &self,
+        id: DocId,
+        text: &str,
+        expected_digest: Option<&str>,
+        gate: WriteGate,
+    ) -> Result<PutResult> {
         let path = self.path_for(id);
         let existing = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
@@ -314,20 +449,43 @@ impl MetaStore {
         // The *old* content is only read to diff against, so it is parsed
         // leniently: an out-of-band edit that broke it must not stop an
         // administrator from writing the repair (`docs/DESIGN.md` §9, review
-        // P2).
+        // P2/R1). That now includes a *syntax* error — pass 2 made the lint
+        // lenient here and left the parse fatal, so `?` on this line was
+        // still the last thing standing between a tabbed-in `datacenter.yaml`
+        // and its repair. Unparseable old content diffs as the empty
+        // document: the repair reports everything it writes as newly set,
+        // which is exactly true of a document that had no readable structure.
         let old_value = match &existing {
-            Some(bytes) => {
+            // Above the read cap the old content is not parsed at all: the
+            // point of the cap is that nothing pulls a multi-megabyte
+            // document through the YAML parser, and this is the path that
+            // replaces such a file.
+            Some(bytes) if bytes.len() as u64 <= MAX_READ_BYTES => {
                 let old_raw = String::from_utf8(bytes.clone())
                     .map_err(|e| Error::Other(anyhow::anyhow!("invalid utf-8: {e}")))?;
-                format::parse_raw(DISK_FORMAT, &old_raw)?
+                format::parse_raw(DISK_FORMAT, &old_raw)
+                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
             }
-            None => Value::Object(serde_json::Map::new()),
+            _ => Value::Object(serde_json::Map::new()),
         };
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
-        // The write-time gate: the content being stored is fully linted.
-        let new_value = format::parse(DISK_FORMAT, &normalized)?;
+        // The write-time gate: the content being stored is validated as
+        // `gate` requires (never less than "parses, and is a map").
+        let new_value = match gate {
+            WriteGate::Document => format::parse(DISK_FORMAT, &normalized)?,
+            WriteGate::CallerLinted => {
+                let value = format::parse_raw(DISK_FORMAT, &normalized)?;
+                if !value.is_object() {
+                    return Err(Error::Lint(vec![Lint {
+                        path: Path::root(),
+                        msg: "top level must be an object".to_string(),
+                    }]));
+                }
+                value
+            }
+        };
 
         self.write_atomic(&path, normalized.as_bytes())?;
 
@@ -340,6 +498,8 @@ impl MetaStore {
                 path,
                 raw: normalized,
                 value: new_value,
+                // It was just parsed, on the way in.
+                parse_error: None,
                 digest: dig,
                 mtime,
             },
