@@ -57,12 +57,12 @@ PVE conventions (form/JSON parameters; nested values are JSON-encoded strings).
 | Method | Path | Params | Returns |
 |---|---|---|---|
 | GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller] }]` — every guest in the vmlist, `digest: ""` when no document |
-| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ vmid, view, digest, data }` or `{ vmid, view, digest, text }` |
+| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object |
 | PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | — | the caller's effective grants: `{ full: [vmids or "*"], scopes: [{prefix, mode}] }` (what the UI's "view as" offers) |
-| GET | `/meta/version` | — | `{ token }` — content hash over the store; poll it |
+| GET | `/meta/access` | `vmid` or `dc=1` (optional) | `{ read, write, scopes: [{prefix, mode}] }` for that document; without either, the caller's scopes and datacenter read/write |
+| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store and the newest mtime; poll it |
 
 Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust
 core through the perlmod bindings (`PVE::RS::Meta`): view extraction, prefix stripping,
@@ -185,3 +185,26 @@ These resolve the under-specified corners the review found (`REVIEW-2026-09-07.m
   diverted for another manifest is refused with a clear error (documented limitation).
 * **Service restarts** in maintainer scripts go through `deb-systemd-invoke
   reload-or-try-restart`.
+
+## 9. Decisions from the 2026-09-08 review (binding)
+
+* **`scopes` is admin-only, whatever the scope grants.** A write that touches `scopes`
+  requires `full_write` on the datacenter document; no scope (including a broad one)
+  can grant it. Scope prefixes must be non-empty: full access is only ever granted
+  through PVE ACLs, never through an empty-prefix scope.
+* **`scopes` keys are PVE authids** (validated with the authid rule, dots allowed) and the
+  `scopes` map is an opaque leaf for path addressing: a view may target `scopes` as a
+  whole, never a single entry. Entries are added or removed by writing the map.
+* **Reads never lint.** The store reads and returns what is on disk; strict lint runs only
+  on the content being written. A malformed `scopes` container or entry is skipped with
+  a warning and grants nothing.
+* **The bare `__` comment of a map is visible only when the map itself is readable**
+  (a scope on `p` covers `p`, `p__` and everything below `p`, nothing above it).
+* **Orphans** (documents whose vmid is no longer in the vmlist) are listed by
+  `GET /meta/guests` with `orphan: true` for callers with datacenter read, and may be
+  deleted by callers with datacenter write. Nothing else may write them.
+* **`GET /meta/access` and the single-document GET** are documented as implemented:
+  `{ read, write, scopes }` with optional `vmid`/`dc`; documents return `id`, `view`,
+  `digest`, ordered `keys`, and `data` or `text`. `GET /meta/version` returns
+  `{ token, changed }`.
+* **lintian runs in every `deb` target.**
