@@ -227,6 +227,21 @@ fn check_prefix(prefix: &Path) -> std::result::Result<(), String> {
             model::COMMENT_SUFFIX
         ));
     }
+    // A comment key is a leaf string, so nothing is addressable below it: a
+    // prefix that passes *through* one (`a__.b`) could never be used as a view
+    // (`api::parse_view` refuses it, review pass 4 Q1). Refuse it here too so
+    // the dead grant is an error at configuration time instead of a 400 on
+    // every use. A prefix that *ends* in a comment key (`a__`) stays legal.
+    let segs = prefix.segments();
+    if segs.len() > 1
+        && segs[..segs.len() - 1]
+            .iter()
+            .any(|s| model::is_comment_key(s))
+    {
+        return Err(format!(
+            "invalid prefix '{prefix}': a comment key is a leaf, nothing is addressable              below it"
+        ));
+    }
     Ok(())
 }
 
@@ -594,6 +609,15 @@ mod tests {
     }
 
     #[test]
+fn parse_scopes_rejects_a_prefix_through_a_comment_key() {
+    let doc = serde_json::json!({"scopes": {"a@pve": [{"prefix": "a__.b", "mode": "rw"}]}});
+    let err = parse_scopes(&doc).unwrap_err().to_string();
+    assert!(err.contains("comment key is a leaf"), "{err}");
+    let ok = serde_json::json!({"scopes": {"a@pve": [{"prefix": "a__", "mode": "rw"}]}});
+    assert!(parse_scopes(&ok).is_ok());
+}
+
+#[test]
     fn parse_scopes_rejects_an_empty_prefix() {
         // `docs/DESIGN.md` §9, review P1 + LOW #1: an empty prefix is
         // "everything", i.e. write access to `scopes` itself. Whole-document
