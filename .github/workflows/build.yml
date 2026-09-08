@@ -28,7 +28,8 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential curl git pkg-config libssl-dev libperl-dev perl \
-            debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen lintian
+            debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen lintian \
+            nodejs npm
 
       - name: Install rustup toolchain
         run: |
