@@ -1,249 +1,201 @@
-# pve-meta — design (revision 4)
+# pve-meta — design (revision 5)
 
-This document replaces `API.md`, `NATIVE-API-SPEC.md`, `UI-SPEC.md` and `DAEMON-SPEC.md`.
-It describes the one feature this project builds, the two generic seams it needs in
-Proxmox VE, and nothing else.
+Revision 5 supersedes revision 4 (`DESIGN-rev4.md`, kept for the record) and the
+review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
+deviations recorded in §11. It is the single authority for the code; where code and this
+document disagree, the code is wrong.
 
-## 1. The feature
+## 1. Threat model
+
+This is a trusted, single-administrator environment: a homelab cluster. The principals
+are the administrator and the service API tokens that same administrator issued.
+pve-meta holds configuration intent, not secrets. Scopes are a **blast-radius limiter**,
+not an access-control system: their job is that an operator with a bug writes garbage
+into its own prefix instead of everyone's, and that a principal sees the part of a
+document it cares about. They must be correct; they are not adversarially hardened.
+
+In scope: a scoped principal does not read or write document content outside its
+granted prefixes; a concurrent write does not silently lose another's update.
+Out of scope: key-name disclosure through errors, digests or listings; any defence
+against a principal the administrator deliberately issued a token to. pve-meta gates
+nothing but access to metadata documents; it never restricts a PVE permission the
+platform itself grants.
+
+## 2. The feature
 
 Every guest (vmid) and the datacenter have one **document**: a nested key-value tree
-stored as YAML in `/etc/pve/meta/<vmid>.yaml` (`datacenter.yaml`). A document is the
-JSON data model with ordered maps, no nulls, and **comment keys**: a key ending in `__`
-is a human note about its sibling (`host__` documents `host`, a bare `__` documents the
-map). Comment keys are ordinary data and travel with the document everywhere.
+stored as YAML in `/etc/pve/meta/<vmid>.yaml` (`datacenter.yaml`). A document is the JSON
+data model with ordered maps and no nulls. A key ending in `__` is a **comment key**: a
+string note about its sibling (`host__` documents `host`, a bare `__` documents the
+map). Comment keys are ordinary data; the UI renders them as the description of the
+row they document. No key is reserved in any document.
 
-A caller reads or writes the document through a **view**: a key-path prefix. A view of
-`traefik` is the subtree under `traefik`, returned with the prefix stripped, in JSON or as
-YAML text. Views are also the unit of access: a principal (PVE user or API token) can be
-granted read or read-write on a prefix, and then sees and edits only that part of every
-document. That is the whole feature: a per-guest key-value tree, and prefix-scoped views
-of it. Nothing about namespaces, operators, or forms.
+A caller reads or writes a document through a **view**: a key-path prefix (dotted, any
+depth, through maps only). A view of `traefik` is the subtree under `traefik`, returned
+with the prefix stripped. Views are also the unit of access.
 
-## 2. Access
+## 3. Registrations, scopes, grants
 
-Two grant paths, evaluated per request:
+Access-control data lives **outside** the documents, one file per principal, in a drop
+directory: `/etc/pve/meta.d/operators/<name>.yaml` (cluster-wide, pmxcfs) with packaged
+defaults in `/usr/share/pve-meta/operators/<name>.yaml` (a cluster file overrides the
+packaged file of the same name). One format serves scopes and operator registration:
 
-1. **PVE ACLs** (full access): `VM.Audit` on `/vms/<vmid>` reads the whole document,
-   `VM.Config.Options` writes it. Datacenter document: `Sys.Audit` / `Sys.Modify` on `/`.
-2. **Scopes** (partial access): entries in the datacenter document, keyed by authid:
+```yaml
+authid: svc@pve!traefik
+description: Traefik dynamic-configuration provider
+scopes:
+  - prefix: traefik            # any dotted path, nested allowed
+    mode: rw                   # ro | rw
+    selector: { all: true }    # or { tag: traefik }; room for { pool: name } later
+    grammar:                   # optional, PVE::JSONSchema dialect for the subtree
+      type: object
+      properties:
+        spec:
+          type: object
+          properties:
+            host: { type: string, description: Public host name }
+            port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+```
 
-   ```yaml
-   scopes:
-     svc@pve!traefik:
-       - prefix: traefik
-         mode: rw
-       - prefix: netbird
-         mode: ro
-   ```
+Rules:
 
-   A scope grants that principal the prefix on **every** guest document (no per-vmid
-   scoping in this revision), without needing any VM privilege. Scopes never restrict a
-   principal that already has full access through ACLs.
+* Files are parsed strictly and independently; a malformed file is skipped with a
+  warning and grants nothing. Prefixes are non-empty. `authid` is a PVE user or token id.
+* A **selector** restricts a scope to guests: `all`, or `tag: <t>` (the guest carries the
+  PVE tag). Tag membership is read from the cluster's cached guest properties. Adding the
+  tag is the deliberate act of granting the operator that guest.
+* Scopes apply to **guest documents only**. The datacenter document is governed by ACLs
+  alone.
+* A scope on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
+  is the only comment-key rule.
 
-Reading a view `P` requires read on `P` (ACL, or a scope whose prefix is a prefix of `P`).
-Writing requires write on every touched path. A read without `view` returns the union of
-the caller's readable subtrees (full document for ACL holders). A non-existent document
-is an empty document with digest `""`; there is no explicit create.
+Grants for a caller on a guest document:
 
-Only principals with `Sys.Modify` on `/` may edit `scopes` (it lives in the datacenter
-document, so that rule falls out of the datacenter write permission; additionally any
-write touching `scopes` is refused for scope-granted principals).
+* `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`
+  (datacenter: `Sys.Audit` / `Sys.Modify` on `/`).
+* `scopes` = the union of scope entries from registrations whose `authid` is the caller
+  and whose selector matches the guest.
+* Reading view `P` requires full read or a scope covering `P`; writing requires full
+  write or a `rw` scope covering every touched path; a write to the root view requires
+  full write. A read by a caller with no grant at all is 403. Authorization is decided
+  from the request and a plan computed against a copy, never from a diff of stored data.
 
-## 3. API (native, `/api2/json/meta`, served by pveproxy/pvedaemon)
+## 4. Documents on the wire
 
-Reads run in pveproxy, writes are `protected` and run in pvedaemon. Parameters follow
-PVE conventions (form/JSON parameters; nested values are JSON-encoded strings).
+* Reads: `data` (JSON object, unordered) or `text` (YAML, the file's own text for the
+  root view, a canonical dump for a sub-view). Key order is preserved in the file and is
+  not a wire contract; the UI sorts.
+* Writes: `data` (JSON string) or `text` (YAML) with `mode=replace` (the view's subtree
+  is replaced; `{}` stores an empty map) or `mode=merge` (merge-patch, `null` deletes; a
+  merge that touches nothing changes nothing). One lint runs on the planned document;
+  the write is refused with a 400 that names the offending path. `digest` is the
+  optional expected file digest (409 on mismatch); `dry_run=1` plans and validates
+  without writing.
+* Unparsable file: `format=yaml` returns the raw text plus `parse_error` (so an
+  administrator can repair it); `format=json` returns 422 with the parse error; a root
+  `replace` by a full writer repairs it. This is a per-document condition, never
+  cluster-wide.
+* Writes run under `PVE::Cluster::cfs_lock_domain("pve-meta-<id>")` with the digest
+  check inside the lock; files are written atomically with node/pid/seq-unique temp
+  names. Errors name paths; there is no disclosure filtering.
+
+## 5. API (native, `/api2/json/meta`, served by pveproxy/pvedaemon)
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller], orphan }]` — every guest in the vmlist the caller can read something of, `digest: ""` when no document; `node`/`name` only with `VM.Audit`; documents whose vmid is no longer in the vmlist are listed with `orphan: 1` (and `node`/`type`/`name` null) for callers with datacenter read |
-| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object. A document whose stored text does not parse answers 200 with `parse_error` (the parser's message), empty `data`/`text`, no `keys`, its real `digest`, and — for a caller with full read — `raw`, the text to repair from (§9) |
-| PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
-| DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
-| GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | `vmid` or `dc=1` (optional) | `{ read, write, scopes: [{prefix, mode}] }` for that document; without either, the caller's scopes and datacenter read/write; for an orphan vmid, `read`/`write` are `Sys.Audit`/`Sys.Modify` on `/` and `scopes` is empty (§9), matching GET and DELETE; 404 for a vmid that is neither a guest nor an orphan |
-| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store and the newest mtime; poll it |
+| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store; poll it |
+| GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags: [..], digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
+| GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
+| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |
+| DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
+| GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
+| GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
+| GET | `/meta/operators` | — | `[{ name, authid, description, scopes: [{ prefix, mode, selector, grammar? }] }]` — all registrations, readable by every authenticated user |
 
-Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust
-core through the perlmod bindings (`PVE::RS::Meta`): view extraction, prefix stripping,
-merge/replace, touched-path computation, YAML/JSON rendering and digesting all happen
-in Rust; Perl does parameters, permissions and scope lookup.
+PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
+404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
+PVE conventions; `data` is a JSON-encoded string parameter.
 
-## 4. Guest lifecycle
+Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over
+`pve_meta_core::api` through the perlmod bindings. **Grants, guest lists and results
+cross the Perl/Rust boundary as native hashes/arrays**, never as JSON strings; only the
+client-supplied `data` parameter is a JSON string, decoded once in Rust.
 
-Metadata is part of the guest: snapshot, rollback, delete-snapshot, clone, destroy and
-container backup/restore carry it, through one-line calls to `PVE::RS::Meta` inserted
-into pve-container, qemu-server, libpve-guest-common and vzdump (see
-`LIFECYCLE-PATCHES.md`). QEMU backups through QEMU's own backup command cannot embed
-the blob (fixed parameter set); that is a documented gap.
+## 6. Guest lifecycle
 
-## 5. Two generic seams in Proxmox VE (package `pve-ext`)
+* **Snapshots**: `pct/qm snapshot`, `rollback` and `delsnapshot` copy, restore and remove
+  `/etc/pve/meta/<vmid>.<snapname>.yaml` through one patched file,
+  `PVE/AbstractConfig.pm` (package libpve-guest-common-perl), calling
+  `PVE::RS::Meta::on_snapshot/on_rollback/on_delsnap`.
+* **Destroy**: no hook. A GC (`PVE::RS::Meta::gc`, run by a systemd timer on every node
+  under the cluster lock) removes documents and snapshot copies whose vmid is no longer
+  in the vmlist. There is no orphan concept in the API.
+* **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up
+  `/etc/pve`". The QEMU backup command cannot embed foreign blobs, so a partial guarantee
+  is not offered.
 
-Everything that touches pve-manager or the PVE UI goes through one small, reusable
-extension layer, so that adding a page or an API module never needs another patch:
+## 7. Extension seams (`pve-ext`)
 
-* **API modules.** One line in `PVE/API2.pm` (`use PVE::API2::Ext;`) loads
-  `PVE::API2::Ext`, which scans `/usr/share/perl5/PVE/API2/Ext/*.pm`, `require`s each
-  module and registers it in the API root at the path the module declares
-  (`sub ext_path { 'meta' }`). Modules are plain `PVE::RESTHandler` subclasses.
-* **UI pages.** One `<script>` line in `index.html.tpl` loads `pve-ext-loader.js`, which
-  fetches `GET /api2/json/ext/pages` (served by `PVE::API2::Ext` from
-  `/usr/share/pve-ext/pages/*.json`) and adds one tab per manifest to the declared
-  targets (`lxc`, `qemu`, `node`, `dc`) as a same-origin iframe:
+Unchanged in substance: one `<script>` line in `index.html.tpl` loading the page loader,
+two lines at the end of `PVE/API2.pm` calling `PVE::API2::Ext->register_all`, the
+manifest-driven `pve-ext-patch`, and page manifests in `/usr/share/pve-ext/pages/`.
+**New:** a page manifest may declare either `url` (a same-origin iframe) or `script` +
+`xtype` (a native ExtJS panel class defined by that script and instantiated as the tab).
+Both substitute the same placeholders; `requires` gating applies to both.
 
-  ```json
-  { "id": "pve-meta", "title": "Metadata", "iconCls": "fa fa-tags",
-    "targets": ["lxc", "qemu", "dc"],
-    "url": "/pve2/js/pve-meta-ui/index.html?{query}",
-    "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] } }
-  ```
+## 8. The UI: one tree of the document
 
-  Placeholders `{vmid}`, `{node}`, `{type}`, `{theme}` and `{query}` are substituted by
-  the loader; a tab is only added when the logged-in user has the listed privileges
-  (checked against the UI's capability map, `PVE.Utils`/`Proxmox.UserName` caps).
-* **Managed patches.** `pve-ext-patch` applies, verifies, removes and reports a set of
-  dpkg-diverted file patches described by manifests in `/usr/share/pve-ext/patches/*.toml`
-  (file, owning package, diff, marker). pve-ext ships its own two-line manifest; pve-meta
-  ships the lifecycle manifest. Triggers on the patched paths re-apply after upgrades;
-  `perl -c` and template checks gate installation; `remove` restores pristine files.
+The page shows one tree of the document the caller can see: rows are the union of the
+keys present and the keys the applicable grammars declare (declared-but-unset rows are
+greyed with default and description and a "set" action). Columns: key, value (inline
+editor by type: string, integer/number, boolean, enum; arrays as one text leaf),
+owner (the registration whose scope covers the row, from `/meta/operators`, plus the
+selector). Comment keys are shown as the row description, not as rows. Editability is
+per row from `/meta/access`. A row edit is `PUT ?view=<path>&mode=replace` with the
+scalar; add is the same at a new path; delete is `DELETE ?view=<path>`. The digest is
+sent and 409 reloads. The version poll refreshes the tree and the grants.
 
-pve-meta depends on pve-ext. The lifecycle patches are pve-meta's own manifest.
+Monaco has two jobs: "edit subtree as text" (YAML/JSON toggle, presentation only) with
+diff-confirmed apply, and the diff dialog itself.
 
-## 6. The editor page
+Two implementations are built and compared on the lab cluster, then one is kept:
 
-A single page, `/pve2/js/pve-meta-ui/index.html?vmid=<id>|dc=1&theme=…`, built with
-pwt exactly the way PDM composes a page (see `design/PDM-DESIGN-LANGUAGE.md`), containing:
+* `ui/` — pwt/Yew, `DataTable` over a `TreeStore` (the PDM pattern), same-origin iframe.
+* `ui-extjs/` — plain JavaScript, `Ext.tree.Panel` with columns, a native tab through the
+  `script`/`xtype` manifest form; session, CSRF, theme and i18n come from the PVE UI.
 
-* a header line with the document identity (`105 wiki (lxc, node1)` / `Datacenter`),
-* a toolbar: **View as** (a dropdown of the prefixes the caller may see: the top-level
-  keys plus the caller's scopes; "whole document" first), **Reload**, **Apply**,
-  **Discard**,
-* a full-height **Monaco** editor with YAML mode showing exactly what
-  `GET …?view=<selected>&format=yaml` returns; editing is enabled when the caller may
-  write that view; Apply sends `PUT …?view=<selected>&format=yaml&mode=replace` with
-  the digest after showing a diff confirmation dialog; a 409 shows a "changed on
-  server" notice with Reload,
-* a status line for errors (server message verbatim),
-* a fallback rule: if the selected view stops being one of the caller's options (the
-  key was deleted, or the covering scope was revoked), the editor falls back to the
-  whole document, silently when the buffer is clean and otherwise through the same
-  confirmation dialog Discard, Reload and view switching use; the page re-reads its
-  access grants on Reload and whenever the store version changes.
+Both ship as page manifests ("Metadata", "Metadata (ExtJS)") during the comparison.
 
-No forms, no schema, no namespace buttons. Monaco is loaded from files shipped in the
-package and mounted into a container the pwt page provides; its theme follows pwt's
-light/dark state.
-
-## 7. Repository layout after this revision
+## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, YAML on disk / JSON on the wire, views, merge, scopes, the
-                         authorization-checked api layer (pve_meta_core::api), digest, store
-crates/pve-meta-perl     PVE::RS::Meta: perlmod exports of the lifecycle hooks and the api layer
+crates/pve-meta-core     document model, views, scopes+selectors+registrations, lint, api layer, store, gc
+crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
 perl/PVE/API2/Ext/Meta.pm
-ui/                      the editor page (pwt + Monaco)
-patches/lifecycle/       the Perl diffs + manifest
-pve-ext/                 the extension layer (its own Debian package; may move to its own repo)
-debian/, Makefile        two packages: pve-meta, libpve-meta-rs-perl (plus pve-ext)
+operators/               packaged example registrations (none required)
+patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
+pve-ext/                 the extension layer (own package)
+ui/  ui-extjs/           the two editor implementations
+debian/, Makefile        packages: pve-ext, pve-meta, libpve-meta-rs-perl
 ```
 
-## 8. Decisions from the 2026-09-07 review (binding)
+## 10. What revision 5 deletes
 
-These resolve the under-specified corners the review found (`REVIEW-2026-09-07.md`).
+Reserved `scopes` key and every rule keyed on it (opaque-leaf addressing, touched-path
+collapsing, `check_scopes_write`, authid key lint); the strict/lenient scope parser
+split; the per-request datacenter read for grants; `WriteGate`, `lint_at`/`lint_relaxed*`,
+the lint-finding subset check; `may_name` and all message redaction; the `keys` wire
+field and the UI's YAML key scanner; the comment-key access machinery (`covers` aliasing
+beyond the one sibling rule, bare-`__` prefix rule, mid-path rejection, `filter`'s comment
+pass); orphan listing/deletion/access rules; the destroy, clone and backup hooks and
+their six diffs; JSON-string crossings for grants, guest lists and results
+(`_grants_json`, `_inflate_view`, `parse_grants`, `data_json`); the "View as" selector.
 
-* **Authorization is decided from the request, never from a diff.** A write must satisfy
-  `can_write(view)` before anything is computed, and every path the planned mutation
-  touches is checked on a *plan* computed against a copy; the stored document is only
-  modified after the check passes. A caller without full write may not write the root
-  view. 403 messages never name a path the caller cannot read.
-* **Reads require a grant.** A principal with neither an ACL nor a scope covering
-  anything in a document gets 403, not an empty document. `GET /meta/guests` lists
-  only guests the caller can read something of; `name` and `node` are included only
-  with `VM.Audit` on that guest.
-* **`merge` with `null` deletes; `replace` with `{}` stores an empty map.** Deleting a
-  view is `DELETE …?view=`. Payload lint allows `null` only as a merge delete marker.
-  A merge that touches nothing changes nothing (no container creation).
-* **Comment keys follow their subject.** A scope on prefix `p` also covers the sibling
-  comment key `p__`; a view of `p` contains only the subtree of `p`.
-* **`GET /meta/access`** takes an optional `vmid` and returns `{ read, write, scopes }`
-  for that guest (or for the datacenter with `dc=1`); without either it returns the
-  caller's scopes and whether they have datacenter read/write.
-* **Key order is guaranteed in YAML text only.** `data` (JSON) is an unordered object
-  on the wire; clients that care about order use `format=yaml`.
-* **`scopes` is validated at write time** (400 naming the entry) and read leniently:
-  a malformed entry for another principal is skipped with a warning and never denies
-  service to anyone else.
-* **Writes are serialised.** Every API write runs under `PVE::Cluster::cfs_lock_domain`
-  keyed by document id, with the digest check inside the lock. Lifecycle hooks run
-  inside PVE's own guest locks and copy files; a rollback may replace an in-flight edit,
-  which the editor detects through the digest.
-* **The API never creates documents for guests that do not exist** (404 from the vmlist),
-  and `DELETE` of a document removes only the current document; snapshot copies are
-  handled exclusively by the lifecycle hooks.
-* **YAML only on disk.** TOML/JSON on-disk support, `convert`, format settings, the
-  format-preserving edit engine and other unreachable core code are removed. Digest
-  and version are computed from file content on every call (no mtime cache).
-* **Extension registration happens after the core.** `PVE::API2::Ext` registers its
-  modules from an explicit call at the end of `PVE/API2.pm`, skips paths that already
-  exist, and never dies.
-* **Managed patches: no fuzz, no stacking.** `patch -F0`; a manifest whose file is already
-  diverted for another manifest is refused with a clear error (documented limitation).
-* **Service restarts** in maintainer scripts go through `deb-systemd-invoke
-  reload-or-try-restart`.
+## 11. Deviations from DIRECTION.md, with reasons
 
-## 9. Decisions from the 2026-09-08 review (binding)
-
-* **`scopes` is admin-only, whatever the scope grants.** A write that touches `scopes`
-  requires `full_write` on the datacenter document; no scope (including a broad one)
-  can grant it. Scope prefixes must be non-empty: full access is only ever granted
-  through PVE ACLs, never through an empty-prefix scope.
-* **`scopes` keys are PVE authids** (validated with the authid rule, dots allowed) and the
-  `scopes` map is an opaque leaf for path addressing: a view may target `scopes` as a
-  whole, never a single entry. Entries are added or removed by writing the map.
-* **Reads never lint, and never fail on a document's own content.** The store reads and
-  returns what is on disk. Text that does not parse as YAML at all is reported *per
-  document* — `parse_error` plus the empty value, and `raw` for a caller with full read —
-  never as an error, because `api::grants` reads `datacenter.yaml` on every guest request
-  and both write handlers read a document before planning: a fatal parse was a
-  cluster-wide 400 for every principal, root included, that also blocked its own repair.
-  An unparseable (or oversized) document is repaired by replacing it whole — `PUT` with no
-  `view` and `mode=replace`, or `DELETE` — and every narrower write against it is refused
-  with 400, since the value planned against is the empty document and a narrower write
-  would silently discard the file. A malformed `scopes` container or entry, and an
-  unparseable `datacenter.yaml`, are skipped with a warning and grant nothing.
-* **Strict lint runs only on the content being written.** A caller who may replace the
-  whole document is gated on the whole document; anyone else is gated on the subtree
-  their view writes, so one out-of-band bad key elsewhere denies nobody. A 400 from lint
-  obeys the same disclosure rule as a 403: findings the caller may read are named, the
-  rest are counted.
-* **A document that is not a map at the top level is the empty document for a scope-only
-  reader** and is returned as-is to a full reader; the write gate refuses to store it
-  again. A view prefix addresses only through maps, so no scope covers any part of such
-  a document.
-* **`scopes` is a reserved top-level key in every document**, not only the datacenter one:
-  one key rule (PVE authids, dots allowed), one addressing rule (an opaque leaf — `touched`
-  reports `scopes`, never `scopes.<authid>`), one scope-prefix rule, everywhere. Only the
-  datacenter document's `scopes` map *means* anything, and only there does a write to it
-  additionally require `Sys.Modify`.
-* **A scope prefix is non-empty, never inside `scopes`, and never a bare `__`** — checked
-  both where the datacenter document is written and where a `grants` value crosses into
-  the core. A bare `__` documents the map it sits in and is readable only where that map
-  is; `prefix: a__` (the note about `a`) stays legal.
-* **Documents have a read size cap** (4 MiB, eight times the write limit): a larger file
-  is refused with a clear error rather than parsed and hashed on every request, and can
-  still be replaced or deleted whole.
-* **The bare `__` comment of a map is visible only when the map itself is readable**
-  (a scope on `p` covers `p`, `p__` and everything below `p`, nothing above it).
-* **Orphans** (documents whose vmid is no longer in the vmlist) are listed by
-  `GET /meta/guests` with `orphan: true` for callers with datacenter read, and may be
-  deleted by callers with datacenter write. Nothing else may write them. An orphan's
-  read/write authority is computed **purely from `/`** (`Sys.Audit` / `Sys.Modify`): there
-  is no guest, so a `/vms/<vmid>` ACL left behind by a destroy that never ran
-  `remove_vm_access` confers nothing, and scopes do not apply. `GET /meta/access?vmid=`
-  answers for an orphan with exactly those two flags and an empty `scopes` — the same
-  answer its GET and DELETE act on — rather than 404.
-* **`GET /meta/access` and the single-document GET** are documented as implemented:
-  `{ read, write, scopes }` with optional `vmid`/`dc`; documents return `id`, `view`,
-  `digest`, ordered `keys`, and `data` or `text`. `GET /meta/version` returns
-  `{ token, changed }`.
-* **lintian runs in every `deb` target.**
+* **Lifecycle is snapshot-only, not zero.** Rollback restoring metadata was an explicit
+  product decision; it costs one patched file in the least-churned package.
+* **The pwt implementation is not dropped by fiat.** pwt has a tree grid (`DataTable` +
+  `TreeStore`, used by PDM), which was the doc's premise for switching; both
+  implementations are built and judged on the lab instead.
