@@ -18,12 +18,18 @@
 # On `upgrade` we deliberately do nothing: the new version's postinst
 # re-applies (idempotently) once it's configured, so there is no need
 # (and no benefit) to unpatch in between.
+#
+# No `postrm` in this package: it ships no systemd unit and no conffile
+# cleanup logic, so debhelper has nothing to inject there -- a maintainer
+# script holding only `#DEBHELPER#` ships empty and trips lintian's
+# `maintainer-script-empty`. Add one back if a future release actually
+# needs post-removal cleanup.
 set -e
 
 case "$1" in
     remove)
-        if [ -x /usr/sbin/pve-ext-patch ]; then
-            /usr/sbin/pve-ext-patch remove pve-manager || {
+        if command -v pve-ext-patch >/dev/null 2>&1; then
+            pve-ext-patch remove pve-manager || {
                 echo "pve-ext: warning: pve-ext-patch remove failed, its patch may still be active." >&2
             }
         fi

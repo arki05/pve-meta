@@ -15,15 +15,13 @@
 # exist to diagnose problems afterwards.
 set -e
 
-PVE_EXT_PATCH=/usr/sbin/pve-ext-patch
-
 apply_lifecycle_patch() {
-    if [ -x "$PVE_EXT_PATCH" ]; then
-        "$PVE_EXT_PATCH" apply pve-meta-lifecycle || {
+    if command -v pve-ext-patch >/dev/null 2>&1; then
+        pve-ext-patch apply pve-meta-lifecycle || {
             echo "pve-meta: warning: pve-ext-patch apply pve-meta-lifecycle failed, see above." >&2
         }
     else
-        echo "pve-meta: warning: $PVE_EXT_PATCH not found or not executable (is pve-ext installed?)." >&2
+        echo "pve-meta: warning: pve-ext-patch not found on PATH (is pve-ext installed?)." >&2
     fi
 }
 

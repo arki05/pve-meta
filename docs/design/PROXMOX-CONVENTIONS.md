@@ -1050,7 +1050,7 @@ with `/usr/share/perl5/Proxmox/Lib/PVE.pm` the generated base class implementing
 - [ ] Wrap every user-visible string in `tr!()`; error titles `"Unable to <verb> <object>"`, confirmations end in `?`.
 - [ ] `thread_local!` for `DataTable` column definitions.
 
-**Perl (`PVE::API2::Meta`)**
+**Perl (`PVE::API2::Ext::Meta`)**
 
 - [ ] Header order: `package` / `use strict; use warnings;` / grouped `use` / `use base qw(PVE::RESTHandler);`.
 - [ ] `register_method` key order; `additionalProperties => 0`; `returns` before `code`.
@@ -1060,17 +1060,30 @@ with `/usr/share/perl5/Proxmox/Lib/PVE.pm` the generated base class implementing
 - [ ] Digest round-trip: `extract_param($param,'digest')` + `PVE::Tools::assert_if_modified` inside `lock_config`.
 - [ ] `permissions => { check => ['perm', '/vms/{vmid}', [...]] }` on every method.
 
-**JS (`pve-manager-patch`)**
+**JS (`pve-ext` page manifest / loader)** — supersedes the pre-`pve-ext` `Ext.define(...,
+{override: ...})`/`xtype: 'pveMetaTab'` approach below, which throws in real ExtJS 7
+classic and silently kills the whole config panel (see `pve-ext-loader.js`'s own header
+comment and `pve-ext/README.md`, "UI pages").
 
-- [ ] Tab entry as `{ title: gettext('Metadata'), itemId: 'meta', iconCls: 'fa fa-tags', xtype: 'pveMetaTab' }`.
-- [ ] Gate it on a `GuiCap` privilege the way other tabs are.
-- [ ] Use `Ext.define(..., { override: ... })` with a one-line "why" comment for any monkeypatch.
-- [ ] `gettext()` every string; `Proxmox.Utils.API2Request` for calls; `Ext.Msg.alert(gettext('Error'), response.htmlStatus)` on failure.
+- [ ] Ship a page manifest (`pages/pve-meta.json`) with `id`, `title`, `iconCls`,
+      `targets`, `url`, optional `requires` — see `pve-ext/README.md`, "UI pages".
+- [ ] Gate the tab client-side via `requires`, checked against
+      `Ext.state.Manager.get('GuiCap')` — a UX convenience only, never the access
+      control; the backend API must enforce the real permission check regardless of
+      whether the tab was shown.
+- [ ] Patch `PVE.panel.Config.prototype.initComponent` by capturing the original
+      function and calling it first, then adding the extra tab(s) — never via the
+      global `Ext.override(cls, {...})` + `this.callParent(...)` shim.
+- [ ] `escapeHtml(title)` and `sanitizeIconCls(iconCls)` on every manifest-sourced
+      string before it reaches the DOM/ExtJS config.
+- [ ] Every seam individually `try`/`catch`-guarded; a failure logs to the console
+      (prefixed `[pve-ext]`) and degrades to "that one thing doesn't happen" — it must
+      never be possible for a broken manifest to break the PVE UI itself.
 
 **Packaging**
 
 - [ ] Keep version data flowing from `debian/changelog` (`pkg-info.mk`/`default.mk`), never hand-set.
-- [ ] Add the `Cargo.toml` ⇄ `changelog` version cross-check to `override_dh_auto_configure`, guarded on `DEB_DISTRIBUTION != UNRELEASED`.
+- [x] Add the `Cargo.toml` ⇄ `changelog` version cross-check to `override_dh_auto_configure`, guarded on `DEB_DISTRIBUTION != UNRELEASED`.
 - [ ] `install -Dm644` / `find … -exec install -Dm644` for file installation.
-- [ ] Run `lintian` from the `deb`/`dsc` targets.
+- [x] Run `lintian` from the `deb`/`dsc` targets (both `Makefile:deb` and `pve-ext/Makefile:deb`; fatal when `$CI` is set, `|| true` locally — see `pve-ext/README.md`, "Managed patches" build notes, and `docs/DESIGN.md` §9).
 - [ ] `upload` guarded by `git diff --exit-code`.

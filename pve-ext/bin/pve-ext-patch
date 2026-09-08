@@ -51,6 +51,8 @@
 # two-file manifest, pve-meta ships its seven-file lifecycle manifest, and
 # so on for any future package that needs to patch stock PVE):
 #
+#   id = "pve-manager"                    # this manifest's stable claim identity
+#
 #   [[file]]
 #   path = "/usr/share/perl5/PVE/API2.pm"
 #   package = "pve-manager"
@@ -58,14 +60,25 @@
 #   marker = "PVE::API2::Ext->register_all();"
 #   check = "perl"                        # "perl" (default) or "template"
 #
+# The top-level `id` is what claim_file_for()'s per-path ".claimed-by"
+# marker records (see below) - a stable name for "this manifest", so that
+# invoking the SAME manifest content under two different paths/basenames
+# (e.g. a checkout's "patches/lifecycle.toml" vs. its installed name
+# "pve-meta-lifecycle.toml") claims files under the same identity instead
+# of refusing itself. A manifest with no `id` falls back to its filename
+# basename, with a warning - support for that predates this field and
+# exists only for manifests that haven't added it yet.
+#
 # Parsed by a small awk reader below - no TOML library, no Perl TOML
 # module (none ship with PVE) - just dpkg-divert, patch and perl, exactly
 # like the two tools this generalizes. It understands exactly the subset
-# of TOML these manifests use: repeated [[file]] array-of-tables blocks,
-# each holding a handful of `key = "value"` (or `key = 'value'`) string
-# assignments, blank lines, and '#' comments running to end-of-line
-# (assumed to never appear as literal text inside a manifest's own string
-# values - true for every manifest this project ships).
+# of TOML these manifests use: an optional top-level `id = "value"`
+# assignment before the first table, repeated [[file]] array-of-tables
+# blocks, each holding a handful of `key = "value"` (or `key = 'value'`)
+# string assignments, blank lines, and '#' comments running to
+# end-of-line (assumed to never appear as literal text inside a
+# manifest's own string values - true for every manifest this project
+# ships).
 #
 # Intended to be installed as /usr/sbin/pve-ext-patch and invoked from
 # postinst/triggers (both pve-ext's own and every consumer package's -
@@ -80,6 +93,7 @@ ROOT_DIR=""
 SCRATCH_ROOT=""
 
 log() { echo "pve-ext-patch: $*"; }
+warn() { echo "pve-ext-patch: WARNING: $*" >&2; }
 err() { echo "pve-ext-patch: ERROR: $*" >&2; }
 die() {
     err "$*"
@@ -141,6 +155,57 @@ resolve_manifest() {
             return 1
             ;;
     esac
+}
+
+# Reads a manifest's own claim identity: a top-level `id = "..."` key,
+# declared once, before the manifest's first `[[file]]` table (never inside
+# one - a `[[file]]` entry's own fields are unrelated to this). This is what
+# claim_file_for()/apply_one()/remove_one() use as the manifest's identity,
+# so that two different names for the *same* manifest content (a checkout
+# path like "patches/lifecycle.toml" vs. its installed name
+# "pve-meta-lifecycle.toml") claim the same files instead of silently
+# refusing each other (see pve-ext/README.md, "Managed patches").
+# Echoes the id and returns 0, or returns 1 with nothing echoed when the
+# manifest has none (an older manifest predating this field) - the caller
+# falls back to the filename basename in that case, with a warning.
+manifest_id() {
+    local manifest="$1" id
+    id="$(awk '
+        function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+        function unquote(s,    n, c) {
+            s = trim(s)
+            n = length(s)
+            if (n >= 2) {
+                c = substr(s, 1, 1)
+                if ((c == "\"" || c == "'\''") && substr(s, n, 1) == c) {
+                    s = substr(s, 2, n - 2)
+                }
+            }
+            return s
+        }
+        /^[ \t]*\[\[file\]\]/ { exit }
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            t = trim(line)
+            if (match(t, /^id[ \t]*=/)) { print unquote(substr(t, RSTART + RLENGTH)); exit }
+        }
+    ' "$manifest")"
+    [ -n "$id" ] || return 1
+    echo "$id"
+}
+
+# Resolves a manifest's claim identity: its own declared `id` field, or (with
+# a warning - see manifest_id()) its filename basename as a fallback for a
+# manifest that predates the field.
+manifest_claim_name() {
+    local manifest="$1" id
+    if id="$(manifest_id "$manifest")"; then
+        echo "$id"
+        return 0
+    fi
+    warn "$manifest: no top-level 'id' field found; falling back to the filename-derived claim identity '$(basename "$manifest" .toml)' (a manifest referenced under two different paths/names then claims its files under two different identities - add an 'id' field to fix this, see pve-ext/README.md)"
+    basename "$manifest" .toml
 }
 
 # Populates the global array MANIFESTS with resolved manifest file paths:
@@ -311,14 +376,30 @@ write_claim() {
 # unnoticed. Leave a durable trail in two places a human or monitoring
 # actually looks: syslog, and a marker file `status`/an admin can check
 # for without having captured the original postinst output.
-FAILURE_MARKER_DIR="${ROOT_DIR}/run/pve-ext-patch"
+#
+# A function, not a top-level assignment: --root is parsed inside main(),
+# on the very last line of the file, so a top-level `FAILURE_MARKER_DIR=
+# "${ROOT_DIR}/run/pve-ext-patch"` would evaluate during the initial pass
+# with ROOT_DIR still "" and bake the *real* /run/pve-ext-patch into every
+# later call, regardless of --root - exactly the isolation leak every
+# other root-derived path here (manifest_dir, real_path_for,
+# diverted_path_for, set_dpkg_root_args) already avoids by being a
+# function that re-reads $ROOT_DIR when called.
+failure_marker_dir() { echo "${ROOT_DIR}/run/pve-ext-patch"; }
 
 record_failure() {
     # $1 = mpath, $2 = message
-    mkdir -p "$FAILURE_MARKER_DIR" 2>/dev/null
+    local dir
+    dir="$(failure_marker_dir)"
+    mkdir -p "$dir" 2>/dev/null
     printf '%s %s: %s\n' "$(date -Is 2>/dev/null || date)" "$1" "$2" \
-        >>"${FAILURE_MARKER_DIR}/failed" 2>/dev/null
-    if command -v logger >/dev/null 2>&1; then
+        >>"${dir}/failed" 2>/dev/null
+    # Under --root (CI/dev verification against an extracted tree, or a
+    # scratch root for testing) the real host's syslog is not this run's
+    # concern at all - and writing to it would be exactly the kind of
+    # live-system side effect --root exists to avoid. Only reach for
+    # logger() when operating on the real system (no --root given).
+    if [ -z "$ROOT_DIR" ] && command -v logger >/dev/null 2>&1; then
         logger -t pve-ext-patch -p user.err -- "$1: $2" 2>/dev/null || true
     fi
 }
@@ -433,6 +514,7 @@ apply_one() {
         existing_claim="$(read_claim "$claim")"
         if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
             err "$mpath: already diverted for manifest '$existing_claim' - pve-ext-patch does not support two manifests patching the same file (documented limitation, see pve-ext/README.md); refusing to touch it for manifest '$mname'"
+            record_failure "$mpath" "claim mismatch: already diverted for manifest '$existing_claim', refused for '$mname'"
             return 1
         fi
         log "$mpath: diversion already in place (owned by ${PKG}, manifest ${existing_claim:-$mname}); reusing pristine copy at $diverted"
@@ -531,8 +613,8 @@ cmd_apply() {
     local manifest mdir mname rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
         mdir="$(abs_dir "$(dirname "$manifest")")"
-        mname="$(basename "$manifest" .toml)"
-        log "manifest: $manifest"
+        mname="$(manifest_claim_name "$manifest")"
+        log "manifest: $manifest (claim id: $mname)"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))
@@ -598,8 +680,8 @@ cmd_remove() {
 
     local manifest mname rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
-        mname="$(basename "$manifest" .toml)"
-        log "manifest: $manifest"
+        mname="$(manifest_claim_name "$manifest")"
+        log "manifest: $manifest (claim id: $mname)"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))

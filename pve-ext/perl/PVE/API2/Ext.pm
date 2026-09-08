@@ -361,9 +361,20 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my @manifests;
+        my $seen_ids = {};
         for my $file (sort glob("$EXT_PAGE_DIR/*.json")) {
             my $manifest = _load_page_manifest($file);
-            push @manifests, $manifest if $manifest;
+            next if !$manifest;
+
+            my $id = $manifest->{id};
+            if ($seen_ids->{$id}) {
+                warn "pve-ext: skipping page manifest '$file': duplicate id '$id'"
+                    . " (already provided by '$seen_ids->{$id}')\n";
+                next;
+            }
+            $seen_ids->{$id} = $file;
+
+            push @manifests, $manifest;
         }
         return \@manifests;
     },

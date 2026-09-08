@@ -1,0 +1,14 @@
+# unsafe-libyaml (crates.io, pulled in transitively via pve-meta-core's
+# serde_yaml_ng dependency -- see Cargo.lock) is a line-for-line Rust
+# transliteration of libyaml's C source, statically linked into
+# libpve_meta_rs.so. lintian's embedded-library heuristic fires on
+# libyaml's own panic-message text and yaml.h-derived symbol/constant
+# names, copied verbatim by the transliteration -- not on any copied C
+# object code that would need independent security patching (the actual
+# concern embedded-library exists to catch). Upstream:
+# https://docs.rs/unsafe-libyaml
+#
+# Path is arch-dependent (built as Architecture: any); glob the
+# multiarch/perl-version segments so this stays valid across archs and
+# perl bumps.
+libpve-meta-rs-perl: embedded-library libyaml [usr/lib/*/perl5/*/auto/libpve_meta_rs.so]

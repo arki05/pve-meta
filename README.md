@@ -63,12 +63,14 @@ are `protected` and run in pvedaemon.
 | Method | Path | Params | Returns |
 |---|---|---|---|
 | GET | `/meta/guests` | `has` (prefix filter) | `[{ vmid, node, type, name, digest, keys: [top-level keys visible to the caller] }]` — every guest in the vmlist, `digest: ""` when no document |
-| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ vmid, view, digest, data }` or `{ vmid, view, digest, text }` |
-| PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
+| GET | `/meta/guests/{vmid}` | `view` (prefix, optional), `format` = `json` (default) or `yaml`, `comments` (default 1) | `{ id, view, digest, keys, data }` or `{ id, view, digest, keys, text }` — `keys` is the ordered list of top-level keys of the returned value; `data` is an unordered JSON object |
+| PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 when the write touches a path outside the caller's write grants (including the view itself, and any write to `scopes` for a scope-granted principal — see "Permissions"), 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | — | the caller's effective grants: `{ full: [vmids or "*"], scopes: [{prefix, mode}] }` (what the UI's "View as" offers) |
-| GET | `/meta/version` | — | `{ token }` — content hash over the store; poll it |
+| GET | `/meta/access` | `vmid` or `dc=1` (optional) | `{ read, write, scopes: [{prefix, mode}] }` for that document; without either, the caller's scopes and datacenter read/write (what the UI's "View as" offers) |
+| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store and the newest mtime; poll it |
+
+PUT and DELETE 404 for a vmid absent from the vmlist; GET does not (an absent guest's document simply reads as empty, digest `""`).
 
 `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust core through the
 perlmod bindings (`PVE::RS::Meta`): view extraction, prefix stripping, merge/replace,

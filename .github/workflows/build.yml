@@ -28,7 +28,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential curl git pkg-config libssl-dev libperl-dev perl \
-            debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen
+            debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen lintian
 
       - name: Install rustup toolchain
         run: |

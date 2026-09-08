@@ -78,7 +78,15 @@ install:
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
 	# pve-ext managed-patch manifest for the seven guest-lifecycle hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md).
-	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/pve-meta-lifecycle.toml
+	# Installed under its own declared `id` (patches/lifecycle.toml's
+	# top-level `id = "..."` field), not its checkout filename -- so that
+	# pve-ext-patch's claim identity, read from the manifest's own content
+	# rather than whatever path/basename it was invoked with, is the same
+	# whether run against this checkout or the installed package (see
+	# pve-ext/bin/pve-ext-patch's header comment, "manifest_id").
+	lifecycle_id="$$(awk '/^\[\[file\]\]/{exit} match($$0, /^id[ \t]*=/){v=substr($$0, RSTART+RLENGTH); gsub(/^[ \t]*"?|"?[ \t]*$$/, "", v); print v; exit}' patches/lifecycle.toml)"; \
+	[ -n "$$lifecycle_id" ] || { echo "error: patches/lifecycle.toml has no top-level 'id' field" >&2; exit 1; }; \
+	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
 
@@ -89,10 +97,27 @@ install:
 #     (dpkg-buildpackage always drops artifacts in the parent of the source root it's
 #     invoked from).
 #   - pve-meta, libpve-meta-rs-perl: this source package's two binaries (see debian/control).
+#
+# lintian runs as part of this target, not as a separate step (see
+# docs/design/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 9,
+# pve-ext/README.md "Building and packaging"), mirroring the plain
+# `lintian $(DEBS)` upstream pve-rs uses (no --fail-on override: lintian's
+# own default -- exit non-zero only on an E: tag -- is what "fatal" below
+# means; a W: is printed but does not fail the build, same as upstream).
+# `|| true` for a local/dev build (unset $CI) so an unrelated lintian nag
+# never blocks iterating locally; unconditionally fatal when $CI is set
+# (matches .github/workflows/build.yml, which sets it automatically) --
+# CI is the actual gate. `pve-ext`'s own artifacts were already moved into
+# ".." above, so all three packages' .debs are lintianed together here.
 deb:
 	$(MAKE) -C pve-ext deb
 	for f in pve-ext_*.deb pve-ext_*.buildinfo pve-ext_*.changes; do [ -e "$$f" ] && mv -f "$$f" ..; done
 	dpkg-buildpackage -b -us -uc -d
+	if [ -n "$$CI" ]; then \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-ext_*.deb; \
+	else \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-ext_*.deb || true; \
+	fi
 
 check:
 	# `ui/` is its own separate Cargo workspace (see the root Cargo.toml's

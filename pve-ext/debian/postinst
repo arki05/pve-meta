@@ -15,15 +15,13 @@
 # `pve-ext-patch verify`/`status` exist to diagnose problems afterwards.
 set -e
 
-PVE_EXT_PATCH=/usr/sbin/pve-ext-patch
-
 apply_patch() {
-    if [ -x "$PVE_EXT_PATCH" ]; then
-        "$PVE_EXT_PATCH" apply pve-manager || {
+    if command -v pve-ext-patch >/dev/null 2>&1; then
+        pve-ext-patch apply pve-manager || {
             echo "pve-ext: warning: pve-ext-patch apply failed, see above." >&2
         }
     else
-        echo "pve-ext: warning: $PVE_EXT_PATCH not found or not executable." >&2
+        echo "pve-ext: warning: pve-ext-patch not found on PATH." >&2
     fi
 }
 

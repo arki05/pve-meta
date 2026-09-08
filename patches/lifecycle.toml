@@ -16,6 +16,14 @@
 # and mounts whatever it finds via that module's own `ext_path` - see
 # pve-ext/README.md) - PVE::API2::Ext::Meta just needs to exist there, no
 # registration diff required.
+#
+# `id` is this manifest's stable claim identity (see pve-ext/bin/pve-ext-patch's
+# header comment): the root Makefile installs this file under
+# "<id>.toml", so `pve-ext-patch apply patches/lifecycle.toml` from a
+# checkout and `pve-ext-patch apply pve-meta-lifecycle` against the
+# installed package claim the same files either way, regardless of the
+# two names' different basenames.
+id = "pve-meta-lifecycle"
 
 [[file]]
 path = "/usr/share/perl5/PVE/AbstractConfig.pm"

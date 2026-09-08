@@ -105,7 +105,10 @@ restart needed to pick up a new/changed manifest — and validates each
 file's shape (the fields above; `targets` entries must be one of the four
 known values; `requires`, if present, must map to arrays). A malformed
 manifest is skipped with a `warn`, never breaks the endpoint for every
-other manifest.
+other manifest. A manifest whose `id` duplicates one already seen in the
+same directory listing (first one wins, by sorted filename) is likewise
+skipped with a `warn` naming both files — the same warn-and-skip
+convention the API-module seam uses for a colliding `ext_path`.
 
 `pve-ext-loader.js` (installed by pve-ext, loaded via one `<script>` line
 dpkg-diverted into stock `index.html.tpl`, right after `pvemanagerlib.js`)
@@ -171,6 +174,8 @@ are exactly this) — ship a TOML manifest at
 `/usr/share/pve-ext/patches/<name>.toml`:
 
 ```toml
+id = "pve-manager"                        # this manifest's stable claim identity
+
 [[file]]
 path = "/usr/share/perl5/PVE/API2.pm"
 package = "pve-manager"
@@ -181,6 +186,7 @@ check = "perl"                            # perl -c gate; or "template" for an H
 
 | Field | Required | Meaning |
 |---|---|---|
+| `id` (top-level, before any `[[file]]`) | strongly recommended | This manifest's stable claim identity (see "Claim identity" below); falls back to the manifest's own filename basename, with a warning, when absent. |
 | `path` | yes | Absolute path of the file to patch. |
 | `package` | no | The upstream package that ships `path` — informational, shown in `status` output. |
 | `diff` | yes | A unified diff (`a/`/`b/` headers using `path` with its leading `/` stripped), applied with `patch -p1`, relative to the manifest's own directory. |
@@ -213,8 +219,13 @@ tools this generalizes proved out:
   upstream package upgrade replaced the diverted pristine with a newer
   one), `apply` restores the *current* pristine over the real path rather
   than leaving it holding content patched against the old one, and
-  records the failure to syslog and to `/run/pve-ext-patch/failed` (never
-  only stderr, which a postinst commonly swallows).
+  records the failure to syslog and to `<ROOT_DIR>/run/pve-ext-patch/failed`
+  (never only stderr, which a postinst commonly swallows) — under `--root`
+  that marker directory, and the syslog write, both resolve inside the
+  given root: `--root` is a hard isolation boundary, so nothing this tool
+  does — including its failure trail, not just `dpkg-divert`/the diversion
+  itself/the claim marker — ever touches the real `/run` or the real
+  syslog while it's given.
 - Best-effort per file, across every file in every selected manifest: one
   file's anchors moving on some future PVE point release must never block
   patching the others.
@@ -228,6 +239,23 @@ With no manifest named, `apply`/`remove`/`verify`/`status` act on every
 `../patches` next to the script) — so pve-ext's own manifest and every
 consumer's manifest are all covered by e.g. a bare `pve-ext-patch status`
 with no arguments.
+
+### Claim identity
+
+A manifest's claim identity — what the `.claimed-by` marker (below) records,
+and what a re-`apply` compares against to decide "is this still my file" —
+comes from its own top-level `id` field, **not** from the path or basename
+it was invoked with. This matters because the same manifest content is
+often reachable under two different names: a checkout path like
+`patches/lifecycle.toml` and an installed name like
+`pve-meta-lifecycle.toml` (the root Makefile installs pve-meta's manifest
+under its declared `id`, precisely so the two stay in sync — see that
+Makefile's `install` target). Without a stable `id`, those two names would
+claim the same files under two different identities and refuse each
+other — the exact trap a filename-derived identity falls into. A manifest
+with no `id` field still works, falling back to its filename basename with
+a `WARNING:` on every invocation; add the field to silence it and to make
+the manifest's identity stable across renames.
 
 ### Limitation: no two manifests may patch the same file
 
@@ -283,6 +311,7 @@ perl/PVE/API2/Ext.pm             -> /usr/share/perl5/PVE/API2/Ext.pm
 (empty dir, for consumers)       -> /usr/share/perl5/PVE/API2/Ext/
 js/pve-ext-loader.js             -> /usr/share/pve-manager/js/pve-ext-loader.js  (served as /pve2/js/pve-ext-loader.js)
 bin/pve-ext-patch                -> /usr/sbin/pve-ext-patch
+man/pve-ext-patch.8              -> /usr/share/man/man8/pve-ext-patch.8
 patches/pve-manager.toml + diffs -> /usr/share/pve-ext/patches/
 (empty dir, for consumers)       -> /usr/share/pve-ext/pages/
 ```
@@ -292,3 +321,22 @@ pve-ext's own `debian/postinst`/`debian/prerm` apply/remove exactly its own
 everything else in this document depends on); every other manifest, page
 and API module comes from whatever package depends on `pve-ext` and drops
 it in.
+
+## Building and packaging
+
+`make deb` (from this directory, or via the root `Makefile`'s `deb` target,
+which builds this package first) runs `lintian` against the freshly built
+`.deb`(s) as part of the target itself, not as a separate manual step (see
+`docs/design/PROXMOX-CONVENTIONS.md` §7.6 and §8, and `docs/DESIGN.md` §9):
+fatal (a non-zero `make deb` exit) when `$CI` is set in the environment, and
+`|| true` (advisory only, output still printed) for a local/dev build where
+`$CI` is unset — CI is expected to catch anything a local build let through.
+The root Makefile's `deb` target lintians `pve-meta`, `libpve-meta-rs-perl`
+and `pve-ext` together after both builds finish; running `make -C pve-ext
+deb` on its own (as the ceiling watcher and CI both also do to build
+`pve-ext` independently) lintians `pve-ext` a second time on its own.
+Package-specific false positives are silenced with a `debian/*.lintian-
+overrides` file and a comment explaining why, never by skipping the check —
+see `debian/libpve-meta-rs-perl.lintian-overrides` for a worked example
+(the `unsafe-libyaml` crate trips lintian's `embedded-library` heuristic on
+panic-message/registry-path text, not on any actual C object it duplicates).

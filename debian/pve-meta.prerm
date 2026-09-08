@@ -11,12 +11,20 @@
 # On `upgrade` we deliberately do nothing: the new version's postinst
 # re-applies (idempotently) once it's configured, so there is no need
 # (and no benefit) to unpatch in between.
+#
+# No `postrm`/`preinst` in this package: this is pve-meta's first release
+# (nothing to migrate in `preinst`), and it ships no systemd unit and no
+# conffile cleanup logic, so debhelper has nothing to inject into a
+# `postrm` either -- a maintainer script that would hold only `#DEBHELPER#`
+# ships empty and trips lintian's `maintainer-script-empty`. Add one back
+# if a future release actually needs pre-unpack migration or post-removal
+# cleanup (see docs/DISTRIBUTION.md for the package's release process).
 set -e
 
 case "$1" in
     remove)
-        if [ -x /usr/sbin/pve-ext-patch ]; then
-            /usr/sbin/pve-ext-patch remove pve-meta-lifecycle || {
+        if command -v pve-ext-patch >/dev/null 2>&1; then
+            pve-ext-patch remove pve-meta-lifecycle || {
                 echo "pve-meta: warning: pve-ext-patch remove pve-meta-lifecycle failed, its patch may still be active." >&2
             }
         fi
