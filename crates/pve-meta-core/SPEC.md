@@ -300,7 +300,13 @@ diff:
    can repair it, and only the subtree at the view for anyone else, whose write is stored
    under `WriteGate::CallerLinted` for the same reason (`docs/DESIGN.md` §9: strict lint
    runs only on the content being written). A 400 from lint names only findings the caller
-   may read, counting the rest — the same disclosure rule 403s obey;
+   may read, counting the rest — the same disclosure rule 403s obey. **Narrowing the scope
+   of the lint may not narrow the rules**: a write without `full_write` additionally
+   compares `lint(document)` before and after the plan and is refused with a path-free 400
+   if the finding set *grew*. Findings that were already there are carried through
+   untouched — that availability is what the narrowing bought — so the net costs nobody a
+   write they could make before, and no scoped principal can leave the document in a state
+   that blocks a `full_write` caller's narrow writes;
 4. a datacenter write that touches `scopes` additionally requires `full_write` — the
    access-control map is admin-only whatever the scopes say, since `check_write` asks
    only whether the *path* is covered and a scope covering `scopes` makes that true
@@ -326,10 +332,20 @@ every path a client is handed is addressable as a view again.
 **403 messages** never name a path the caller cannot read: the offending path is included
 only when the caller has read access to its parent.
 
-**View addressing**: `scopes` is an opaque leaf. `?view=scopes` addresses the whole map;
-anything deeper is a 400 explaining why (its keys are authids, which may contain the path
-separator). Entries are added and removed by writing the map, `mode=merge` with `null` to
-delete one (`docs/DESIGN.md` §9).
+**View addressing** (`parse_view`, one owner for GET, PUT and DELETE alike, whatever the
+caller's grants):
+
+* `scopes` is an opaque leaf. `?view=scopes` addresses the whole map; anything deeper is a
+  400 explaining why (its keys are authids, which may contain the path separator). Entries
+  are added and removed by writing the map, `mode=merge` with `null` to delete one
+  (`docs/DESIGN.md` §9).
+* a **comment key is a leaf**: a view may *end* at one (`?view=p.q__`, `?view=p.__` — the
+  note itself, whose value is a string) but never pass *through* one. A comment key in any
+  non-final segment is a 400, the bare `__` included. Nothing may live below a comment key
+  by rule 4 of the document model, so such a view can only describe a document `lint`
+  refuses; without the check the write path materialised the intermediate segment blindly
+  and only the *last* one was linted (`lint_at`), so a scoped `PUT ?view=p.q__.r` stored a
+  document that then blocked every narrow write by a `full_write` caller.
 
 One unreadable document never denies a *listing*: `list_guests` reads
 tolerantly, so a guest whose document does not parse (or is above the read cap)
@@ -397,6 +413,9 @@ scenarios:
   every narrower write against it is refused; a list- or scalar-rooted document is empty
   for a scope-only caller through both the view-less GET and `?has=`; a lint 400 names no
   path the caller cannot read and a scoped write is not blocked by an out-of-band key
-  elsewhere; a nested `null` delete marker is applied, never stored; `touched` collapses
+  elsewhere; a view through a comment key (`p.q__.r`, `p.__.x`, `p.a__.b.c`) is a 400 for
+  GET, PUT (replace and merge) and DELETE, scoped and full alike, while a view ending at
+  one still works; over a corpus of scoped writes, every accepted one leaves `lint` with
+  no finding it did not already have; a nested `null` delete marker is applied, never stored; `touched` collapses
   a path inside `scopes`; an invalid scope prefix is refused where `grants_json` is
   parsed.

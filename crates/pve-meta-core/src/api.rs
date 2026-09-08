@@ -57,6 +57,7 @@
 //! HTTP status prefix and a human-readable message); the Perl layer parses
 //! that prefix back out and re-raises via `PVE::Exception::raise`.
 
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -182,6 +183,17 @@ fn id_str(id: DocId) -> String {
 /// path separator (`john.doe@pve`), so a per-entry view could never have
 /// worked for a large class of legitimate principals; entries are added and
 /// removed by writing the map (`mode=merge` with `null` deletes one).
+///
+/// A **comment key is a leaf** (`docs/DESIGN.md` §9, review pass 4 Q1): its
+/// value must be a string, so nothing can legitimately live below one.
+/// `?view=traefik__` (the note itself) is fine; `?view=traefik__.x` is not,
+/// and neither is a comment key in any *intermediate* segment — the last
+/// segment is the only one `model::lint_at` anchors on, so
+/// `?view=p.q__.r` would otherwise let a narrow write materialise `q__` as a
+/// map through `view::descend_creating` and store a document that the
+/// whole-document `model::lint` refuses. That is checked here, at the one
+/// place every caller passes through, rather than in the write path, so the
+/// answer is the same for a `full_write` caller, for GET and for DELETE.
 fn parse_view(view: Option<&str>) -> Result<DocPath, anyhow::Error> {
     let path = match view {
         Some(s) => DocPath::parse(s).map_err(api_err)?,
@@ -193,6 +205,20 @@ fn parse_view(view: Option<&str>) -> Result<DocPath, anyhow::Error> {
              (a single entry is not path-addressable -- an authid may contain dots); \
              add or remove one entry with mode=merge",
         ));
+    }
+    // Every segment but the last: the last one may be a comment key (that is
+    // the note itself), an intermediate one may not.
+    if let Some((_, ancestors)) = path.segments().split_last() {
+        if let Some(seg) = ancestors.iter().find(|s| model::is_comment_key(s)) {
+            return Err(bad_request(format!(
+                "invalid view '{path}': '{seg}' is a comment key and a comment key's value \
+                 is a string ('{}' documents the map it sits in, 'k{}' documents the \
+                 sibling key 'k'), so nothing is addressable below it; view the comment \
+                 key itself, or a path that does not pass through one",
+                model::COMMENT_SUFFIX,
+                model::COMMENT_SUFFIX,
+            )));
+        }
     }
     Ok(path)
 }
@@ -723,6 +749,19 @@ fn authorize_view_write(grants: &Grants, view_path: &DocPath) -> Result<(), anyh
 ///
 /// Either way the rendered message names only paths the caller may read; see
 /// [`lint_error`].
+///
+/// **The narrowing's safety net** (review pass 4 Q1). Narrowing the *scope*
+/// of the lint may not narrow the *rules*: whatever a scoped write is allowed
+/// to do, it may never leave behind a document that the whole-document
+/// `model::lint` — the gate every `full_write` caller still runs — rejects
+/// for a reason that was not already there, because that would let a
+/// low-privileged principal permanently disable a high-privileged one's
+/// narrow writes. So a non-`full_write` write additionally compares
+/// `model::lint(stored)` before and after and refuses the write if the
+/// finding set *grew*. Pre-existing findings are carried through untouched —
+/// that availability is exactly what the narrowing bought — and the refusal
+/// is deliberately path-free, since by construction the new finding may sit
+/// outside what the caller may read.
 fn plan_write(
     doc_id: DocId,
     view_path: &DocPath,
@@ -730,6 +769,10 @@ fn plan_write(
     grants: &Grants,
     mutate: impl FnOnce(&mut Value) -> Result<Vec<Touched>, anyhow::Error>,
 ) -> Result<Vec<Touched>, anyhow::Error> {
+    // Computed before the mutation, from the same value the mutation runs
+    // against, so no clone of the document is needed.
+    let findings_before = (!grants.full_write).then(|| lint_findings(planned));
+
     let touched = mutate(planned)?;
 
     if let Err(denied) = grants.check_write(&touched) {
@@ -755,8 +798,27 @@ fn plan_write(
         return Err(lint_error(grants, lints));
     }
 
+    if let Some(before) = findings_before {
+        let after = lint_findings(planned);
+        if !after.is_subset(&before) {
+            return Err(bad_request(
+                "document failed validation: this write would leave the stored document \
+                 invalid as a whole -- narrow it, or ask a caller with full write access \
+                 to repair the document first",
+            ));
+        }
+    }
+
     check_scopes_write(doc_id, planned, &touched, grants)?;
     Ok(touched)
+}
+
+/// [`model::lint`]'s findings as a comparable set, for [`plan_write`]'s
+/// before/after invariant. Rendered rather than structural because
+/// [`model::Lint`] is not `Ord`/`Hash`, and its `Display` (`path: msg`) is
+/// exactly the identity we want to compare.
+fn lint_findings(doc: &Value) -> BTreeSet<String> {
+    model::lint(doc).iter().map(ToString::to_string).collect()
 }
 
 /// Renders lint findings into a `400` that names only what the caller may
@@ -1814,6 +1876,164 @@ mod tests {
         // ... and a legitimate comment-key write still goes through.
         put_document(&store, "100", Some("traefik__"), "json", "\"the ingress config\"", "replace", None, false, &scoped)
             .expect("a string comment value is fine");
+    }
+
+    #[test]
+    fn a_view_through_a_comment_key_is_refused_for_every_caller() {
+        // Review pass 4 Q1, the regression the R6 narrowing introduced.
+        // `model::lint_at` anchors on the view path's *last* segment only, so
+        // a comment key in any intermediate segment was materialised blindly
+        // by `view::descend_creating` and checked nowhere: `PUT
+        // ?view=p.q__.r` stored `p: {q__: {r: 1}}`, which the whole-document
+        // `model::lint` refuses -- so a scoped principal could permanently
+        // disable every narrow write of a `full_write` one. A comment key is
+        // a leaf string; nothing is addressable below it, and `parse_view`
+        // now says so for every caller and every verb.
+        let (_dir, store) = store();
+        seed(&store, "100", "p:\n  host: a\n  q__: the note\n");
+        let before = read_raw(&store, "100").unwrap();
+
+        let scoped = grants_json(false, false, json!([{"prefix": "p", "mode": "rw"}]));
+        let full = grants_json(true, true, json!([]));
+
+        for grants in [&scoped, &full] {
+            for view in ["p.q__.r", "p.__.x", "p.a__.b.c"] {
+                for (mode, payload) in [("replace", "1"), ("merge", "1"), ("merge", "{\"z\": 1}")] {
+                    let err =
+                        put_document(&store, "100", Some(view), "json", payload, mode, None, false, grants)
+                            .map(|ok| panic!("?view={view} ({mode}) was accepted: {ok:?}"))
+                            .unwrap_err();
+                    assert_eq!(status(&err), 400, "?view={view} ({mode}): {err}");
+                    assert!(err.to_string().contains("comment key"), "?view={view}: {err}");
+                    assert_eq!(read_raw(&store, "100").unwrap(), before, "?view={view} wrote anyway");
+                }
+                // The same answer on the read and delete paths: one rule, one
+                // owner (`parse_view`), so `touched` and `?view=` cannot drift.
+                let err = get_document(&store, "100", Some(view), "json", true, grants).unwrap_err();
+                assert_eq!(status(&err), 400, "GET ?view={view}: {err}");
+                let err = delete_document(&store, "100", Some(view), None, grants).unwrap_err();
+                assert_eq!(status(&err), 400, "DELETE ?view={view}: {err}");
+                assert_eq!(read_raw(&store, "100").unwrap(), before, "DELETE ?view={view} wrote anyway");
+            }
+        }
+
+        // A comment key as the *final* segment is untouched: that is the note
+        // itself, and writing it a string is the documented way to set one.
+        put_document(&store, "100", Some("p.q__"), "json", "\"a better note\"", "replace", None, false, &scoped)
+            .expect("a view ending at a comment key is legal");
+        assert!(read_raw(&store, "100").unwrap().contains("a better note"));
+        get_document(&store, "100", Some("p.q__"), "json", true, &scoped).expect("and readable");
+        // Including the bare `__`, which documents the map it sits in.
+        put_document(&store, "100", Some("p.__"), "json", "\"about p\"", "replace", None, false, &scoped)
+            .expect("a bare comment key is a legal leaf view");
+    }
+
+    #[test]
+    fn an_accepted_scoped_write_never_adds_a_whole_document_lint_finding() {
+        // The standing invariant behind review pass 4 Q1, asserted rather
+        // than argued: `plan_write` lints only the written subtree for a
+        // caller without `full_write`, so the narrowing is only safe while
+        // *no* accepted scoped write can leave the document with a finding
+        // `model::lint` did not already have. Run a corpus of writes -- legal
+        // ones, illegal ones, comment keys, nested payloads, deletes, merges
+        // -- against a document that already carries an out-of-band finding,
+        // and check the finding set after every accepted one.
+        let (dir, store) = store();
+        // Written behind the store's back: `put_raw` lints, and the point is
+        // to start from a document the whole-document lint already refuses,
+        // so a pre-existing finding is *carried* rather than blocking anyone.
+        std::fs::write(
+            dir.path().join("100.yaml"),
+            "p:\n  host: a\n  q__: the note\nsecret area:\n  k: v\n",
+        )
+        .unwrap();
+
+        let scoped = grants_json(false, false, json!([{"prefix": "p", "mode": "rw"}]));
+        let baseline = lint_findings(&read_or_empty(&store, DocId::Guest(100)).unwrap().value);
+        assert!(!baseline.is_empty(), "the corpus starts from an already-invalid document");
+
+        let views = ["p", "p.host", "p.q__", "p.__", "p.deep", "p.deep.x", "p.q__.r", "p.a__.b.c"];
+        let payloads = [
+            "1", "\"s\"", "null", "{}", "{\"a\": 1}", "{\"x__\": 5}", "{\"x__\": \"ok\"}",
+            "{\"bad key\": 1}", "{\"a.b\": 1}", "{\"deep\": {\"y__\": 7}}", "[1, 2]",
+            "{\"n\": null}", "{\"scopes\": {\"a@pve\": 1}}",
+        ];
+
+        let mut accepted = 0usize;
+        for view in views {
+            for payload in payloads {
+                for mode in ["replace", "merge"] {
+                    let before =
+                        lint_findings(&read_or_empty(&store, DocId::Guest(100)).unwrap().value);
+                    let outcome =
+                        put_document(&store, "100", Some(view), "json", payload, mode, None, false, &scoped);
+                    let after =
+                        lint_findings(&read_or_empty(&store, DocId::Guest(100)).unwrap().value);
+                    match outcome {
+                        Ok(_) => {
+                            accepted += 1;
+                            let grew: Vec<_> = after.difference(&before).collect();
+                            assert!(
+                                grew.is_empty(),
+                                "?view={view} ({mode}) {payload} was accepted and added {grew:?}"
+                            );
+                        }
+                        Err(e) => {
+                            assert_eq!(status(&e), 400, "?view={view} ({mode}) {payload}: {e}");
+                            assert_eq!(after, before, "a refused write changed the document");
+                        }
+                    }
+                    // The out-of-band finding is never *fixed* by a scoped
+                    // write either, so it stays in the baseline throughout:
+                    // availability, not a moving target.
+                    assert!(baseline.is_subset(&after), "?view={view} ({mode}) {payload}");
+                }
+            }
+        }
+        assert!(accepted > 20, "the corpus must actually accept writes ({accepted})");
+
+        // Whatever the corpus did, a `full_write` caller's narrow write --
+        // the operation Q1's exploit disabled -- is still refused only by the
+        // one pre-existing out-of-band key, and never by anything a scoped
+        // caller stored.
+        let full = grants_json(true, true, json!([]));
+        let err = put_document(&store, "100", Some("p.host"), "json", "\"z\"", "replace", None, false, &full)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret area"), "{err}");
+        assert_eq!(err.matches("invalid key").count(), 1, "one finding, the pre-existing one: {err}");
+    }
+
+    #[test]
+    fn plan_write_refuses_a_scoped_write_that_would_add_a_finding() {
+        // The safety net itself, exercised directly: `plan_write`'s
+        // before/after comparison must fire even for a mutation the narrow
+        // lint cannot see, and its 400 must name no path (the new finding may
+        // sit outside what the caller may read).
+        let (_dir, store) = store();
+        seed(&store, "100", "p:\n  host: a\n");
+        let scoped = grants_json(false, false, json!([{"prefix": "p", "mode": "rw"}]));
+        let view = DocPath::parse("p.host").unwrap();
+        let grants: Grants = serde_json::from_str(&scoped).unwrap();
+        let mut planned = read_or_empty(&store, DocId::Guest(100)).unwrap().value;
+
+        let err = plan_write(DocId::Guest(100), &view, &mut planned, &grants, |v| {
+            // A mutation the narrow lint at `p.host` cannot see, standing in
+            // for any future hole of Q1's shape.
+            v["p"]["z__"] = json!({"r": 1});
+            Ok(vec![Touched { path: DocPath::parse("p.host").unwrap(), op: Op::Set }])
+        })
+        .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(!err.to_string().contains("z__"), "the refusal must name no path: {err}");
+
+        // The same mutation confined to findings that already existed is fine.
+        let mut planned = read_or_empty(&store, DocId::Guest(100)).unwrap().value;
+        plan_write(DocId::Guest(100), &view, &mut planned, &grants, |v| {
+            v["p"]["host"] = json!("b");
+            Ok(vec![Touched { path: DocPath::parse("p.host").unwrap(), op: Op::Set }])
+        })
+        .expect("a clean scoped write is unaffected");
     }
 
     #[test]

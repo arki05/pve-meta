@@ -786,6 +786,55 @@ ok(
 );
 unlink("$root/9502.yaml");
 
+# --- a view never passes through a comment key (pass 4 Q1) ----------------
+#
+# A comment key is a leaf string, so nothing may live below one -- but
+# `lint_at` anchors on the view's *last* segment only, so an intermediate
+# comment key was materialised blindly and checked nowhere:
+# `PUT ?view=traefik.q__.r` stored `traefik: {q__: {r: 1}}`, which the
+# whole-document lint refuses, so a scoped principal could permanently block
+# every narrow write by a full-write one.
+write_file('9505.yaml', "traefik:\n  host: a\n");
+for my $view ('traefik.q__.r', 'traefik.__.x', 'traefik.a__.b.c') {
+    for my $grants ([SCOPED => $SCOPED], [FULL => $FULL]) {
+        my ($who, $g) = @$grants;
+        for my $mode ('replace', 'merge') {
+            $res = eval { PVE::RS::Meta::api_put('9505', $view, 'json', '1', $mode, undef, 0, $g) };
+            ok(!defined($res), "[$who] a $mode at '$view' is refused");
+            like($@, api_error_status(400), "[$who] ... with 400:");
+            like($@, qr/comment key/, "[$who] ... naming the rule");
+        }
+        $res = eval { PVE::RS::Meta::api_get('9505', $view, 'json', 1, $g) };
+        ok(!defined($res), "[$who] a GET of '$view' is refused too");
+        $res = eval { PVE::RS::Meta::api_delete('9505', $view, undef, $g) };
+        ok(!defined($res), "[$who] and a DELETE of '$view'");
+    }
+    is(read_file('9505.yaml'), "traefik:\n  host: a\n", "'$view' wrote nothing");
+}
+# A view *ending* at a comment key is untouched -- that is the note itself.
+ok(
+    defined(eval {
+        PVE::RS::Meta::api_put('9505', 'traefik.q__', 'json', '"about q"', 'replace', undef, 0, $SCOPED)
+    }),
+    'a view ending at a comment key is still legal',
+);
+ok(
+    defined(eval {
+        PVE::RS::Meta::api_put('9505', 'traefik.__', 'json', '"about traefik"', 'replace', undef, 0, $SCOPED)
+    }),
+    'including the bare `__` that documents the map it sits in',
+);
+# And the safety net behind the narrowed lint: an accepted scoped write never
+# leaves the document with a whole-document lint finding it did not already
+# have, so a full-write caller's narrow write keeps working afterwards.
+ok(
+    defined(eval {
+        PVE::RS::Meta::api_put('9505', 'traefik.host', 'json', '"b"', 'replace', undef, 0, $FULL)
+    }),
+    'a full-write narrow write still works after every scoped write above',
+);
+unlink("$root/9505.yaml");
+
 # --- a nested delete marker is applied, not stored (pass 3 R7) -------------
 PVE::RS::Meta::api_put('9503', undef, 'json', encode_json({ traefik => { host => 'x' } }), 'replace', undef, 0, $FULL);
 my $noop = PVE::RS::Meta::api_put('9503', 'traefik', 'json', '{"sub":{"gone":null}}', 'merge', undef, 0, $SCOPED);
