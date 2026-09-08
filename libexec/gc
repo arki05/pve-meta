@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+
+# pve-meta-gc: remove /etc/pve/meta documents (and their snapshot copies)
+# whose vmid is no longer in the cluster's vmlist.
+#
+# Run hourly by pve-meta-gc.timer (see debian/pve-meta.pve-meta-gc.service,
+# debian/pve-meta.pve-meta-gc.timer), installed at /usr/libexec/pve-meta/gc.
+# This is the replacement for the former on_destroy lifecycle hook: instead
+# of patching pve-container's and qemu-server's destroy paths to remove a
+# guest's metadata synchronously, a periodic sweep removes it within one
+# GC interval of the guest actually disappearing from the vmlist. There is
+# no orphan concept anywhere else in the API -- see docs/DESIGN.md section 6
+# and docs/LIFECYCLE-PATCHES.md.
+#
+# Runs under PVE::Cluster::cfs_lock_domain('pve-meta-gc', ...) so concurrent
+# runs on different nodes (the timer fires on every node) never race each
+# other; PVE::RS::Meta::gc() itself does the actual file removal and
+# reports how many documents (including snapshot copies) it removed.
+
+use strict;
+use warnings;
+
+use PVE::Cluster;
+use PVE::RS::Meta;
+use Sys::Syslog qw(openlog syslog closelog);
+
+my $LOCK_TIMEOUT = 30;
+
+openlog('pve-meta-gc', 'pid', 'daemon');
+
+my $removed = eval {
+    PVE::Cluster::cfs_lock_domain(
+        'pve-meta-gc',
+        $LOCK_TIMEOUT,
+        sub {
+            # Must be read inside the lock: cfs_lock_domain refreshes the
+            # cached cluster filesystem state, and a vmlist read beforehand
+            # (or cached from an earlier, unlocked call) can observe an
+            # empty list on a pmxcfs hiccup. An empty vmlist is refused
+            # outright rather than passed through: gc() treats "no vmids"
+            # as "every guest is gone", which would delete every document
+            # in the store instead of the handful actually orphaned.
+            my $vmlist = PVE::Cluster::get_vmlist();
+            my @vmids = sort { $a <=> $b } keys %{ $vmlist->{ids} // {} };
+            die "refusing to gc with an empty vmlist\n" if !@vmids;
+            return PVE::RS::Meta::gc(\@vmids);
+        },
+    );
+};
+my $err = $@;
+
+if ($err) {
+    syslog('err', "garbage collection failed: %s", $err);
+    closelog();
+    die $err;
+}
+
+syslog('info', "removed %d stale document(s)", $removed // 0);
+closelog();
+
+exit 0;

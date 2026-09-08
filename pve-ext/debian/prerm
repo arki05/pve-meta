@@ -21,9 +21,16 @@
 #
 # No `postrm` in this package: it ships no systemd unit and no conffile
 # cleanup logic, so debhelper has nothing to inject there -- a maintainer
-# script holding only `#DEBHELPER#` ships empty and trips lintian's
-# `maintainer-script-empty`. Add one back if a future release actually
-# needs post-removal cleanup.
+# script holding only the debhelper-substitution placeholder with nothing
+# else around it ships empty and trips lintian's `maintainer-script-empty`.
+# Add one back if a future release actually needs post-removal cleanup.
+#
+# NOTE: never spell out that placeholder's literal text anywhere in this
+# file except its own line, below -- dh_installdeb's substitution is a
+# blind string replace, not shell-aware, so a second, quoted-for-prose
+# occurrence (once tried in this comment) gets replaced too and corrupts
+# the script (see debian/pve-meta.prerm in the sibling package for the
+# incident this note documents).
 set -e
 
 case "$1" in

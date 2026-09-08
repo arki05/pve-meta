@@ -76,8 +76,9 @@ install:
 	if [ -d $(UI_DIST) ]; then cp -a $(UI_DIST)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui/; fi
 	# pve-ext UI-page manifest (see pages/pve-meta.json, pve-ext/README.md).
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
-	# pve-ext managed-patch manifest for the seven guest-lifecycle hooks
-	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md).
+	# pve-ext managed-patch manifest for the guest-lifecycle snapshot hooks
+	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
+	# lifecycle is snapshot-only, see docs/LIFECYCLE-PATCHES.md).
 	# Installed under its own declared `id` (patches/lifecycle.toml's
 	# top-level `id = "..."` field), not its checkout filename -- so that
 	# pve-ext-patch's claim identity, read from the manifest's own content
@@ -93,6 +94,28 @@ install:
 	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
+	# GC (see docs/DESIGN.md section 6, README.md): the script run hourly by
+	# pve-meta-gc.timer/pve-meta-gc.service (debian/pve-meta.pve-meta-gc.*,
+	# installed/enabled by dh_installsystemd -- see debian/rules).
+	install -D -m 0755 libexec/gc $(DESTDIR)$(PREFIX)/libexec/pve-meta/gc
+	# Packaged example operator registrations (docs/DESIGN.md section 3);
+	# none are required for pve-meta to work, so this directory may be
+	# empty in a checkout that hasn't added any yet -- `mkdir -p` plus a
+	# tolerant glob copy, never a hard failure.
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/operators
+	if [ -d operators ] && ls operators/*.yaml >/dev/null 2>&1; then \
+		cp operators/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/operators/; \
+	fi
+	# pve-ext UI-page manifest for the ExtJS editor (see
+	# pages/pve-meta-extjs.json, docs/DESIGN.md section 8) and its static
+	# files, served the same way as the wasm UI. ui-extjs/ is a sibling
+	# project directory maintained separately; tolerate it not existing
+	# yet (or not being built) exactly like $(UI_DIST) above.
+	install -D -m 0644 pages/pve-meta-extjs.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-extjs.json
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs
+	if ls ui-extjs/*.js >/dev/null 2>&1; then \
+		cp ui-extjs/*.js $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/; \
+	fi
 
 # `make deb` builds every package this repo ships, in one call:
 #   - pve-ext:                    its own source package, built via `make -C pve-ext deb`.

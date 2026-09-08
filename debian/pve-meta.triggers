@@ -1,15 +1,11 @@
 # Guest-lifecycle-hook managed patch (see patches/lifecycle.toml,
-# patches/lifecycle/, applied via pve-ext-patch): re-run whenever any of
-# these packages reship the files it patches, so the patch survives their
-# upgrades. postinst calls pve-ext-patch tolerantly (no-op if it, or a
-# target file, is absent).
+# patches/lifecycle/, applied via pve-ext-patch): re-run whenever
+# libpve-guest-common-perl reships the file it patches, so the patch
+# survives its upgrades. postinst calls pve-ext-patch tolerantly (no-op if
+# it, or the target file, is absent).
 #
-# Note: index.html.tpl and PVE/API2.pm are no longer this package's
-# concern -- pve-ext owns those triggers now (see pve-ext/debian/triggers).
+# Note: index.html.tpl and PVE/API2.pm are not this package's concern --
+# pve-ext owns those triggers (see pve-ext/debian/triggers). pve-container
+# and qemu-server are no longer patched at all (lifecycle is snapshot-only,
+# see docs/DESIGN.md section 6 and docs/LIFECYCLE-PATCHES.md).
 interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm
-interest-noawait /usr/share/perl5/PVE/API2/LXC.pm
-interest-noawait /usr/share/perl5/PVE/LXC/Create.pm
-interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm
-interest-noawait /usr/share/perl5/PVE/API2/Qemu.pm
-interest-noawait /usr/share/perl5/PVE/QemuServer.pm
-interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm

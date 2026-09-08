@@ -1,0 +1,9 @@
+{
+    "id": "pve-meta-extjs",
+    "title": "Metadata (ExtJS)",
+    "iconCls": "fa fa-tags",
+    "targets": ["lxc", "qemu", "dc"],
+    "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",
+    "xtype": "pveMetaTreePanel",
+    "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
+}

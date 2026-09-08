@@ -13,9 +13,9 @@ watcher" (§6) is the cheapest way to find out *before* a user's `apt dist-upgra
 a new upstream point release moved an anchor our diffs depend on, without ever
 *blocking* that upgrade — see "Upgrade gating" at the end of §6. `pve-ext-patch` itself
 (the tool the ceiling watcher drives) is documented in `pve-ext/README.md`; the
-research that led to pve-meta's own seven-file lifecycle manifest is in
-`docs/LIFECYCLE-PATCHES.md` (superseded by `pve-ext-patch` + `patches/lifecycle.toml`,
-§10 of that document).
+research that led to pve-meta's own guest-lifecycle manifest is in
+`docs/LIFECYCLE-PATCHES.md` (lifecycle is snapshot-only: one file, `pve-ext-patch` +
+`patches/lifecycle.toml`).
 
 ## 1. Repo layout
 
@@ -215,8 +215,6 @@ The patched packages carry a *tested ceiling*, not a dependency pin, so
 ```toml
 [tested]
 pve-manager = "9.2.11"
-pve-container = "6.1.13"
-qemu-server = "9.2.6"
 libpve-guest-common-perl = "6.0.5"
 ```
 
@@ -224,7 +222,7 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
 `workflow_dispatch`) `scripts/watch-pve/check.sh`:
 
 1. fetches the Proxmox no-subscription `Packages` index for `trixie`;
-2. for each of the four tracked packages, compares its current version there (via
+2. for each of the two tracked packages, compares its current version there (via
    `dpkg --compare-versions`) against `ceilings.toml`'s ceiling;
 3. for every package strictly newer than its ceiling: downloads the `.deb`, extracts it
    with `dpkg-deb -x`, and runs `pve-ext-patch --root <extracted> verify <manifest>`
@@ -232,11 +230,10 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
    against the pristine copy it can find under `--root`, never touching anything):
    - **pve-manager**: verifies pve-ext's own manifest,
      `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
-   - **pve-container / qemu-server / libpve-guest-common-perl**: verifies
-     `patches/lifecycle.toml` (pve-meta's seven guest-lifecycle diffs), filtered down
-     first to just that package's own `[[file]]` entries -- a single package's
-     extracted tree never has the *other* two packages' files, so verifying the whole
-     manifest against it would misreport "no pristine source found" for those;
+   - **libpve-guest-common-perl**: verifies `patches/lifecycle.toml` (pve-meta's one
+     guest-lifecycle diff — lifecycle is snapshot-only, see
+     `docs/LIFECYCLE-PATCHES.md`), filtered down first to that package's own `[[file]]`
+     entries (a no-op today, kept for a future entry);
 4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
    packages with any failure get **one GitHub issue** (label `pve-upgrade`) carrying the
    full `pve-ext-patch verify` output, plus a `TODO(llm-fix)` block marking the hand-off

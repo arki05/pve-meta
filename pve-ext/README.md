@@ -96,17 +96,20 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
 | `title` | yes | Tab title. |
 | `iconCls` | no | An ExtJS/FontAwesome icon class (default: `fa fa-puzzle-piece`). |
 | `targets` | yes | Any of `lxc`, `qemu`, `node`, `dc` — which config panel(s) get the tab. |
-| `url` | yes | Iframe `src`, with placeholders substituted (below). Same-origin (relative, no scheme/host/port) is strongly recommended — see "Serving your page's files", below. |
+| `url` | exactly one of `url` or `script`+`xtype` | Iframe `src`, with placeholders substituted (below). Same-origin (relative, no scheme/host/port) is strongly recommended — see "Serving your page's files", below. |
+| `script` | exactly one of `url` or `script`+`xtype` | URL of a JS file defining an ExtJS class (placeholders substituted, same as `url`), loaded once and instantiated as the tab's content instead of an iframe. Requires `xtype`. |
+| `xtype` | with `script` | The `xtype` (ExtJS alias) the script registers; the tab becomes `{ xtype, vmid, type, node, dc }` (whichever of those apply to the target — see below), not an iframe. |
 | `requires` | no | Per-capability-category privilege lists (see "Privilege check", below). Omit to show the tab to every logged-in user. |
 
 `GET /api2/json/ext/pages` (served by `PVE::API2::Ext`, `permissions => {
 user => 'all' }`) re-reads this directory **on every call** — no daemon
 restart needed to pick up a new/changed manifest — and validates each
 file's shape (the fields above; `targets` entries must be one of the four
-known values; `requires`, if present, must map to arrays). A malformed
-manifest is skipped with a `warn`, never breaks the endpoint for every
-other manifest. A manifest whose `id` duplicates one already seen in the
-same directory listing (first one wins, by sorted filename) is likewise
+known values; `requires`, if present, must map to arrays; exactly one of
+`url` or `script`+`xtype` must be present). A malformed manifest is
+skipped with a `warn`, never breaks the endpoint for every other
+manifest. A manifest whose `id` duplicates one already seen in the same
+directory listing (first one wins, by sorted filename) is likewise
 skipped with a `warn` naming both files — the same warn-and-skip
 convention the API-module seam uses for a colliding `ext_path`.
 
@@ -114,18 +117,31 @@ convention the API-module seam uses for a colliding `ext_path`.
 dpkg-diverted into stock `index.html.tpl`, right after `pvemanagerlib.js`)
 fetches that endpoint once (lazily, on first use — see the file's own
 header comment for why) and, for every manifest whose `targets` includes
-the panel currently being built, adds one tab: a `layout: 'fit'` panel
-containing a same-origin `<iframe>`, sized to fill it. This works by
-patching `PVE.panel.Config.prototype.initComponent` directly (replacing
-the function, calling the original it captured first, then adding the
-extra tabs) — proved out in a real browser against ExtJS 7 classic. It
-must **never** be done via the global `Ext.override(cls, {...})` shim
-with `this.callParent(...)` inside the replacement: that form throws in
-real ExtJS 7 classic and silently kills the whole config panel. Every seam this script
-touches is individually `try`/`catch`-guarded; a failure anywhere logs to
-the console (prefixed `[pve-ext]`) and degrades to "that one thing doesn't
-happen" — **it must never be possible for a broken manifest, or a broken
-`/ext/pages` response, to break the PVE UI itself.**
+the panel currently being built, adds one tab. For a `url` manifest that
+tab is a `layout: 'fit'` panel containing a same-origin `<iframe>`, sized
+to fill it. For a `script`+`xtype` manifest the tab is instead a
+`layout: 'fit'` panel that, once rendered, inserts a `<script>` tag for
+`script` (once per URL — cached, so several tabs referencing the same
+script only load it once), waits for `xtype` to resolve to a defined
+class (`Ext.ClassManager.getNameByAlias('widget.' + xtype)` then
+`isCreated()` on the resolved name — a bare `isCreated(xtype)` does
+**not** work, verified against real ExtJS 7 classic), and then replaces
+its own content with
+`{ xtype, vmid, type, node, dc }` — the same placeholder values `url`
+would have received, passed as config properties instead of substituted
+into a URL, so the panel's own initComponent can read `this.vmid`/
+`this.node`/etc. directly. Either way, adding a tab works by patching
+`PVE.panel.Config.prototype.initComponent` directly (replacing the
+function, calling the original it captured first, then adding the extra
+tabs) — proved out in a real browser against ExtJS 7 classic. It must
+**never** be done via the global `Ext.override(cls, {...})` shim with
+`this.callParent(...)` inside the replacement: that form throws in real
+ExtJS 7 classic and silently kills the whole config panel. Every seam
+this script touches is individually `try`/`catch`-guarded; a failure
+anywhere logs to the console (prefixed `[pve-ext]`) and degrades to "that
+one thing doesn't happen" — **it must never be possible for a broken
+manifest, a broken `/ext/pages` response, or a script that never defines
+its `xtype`, to break the PVE UI itself.**
 
 ### Placeholders
 
@@ -159,11 +175,12 @@ the tab was shown; never rely on `requires` for security.
 pveproxy already maps `/pve2/js/` to `/usr/share/pve-manager/js/` (see
 `add_dirs()` in `PVE::Service::pveproxy`) — that's how
 `pve-ext-loader.js` itself gets served. Ship your page's own static files
-(e.g. `pve-meta`'s Monaco-based editor) under
-`/usr/share/pve-manager/js/<your-app>/` and point `url` at
-`/pve2/js/<your-app>/index.html?{query}` — a same-origin, host/port-relative
-path, so there is no cross-origin/mixed-content concern, exactly like the
-main PVE UI's own assets.
+(e.g. `pve-meta`'s Monaco-based iframe editor, or its ExtJS `script`+`xtype`
+page) under `/usr/share/pve-manager/js/<your-app>/`, and point `url` (an
+HTML entry point) or `script` (a JS file defining your `xtype`) at
+`/pve2/js/<your-app>/...?{query}` — a same-origin, host/port-relative path
+either way, so there is no cross-origin/mixed-content concern, exactly like
+the main PVE UI's own assets.
 
 ## 3. Managed patches — `pve-ext-patch`
 
@@ -214,8 +231,8 @@ manifest-id <manifest-file>`, just prints a manifest's declared `id` (see
   passes its `check`. `--fuzz=0` is deliberate, not an oversight: GNU
   patch's default fuzz (2) will slide a hunk onto the wrong one of
   several near-identical anchors in the same file and report success —
-  several of pve-meta's own lifecycle-patch targets have exactly that
-  shape (see `docs/LIFECYCLE-PATCHES.md`) — and a hunk that silently lands
+  pve-meta's own lifecycle-patch target has exactly that shape (see
+  `docs/LIFECYCLE-PATCHES.md`) — and a hunk that silently lands
   in the wrong place is worse than one that fails loudly. On any failure
   after a diversion that already existed (i.e. a re-apply after an
   upstream package upgrade replaced the diverted pristine with a newer
@@ -312,8 +329,8 @@ by construction — they simply never name the same file.
 
 `pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
 project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
-is a worked example of all four steps for seven files across three
-upstream packages.
+is a worked example of all four steps, for the one guest-lifecycle file it
+patches (lifecycle is snapshot-only; see `docs/LIFECYCLE-PATCHES.md`).
 
 ## Summary: what pve-ext ships
 

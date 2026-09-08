@@ -19,9 +19,11 @@ Description: Structured, versioned metadata store for Proxmox VE
  for the datacenter, stored under /etc/pve/meta and replicated by pmxcfs like
  any other cluster file. The API is served natively by pveproxy/pvedaemon
  (PVE::API2::Ext::Meta, discovered by pve-ext, see docs/DESIGN.md) under
- /api2/json/meta/...; this package also ships the wasm editor UI (as a
- pve-ext page manifest) and the guest-lifecycle integration patches (as a
- pve-ext managed-patch manifest).
+ /api2/json/meta/...; this package also ships both editor UIs (pwt/wasm and
+ ExtJS, as pve-ext page manifests, during their comparison), the
+ snapshot/rollback guest-lifecycle patch (as a pve-ext managed-patch
+ manifest), and an hourly GC timer that removes documents for guests that
+ no longer exist.
 
 Package: libpve-meta-rs-perl
 Architecture: any

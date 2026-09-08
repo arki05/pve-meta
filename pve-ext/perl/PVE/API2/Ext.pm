@@ -231,11 +231,32 @@ sub _load_page_manifest {
         return undef;
     }
 
-    for my $key (qw(id title targets url)) {
-        if (!defined($manifest->{$key}) || $manifest->{$key} eq '') {
+    for my $key (qw(id title targets)) {
+        if (!defined($manifest->{$key}) || (!ref($manifest->{$key}) && $manifest->{$key} eq '')) {
             warn "pve-ext: skipping page manifest '$file': missing or empty '$key'\n";
             return undef;
         }
+    }
+
+    # A page's content is either a same-origin iframe (`url`) or a native
+    # ExtJS panel class (`script` + `xtype`, instantiated as the tab
+    # content instead of an iframe -- see js/pve-ext-loader.js). Exactly
+    # one of the two forms, never both, never neither.
+    my $has_url = defined($manifest->{url}) && $manifest->{url} ne '';
+    my $has_script = defined($manifest->{script}) && $manifest->{script} ne '';
+    my $has_xtype = defined($manifest->{xtype}) && $manifest->{xtype} ne '';
+
+    if ($has_script != $has_xtype) {
+        warn "pve-ext: skipping page manifest '$file': 'script' and 'xtype' must both be present or both absent\n";
+        return undef;
+    }
+    if ($has_url && $has_script) {
+        warn "pve-ext: skipping page manifest '$file': declares both 'url' and 'script'+'xtype' -- exactly one is allowed\n";
+        return undef;
+    }
+    if (!$has_url && !$has_script) {
+        warn "pve-ext: skipping page manifest '$file': must declare either 'url' or 'script'+'xtype'\n";
+        return undef;
     }
 
     if (ref($manifest->{targets}) ne 'ARRAY' || !scalar(@{ $manifest->{targets} })) {
@@ -333,14 +354,16 @@ __PACKAGE__->register_method({
     method => 'GET',
     permissions => { user => 'all' },
     description => "List the UI-tab page manifests found under "
-        . "/usr/share/pve-ext/pages/*.json (see pve-ext/README.md). This "
-        . "endpoint only validates manifest *shape*; it does not enforce "
-        . "the 'requires' privileges itself -- js/pve-ext-loader.js does "
-        . "that client-side (so a user simply never sees a tab they can't "
-        . "use), and each page's own backend API enforces access "
-        . "server-side. Re-reads the directory on every call, so dropping "
-        . "in a new manifest takes effect immediately, without a service "
-        . "restart.",
+        . "/usr/share/pve-ext/pages/*.json (see pve-ext/README.md). A "
+        . "manifest's content is either a same-origin iframe ('url') or a "
+        . "native ExtJS panel class ('script'+'xtype'); exactly one form "
+        . "is present. This endpoint only validates manifest *shape*; it "
+        . "does not enforce the 'requires' privileges itself -- "
+        . "js/pve-ext-loader.js does that client-side (so a user simply "
+        . "never sees a tab they can't use), and each page's own backend "
+        . "API enforces access server-side. Re-reads the directory on "
+        . "every call, so dropping in a new manifest takes effect "
+        . "immediately, without a service restart.",
     parameters => {
         additionalProperties => 0,
         properties => {},
@@ -354,7 +377,9 @@ __PACKAGE__->register_method({
                 title => { type => 'string' },
                 iconCls => { type => 'string', optional => 1 },
                 targets => { type => 'array', items => { type => 'string' } },
-                url => { type => 'string' },
+                url => { type => 'string', optional => 1 },
+                script => { type => 'string', optional => 1 },
+                xtype => { type => 'string', optional => 1 },
                 requires => { type => 'object', optional => 1 },
             },
         },

@@ -15,6 +15,22 @@
 # exist to diagnose problems afterwards.
 set -e
 
+# /etc/pve is pmxcfs, mounted only on a node that has joined (or formed) a
+# cluster; a freshly unpacked package on a not-yet-configured node must
+# never touch it. `/etc/pve/local` is pmxcfs's own per-node symlink and
+# only exists once the filesystem is actually mounted -- the same guard
+# pattern PVE's own packages use before writing under /etc/pve. Creating
+# this drop directory here (rather than lazily, on first read) means an
+# administrator dropping a registration file into it right after install
+# never has to first go looking for why the directory doesn't exist yet.
+ensure_operators_dropdir() {
+    if [ -d /etc/pve/local ]; then
+        mkdir -p /etc/pve/meta.d/operators || {
+            echo "pve-meta: warning: could not create /etc/pve/meta.d/operators." >&2
+        }
+    fi
+}
+
 apply_lifecycle_patch() {
     if command -v pve-ext-patch >/dev/null 2>&1; then
         pve-ext-patch apply pve-meta-lifecycle || {
@@ -45,6 +61,7 @@ restart_pve_services() {
 
 case "$1" in
     configure)
+        ensure_operators_dropdir
         apply_lifecycle_patch
         restart_pve_services
         ;;

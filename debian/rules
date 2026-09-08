@@ -36,3 +36,13 @@ override_dh_auto_test:
 	# Rust tests run separately on the build host (cargo test -p pve-meta-core);
 	# skipped here since the packaging build runs with -d and no guaranteed
 	# network access for crates.io during a plain `dpkg-buildpackage`.
+
+# GC timer (docs/DESIGN.md section 6, README.md): dh_installsystemd's
+# default (no --name) only looks for debian/pve-meta.{service,timer} --
+# a *second*, differently-named unit pair for the same package needs an
+# explicit --name so it looks for debian/pve-meta.pve-meta-gc.{service,timer}
+# instead and installs/enables them as pve-meta-gc.{service,timer} (see
+# dh_installsystemd(1), "--name"). Default behavior otherwise (timer
+# enabled+started, service only enabled) is what we want.
+override_dh_installsystemd:
+	dh_installsystemd --name=pve-meta-gc

@@ -12,13 +12,19 @@
 # re-applies (idempotently) once it's configured, so there is no need
 # (and no benefit) to unpatch in between.
 #
-# No `postrm`/`preinst` in this package: this is pve-meta's first release
-# (nothing to migrate in `preinst`), and it ships no systemd unit and no
-# conffile cleanup logic, so debhelper has nothing to inject into a
-# `postrm` either -- a maintainer script that would hold only `#DEBHELPER#`
-# ships empty and trips lintian's `maintainer-script-empty`. Add one back
-# if a future release actually needs pre-unpack migration or post-removal
-# cleanup (see docs/DISTRIBUTION.md for the package's release process).
+# No `preinst` in this package: this is pve-meta's first release, so there
+# is nothing to migrate. `postrm` does not need a source file of its own --
+# dh_installsystemd's disable-on-purge snippet for pve-meta-gc.{service,
+# timer} is enough content on its own that debhelper generates a fresh
+# `postrm` from scratch at build time; a hand-written one here would just
+# hold the debhelper-substitution placeholder with nothing else around it,
+# which is exactly the shape lintian's `maintainer-script-empty` flags.
+#
+# NOTE: never spell out the literal debhelper-substitution placeholder
+# text anywhere in this file except its own line, below -- dh_installdeb's
+# substitution is a blind string replace, not shell-aware, so a second,
+# quoted-for-prose occurrence (once tried in this comment) gets replaced
+# too and corrupts the script.
 set -e
 
 case "$1" in

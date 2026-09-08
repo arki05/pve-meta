@@ -2,7 +2,7 @@
 # scripts/watch-pve/check.sh
 #
 # Scheduled ceiling watcher (see .github/workflows/watch-pve.yml). Compares
-# the Proxmox no-subscription repo's current versions of the four packages
+# the Proxmox no-subscription repo's current versions of the two packages
 # our patches touch against ceilings.toml's [tested] table at the repo
 # root. For each package with a newer upstream version:
 #
@@ -10,12 +10,13 @@
 #   2. for pve-manager: runs `pve-ext-patch --root <extracted> verify` against
 #      pve-ext's own manifest (pve-ext/patches/pve-manager.toml), covering
 #      index.html.tpl and PVE/API2.pm;
-#   3. for pve-container / qemu-server / libpve-guest-common-perl: the same
-#      `pve-ext-patch --root <extracted> verify`, against a copy of
-#      patches/lifecycle.toml filtered down to that package's own entries
-#      (a single package's extracted tree never has the *other* two
-#      packages' files, so verifying the whole manifest at once against it
-#      would wrongly report "no pristine source found" for those).
+#   3. for libpve-guest-common-perl: the same `pve-ext-patch --root
+#      <extracted> verify`, against a copy of patches/lifecycle.toml
+#      filtered down to that package's own entries (lifecycle is
+#      snapshot-only in this revision -- one file, one package -- but the
+#      filter step is kept so a future entry doesn't require re-deriving
+#      this logic; see docs/DESIGN.md section 6 and
+#      docs/LIFECYCLE-PATCHES.md).
 #
 # A package with a clean verify on every applicable check gets its ceiling
 # bumped and rolled into one PR. A package with any failure gets rolled into
@@ -43,7 +44,7 @@ PVE_COMPONENT="pve-no-subscription"
 PVE_ARCH="amd64"
 PACKAGES_URL="$PVE_REPO_BASE/dists/$PVE_SUITE/$PVE_COMPONENT/binary-$PVE_ARCH/Packages"
 
-TRACKED_PACKAGES=(pve-manager pve-container qemu-server libpve-guest-common-perl)
+TRACKED_PACKAGES=(pve-manager libpve-guest-common-perl)
 
 DRY_RUN="${PVE_META_DRY_RUN:-0}"
 
@@ -158,14 +159,12 @@ check_pve_manager() {
 check_lifecycle_manifest() {
     # check_lifecycle_manifest <pkg> <extracted>
     #
-    # patches/lifecycle.toml covers three different upstream packages
-    # (see the file itself); a single package's extracted tree only ever
-    # has *that* package's files, so verifying the whole manifest against
-    # it would wrongly report "no pristine source found" for every entry
-    # belonging to the other two. Filter the manifest down to $pkg's own
-    # [[file]] blocks first, into a scratch manifest that sits next to a
-    # symlink back to the real patches/lifecycle/ diff directory (each
-    # entry's `diff` path is relative to the manifest's own directory).
+    # patches/lifecycle.toml covers libpve-guest-common-perl only (see the
+    # file itself); filter it down to $pkg's own [[file]] blocks first
+    # (a no-op today, kept in case a future entry covers another package),
+    # into a scratch manifest that sits next to a symlink back to the real
+    # patches/lifecycle/ diff directory (each entry's `diff` path is
+    # relative to the manifest's own directory).
     local pkg="$1" extracted="$2"
     local tmp_dir="$WORKDIR/lifecycle-manifest.$pkg"
     local tmp_manifest="$tmp_dir/pve-meta-lifecycle.toml"

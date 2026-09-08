@@ -22,6 +22,17 @@
  * capture-and-apply fix is proven in a real browser against real
  * pve-manager and must not be changed without re-doing that verification.
  *
+ * A manifest's tab content is either a same-origin iframe ("url") or a
+ * native ExtJS panel class ("script" + "xtype"): the script is inserted
+ * into the document as a <script> tag (once per URL, cached), and once
+ * its xtype resolves to a defined class (waitForXtype() below - verified
+ * against real ExtJS 7 classic that this needs the "widget." alias
+ * lookup, not a bare Ext.ClassManager.isCreated(xtype)), the tab
+ * instantiates "{ xtype, ...config }" in place of the iframe, with vmid/
+ * type/node/dc passed as config properties (see buildInstanceConfig()).
+ * PVE::API2::Ext validates that a manifest declares exactly one of the
+ * two forms; this file trusts that already holds.
+ *
  * Design goal: NEVER break the PVE UI. Every seam this script depends on
  * (Ext/PVE class shapes, the /ext/pages API, one page manifest's shape) is
  * individually try/catch-guarded; a failure anywhere logs to the console
@@ -300,6 +311,156 @@
         };
     }
 
+    // --- "script" + "xtype" pages: a native ExtJS panel instead of an
+    //     iframe -----------------------------------------------------
+    //
+    // Loads a page's script exactly once (per URL), regardless of how
+    // many tabs/targets reference it, and caches success/failure so a
+    // second reference never re-fetches or re-`<script>`-injects it.
+    // Queues every caller's callback while a load is in flight.
+    var scriptLoadState = {}; // src -> 'loaded' | 'error' | [pending callbacks]
+
+    function loadScriptOnce(src, cb) {
+        var state = scriptLoadState[src];
+        if (state === 'loaded') {
+            cb();
+            return;
+        }
+        if (state === 'error') {
+            cb(new Error('a previous attempt to load this script already failed'));
+            return;
+        }
+        if (Ext.isArray(state)) {
+            state.push(cb);
+            return;
+        }
+        scriptLoadState[src] = [cb];
+        try {
+            var el = document.createElement('script');
+            el.src = src;
+            el.async = true;
+            el.onload = function () {
+                var callbacks = scriptLoadState[src] || [];
+                scriptLoadState[src] = 'loaded';
+                for (var i = 0; i < callbacks.length; i++) {
+                    callbacks[i]();
+                }
+            };
+            el.onerror = function () {
+                var callbacks = scriptLoadState[src] || [];
+                scriptLoadState[src] = 'error';
+                for (var i = 0; i < callbacks.length; i++) {
+                    callbacks[i](new Error('script failed to load: ' + src));
+                }
+            };
+            document.head.appendChild(el);
+        } catch (e) {
+            var callbacks = scriptLoadState[src] || [];
+            scriptLoadState[src] = 'error';
+            callbacks.forEach(function (fn) {
+                fn(e);
+            });
+        }
+    }
+
+    // Polls (simple setTimeout loop - no Ext.util.TaskManager dependency
+    // needed for this) until the manifest's xtype resolves to a defined
+    // class, or timeoutMs elapses.
+    function waitForXtype(xtype, timeoutMs, cb) {
+        var deadline = Date.now() + timeoutMs;
+        function poll() {
+            var created = false;
+            try {
+                // Ext.ClassManager.isCreated() takes a class *name*
+                // ("Foo.bar.Panel"), not an xtype/alias - an xtype only
+                // resolves to a name through the "widget." alias
+                // namespace ExtJS registers as part of Ext.define(), via
+                // getNameByAlias(). Verified against real ExtJS 7 classic:
+                // isCreated(xtype) and isCreated('widget.' + xtype) both
+                // always report false, even once the class is fully
+                // defined and instantiable.
+                var name = Ext.ClassManager && Ext.ClassManager.getNameByAlias('widget.' + xtype);
+                created = !!(name && Ext.ClassManager.isCreated(name));
+            } catch (e) {
+                created = false;
+            }
+            if (created) {
+                cb(true);
+                return;
+            }
+            if (Date.now() >= deadline) {
+                cb(false);
+                return;
+            }
+            setTimeout(poll, 100);
+        }
+        poll();
+    }
+
+    // vmid/type/node/dc as config properties on the instantiated xtype,
+    // matching whichever of them apply to this target - the same shape
+    // buildQuery() above encodes into a query string for the iframe form.
+    function buildInstanceConfig(target, vars) {
+        var cfg = { type: vars.type };
+        if (target === 'lxc' || target === 'qemu') {
+            cfg.vmid = vars.vmid;
+            cfg.node = vars.node;
+        } else if (target === 'node') {
+            cfg.node = vars.node;
+        } else {
+            cfg.dc = 1;
+        }
+        return cfg;
+    }
+
+    var SCRIPT_XTYPE_TIMEOUT_MS = 15000;
+
+    function buildScriptTabItem(manifest, scriptSrc, instanceConfig) {
+        return {
+            xtype: 'panel',
+            itemId: 'pve-ext-' + manifest.id,
+            title: escapeHtml(manifest.title),
+            iconCls: sanitizeIconCls(manifest.iconCls) || 'fa fa-puzzle-piece',
+            layout: 'fit',
+            border: 0,
+            items: [{ xtype: 'component', html: '' }],
+            listeners: {
+                afterrender: function () {
+                    var panel = this;
+                    loadScriptOnce(scriptSrc, function (loadErr) {
+                        if (loadErr) {
+                            warn('page "' + manifest.id + '": failed to load script "' + scriptSrc + '"', loadErr);
+                            return;
+                        }
+                        waitForXtype(manifest.xtype, SCRIPT_XTYPE_TIMEOUT_MS, function (ok) {
+                            if (!ok) {
+                                warn(
+                                    'page "' +
+                                        manifest.id +
+                                        '": xtype "' +
+                                        manifest.xtype +
+                                        '" was never registered after loading "' +
+                                        scriptSrc +
+                                        '"',
+                                );
+                                return;
+                            }
+                            try {
+                                if (panel.destroying || panel.destroyed) {
+                                    return;
+                                }
+                                panel.removeAll(true);
+                                panel.add(Ext.apply({ xtype: manifest.xtype }, instanceConfig));
+                            } catch (e) {
+                                warn('page "' + manifest.id + '": failed to instantiate xtype "' + manifest.xtype + '"', e);
+                            }
+                        });
+                    });
+                },
+            },
+        };
+    }
+
     // Builds the list of tab item configs to add to a given PVE.panel.Config
     // instance, or [] if this instance's class isn't one of our targets, or
     // no manifest applies to it.
@@ -353,8 +514,13 @@
         for (var i = 0; i < pages.length; i++) {
             var manifest = pages[i];
             try {
-                if (!manifest || !manifest.id || !manifest.title || !manifest.url || !Ext.isArray(manifest.targets)) {
-                    warn('ignoring malformed page manifest (missing id/title/url/targets): ' + JSON.stringify(manifest));
+                if (!manifest || !manifest.id || !manifest.title || !Ext.isArray(manifest.targets)) {
+                    warn('ignoring malformed page manifest (missing id/title/targets): ' + JSON.stringify(manifest));
+                    continue;
+                }
+                var isScriptForm = !!(manifest.script && manifest.xtype);
+                if (!manifest.url && !isScriptForm) {
+                    warn('ignoring page manifest "' + manifest.id + '": neither "url" nor "script"+"xtype" present');
                     continue;
                 }
                 if (manifest.targets.indexOf(target) === -1) {
@@ -363,9 +529,16 @@
                 if (!hasRequiredCaps(manifest, targetInfo.capKey)) {
                     continue; // user lacks a listed privilege - never add the tab
                 }
-                var src = expandUrl(manifest.url, vars);
-                src = expandQueryPlaceholder(src, query);
-                items.push(buildTabItem(manifest, src));
+                if (isScriptForm) {
+                    var scriptSrc = expandUrl(manifest.script, vars);
+                    scriptSrc = expandQueryPlaceholder(scriptSrc, query);
+                    var instanceConfig = buildInstanceConfig(target, vars);
+                    items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
+                } else {
+                    var src = expandUrl(manifest.url, vars);
+                    src = expandQueryPlaceholder(src, query);
+                    items.push(buildTabItem(manifest, src));
+                }
             } catch (e) {
                 warn('failed to build tab for page manifest "' + (manifest && manifest.id) + '", skipping it', e);
             }
