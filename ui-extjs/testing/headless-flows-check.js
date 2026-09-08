@@ -278,7 +278,46 @@ async function main() {
             '',
         );
 
-        // --- 5. The datacenter document --------------------------------------
+        // --- 5. Document keys colliding with Object.prototype members (S3) ---
+        // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved
+        // document keys (DESIGN §4). A throwaway subtree, deleted again below.
+        await api(
+            `/api2/json/meta/guests/${vmid}`,
+            'PUT',
+            tk,
+            csrf,
+            'view=protokeys&mode=replace&data=' +
+                encodeURIComponent(
+                    JSON.stringify({
+                        constructor: 'ctor-value',
+                        toString: 'tostring-value',
+                        hasOwnProperty: 'hop-value',
+                    }),
+                ),
+        );
+        await sleep(500);
+        await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].reload());
+        await sleep(2500);
+        result.checks.protoKeys = await page.evaluate(() => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            const r = {};
+            p.getRootNode().cascadeBy((n) => {
+                if (n.data.path && n.data.path.indexOf('protokeys.') === 0) {
+                    r[n.data.path] = n.data.valueText;
+                }
+            });
+            return {
+                rows: r,
+                // Nothing in the fix should ever reach the page's global Object.
+                objectIntact:
+                    typeof window.Object === 'function' && typeof window.Object.create === 'function',
+            };
+        });
+        await page.screenshot({ path: `${out}/extjs-protokeys.png` });
+        await api(`/api2/json/meta/guests/${vmid}?view=protokeys`, 'DELETE', tk, csrf, '');
+        await sleep(500);
+
+        // --- 6. The datacenter document --------------------------------------
         await openTab(page, 'dc');
         result.checks.datacenter = await page.evaluate(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];

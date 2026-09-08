@@ -298,14 +298,22 @@ impl PveMetaTree {
         tree::find(&self.rows, self.selected.as_deref()?)
     }
 
-    /// True if the caller may create a key somewhere in this document.
+    /// True if the caller may create a key under the row `add_dialog()` would target:
+    /// the selected map, else the selected leaf's parent, else the document root.
+    ///
+    /// Mirrors `text_dialog()`'s gate rather than asking "is there *any* writable scope
+    /// anywhere" — that older check ignored the selection entirely, so a principal
+    /// scoped to one prefix kept an enabled Add button while an unwritable row (or
+    /// nothing) was selected, and the dialog opened targeting it only to fail at
+    /// submit (`docs/REVIEW-2026-09-08-rev5.md` S7). The server remains the arbiter
+    /// either way; this only decides whether the button is offered.
     fn may_add(&self) -> bool {
-        self.access.write
-            || self
-                .access
-                .scopes
-                .iter()
-                .any(|scope| scope.mode == crate::model::Mode::Rw)
+        let parent = match self.selected_node() {
+            Some(node) if node.kind.is_map() => node.path.clone(),
+            Some(node) => parent_path(&node.path),
+            None => String::new(),
+        };
+        self.access.may_write(&parent) || (parent.is_empty() && self.access.write)
     }
 
     /// The subtree "Edit as text" acts on: the selected map, else the whole document.
@@ -1272,8 +1280,8 @@ impl LoadableComponent for PveMetaTree {
                     text.current().to_string(),
                     text.format.language(),
                     text.generation,
-                    !self.access.may_write(&text.path)
-                        && !(text.path.is_empty() && self.access.write),
+                    !(self.access.may_write(&text.path)
+                        || (text.path.is_empty() && self.access.write)),
                 ),
                 _ => (String::new(), "yaml", 0, true),
             };

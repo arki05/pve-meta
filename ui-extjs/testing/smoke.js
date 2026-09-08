@@ -185,9 +185,16 @@ const panel = {
         },
     ],
 };
-['entry', 'addData', 'addGrammar', 'schemaKind', 'applicableScopes', 'ownerFor', 'editableFor'].forEach(
-    (m) => (panel[m] = P[m]),
-);
+[
+    'entry',
+    'addData',
+    'addGrammar',
+    'schemaKind',
+    'applicableScopes',
+    'resolvedScopeApplies',
+    'ownerFor',
+    'editableFor',
+].forEach((m) => (panel[m] = P[m]));
 
 const scopes = panel.applicableScopes.call(panel);
 eq('applicable scopes', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
@@ -223,6 +230,45 @@ eq('owner of unclaimed', panel.ownerFor.call(panel, 'mine.key', scopes), '');
 panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
 eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
 eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), false);
+
+console.log('\n--- S6: scope-only principal (no VM.Audit, so no tags) ---');
+// No `me.tags` (as a caller without VM.Audit gets from GET /meta/guests), but
+// GET /meta/access already resolved this caller's own tag-selector scope.
+const scopedPanel = Object.assign({}, panel);
+scopedPanel.tags = [];
+scopedPanel.access = { read: 0, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
+const scopedScopes = panel.applicableScopes.call(scopedPanel);
+// `netbird` is still applicable regardless of tags (its selector is `all: true`);
+// `traefik` is a `tag` selector that only resolves via GET /meta/access now.
+eq('resolved-scope applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
+    'netbird',
+    'traefik',
+]);
+eq(
+    'owner label still comes from the registration',
+    panel.ownerFor.call(scopedPanel, 'traefik.spec.host', scopedScopes),
+    'traefik (tag: traefik)',
+);
+
+console.log('\n--- S3: document keys colliding with Object.prototype members ---');
+// `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
+// keys (DESIGN §4) that must become ordinary rows, not resolve through the
+// prototype chain to the page's global Object.
+const protoDoc = { constructor: 'ctor-value', toString: 'tostring-value', hasOwnProperty: 'hop-value' };
+const protoRoot = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
+panel.addData.call(panel, protoRoot, protoDoc);
+eq('proto-named keys become rows', Object.keys(protoRoot.children).sort(), [
+    'constructor',
+    'hasOwnProperty',
+    'toString',
+]);
+['constructor', 'toString', 'hasOwnProperty'].forEach((k) => {
+    eq(`${k} row is a plain entry, not the global`, typeof protoRoot.children[k], 'object');
+    eq(`${k} row present`, protoRoot.children[k].present, true);
+    eq(`${k} row path`, protoRoot.children[k].path, k);
+    eq(`${k} row value`, protoRoot.children[k].value, protoDoc[k]);
+});
+eq('global Object untouched', typeof Object.create, 'function');
 
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
 process.exit(fails ? 1 : 0);

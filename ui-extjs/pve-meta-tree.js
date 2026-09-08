@@ -829,7 +829,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     reload: function () {
         let me = this;
-        if (!me.rendered || me.isDestroyed) {
+        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow) {
             return;
         }
         Proxmox.Utils.setErrorMask(me, true);
@@ -929,6 +929,13 @@ Ext.define('PVE.meta.TreePanel', {
                 if (me.token === null) {
                     me.token = token;
                 } else if (token && token !== me.token) {
+                    // Re-check: an edit (or the text window) may have started while
+                    // this request was in flight. Do *not* advance me.token here -
+                    // leaving it stale means the next 5 s tick sees the same change
+                    // and retries, instead of the reload being lost silently.
+                    if (me.isDestroyed || me.editing || me.textWindow) {
+                        return;
+                    }
                     me.token = token;
                     me.reload();
                 }
@@ -938,8 +945,26 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- rows ---------------------------------------------------------------
 
+    // `true` if `/meta/access` (server-resolved, not gated on VM.Audit) already
+    // told us this scope applies to us: same prefix and mode as one of our own
+    // resolved scopes.
+    resolvedScopeApplies: function (scope) {
+        let me = this;
+        return (me.access.scopes || []).some(
+            (s) => s.prefix === scope.prefix && s.mode === scope.mode,
+        );
+    },
+
     // The scopes of every registration whose selector matches this guest. Scopes
     // apply to guest documents only (DESIGN §3), so the datacenter gets none.
+    //
+    // A `tag` selector is normally resolved against `me.tags` (from
+    // `GET /meta/guests`), but that field is only populated for a caller with
+    // VM.Audit (DESIGN §5). A scope-only principal never has it, so also accept
+    // a scope `/meta/access` already resolved for us: that endpoint resolves
+    // selectors server-side without requiring VM.Audit, so it still surfaces our
+    // own declared rows and Owner label even when `me.tags` is empty. The
+    // registration is still the source of the label (name, selector text).
     applicableScopes: function () {
         let me = this;
         let out = [];
@@ -949,7 +974,12 @@ Ext.define('PVE.meta.TreePanel', {
         me.registrations.forEach(function (reg) {
             (reg.scopes || []).forEach(function (scope) {
                 let sel = scope.selector || {};
-                if (scope.prefix && (sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1))) {
+                let matches =
+                    scope.prefix &&
+                    (sel.all ||
+                        (sel.tag && me.tags.indexOf(sel.tag) !== -1) ||
+                        me.resolvedScopeApplies(scope));
+                if (matches) {
                     out.push(Ext.apply({ registration: reg }, scope));
                 }
             });
@@ -991,7 +1021,11 @@ Ext.define('PVE.meta.TreePanel', {
         parent.children[key] = parent.children[key] || {
             key: key,
             path: path,
-            children: {},
+            // Object.create(null): `key` is a document key (attacker-chosen, and
+            // no key is reserved - DESIGN §4), so a plain `{}` here lets a key
+            // like `constructor` or `hasOwnProperty` resolve through the
+            // prototype chain instead of being treated as absent.
+            children: Object.create(null),
             present: false,
         };
         return parent.children[key];
@@ -1075,7 +1109,7 @@ Ext.define('PVE.meta.TreePanel', {
     buildTree: function (data) {
         let me = this;
         let scopes = me.applicableScopes();
-        let root = { key: '', path: '', children: {}, present: true, kind: 'map' };
+        let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
         scopes.forEach((s) => (s.grammar ? me.addGrammar(root, s.prefix, s.grammar) : undefined));
 
@@ -1109,7 +1143,8 @@ Ext.define('PVE.meta.TreePanel', {
                 });
 
         // Reloading (including from the version poll) must not fold the tree up.
-        let expanded = {};
+        // Keyed by document path, so it gets the same treatment as `children`.
+        let expanded = Object.create(null);
         let seen = false;
         me.getRootNode().cascadeBy(function (n) {
             if (n.data.path && !n.isLeaf()) {
