@@ -45,7 +45,7 @@ use proxmox_yew_comp::{
 };
 
 use crate::api::{self, WriteResult};
-use crate::model::{Access, DocId, top_level_keys_from_yaml};
+use crate::model::{Access, DocId, ViewOutcome, top_level_keys_from_yaml, view_outcome};
 use crate::monaco;
 use crate::request::{Channel, RequestId, RequestTracker};
 
@@ -66,10 +66,11 @@ pub struct Loaded {
     access: Option<Access>,
     /// Set instead of `access` when the grants could not be fetched at all.
     access_error: Option<String>,
-    /// Top-level keys of the whole document, for the "View as" selector; only present
-    /// when this load's view was empty (a whole-document read), in which case the known
-    /// list is kept — a view switch never re-fetches it
-    /// (`docs/REVIEW-2026-09-08-pass2.md` P10).
+    /// Top-level keys of the whole document, for the "View as" selector; present when
+    /// this load's view was empty (a whole-document read, `docs/REVIEW-2026-09-08-
+    /// pass2.md` P10 — a view switch otherwise never re-fetches it) or when a selected
+    /// view's own answer was ambiguous and `load()` fetched the whole document to
+    /// settle it (`docs/REVIEW-2026-09-08-pass3.md` R3).
     keys: Option<Vec<String>>,
     digest: String,
     text: String,
@@ -96,7 +97,7 @@ pub enum Msg {
     Discard,
     Reload,
     VersionToken(String),
-    ServerDigest(RequestId, String),
+    ServerDigest(RequestId, api::DocText),
     ThemeChanged(bool),
 }
 
@@ -198,6 +199,25 @@ impl PveMetaEditor {
     /// True while the editor holds changes that are not on the server.
     fn dirty(&self) -> bool {
         self.draft.is_some()
+    }
+
+    /// Recompute the "View as" selector's items from the current grants and keys.
+    ///
+    /// Called wherever either input changes: a load's answer (`Msg::Loaded`) and the
+    /// version poll's whole-document digest check (`Msg::ServerDigest`) both refresh
+    /// `self.keys`, and the dropdown should never lag one load behind what those two
+    /// already know (`docs/REVIEW-2026-09-08-pass3.md` R3).
+    fn refresh_views(&mut self) {
+        self.views = Rc::new(
+            self.access
+                .view_options(&self.keys)
+                .iter()
+                .map(|option| match option.is_empty() {
+                    true => AttrValue::from(WHOLE_DOCUMENT),
+                    false => AttrValue::from(option.clone()),
+                })
+                .collect(),
+        );
     }
 
     /// Show `view` from now on: strand everything in flight and load the new one.
@@ -526,7 +546,43 @@ impl LoadableComponent for PveMetaEditor {
             }
 
             let document = document?;
-            let keys = view.is_empty().then(|| document_keys(&document));
+
+            // A selected (non-empty) view whose own answer carries no top-level keys is
+            // ambiguous: `view::extract` (`crates/pve-meta-core/src/api.rs`) hands back
+            // the same empty object whether the key still exists and simply has no
+            // content, or has been deleted since the view was last listed
+            // (`docs/REVIEW-2026-09-08-pass3.md` R3 — the invariant P10's fold-in-one-GET
+            // change broke). Settle it with one extra whole-document read, paid only in
+            // this rare case — an ordinary load, whatever it answers, never pays it — so
+            // the "is the selected view still an option" check below sees the document's
+            // current top-level keys rather than whatever `self.keys` last held.
+            let keys = if view.is_empty() {
+                Some(document_keys(&document))
+            } else if document_keys(&document).is_empty() {
+                match api::get_text(doc, "").await {
+                    Ok(whole) => {
+                        if !tracker.accepts(&id) {
+                            log::debug!(
+                                "pve-meta-ui: dropping a stale load of {}, view '{}'",
+                                doc.label(),
+                                view,
+                            );
+                            return Ok(());
+                        }
+                        Some(document_keys(&whole))
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "pve-meta-ui: failed to validate an empty answer for {} view \
+                             '{view}': {err}",
+                            doc.label(),
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             link.send_message(Msg::Loaded(Box::new(Loaded {
                 id,
@@ -574,24 +630,30 @@ impl LoadableComponent for PveMetaEditor {
                 if let Some(keys) = keys {
                     self.keys = keys;
                 }
+                self.refresh_views();
 
-                let options = self.access.view_options(&self.keys);
-                self.views = Rc::new(
-                    options
-                        .iter()
-                        .map(|option| match option.is_empty() {
-                            true => AttrValue::from(WHOLE_DOCUMENT),
-                            false => AttrValue::from(option.clone()),
-                        })
-                        .collect(),
-                );
-
-                // The selected prefix is gone (deleted, or no longer granted). Fall back
-                // to the whole document — and load *it*: the text in hand is the answer
-                // for a view that no longer exists, not for the one now selected.
-                if !options.contains(&id.view) {
-                    self.switch_view(ctx, String::new());
-                    return true;
+                // The selected prefix is gone (deleted, or no longer granted). `keys`
+                // above is fresh whenever it mattered — `load()` fetches a whole-document
+                // read to settle exactly this whenever the answered view itself carried
+                // no top-level keys (`docs/REVIEW-2026-09-08-pass3.md` R3) — so this
+                // reads the document's *current* state, not whatever `self.keys` last
+                // held before P10 folded the key list into the single document GET.
+                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
+                    ViewOutcome::Keep => {}
+                    ViewOutcome::FallBack => {
+                        // Fall back to the whole document — and load *it*: the text in
+                        // hand is the answer for a view that no longer exists, not for
+                        // the one now selected.
+                        self.switch_view(ctx, String::new());
+                        return true;
+                    }
+                    ViewOutcome::ConfirmFallBack => {
+                        // There is a draft against the vanished view — the same question
+                        // a manual switch would ask (F5), not a silent discard.
+                        self.pending_view = Some(String::new());
+                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
+                        return true;
+                    }
                 }
 
                 self.loaded = text;
@@ -706,24 +768,57 @@ impl LoadableComponent for PveMetaEditor {
                 }
                 self.version_token = Some(token);
                 // The store token covers every document, so it only says "something,
-                // somewhere, moved". Ask this one whether it was this document.
+                // somewhere, moved". Ask this one whether it was this document — always
+                // for the *whole* document, never just the selected view: `get_document`
+                // (`crates/pve-meta-core/src/api.rs`) reads the whole document and takes
+                // its digest before filtering, so it is the same one request either way,
+                // and it doubles as a refresh of the "View as" key list on every poll
+                // tick, instead of only on the next whole-document load
+                // (`docs/REVIEW-2026-09-08-pass3.md` R3).
                 let id = self.requests.issue(Channel::Digest);
                 let doc = id.doc;
-                let view = id.view.clone();
                 let link = ctx.link().clone();
                 ctx.link().spawn(async move {
-                    match api::get_text(doc, &view).await {
-                        Ok(document) => link.send_message(Msg::ServerDigest(id, document.digest)),
+                    match api::get_text(doc, "").await {
+                        Ok(document) => link.send_message(Msg::ServerDigest(id, document)),
                         Err(err) => log::warn!("pve-meta-ui: digest check failed: {err}"),
                     }
                 });
                 return false;
             }
-            Msg::ServerDigest(id, digest) => {
+            Msg::ServerDigest(id, document) => {
                 // A digest read for a view the page has left says nothing about the one
                 // it now shows.
-                if !self.requests.accepts(&id) || digest == self.digest {
+                if !self.requests.accepts(&id) {
                     return false;
+                }
+                // Always the whole document (see above): fresh top-level keys,
+                // regardless of whether the digest moved — keep `self.keys` (and the
+                // "View as" items built from it) from going stale between whole-document
+                // loads (R3).
+                self.keys = document_keys(&document);
+                self.refresh_views();
+
+                // React to the selected view disappearing the moment fresh keys say so,
+                // rather than waiting for a follow-up load to rediscover it: cheaper (no
+                // detour through an ambiguous, now-stale answer for a view that is
+                // already known to be gone) and exactly the same decision `Msg::Loaded`
+                // makes for the same reason.
+                match view_outcome(&self.access, &self.keys, &id.view, self.dirty()) {
+                    ViewOutcome::Keep => {}
+                    ViewOutcome::FallBack => {
+                        self.switch_view(ctx, String::new());
+                        return true;
+                    }
+                    ViewOutcome::ConfirmFallBack => {
+                        self.pending_view = Some(String::new());
+                        ctx.link().change_view(Some(ViewState::ConfirmSwitchView));
+                        return true;
+                    }
+                }
+
+                if document.digest == self.digest {
+                    return true;
                 }
                 // Never throw away unapplied edits: say so and offer the reload instead.
                 if self.dirty() {

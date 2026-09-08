@@ -143,6 +143,43 @@ impl Access {
     }
 }
 
+/// What a load answering a selected view should do once the caller's grants and the
+/// document's *current* top-level keys are both known.
+///
+/// Pulled out of `editor.rs`'s `Msg::Loaded` handling as a pure function so the fallback
+/// invariant is unit-tested natively rather than only through the wasm32-only state
+/// machine that calls it: a selected view that is no longer an option (deleted, or no
+/// longer covered by a scope) always ends up on the whole document, and never silently
+/// drops an unapplied edit to get there (`docs/REVIEW-2026-09-08-pass3.md` R3 — a
+/// regression from folding the key list into the single document GET, `P10`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewOutcome {
+    /// `view` is still among `access.view_options(keys)`: show what was loaded for it.
+    Keep,
+    /// `view` is gone and the buffer holds no unapplied edits: fall back to the whole
+    /// document right away.
+    FallBack,
+    /// `view` is gone, but the buffer holds unapplied edits: ask before discarding them,
+    /// the same way a manual view switch does (`docs/DESIGN.md`'s F5 discipline).
+    ConfirmFallBack,
+}
+
+/// Decide what a load of `view` should do, given the caller's grants, the document's
+/// current top-level `keys`, and whether the buffer is `dirty`.
+pub fn view_outcome(access: &Access, keys: &[String], view: &str, dirty: bool) -> ViewOutcome {
+    if access
+        .view_options(keys)
+        .iter()
+        .any(|option| option == view)
+    {
+        return ViewOutcome::Keep;
+    }
+    match dirty {
+        true => ViewOutcome::ConfirmFallBack,
+        false => ViewOutcome::FallBack,
+    }
+}
+
 /// `prefix` covers `view` as a plain key-path prefix, comment keys not considered.
 fn covers_exactly(prefix: &str, view: &str) -> bool {
     prefix.is_empty()
@@ -343,6 +380,76 @@ mod tests {
             access.view_options(&keys),
             vec!["", "traefik", "notes", "netbird"],
         );
+    }
+
+    #[test]
+    fn view_outcome_keeps_a_view_still_listed_in_fresh_keys() {
+        let access: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
+        let keys = vec!["traefik".to_string(), "netbird".to_string()];
+
+        assert_eq!(
+            view_outcome(&access, &keys, "netbird", false),
+            ViewOutcome::Keep,
+        );
+        // A dirty buffer changes nothing while the view is still valid.
+        assert_eq!(
+            view_outcome(&access, &keys, "netbird", true),
+            ViewOutcome::Keep,
+        );
+    }
+
+    #[test]
+    fn view_outcome_falls_back_when_a_clean_views_key_is_gone() {
+        // R3: a key deleted out-of-band (or its scope revoked) between one load and the
+        // next, no unapplied edits to lose.
+        let access: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
+        let keys = vec!["traefik".to_string()];
+
+        assert_eq!(
+            view_outcome(&access, &keys, "netbird", false),
+            ViewOutcome::FallBack,
+        );
+    }
+
+    #[test]
+    fn view_outcome_asks_before_falling_back_over_unapplied_edits() {
+        // R3's live repro: the selected view disappears while the buffer is dirty — the
+        // fallback must not silently discard the draft (`docs/DESIGN.md`'s F5
+        // discipline, the same one a manual view switch already honours).
+        let access: Access = serde_json::from_value(json!({"read": 1, "write": 1})).unwrap();
+        let keys = vec!["traefik".to_string()];
+
+        assert_eq!(
+            view_outcome(&access, &keys, "netbird", true),
+            ViewOutcome::ConfirmFallBack,
+        );
+    }
+
+    #[test]
+    fn view_outcome_keeps_a_scope_prefix_even_when_the_document_has_no_such_key_yet() {
+        // Scopes are granted on every document (§2: no per-vmid scoping), so a document
+        // that simply never had this key is not the same as one that lost it — the
+        // scope alone keeps the view a valid option.
+        let access: Access = serde_json::from_value(json!({
+            "read": 0,
+            "write": 0,
+            "scopes": [{"prefix": "netbird", "mode": "rw"}],
+        }))
+        .unwrap();
+
+        assert_eq!(
+            view_outcome(&access, &[], "netbird", false),
+            ViewOutcome::Keep,
+        );
+    }
+
+    #[test]
+    fn view_outcome_keeps_the_whole_document_view() {
+        // The empty view is always an option (`view_options` always starts with it), so
+        // it can never trigger a fallback loop against itself.
+        let access = Access::default();
+
+        assert_eq!(view_outcome(&access, &[], "", false), ViewOutcome::Keep);
     }
 
     #[test]
