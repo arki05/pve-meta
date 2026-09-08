@@ -85,7 +85,7 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
   "title": "Metadata",
   "iconCls": "fa fa-tags",
   "targets": ["lxc", "qemu", "dc"],
-  "url": "/pve2/js/pve-meta-ui/index.html?{query}",
+  "url": "/pve2/js/my-app/index.html?{query}",
   "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
 }
 ```

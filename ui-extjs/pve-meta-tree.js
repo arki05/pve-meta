@@ -29,8 +29,9 @@
  *
  * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
  * card on the whole document, and the diff that confirms either one's Apply. Its AMD
- * loader is fetched lazily on first use from /pve2/js/pve-meta-ui/vs/loader.js (shipped
- * by the pve-meta UI package); every editor is disposed when its owner goes away.
+ * loader is fetched lazily on first use from /pve2/js/pve-meta-extjs/vs/loader.js
+ * (Monaco is vendored into the package by `make ui`, never fetched from a CDN); every
+ * editor is disposed when its owner goes away.
  *
  * YAML is js-yaml 4.1.0, vendored in vendor/ and loaded lazily the same way. It is used
  * only for presentation — the YAML/JSON view toggle and the diff. The server stays the
@@ -530,7 +531,7 @@ PVE.meta.Lint = {
 // ---------------------------------------------------------------------------
 
 PVE.meta.Monaco = {
-    VS: '/pve2/js/pve-meta-ui/vs',
+    VS: '/pve2/js/pve-meta-extjs/vs',
     promise: null,
 
     load: function () {

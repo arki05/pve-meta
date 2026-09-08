@@ -1,10 +1,13 @@
 # ui-extjs — the native ExtJS editor
 
-One file, `pve-meta-tree.js`, plain ES2017, no build step, plus `vendor/` (js-yaml). It
-defines a panel (`xtype: pveMetaTreePanel`) that pve-ext's page loader instantiates as a
-native tab inside the PVE guest and datacenter config panels. This is one of the two
-implementations DESIGN §8 asks to be built and compared on the lab; the other is
-`../ui/` (pwt/Yew in an iframe).
+One file, `pve-meta-tree.js`, plain ES2017, no build step, plus `vendor/` (js-yaml, and
+Monaco once `make ui` has vendored it). It defines a panel (`xtype: pveMetaTreePanel`)
+that pve-ext's page loader instantiates as a native tab inside the PVE guest and
+datacenter config panels.
+
+This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
+same specification and compared on the lab; it was removed once the choice was made (git
+tag `pwt-ui-removed`).
 
 Session, CSRF, dark theme, i18n and the whole page chrome come from the PVE UI. Nothing
 in this file re-derives any of them.
@@ -83,8 +86,9 @@ segmented button at the right end of the toolbar.
 * **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window),
   the Text card (the whole document, in the panel body), and the diff that confirms
   either one's Apply. Its AMD loader is fetched lazily on first use from
-  `/pve2/js/pve-meta-ui/vs/loader.js` (shipped by the pve-meta UI package) and every
-  editor and model is disposed when its owner goes away.
+  `/pve2/js/pve-meta-extjs/vs/loader.js` — Monaco is vendored into the package by the
+  top-level `make ui` (npm), never fetched from a CDN — and every editor and model is
+  disposed when its owner goes away.
 
 ## YAML
 
@@ -115,12 +119,12 @@ pve-ext's page loader (`pve-ext/js/pve-ext-loader.js`) reads page manifests from
 either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This one
 uses the second form:
 
-`pages/pve-meta-extjs.json`:
+`pages/pve-meta.json`:
 
 ```json
 {
-    "id": "pve-meta-extjs",
-    "title": "Metadata (ExtJS)",
+    "id": "pve-meta",
+    "title": "Metadata",
     "iconCls": "fa fa-tags",
     "targets": ["lxc", "qemu", "dc"],
     "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",

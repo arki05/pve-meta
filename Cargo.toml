@@ -13,7 +13,6 @@ members = [
 default-members = [
     "crates/pve-meta-core",
 ]
-exclude = ["ui"]
 
 # Keep debug info in release builds, like upstream `pve-rs` does (it sets the
 # same thing in `proxmox-perl-rs/pve-rs/.cargo/config.toml`). `libpve_meta_rs.so`

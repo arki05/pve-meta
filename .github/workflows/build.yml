@@ -37,9 +37,6 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
-
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
         with:
@@ -48,20 +45,10 @@ jobs:
             ~/.cargo/git
             ~/.cargo/bin
             target
-            ui/target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      - name: Install trunk
-        run: |
-          if ! command -v trunk >/dev/null 2>&1; then
-            curl -fsSL -o /tmp/trunk.tar.gz \
-              https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz
-            tar -xzf /tmp/trunk.tar.gz -C "$HOME/.cargo/bin" trunk
-            chmod +x "$HOME/.cargo/bin/trunk"
-          fi
-          trunk --version
 
       - name: Install grass
         run: |

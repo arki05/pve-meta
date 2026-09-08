@@ -220,13 +220,19 @@ per-row action icons. Editability is per row from `/meta/access`; a row edit is
 digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
 never while an editor is open.
 
-Two implementations exist and are kept for now, both following the above:
+`ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
+mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
+theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe,
+no wasm and no build step beyond vendoring Monaco. YAML is a vendored js-yaml, used for
+presentation only (the YAML/JSON toggle and the diff's original side) — the server stays
+the authority, and an Apply sends the buffer back as `text`.
 
-* `ui-extjs/` — plain JavaScript, `Ext.tree.Panel` with columns, a native tab through the
-  `script`/`xtype` manifest form; session, CSRF, theme and i18n come from the PVE UI;
-  YAML via a vendored js-yaml, the server stays the authority.
-* `ui/` — pwt/Yew, `DataTable` over a `TreeStore`, same-origin iframe, styled to match
-  the ExtJS grid's density and chrome.
+A second implementation in pwt/Yew was built to the same specification and compared on
+the lab; it was removed once the choice was made (git tag `pwt-ui-removed`). It cost
+~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript for the same page,
+and its only structural advantage — that it never parses YAML itself — was answered by
+vendoring a real parser with a property test. What it was genuinely better at, native
+unit tests, is the thing `ui-extjs/testing/` has to keep earning.
 
 ## 9. Repository layout
 
@@ -237,7 +243,7 @@ perl/PVE/API2/Ext/Meta.pm
 operators/               packaged example registrations (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)
-ui/  ui-extjs/           the two editor implementations
+ui-extjs/                the editor tab (plain JS, native ExtJS panel)
 debian/, Makefile        packages: pve-ext, pve-meta, libpve-meta-rs-perl
 ```
 
@@ -258,6 +264,8 @@ hook — what went is the GC *timer*, not the destroy hook); JSON-string crossin
 
 * **Lifecycle is snapshot-only, not zero.** Rollback restoring metadata was an explicit
   product decision; it costs one patched file in the least-churned package.
-* **The pwt implementation is not dropped by fiat.** pwt has a tree grid (`DataTable` +
-  `TreeStore`, used by PDM), which was the doc's premise for switching; both
-  implementations are built and judged on the lab instead.
+* **The pwt implementation was not dropped by fiat — it was compared first.** DIRECTION
+  §5.4 argued for switching on the premise that `Ext.tree.Panel` had no pwt equivalent;
+  it does (`DataTable` + `TreeStore`, used by PDM). Both were built to this §8 and judged
+  on the lab. ExtJS won on size and build surface, not on the doc's original argument,
+  and pwt was then removed (§8, git tag `pwt-ui-removed`).

@@ -21,27 +21,30 @@ CARGO ?= $(firstword $(wildcard $(CARGO_HOME)/bin/cargo $(HOME)/.cargo/bin/cargo
 DESTDIR ?=
 PREFIX ?= /usr
 
-UI_DIR := ui
-UI_DIST := $(UI_DIR)/dist
+UI_DIR := ui-extjs
+MONACO := $(UI_DIR)/vendor/vs
 
 .PHONY: build ui deb install clean check test
 
 build:
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
 
-# Builds the wasm editor UI with trunk. Falls back to a minimal static placeholder if `trunk`
-# is not installed, so packaging/install/the API-only smoke test still work without the full
-# wasm toolchain (the UI itself is specified in docs/DESIGN.md section 6).
+# Vendors Monaco into ui-extjs/vendor/vs. The editor is a plain JS panel with no build
+# step of its own (see ui-extjs/README.md); the only thing to fetch is Monaco's minified
+# AMD tree, which ships *in the package* and is never loaded from a CDN.
 #
-# `npm install` fetches Monaco, which trunk copies into dist/vs -- the editor is shipped in
-# the package, never loaded from a CDN (see ui/README.md).
+# Tolerant of `npm` being absent: a package built without it simply has no Text card and
+# no diff dialog, which is a degraded editor rather than a failed build. `make deb` in CI
+# has npm (see .github/workflows/build.yml).
 ui:
-	@if command -v trunk >/dev/null 2>&1; then \
-		cd $(UI_DIR) && npm install && trunk build --release; \
+	@if [ -d $(MONACO) ]; then \
+		echo "monaco already vendored in $(MONACO)"; \
+	elif command -v npm >/dev/null 2>&1; then \
+		(cd $(UI_DIR) && npm install --no-audit --no-fund); \
+		mkdir -p $(MONACO); \
+		cp -a $(UI_DIR)/node_modules/monaco-editor/min/vs/. $(MONACO)/; \
 	else \
-		echo "warning: trunk not found, shipping a placeholder UI (see docs/UI-SPEC.md)" >&2; \
-		mkdir -p $(UI_DIST); \
-		printf '<!doctype html><html><head><title>pve-meta</title></head><body><p>pve-meta UI not built (trunk unavailable at package build time).</p></body></html>' > $(UI_DIST)/index.html; \
+		echo "warning: npm not found, packaging without Monaco (no Text card, no diff)" >&2; \
 	fi
 
 # Per docs/DESIGN.md section 5, pve-meta is a consumer of pve-ext's three generic
@@ -57,23 +60,15 @@ ui:
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
 #
 # Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module (if
-# it's been generated yet -- see docs/DESIGN.md section 3), the wasm editor UI
-# (served by pveproxy), and the pve-ext page/patch manifests.
+# it's been generated yet -- see docs/DESIGN.md section 3), the ExtJS editor tab
+# and its vendored assets (served by pveproxy), and the pve-ext page/patch
+# manifests.
 install:
 	if [ -f perl/PVE/API2/Ext/Meta.pm ]; then \
 		install -D -m 0644 perl/PVE/API2/Ext/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext/Meta.pm; \
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
-	# Note: dist/ itself contains a "js" subdirectory (ui/index.html's
-	# `data-target-path="js"` link for js/pve-meta-monaco.js), so this
-	# lands at .../pve-manager/js/pve-meta-ui/js/pve-meta-monaco.js -- a
-	# visually doubled "js" segment, but not a bug: index.html's own
-	# `<script src="js/pve-meta-monaco.js">` is relative to itself, and
-	# both files move together. Not worth reshaping (would mean changing
-	# ui/index.html's copy-file target path) for a cosmetic doubling.
-	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui
-	if [ -d $(UI_DIST) ]; then cp -a $(UI_DIST)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-ui/; fi
 	# pve-ext UI-page manifest (see pages/pve-meta.json, pve-ext/README.md).
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
 	# pve-ext managed-patch manifest for the guest-lifecycle snapshot hooks
@@ -108,12 +103,11 @@ install:
 	if [ -d operators ] && ls operators/*.yaml >/dev/null 2>&1; then \
 		cp operators/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/operators/; \
 	fi
-	# pve-ext UI-page manifest for the ExtJS editor (see
-	# pages/pve-meta-extjs.json, docs/DESIGN.md section 8) and its static
-	# files, served the same way as the wasm UI. ui-extjs/ is a sibling
-	# project directory maintained separately; tolerate it not existing
-	# yet (or not being built) exactly like $(UI_DIST) above.
-	install -D -m 0644 pages/pve-meta-extjs.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-extjs.json
+	# pve-ext UI-page manifest for the editor (see pages/pve-meta.json,
+	# docs/DESIGN.md section 8) and its static files. The manifest is the
+	# `script`+`xtype` form: pve-ext's loader defines the class and puts a
+	# native ExtJS panel in the tab, so there is no iframe and no wasm.
+	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs
 	if ls ui-extjs/*.js >/dev/null 2>&1; then \
 		cp ui-extjs/*.js $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/; \
@@ -124,6 +118,13 @@ install:
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor
 	if [ -d ui-extjs/vendor ]; then \
 		cp -a ui-extjs/vendor/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor/; \
+	fi
+	# Monaco's minified AMD tree, vendored by the `ui` target above and served
+	# from .../js/pve-meta-extjs/vs (pve-meta-tree.js's `VS` constant). Absent
+	# when the build host had no npm; the panel degrades rather than breaking.
+	if [ -d $(MONACO) ]; then \
+		mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vs; \
+		cp -a $(MONACO)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vs/; \
 	fi
 
 # `make deb` builds every package this repo ships, in one call:
@@ -156,12 +157,14 @@ deb:
 	fi
 
 check:
-	# `ui/` is its own separate Cargo workspace (see the root Cargo.toml's
-	# `exclude = ["ui"]`), never a member of this one -- `--exclude
-	# pve-meta-ui` used to name a package that can never match anything
-	# here (cargo only warns and ignores it), so there is nothing to
-	# exclude; run `cargo clippy` from inside ui/ separately to lint it.
 	$(CARGO) clippy --workspace -- -D warnings
+	# The editor is plain JS with no build step; its offline suite covers the
+	# YAML round trip, the row/value helpers and the grammar findings.
+	@if command -v node >/dev/null 2>&1; then \
+		node ui-extjs/testing/smoke.js; \
+	else \
+		echo "warning: node not found, skipping the ui-extjs smoke suite" >&2; \
+	fi
 
 test:
 	$(CARGO) test -p pve-meta-core

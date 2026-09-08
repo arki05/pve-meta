@@ -117,10 +117,11 @@ same at a new path; delete is `DELETE ?view=<path>`. Editability is per row, fro
 `/meta/access`. Monaco is the escape hatch: edit a subtree as YAML/JSON text, with a
 diff-confirmed apply.
 
-Two implementations ship as separate tabs during a side-by-side comparison on the lab
-cluster ("Metadata" and "Metadata (ExtJS)") — `ui/` (pwt/Yew, same-origin iframe) and
-`ui-extjs/` (plain JavaScript, a native `Ext.tree.Panel` tab). One will be kept; see
-`docs/DESIGN.md` §8 and §11.
+The tab is `ui-extjs/`: plain JavaScript, a native `Ext.tree.Panel` mounted through
+pve-ext's `script`+`xtype` manifest form, so session, CSRF, theme and i18n all come from
+the PVE UI. No iframe, no wasm, no build step beyond vendoring Monaco. A second
+implementation in pwt/Yew was built to the same spec and compared on the lab before being
+removed — `docs/DESIGN.md` §8 and §11, git tag `pwt-ui-removed`.
 
 ## Lifecycle
 
@@ -153,9 +154,8 @@ generic seams, so pve-meta itself patches nothing directly:
 * **UI pages.** One `<script>` line in `index.html.tpl` loads `pve-ext-loader.js`, which
   fetches `GET /api2/json/ext/pages` and adds one tab per manifest to its declared
   targets — a same-origin iframe (`url`) or a native ExtJS panel loaded once and
-  instantiated in place (`script` + `xtype`). pve-meta ships one of each:
-  `pages/pve-meta.json` (iframe, the pwt/Yew UI) and `pages/pve-meta-extjs.json`
-  (`script`+`xtype`, the ExtJS UI).
+  instantiated in place (`script` + `xtype`). pve-meta ships one, `pages/pve-meta.json`,
+  in the `script`+`xtype` form.
 * **Managed patches.** `pve-ext-patch` applies, verifies, removes and reports a set of
   dpkg-diverted file patches described by TOML manifests; pve-meta ships one
   (`patches/lifecycle.toml`) for the snapshot/rollback/delete-snapshot hook.
@@ -209,9 +209,9 @@ guests its selector matches, to a principal that may hold no VM privilege at all
 
 Build host: Debian 13 (trixie) with a [rustup](https://rustup.rs/) toolchain under
 `~/.cargo/bin` (not the distro `cargo`/`rustc` packages), `libperl-dev` for the perlmod
-crate, and, for the pwt UI, `trunk`/`grass`/`wasm-opt` (only `pve-meta-core` builds on
-macOS — develop the rest on Linux and `rsync` over). `make build` builds
-`crates/pve-meta-perl`, `make ui` runs `trunk build` in `ui/`, and `make deb` builds
+crate, and `npm` to vendor Monaco (only `pve-meta-core` builds on macOS — develop the
+rest on Linux and `rsync` over). `make build` builds `crates/pve-meta-perl`, `make ui`
+vendors Monaco into `ui-extjs/vendor/vs`, and `make deb` builds
 `pve-ext` (its own source package) plus `pve-meta` and `libpve-meta-rs-perl`, dropping
 all three `.deb`s next to each other in the parent directory. See `docs/BUILD.md` for
 the exact rsync/ssh incantation and the safe way to replace the installed `.so` on a
@@ -225,10 +225,10 @@ live node.
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `operators/` | Packaged example registrations (none required) |
-| `ui/`, `ui-extjs/` | The two editor implementations, compared side by side |
+| `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/lifecycle/` | The one guest-lifecycle diff (snapshot/rollback/delete-snapshot) + `lifecycle.toml` manifest |
-| `pages/` | The "Metadata" and "Metadata (ExtJS)" tabs' page manifests |
+| `pages/` | The "Metadata" tab's page manifest |
 | `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
 | `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `PERL-BINDINGS-SPEC.md` |
@@ -240,7 +240,7 @@ live node.
 
 AGPL-3.0-or-later for this project's own code (every crate inherits
 `license.workspace = true` from the root `Cargo.toml`); a handful of vendored editor
-assets (pwt's stylesheets, Font Awesome, Monaco) carry their own upstream MIT/
+assets (Monaco, js-yaml) carry their own upstream MIT/
 Apache-2.0/OFL-1.1 licenses — see `debian/copyright` for the full, per-file breakdown.
 
 ---

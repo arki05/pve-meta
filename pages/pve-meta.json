@@ -3,6 +3,7 @@
     "title": "Metadata",
     "iconCls": "fa fa-tags",
     "targets": ["lxc", "qemu", "dc"],
-    "url": "/pve2/js/pve-meta-ui/index.html?{query}",
+    "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",
+    "xtype": "pveMetaTreePanel",
     "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
 }
