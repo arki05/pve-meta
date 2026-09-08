@@ -875,12 +875,23 @@ pub fn gc_purge(store: &MetaStore, vmid: u32, live: &[u32]) -> Result<usize, any
 /// **`libexec/gc` does not use this**, and neither should a new caller: it
 /// holds no per-vmid lock and re-validates nothing, so a document written
 /// after `vmids` was read is deleted without a trace. It stays because it is
-/// the exact behaviour the two-phase path has to be tested against, and
-/// because it is the one place `vmids` being empty legitimately means "purge
-/// every guest document" (`crates/pve-meta-perl/test/basic.pl`).
+/// the exact behaviour the two-phase path has to be tested against.
+///
+/// An **empty `vmids` is refused**, as it is in [`gc_purge`]. "No guest
+/// exists" and "the caller has not run `PVE::Cluster::cfs_update()` yet" are
+/// the same input here, and this is the most destructive operation in the
+/// system: until now the only thing standing between the two was one line of
+/// Perl at one call site (`libexec/gc`), and this function has no production
+/// caller at all. A test that wants a whole sweep passes a vmid the store
+/// does not have.
 ///
 /// The datacenter document is never a guest and is never touched.
 pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
+    if vmids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "500: refusing to garbage-collect against an empty vmlist"
+        ));
+    }
     let mut removed = 0;
     for vmid in gc_candidates(store, vmids)? {
         removed += store.purge(vmid).map_err(api_err)?;
@@ -1588,8 +1599,11 @@ mod tests {
         // Idempotent, and a full vmlist removes nothing.
         assert_eq!(gc(&store, &[100]).unwrap(), 0);
         assert_eq!(gc(&store, &[100, 999500]).unwrap(), 0);
-        // An empty vmlist removes everything that is a guest.
-        assert_eq!(gc(&store, &[]).unwrap(), 2);
+        // A whole sweep is expressed with a vmid the store does not have, not
+        // with an empty list: an empty vmlist is refused (it is what an
+        // un-refreshed pmxcfs cache looks like).
+        assert!(gc(&store, &[]).is_err(), "an empty vmlist must be refused");
+        assert_eq!(gc(&store, &[999_999]).unwrap(), 2);
         assert!(read_raw(&store, "100").is_none());
         assert!(read_raw(&store, "datacenter").is_some());
     }

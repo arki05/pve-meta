@@ -156,6 +156,9 @@ mod pve_rs_meta {
     /// a vmlist read under that document's write lock, so a `PUT` that landed
     /// after `$vmids` was read loses its document silently; new callers want
     /// `gc_candidates` + `gc_purge`.
+    ///
+    /// Dies on an empty `$vmids`, like `gc_purge`: it is indistinguishable
+    /// from a caller that has not run `PVE::Cluster::cfs_update()`.
     #[export]
     pub fn gc(vmids: Vec<u32>) -> Result<usize, Error> {
         api::gc(&open_store(), &vmids)

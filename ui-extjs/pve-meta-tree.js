@@ -1255,7 +1255,7 @@ Ext.define('PVE.meta.TreePanel', {
             }
             let name = s.registration.name || s.registration.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
-            let key = name + ' ' + mode;
+            let key = name + '\u0000' + mode;
             if (seen[key]) {
                 return;
             }

@@ -117,7 +117,12 @@ ok(file_exists('datacenter.yaml'), 'the datacenter document is never a guest');
 
 is(PVE::RS::Meta::gc([9100]), 0, 'gc is idempotent');
 is(PVE::RS::Meta::gc([9100, 999500]), 0, 'a vmid back in the vmlist is not removed');
-is(PVE::RS::Meta::gc([]), 2, 'an empty vmlist removes every guest document and snapshot');
+# A whole sweep is a vmid the store does not have -- an empty vmlist is
+# refused, because it is also what a process that skipped cfs_update() sees.
+$res = eval { PVE::RS::Meta::gc([]) };
+ok(!defined($res), 'gc refuses an empty vmlist, like gc_purge');
+like($@, api_error_status(500), 'the empty-vmlist refusal is prefixed 500:');
+is(PVE::RS::Meta::gc([999999]), 2, 'a sweep against a vmlist with no stored vmid removes everything stale');
 ok(file_exists('datacenter.yaml'), '... still never the datacenter document');
 
 # The two-phase GC /usr/libexec/pve-meta/gc actually runs: nominate under

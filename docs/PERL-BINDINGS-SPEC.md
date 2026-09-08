@@ -119,7 +119,8 @@ PVE::Cluster::cfs_lock_domain('pve-meta-gc', 30, sub {
             die "refusing to gc $vmid with an empty vmlist\n" if !@fresh;
             return PVE::RS::Meta::gc_purge($vmid, \@fresh);
         });
-        die $@ if $@;
+        # Best-effort per candidate: a busy lock must not stop the sweep.
+        if (my $err = $@) { syslog('warning', "skipping %d: %s", $vmid, $err); next; }
     }
 });
 die $@ if $@;
@@ -128,10 +129,14 @@ die $@ if $@;
 Three things in that shape are not optional. `cfs_update()` before every vmlist read: a
 fresh process that has not refreshed sees an empty vmlist. The **empty-vmlist guard**,
 because an empty vmlist means "every document is stale" — `gc_purge` refuses one too, so
-the guard sits on the destructive call and not only on its caller. And the explicit
-`die $@ if $@` after each `cfs_lock_domain`, which catches its callback's `die` and
-re-raises it by assigning `$@`: wrapping the call in an `eval {}` instead clears `$@` on
-the way out and swallows the failure silently.
+the guard sits on the destructive call and not only on its caller — `gc` (the
+whole-sweep form) refuses one too, so no export of this module can be handed an empty
+vmlist. And the explicit **`$@` check after each `cfs_lock_domain`**, which catches its
+callback's `die` and re-raises it by assigning `$@`: wrapping the call in an `eval {}`
+instead clears `$@` on the way out and swallows the failure silently. The outer check
+dies (a sweep that cannot take its own lock has done nothing); the inner one warns and
+moves to the next candidate, because one document whose write lock is busy must not stop
+the sweep from reaching the rest — the timer retries it next run.
 
 Nesting `"pve-meta-$vmid"` inside `'pve-meta-gc'` cannot deadlock: a writer only ever
 takes the per-document lock, never the GC one, so there is no lock-order cycle. The

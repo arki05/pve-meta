@@ -55,6 +55,7 @@ openlog('pve-meta-gc', 'pid', 'daemon');
 
 my $removed = 0;
 my $skipped = 0;
+my $failed  = 0;
 
 # NOTE: cfs_lock_domain() catches the callback's die and re-raises it by
 # assigning $@, so every call has to be followed by an explicit `die $@ if $@`
@@ -83,7 +84,18 @@ PVE::Cluster::cfs_lock_domain(
                     return PVE::RS::Meta::gc_purge($vmid, \@fresh);
                 },
             );
-            die $@ if $@;
+            if (my $err = $@) {
+                # Best-effort per candidate: one document whose write lock is
+                # held (a long PUT) or stuck must not stop the sweep from
+                # reaching the others. The timer re-runs, so a candidate
+                # skipped here is simply retried on the next pass -- whereas a
+                # die here would leave every later candidate unswept for as
+                # long as that one lock stays busy.
+                chomp(my $msg = $err);
+                syslog('warning', "skipping %d: %s", $vmid, $msg);
+                $failed++;
+                next;
+            }
             $removed += $n // 0;
             $skipped++ if !$n;
         }
@@ -100,6 +112,8 @@ if ($err) {
 syslog('info', "removed %d stale document(s)", $removed);
 syslog('info', "%d candidate(s) purged nothing (live again, or already gone)", $skipped)
     if $skipped;
+syslog('warning', "%d candidate(s) could not be locked and will be retried next run", $failed)
+    if $failed;
 closelog();
 
 exit 0;
