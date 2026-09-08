@@ -105,3 +105,5 @@ answered with a 500 until pveproxy is restarted.
 `diff-dialog.png`, `after-apply.png`, `conflict-banner.png`, `stale-banner.png`,
 `after-conflict-reload.png`, and the two confirmations that guard a draft,
 `reload-confirm.png` and `switch-confirm.png`.
+
+- If the selected view stops being one of your options (key deleted, scope revoked), the editor falls back to the whole document: silently when the buffer is clean, otherwise after the same confirmation Discard/Reload use (`model::view_outcome` is the source of truth). Access grants are re-read on Reload and on every store version change.

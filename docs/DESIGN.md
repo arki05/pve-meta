@@ -61,7 +61,7 @@ PVE conventions (form/JSON parameters; nested values are JSON-encoded strings).
 | PUT | `/meta/guests/{vmid}` | `view` (optional), exactly one of `data` (JSON string) or `text` (YAML) — the format follows from which one is given, `mode` = `replace` (default: the view's subtree is replaced by the payload) or `merge` (merge-patch; `null` deletes), `digest` (expected file digest, optional), `dry_run` | `{ vmid, view, digest, touched: [{ path, op: set|delete }...] }`; 409 on digest mismatch, 403 if any touched path is outside the caller's write scopes, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view` (optional), `digest` | removes the subtree (or the whole document) |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | `vmid` or `dc=1` (optional) | `{ read, write, scopes: [{prefix, mode}] }` for that document; without either, the caller's scopes and datacenter read/write |
+| GET | `/meta/access` | `vmid` or `dc=1` (optional) | `{ read, write, scopes: [{prefix, mode}] }` for that document; without either, the caller's scopes and datacenter read/write; for an orphan vmid, `read`/`write` are `Sys.Audit`/`Sys.Modify` on `/` and `scopes` is empty (§9), matching GET and DELETE; 404 for a vmid that is neither a guest nor an orphan |
 | GET | `/meta/version` | — | `{ token, changed }` — content hash over the store and the newest mtime; poll it |
 
 Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust
@@ -123,7 +123,12 @@ pwt exactly the way PDM composes a page (see `design/PDM-DESIGN-LANGUAGE.md`), c
   write that view; Apply sends `PUT …?view=<selected>&format=yaml&mode=replace` with
   the digest after showing a diff confirmation dialog; a 409 shows a "changed on
   server" notice with Reload,
-* a status line for errors (server message verbatim).
+* a status line for errors (server message verbatim),
+* a fallback rule: if the selected view stops being one of the caller's options (the
+  key was deleted, or the covering scope was revoked), the editor falls back to the
+  whole document, silently when the buffer is clean and otherwise through the same
+  confirmation dialog Discard, Reload and view switching use; the page re-reads its
+  access grants on Reload and whenever the store version changes.
 
 No forms, no schema, no namespace buttons. Monaco is loaded from files shipped in the
 package and mounted into a container the pwt page provides; its theme follows pwt's
