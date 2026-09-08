@@ -83,9 +83,13 @@ install:
 	# pve-ext-patch's claim identity, read from the manifest's own content
 	# rather than whatever path/basename it was invoked with, is the same
 	# whether run against this checkout or the installed package (see
-	# pve-ext/bin/pve-ext-patch's header comment, "manifest_id").
-	lifecycle_id="$$(awk '/^\[\[file\]\]/{exit} match($$0, /^id[ \t]*=/){v=substr($$0, RSTART+RLENGTH); gsub(/^[ \t]*"?|"?[ \t]*$$/, "", v); print v; exit}' patches/lifecycle.toml)"; \
-	[ -n "$$lifecycle_id" ] || { echo "error: patches/lifecycle.toml has no top-level 'id' field" >&2; exit 1; }; \
+	# pve-ext/bin/pve-ext-patch's header comment, "manifest_id"). Resolved
+	# via pve-ext-patch's own "manifest-id" subcommand rather than a second,
+	# independently-drifting awk parser of the same TOML rule (this
+	# Makefile's own copy used to lack the diff tool's trailing-comment
+	# strip and single-quote support -- see docs/REVIEW-2026-09-08-pass3.md,
+	# Makefile:79 finding).
+	lifecycle_id="$$(pve-ext/bin/pve-ext-patch manifest-id patches/lifecycle.toml)" || exit 1; \
 	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/

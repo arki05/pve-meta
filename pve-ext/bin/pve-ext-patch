@@ -419,8 +419,25 @@ restore_on_failure() {
     local mpath="$1" real="$2" diverted="$3" created_divert="$4"
     if [ "$created_divert" -eq 1 ]; then
         log "$mpath: rolling back diversion created moments ago"
-        dpkg_divert_remove "$mpath" >/dev/null 2>&1
-        rm -f "$(claim_file_for "$mpath")" 2>/dev/null
+        # dpkg-divert --remove --rename refuses to rename the diverted
+        # pristine backup back onto $real while $real already holds a
+        # regular file - and by the time any of apply_one's later failure
+        # branches reach here, $real always does (the pristine-placeholder
+        # restore a few lines below install runs unconditionally before
+        # the dry-run/patch/check gates, so a dry-run, patch or check
+        # failure leaves $real holding that placeholder copy). remove_one
+        # clears $real first for exactly this reason; do the same here -
+        # skipping it used to silently turn this "rollback" into a no-op
+        # that still deleted the claim marker and logged success while the
+        # diversion stayed live in dpkg's database (docs/REVIEW-2026-09-08-
+        # pass3.md's R4 finding).
+        rm -f "$real"
+        if dpkg_divert_remove "$mpath" >/dev/null 2>&1; then
+            rm -f "$(claim_file_for "$mpath")" 2>/dev/null
+        else
+            err "$mpath: FAILED to roll back the diversion just created - dpkg-divert --remove failed; the diversion is still in dpkg's database (owned by ${PKG}) and $real is now missing"
+            record_failure "$mpath" "failed to roll back a freshly created diversion after a later failure - diversion still registered, claim marker left in place, $real missing"
+        fi
         return
     fi
     if [ -f "$diverted" ]; then
@@ -503,12 +520,14 @@ apply_one() {
 
     [ -f "$diff_path" ] || {
         err "$mpath: diff not found: $diff_path"
+        record_failure "$mpath" "diff not found: $diff_path"
         return 1
     }
 
     if is_diverted "$mpath"; then
         if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to touch it"
+            record_failure "$mpath" "diverted by a different package - refused to touch it"
             return 1
         fi
         existing_claim="$(read_claim "$claim")"
@@ -522,11 +541,13 @@ apply_one() {
     else
         [ -f "$real" ] || {
             err "$mpath: expected file not found: $real (owning package: ${mpkg:-unknown})"
+            record_failure "$mpath" "expected file not found: $real (owning package: ${mpkg:-unknown})"
             return 1
         }
         log "$mpath: diverting $real -> $diverted"
         if ! dpkg_divert_add "$mpath"; then
             err "$mpath: dpkg-divert --add failed"
+            record_failure "$mpath" "dpkg-divert --add failed"
             return 1
         fi
         created_divert=1
@@ -558,6 +579,7 @@ apply_one() {
 
     mkdir -p "$(dirname "${work}/${rel}")" || {
         err "$mpath: mkdir scratch dir failed"
+        record_failure "$mpath" "mkdir scratch dir failed"
         return 1
     }
     if ! cp "$diverted" "${work}/${rel}"; then
@@ -880,11 +902,29 @@ cmd_status() {
     return "$rc"
 }
 
+# --- manifest-id ------------------------------------------------------
+#
+# Prints a manifest's own declared claim identity (its top-level `id`
+# field - see manifest_id()'s header comment) with NO basename fallback:
+# a caller of this subcommand wants the exact identity apply/remove will
+# claim files under, so a manifest that hasn't added `id` yet is an error
+# here rather than a silent guess. Exists so that anything needing that
+# identity outside this script - e.g. the root Makefile's `install`
+# target, which installs patches/lifecycle.toml under its declared id -
+# resolves it through this tool's own TOML reader instead of maintaining
+# a second, independently-drifting awk one-liner (see
+# docs/REVIEW-2026-09-08-pass3.md's Makefile:79 finding).
+cmd_manifest_id() {
+    [ "${#MANIFESTS[@]}" -eq 1 ] || die "manifest-id takes exactly one manifest argument"
+    manifest_id "${MANIFESTS[0]}" || die "${MANIFESTS[0]}: no top-level 'id' field found"
+}
+
 # --- usage / main -----------------------------------------------------
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...]
+       $(basename "$0") manifest-id <manifest-file>
 
   apply [manifest...]   Divert each entry's file (if not already), apply its
                         diff (patch -p1 --fuzz=0) into a scratch copy, gate
@@ -902,6 +942,13 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...
                         the live file) and report hunks-would-apply vs.
                         hunks-failed. Makes no changes.
   status [manifest...]  Report per-file diversion/patched/in-sync state.
+  manifest-id <file>    Print the manifest's own declared claim identity
+                        (its top-level 'id' field; no basename fallback -
+                        errors if the field is absent). For build/install
+                        tooling that needs the exact identity apply/remove
+                        will claim files under, e.g. to install a manifest
+                        under its declared id without re-implementing this
+                        tool's TOML 'id' parsing.
 
   --root <dir>          Resolve every path this tool touches under <dir>
                         instead of /, and pass --root <dir> through to
@@ -968,6 +1015,7 @@ main() {
         remove) cmd_remove ;;
         verify) cmd_verify ;;
         status) cmd_status ;;
+        manifest-id) cmd_manifest_id ;;
         *)
             usage
             exit 2

@@ -195,7 +195,9 @@ check = "perl"                            # perl -c gate; or "template" for an H
 
 `pve-ext-patch apply|remove|verify|status [--root DIR] [manifest...]`
 (installed as `/usr/sbin/pve-ext-patch`) keeps every mechanic the two
-tools this generalizes proved out:
+tools this generalizes proved out; a fifth subcommand, `pve-ext-patch
+manifest-id <manifest-file>`, just prints a manifest's declared `id` (see
+"Claim identity" below) for build/install tooling that needs it:
 
 - `dpkg-divert --package pve-ext --add --rename --divert <path>.pve-ext-orig <path>`
   per file, the first time it's touched — the diversion is always owned by
@@ -256,6 +258,15 @@ other — the exact trap a filename-derived identity falls into. A manifest
 with no `id` field still works, falling back to its filename basename with
 a `WARNING:` on every invocation; add the field to silence it and to make
 the manifest's identity stable across renames.
+
+Anything outside this tool that needs a manifest's declared `id` — the
+root Makefile's `install` target is the only current example, installing
+`patches/lifecycle.toml` under its declared identity rather than its
+checkout filename — should resolve it via `pve-ext-patch manifest-id
+<manifest-file>` rather than re-parsing the manifest's TOML a second time.
+Unlike `apply`/`remove`, `manifest-id` never falls back to the filename
+basename: a caller asking for the identity explicitly wants the real one,
+and errors out if the manifest has no `id` field.
 
 ### Limitation: no two manifests may patch the same file
 

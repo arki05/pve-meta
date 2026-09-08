@@ -14,6 +14,10 @@ pve\-ext\-patch \- apply, verify, remove and report pve\-ext managed patches
 .RI [ manifest ...]
 .br
 .B pve\-ext\-patch
+.B manifest\-id
+.I manifest\-file
+.br
+.B pve\-ext\-patch
 .RB { \-h | \-\-help }
 .SH DESCRIPTION
 .B pve\-ext\-patch
@@ -92,10 +96,27 @@ Reports, per file: whether it is diverted and by whom, whether the
 pristine backup is present, which manifest currently claims it, whether
 the marker is present in the live file, and whether the live file is
 byte\-for\-byte in sync with pristine\ +\ diff.
+.TP
+.BI manifest\-id\ manifest\-file
+Prints the manifest's own declared claim identity (its top\-level
+.B id
+field, see "CLAIM IDENTITY" below) and exits non\-zero with an error if
+the field is absent \(em unlike
+.BR apply / remove ,
+this command never falls back to the filename basename, since a caller
+asking for the identity explicitly wants the real one, not a guess. For
+build/install tooling (e.g.\& the pve\-meta package's own top\-level
+.I Makefile )
+that needs to install a manifest under its declared id without
+reimplementing this tool's TOML
+.B id
+parsing a second time.
 .PP
 With no
 .I manifest
-arguments, every command acts on every
+arguments, every command other than
+.B manifest\-id
+acts on every
 .I *.toml
 file found under the manifest directory (see "FILES" below).
 A
