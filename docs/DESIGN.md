@@ -164,8 +164,8 @@ Both substitute the same placeholders; `requires` gating applies to both.
 
 The page shows one tree of the document the caller can see. Rows are the union of the
 keys present and the keys the applicable grammars declare (declared-but-unset rows are
-greyed with their default and a "set" action). No row icons; the expander alone.
-Columns:
+greyed with their default and a "set" action). Rows carry a folder icon for maps and a
+leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
