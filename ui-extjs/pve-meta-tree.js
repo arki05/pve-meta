@@ -1,28 +1,40 @@
 /*
  * pve-meta-tree.js — the native ExtJS implementation of the pve-meta editor.
  *
- * One Ext.tree.Panel with columns Key | Value | Owner over the document the caller
- * can see (DESIGN.md §5, §7, §8). Rows are the union of the keys present in the
- * document and the keys the applicable grammars declare (`GET /meta/operators`,
- * matched by scope prefix and selector against this guest); a declared-but-unset key
- * renders faded with its default and description, and "setting" it is just editing
- * its Value cell. Comment keys (`k__`, and the bare `__` for the map itself) are not
- * rows — they are the description/tooltip of the row they document. Arrays are one
- * text leaf. Owner is the registration whose scope covers the row.
+ * One panel with two cards (DESIGN.md §5, §7, §8):
  *
- * Editing is inline (Ext.grid.plugin.CellEditing), the editor chosen from the grammar
- * type and falling back to the value's own type; editability is per row from
+ *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
+ *     document the caller can see. Rows are the union of the keys present in the
+ *     document and the keys the applicable grammars declare (`GET /meta/operators`,
+ *     matched by scope prefix and selector against this guest); a declared-but-unset key
+ *     renders faded with its default, and "setting" it is just editing it. Map rows
+ *     carry a folder icon (open when expanded), value rows a document icon, both at the
+ *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
+ *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
+ *     one text leaf. Access lists every registration whose scope covers the row.
+ *
+ *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
+ *     toggle), Apply through a diff dialog and Discard.
+ *
+ * The Tree|Text segmented button at the right end of the toolbar swaps the body in
+ * place; leaving Text with an edited buffer asks first.
+ *
+ * Editing is a modal row editor (Edit, double-click, or Enter), the field chosen from
+ * the grammar type and falling back to the value's own type; editability is per row from
  * `GET /meta/access`. A commit is one minimal write:
  *   PUT /meta/guests/{vmid}?view=<dotted.path>&mode=replace&data=<json>&digest=<d>
  * 409 (digest mismatch) reloads and reports the API's message verbatim. A 5 s poll of
- * `GET /meta/version` refreshes the tree when the content token changed — never while
- * a cell editor or the text window is open.
+ * `GET /meta/version` refreshes the tree when the content token changed — never while a
+ * row editor, the text window or the Text card is open.
  *
- * Monaco has exactly two jobs: "Edit as Text" on the selected subtree (YAML, with a
- * presentation-only YAML/JSON toggle), and the diff that confirms that window's
- * Apply. Its AMD loader is fetched lazily on first use from
- * /pve2/js/pve-meta-ui/vs/loader.js (shipped by the pve-meta UI package); every
- * editor is disposed when its window closes.
+ * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
+ * card on the whole document, and the diff that confirms either one's Apply. Its AMD
+ * loader is fetched lazily on first use from /pve2/js/pve-meta-ui/vs/loader.js (shipped
+ * by the pve-meta UI package); every editor is disposed when its owner goes away.
+ *
+ * YAML is js-yaml 4.1.0, vendored in vendor/ and loaded lazily the same way. It is used
+ * only for presentation — the YAML/JSON view toggle and the diff. The server stays the
+ * authority on YAML: an Apply in YAML view sends the buffer to the API as `text`.
  *
  * pve-ext's page loader loads this file and instantiates `pveMetaTreePanel` as the
  * tab (see README.md), so session, CSRF, dark theme and i18n all come from the PVE
@@ -34,6 +46,17 @@ Ext.ns('PVE.meta');
 // ---------------------------------------------------------------------------
 // Helpers: paths, the JSON data model, and YAML in and out.
 // ---------------------------------------------------------------------------
+
+// Row icons. Plain FontAwesome classes: ExtJS marks any node that carries an
+// `iconCls` with `x-tree-icon-custom`, which is the class PVE's own stylesheet
+// sizes and colours for the resource tree (ext6-pve.css: 1.25em, #555; #e6e6e6
+// in proxmox-dark), so these come out the same size and muted grey as every
+// other PVE tree icon without this file shipping a line of CSS.
+PVE.meta.Icons = {
+    map: 'fa fa-folder',
+    mapExpanded: 'fa fa-folder-open',
+    leaf: 'fa fa-file-text-o',
+};
 
 PVE.meta.Utils = {
     // A key ending in `__` documents its sibling; a bare `__` documents the map.
@@ -70,7 +93,7 @@ PVE.meta.Utils = {
         return kind === 'string' ? String(value) : Ext.encode(value);
     },
 
-    // The inverse, for a committed cell edit: field value -> the JSON value to send.
+    // The inverse, for a committed row edit: field value -> the JSON value to send.
     parseValue: function (text, kind) {
         if (kind === 'boolean') {
             return text === true || text === 'true' || text === 1 || text === '1';
@@ -90,185 +113,113 @@ PVE.meta.Utils = {
         return String(text);
     },
 
-    // --- YAML, for the text window's presentation-only YAML/JSON toggle -----
+    // The field a row's value is edited with. The grammar's declared type wins over the
+    // type inferred from the stored value: it is the operator's statement of what the
+    // key means, and the API's JSON view cannot tell a boolean from the integer 1.
+    editorFor: function (d) {
+        if (d.enumValues) {
+            return {
+                xtype: 'combobox',
+                store: d.enumValues.map((v) => String(v)),
+                queryMode: 'local',
+                editable: false,
+                forceSelection: true,
+            };
+        } else if (d.kind === 'boolean') {
+            return { xtype: 'proxmoxcheckbox' };
+        } else if (d.kind === 'number') {
+            return { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
+        }
+        return { xtype: 'textfield', selectOnFocus: true };
+    },
+
+    // Human-readable form of a scope's selector, for the Access tooltip.
+    selectorText: function (selector) {
+        let sel = selector || {};
+        if (sel.tag) {
+            return gettext('tag') + ': ' + sel.tag;
+        } else if (sel.all) {
+            return gettext('all guests');
+        }
+        return Ext.encode(sel);
+    },
+
+    // --- YAML, through the vendored js-yaml (see PVE.meta.Yaml) --------------
     //
-    // The store's own canonical dump is the shape this pair round-trips: block maps,
-    // block sequences, plain and quoted scalars. Anything richer (anchors, block
-    // scalars, multi-document, non-empty flow collections) throws rather than being
-    // silently mangled — the server stays the authority on YAML, and Apply in YAML
-    // mode sends the buffer untouched.
+    // Presentation only: the YAML/JSON view toggle and the diff's "original" side.
+    // `load` uses js-yaml's default schema, which is the safe one (no arbitrary
+    // JS types); `dump` is pinned to the block style the store itself emits.
 
-    yamlScalar: function (value) {
-        if (typeof value !== 'string') {
-            return Ext.encode(value);
+    yamlLib: function () {
+        let y = window.jsyaml;
+        if (!y || !y.load) {
+            throw new Error(gettext('YAML support is not loaded'));
         }
-        let needsQuotes =
-            value === '' ||
-            /^\s|\s$|^[-?:,[\]{}#&*!|>'"%@`]|:\s|\s#|\n/.test(value) ||
-            /^(true|false|null|yes|no|on|off|~)$/i.test(value) ||
-            /^[-+]?[0-9.]+([eE][-+]?[0-9]+)?$/.test(value);
-        if (!needsQuotes) {
-            return value;
-        }
-        return '"' + value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n') + '"';
+        return y;
     },
 
-    yamlDump: function (value, indent) {
-        let U = PVE.meta.Utils;
-        let pad = ' '.repeat((indent = indent || 0));
-        let kind = U.kindOf(value);
-        if (kind === 'map') {
-            let keys = Object.keys(value);
-            return keys.length
-                ? keys
-                      .map(function (k) {
-                          let v = value[k];
-                          let vk = U.kindOf(v);
-                          let deep = (vk === 'map' && Object.keys(v).length) || (vk === 'array' && v.length);
-                          if (!deep) {
-                              return pad + U.yamlScalar(k) + ': ' + U.yamlDump(v, 0).trim() + '\n';
-                          }
-                          // Sequences sit at the key's own indentation, as the store dumps them.
-                          return (
-                              pad + U.yamlScalar(k) + ':\n' + U.yamlDump(v, vk === 'map' ? indent + 2 : indent)
-                          );
-                      })
-                      .join('')
-                : pad + '{}\n';
-        } else if (kind === 'array') {
-            return value.length
-                ? value
-                      .map(function (v) {
-                          let vk = U.kindOf(v);
-                          return vk === 'map' || vk === 'array'
-                              ? pad + '-\n' + U.yamlDump(v, indent + 2)
-                              : pad + '- ' + U.yamlDump(v, 0).trim() + '\n';
-                      })
-                      .join('')
-                : pad + '[]\n';
-        }
-        return pad + U.yamlScalar(value) + '\n';
+    yamlLoad: function (text) {
+        let doc = PVE.meta.Utils.yamlLib().load(String(text));
+        // An empty document is the empty map, not a null: the model has no nulls.
+        return doc === undefined || doc === null ? {} : doc;
     },
 
-    yamlPlain: function (text) {
-        let t = text.trim();
-        let q = t.charAt(0);
-        if (q === '"' || q === "'") {
-            if (t.length < 2 || t.charAt(t.length - 1) !== q) {
-                throw new Error(gettext('unterminated quoted scalar') + ': ' + t);
-            }
-            let body = t.slice(1, -1);
-            return q === '"'
-                ? body.replace(/\\(.)/g, (m, c) => (c === 'n' ? '\n' : c === 't' ? '\t' : c))
-                : body.replace(/''/g, "'");
-        }
-        if (t === '{}') {
-            return {};
-        } else if (t === '[]') {
-            return [];
-        } else if (/^[[{]/.test(t)) {
-            throw new Error(gettext('flow collections are not supported') + ': ' + t);
-        } else if (/^[&*|>]/.test(t)) {
-            // anchors, aliases and block scalars: never guess at these
-            throw new Error(gettext('unsupported YAML syntax') + ': ' + t);
-        } else if (t === 'true' || t === 'false') {
-            return t === 'true';
-        } else if (/^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$/.test(t)) {
-            return Number(t);
-        } else if (/^(null|~)$/.test(t)) {
-            throw new Error(gettext('the document model has no nulls'));
-        }
-        return t;
+    yamlDump: function (value) {
+        return PVE.meta.Utils.yamlLib().dump(value, {
+            indent: 2,
+            lineWidth: -1, // never fold: a folded line is a changed line in the diff
+            noRefs: true, // anchors/aliases are not part of the document model
+            sortKeys: false, // documents are ordered maps (DESIGN §2)
+        });
     },
-
-    // The first content line at or after state.i, as { col, seq }.
-    yamlPeek: function (lines, state) {
-        for (let j = state.i; j < lines.length; j++) {
-            if (!lines[j].trim() || /^\s*#/.test(lines[j])) {
-                continue;
-            }
-            let col = lines[j].length - lines[j].replace(/^ +/, '').length;
-            let body = lines[j].slice(col);
-            return { col: col, seq: body === '-' || body.slice(0, 2) === '- ' };
-        }
-        return null;
-    },
-
-    // Indentation-driven parse of the lines at and below state.i that are indented at
-    // least `indent` columns. Returns a map, an array or a scalar. `seqOnly` marks the
-    // block as a sequence living at its parent key's own indentation — the shape the
-    // store dumps — so it must stop at the first line that is not a sequence item.
-    yamlBlock: function (lines, state, indent, seqOnly) {
-        let U = PVE.meta.Utils;
-        let result;
-        while (state.i < lines.length) {
-            let line = lines[state.i];
-            if (!line.trim() || /^\s*#/.test(line)) {
-                state.i++;
-                continue;
-            }
-            if (/^ *\t/.test(line)) {
-                throw new Error(gettext('tabs are not valid YAML indentation') + ' (line ' + (state.i + 1) + ')');
-            }
-            let col = line.length - line.replace(/^ +/, '').length;
-            if (col < indent) {
-                break;
-            }
-            let body = line.slice(col);
-            let isItem = body.charAt(0) === '-' && (body.length === 1 || body.charAt(1) === ' ');
-            if (seqOnly && !isItem && col === indent) {
-                break;
-            }
-            state.i++;
-
-            if (isItem) {
-                result = result === undefined ? [] : result;
-                if (!Ext.isArray(result)) {
-                    throw new Error(gettext('sequence item inside a mapping') + ' (line ' + state.i + ')');
-                }
-                let rest = body.slice(1).trim();
-                if (rest === '') {
-                    result.push(U.yamlBlock(lines, state, col + 1));
-                } else if (/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s:][^:]*?)\s*:(\s|$)/.test(rest)) {
-                    lines[--state.i] = ' '.repeat(col + 2) + rest; // re-read it as a mapping
-                    result.push(U.yamlBlock(lines, state, col + 2));
-                } else {
-                    result.push(U.yamlPlain(rest));
-                }
-                continue;
-            }
-
-            let m = body.match(/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:]+?)\s*:(?:\s+(.*))?$/);
-            if (!m) {
-                if (result === undefined) {
-                    return U.yamlPlain(body); // a bare scalar document
-                }
-                throw new Error(gettext('cannot parse YAML line') + ' ' + state.i + ': ' + line);
-            }
-            result = result === undefined ? {} : result;
-            if (Ext.isArray(result)) {
-                throw new Error(gettext('mapping key inside a sequence') + ' (line ' + state.i + ')');
-            }
-            let key = String(U.yamlPlain(m[1]));
-            let inline = m[2] === undefined ? '' : m[2].trim();
-            if (inline && inline.charAt(0) !== '"' && inline.charAt(0) !== "'") {
-                inline = inline.replace(/\s+#.*$/, '').trim(); // a trailing comment
-            }
-            if (inline !== '') {
-                result[key] = U.yamlPlain(inline);
-                continue;
-            }
-            // A block sequence may sit at its key's own indentation, not below it.
-            let next = U.yamlPeek(lines, state);
-            let flat = !!next && next.col === col && next.seq;
-            result[key] = U.yamlBlock(lines, state, flat ? col : col + 1, flat);
-        }
-        return result === undefined ? {} : result;
-    },
-
-    yamlParse: (text) => PVE.meta.Utils.yamlBlock(String(text).split('\n'), { i: 0 }, 0),
 
     errText: (err) => String((err && (err.message || err.msg)) || err),
+};
+
+// ---------------------------------------------------------------------------
+// js-yaml, vendored under vendor/ and loaded lazily on first use.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Yaml = {
+    SRC: '/pve2/js/pve-meta-extjs/vendor/js-yaml.min.js',
+    promise: null,
+
+    load: function () {
+        let me = PVE.meta.Yaml;
+        me.promise =
+            me.promise ||
+            new Promise(function (resolve, reject) {
+                if (window.jsyaml && window.jsyaml.load) {
+                    resolve(window.jsyaml);
+                    return;
+                }
+                // js-yaml ships a UMD bundle: if an AMD `define` is present it
+                // registers as an anonymous module instead of setting window.jsyaml.
+                // Monaco's loader installs exactly such a `define`, so hide it for
+                // the duration of this one script load and put it back afterwards.
+                // PVE.meta.Monaco.load() waits for this promise first, so the two
+                // never overlap.
+                let prevDefine = window.define;
+                let restore = (fn) =>
+                    function (arg) {
+                        window.define = prevDefine;
+                        fn(arg);
+                    };
+                window.define = undefined;
+                let script = document.createElement('script');
+                script.src = me.SRC;
+                script.onload = restore(function () {
+                    if (window.jsyaml && window.jsyaml.load) {
+                        resolve(window.jsyaml);
+                    } else {
+                        reject(new Error('js-yaml did not register (' + me.SRC + ')'));
+                    }
+                });
+                script.onerror = restore(() => reject(new Error('failed to load ' + me.SRC)));
+                document.head.appendChild(script);
+            });
+        return me.promise;
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -283,28 +234,39 @@ PVE.meta.Monaco = {
         let me = PVE.meta.Monaco;
         me.promise =
             me.promise ||
-            new Promise(function (resolve, reject) {
-                if (window.monaco && window.monaco.editor) {
-                    resolve(window.monaco);
-                    return;
-                }
-                // Absolute, because a language worker resolves its own scripts against
-                // this and has no page URL to make a root-relative path absolute with.
-                let vs = window.location.origin + me.VS;
-                window.MonacoEnvironment = { baseUrl: vs };
-                let script = document.createElement('script');
-                script.src = vs + '/loader.js';
-                script.onload = function () {
-                    try {
-                        window.require.config({ paths: { vs: vs } });
-                        window.require(['vs/editor/editor.main'], () => resolve(window.monaco), reject);
-                    } catch (err) {
-                        reject(err);
-                    }
-                };
-                script.onerror = () => reject(new Error('failed to load ' + script.src));
-                document.head.appendChild(script);
-            });
+            // js-yaml first, deliberately: its UMD bundle and Monaco's AMD loader
+            // both want the global `define`, and every caller of Monaco here also
+            // needs the YAML codec.
+            PVE.meta.Yaml.load().then(
+                () =>
+                    new Promise(function (resolve, reject) {
+                        if (window.monaco && window.monaco.editor) {
+                            resolve(window.monaco);
+                            return;
+                        }
+                        // Absolute, because a language worker resolves its own scripts
+                        // against this and has no page URL to make a root-relative path
+                        // absolute with.
+                        let vs = window.location.origin + me.VS;
+                        window.MonacoEnvironment = { baseUrl: vs };
+                        let script = document.createElement('script');
+                        script.src = vs + '/loader.js';
+                        script.onload = function () {
+                            try {
+                                window.require.config({ paths: { vs: vs } });
+                                window.require(
+                                    ['vs/editor/editor.main'],
+                                    () => resolve(window.monaco),
+                                    reject,
+                                );
+                            } catch (err) {
+                                reject(err);
+                            }
+                        };
+                        script.onerror = () => reject(new Error('failed to load ' + script.src));
+                        document.head.appendChild(script);
+                    }),
+            );
         return me.promise;
     },
 
@@ -345,6 +307,53 @@ PVE.meta.Monaco = {
         }
         editor.dispose();
     },
+
+    // Monaco's other job: original vs edited, side by side, as the confirm step
+    // before anything is written. Shared by the selection window and the Text card.
+    // cfg: { title, original, modified, lang, apply }
+    confirmDiff: function (cfg) {
+        let state = {};
+        let win = Ext.create('Ext.window.Window', {
+            title: gettext('Confirm') + ': ' + Ext.htmlEncode(cfg.title),
+            itemId: 'pveMetaDiffWindow',
+            modal: true,
+            width: 1000,
+            height: 620,
+            layout: 'fit',
+            referenceHolder: true,
+            items: [{ xtype: 'component', reference: 'diff', style: 'height:100%;width:100%' }],
+            buttons: [
+                {
+                    text: gettext('Apply'),
+                    handler: function () {
+                        win.close();
+                        cfg.apply();
+                    },
+                },
+                { text: gettext('Back'), handler: () => win.close() },
+            ],
+        });
+        win.on('afterrender', function () {
+            let monaco = window.monaco;
+            state.editor = monaco.editor.createDiffEditor(win.lookupReference('diff').getEl().dom, {
+                theme: PVE.meta.Monaco.theme(),
+                automaticLayout: true,
+                readOnly: true,
+                renderSideBySide: true,
+                minimap: { enabled: false },
+            });
+            state.editor.setModel({
+                original: monaco.editor.createModel(cfg.original, cfg.lang),
+                modified: monaco.editor.createModel(cfg.modified, cfg.lang),
+            });
+        });
+        win.on('destroy', function () {
+            PVE.meta.Monaco.dispose(state.editor);
+            state.editor = null;
+        });
+        win.show();
+        return win;
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -357,11 +366,14 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'key', type: 'string' },
         { name: 'path', type: 'string' }, // dotted; this is the `view` of a write
         { name: 'valueText', type: 'string' },
-        { name: 'ownerText', type: 'string' },
-        { name: 'description', type: 'string' },
+        { name: 'description', type: 'string' }, // the comment key `k__`, if present
+        { name: 'grammarDescription', type: 'string' }, // the grammar's, shown as tooltip
+        { name: 'accessText', type: 'string' }, // plain-text summary of accessList
+        { name: 'accessList' }, // [{ name, mode, selector, prefix }]
         { name: 'kind', type: 'string' }, // map | array | string | number | boolean
         { name: 'present', type: 'boolean' },
         { name: 'editable', type: 'boolean' },
+        { name: 'expandedCls', type: 'string' }, // iconCls while this map row is open
         { name: 'defaultValue' },
         { name: 'enumValues' },
         { name: 'rawValue' },
@@ -455,7 +467,113 @@ Ext.define('PVE.meta.AddKeyWindow', {
 });
 
 // ---------------------------------------------------------------------------
-// "Edit as Text" — Monaco on one subtree, with a diff-confirmed Apply.
+// The row editor — opened by Edit, double-click or Enter (DESIGN §8).
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.EditValueWindow', {
+    extend: 'Ext.window.Window',
+    xtype: 'pveMetaEditValueWindow',
+
+    modal: true,
+    width: 480,
+    layout: 'fit',
+    defaultButton: 'okBtn',
+    // configs: rec (the tree record being edited)
+
+    initComponent: function () {
+        let me = this;
+        let U = PVE.meta.Utils;
+        let d = me.rec.data;
+        me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(d.path));
+
+        let value;
+        if (d.present) {
+            value = d.kind === 'boolean' || d.kind === 'number' ? d.rawValue : d.valueText;
+        } else if (d.defaultValue !== undefined) {
+            value = d.defaultValue;
+        } else {
+            value = d.kind === 'boolean' ? false : '';
+        }
+
+        let items = [
+            {
+                xtype: 'displayfield',
+                fieldLabel: gettext('Key'),
+                value: Ext.htmlEncode(d.path),
+            },
+        ];
+        let note = d.description || d.grammarDescription;
+        if (note) {
+            items.push({
+                xtype: 'displayfield',
+                fieldLabel: gettext('Description'),
+                value: Ext.htmlEncode(note),
+            });
+        }
+        items.push(
+            Ext.apply(
+                {
+                    name: 'value',
+                    itemId: 'valueField',
+                    fieldLabel: gettext('Value'),
+                    value: value,
+                },
+                U.editorFor(d),
+            ),
+        );
+        if (!d.present && d.defaultValue !== undefined) {
+            items.push({
+                xtype: 'displayfield',
+                fieldLabel: gettext('Default'),
+                value: Ext.htmlEncode(U.displayValue(d.defaultValue, U.kindOf(d.defaultValue))),
+            });
+        }
+
+        Ext.apply(me, {
+            items: [
+                {
+                    xtype: 'form',
+                    reference: 'form',
+                    bodyPadding: 10,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 110 },
+                    items: items,
+                },
+            ],
+            buttons: [
+                { text: gettext('OK'), itemId: 'okBtn', handler: () => me.submit() },
+                { text: gettext('Cancel'), handler: () => me.close() },
+            ],
+        });
+        me.callParent();
+        me.on('show', () => me.down('#valueField').focus(true, 50));
+    },
+
+    submit: function () {
+        let me = this;
+        let form = me.down('form').getForm();
+        if (!form.isValid()) {
+            return;
+        }
+        let d = me.rec.data;
+        let value;
+        try {
+            value = PVE.meta.Utils.parseValue(me.down('#valueField').getValue(), d.kind);
+        } catch (err) {
+            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            return;
+        }
+        if (d.present && Ext.encode(value) === Ext.encode(d.rawValue)) {
+            me.close(); // nothing actually changed
+            return;
+        }
+        me.fireEvent('setvalue', value);
+        me.close();
+    },
+});
+
+// ---------------------------------------------------------------------------
+// "Edit selection as text" — Monaco on one subtree, with a diff-confirmed Apply.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.TextWindow', {
@@ -468,13 +586,13 @@ Ext.define('PVE.meta.TextWindow', {
     layout: 'fit',
     referenceHolder: true, // lookupReference('mount'/'langbtn') needs this
     lang: 'yaml',
-    // configs: view (dotted path, '' = root), text (YAML), tree (the owning panel)
+    // configs: view (dotted path), text (YAML), tree (the owning panel)
 
     initComponent: function () {
         let me = this;
         me.original = me.text || '';
         me.title = Ext.String.format(
-            gettext('Edit as Text: {0}'),
+            gettext('Edit selection as text: {0}'),
             Ext.htmlEncode(me.view || gettext('(whole document)')),
         );
 
@@ -485,9 +603,13 @@ Ext.define('PVE.meta.TextWindow', {
                     xtype: 'segmentedbutton',
                     reference: 'langbtn',
                     value: 'yaml',
+                    // `ui` per item, not the container's `defaultUI`: the latter only
+                    // reaches a child that has no `ui` of its own, and the theme's
+                    // plain `default` is PVE's blue primary button - far too loud for
+                    // a view switch sitting in a toolbar of grey buttons.
                     items: [
-                        { text: 'YAML', value: 'yaml' },
-                        { text: 'JSON', value: 'json' },
+                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
                     ],
                     listeners: { change: (btn, value) => me.switchLang(value) },
                 },
@@ -520,9 +642,8 @@ Ext.define('PVE.meta.TextWindow', {
         // Monaco leaks a ResizeObserver and its models otherwise, and a stale buffer
         // is one that can be applied to the wrong path.
         me.on('destroy', function () {
-            PVE.meta.Monaco.dispose(me.diffEditor);
             PVE.meta.Monaco.dispose(me.editor);
-            me.editor = me.diffEditor = null;
+            me.editor = null;
         });
     },
 
@@ -539,7 +660,7 @@ Ext.define('PVE.meta.TextWindow', {
             value =
                 me.lang === 'json'
                     ? Ext.decode(me.editor.getValue())
-                    : PVE.meta.Utils.yamlParse(me.editor.getValue());
+                    : PVE.meta.Utils.yamlLoad(me.editor.getValue());
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -561,7 +682,6 @@ Ext.define('PVE.meta.TextWindow', {
         );
     },
 
-    // Monaco's second job: original vs edited, side by side, as the confirm step.
     showDiff: function () {
         let me = this;
         if (!me.editor) {
@@ -572,7 +692,7 @@ Ext.define('PVE.meta.TextWindow', {
         let original = me.original;
         if (lang === 'json') {
             try {
-                original = JSON.stringify(PVE.meta.Utils.yamlParse(me.original), null, 2);
+                original = JSON.stringify(PVE.meta.Utils.yamlLoad(me.original), null, 2);
             } catch (_err) {
                 lang = 'yaml'; // cannot render the original as JSON; diff the YAML
             }
@@ -581,46 +701,13 @@ Ext.define('PVE.meta.TextWindow', {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
-
-        let win = Ext.create('Ext.window.Window', {
-            title: gettext('Confirm') + ': ' + Ext.htmlEncode(me.view || gettext('(whole document)')),
-            itemId: 'pveMetaDiffWindow',
-            modal: true,
-            width: 1000,
-            height: 620,
-            layout: 'fit',
-            referenceHolder: true,
-            items: [{ xtype: 'component', reference: 'diff', style: 'height:100%;width:100%' }],
-            buttons: [
-                {
-                    text: gettext('Apply'),
-                    handler: function () {
-                        win.close();
-                        me.apply(edited, me.lang);
-                    },
-                },
-                { text: gettext('Back'), handler: () => win.close() },
-            ],
+        PVE.meta.Monaco.confirmDiff({
+            title: me.view || gettext('(whole document)'),
+            original: original,
+            modified: edited,
+            lang: lang,
+            apply: () => me.apply(edited, me.lang),
         });
-        win.on('afterrender', function () {
-            let monaco = window.monaco;
-            me.diffEditor = monaco.editor.createDiffEditor(win.lookupReference('diff').getEl().dom, {
-                theme: PVE.meta.Monaco.theme(),
-                automaticLayout: true,
-                readOnly: true,
-                renderSideBySide: true,
-                minimap: { enabled: false },
-            });
-            me.diffEditor.setModel({
-                original: monaco.editor.createModel(original, lang),
-                modified: monaco.editor.createModel(edited, lang),
-            });
-        });
-        win.on('destroy', function () {
-            PVE.meta.Monaco.dispose(me.diffEditor);
-            me.diffEditor = null;
-        });
-        win.show();
     },
 
     apply: function (text, lang) {
@@ -634,20 +721,15 @@ Ext.define('PVE.meta.TextWindow', {
 });
 
 // ---------------------------------------------------------------------------
-// The panel.
+// The panel: a card layout over the tree and the full-document text editor.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.TreePanel', {
-    extend: 'Ext.tree.Panel',
+    extend: 'Ext.panel.Panel',
     xtype: 'pveMetaTreePanel',
 
-    rootVisible: false,
-    scrollable: true,
+    layout: 'card',
     border: false,
-    animate: false,
-    useArrows: true,
-    emptyText: gettext('No metadata'),
-    viewConfig: { loadMask: false },
 
     // vmid/node/type/dc arrive as config properties from pve-ext's page loader;
     // pveSelNode is the fallback for anything that adds this panel the PVE way.
@@ -665,48 +747,176 @@ Ext.define('PVE.meta.TreePanel', {
         me.registrations = [];
         me.tags = [];
         me.token = null;
-        me.editing = false;
+        me.editing = false; // a row editor is open
+        me.mode = 'tree';
+        me.textLang = 'yaml';
+        me.textOriginal = '';
 
         me.store = Ext.create('Ext.data.TreeStore', {
             model: 'PVE.meta.TreeModel',
             root: { expanded: true, children: [] },
         });
-        me.cellEditing = Ext.create('Ext.grid.plugin.CellEditing', { clicksToEdit: 1 });
 
         Ext.apply(me, {
-            plugins: [me.cellEditing],
-            columns: me.buildColumns(),
             tbar: me.buildToolbar(),
-            listeners: {
-                beforeedit: (editor, e) => me.onBeforeEdit(e),
-                edit: (editor, e) => me.onEdit(e),
-                canceledit: () => {
-                    me.editing = false;
-                },
-            },
+            items: [me.buildTreeCard(), me.buildTextCard()],
         });
         me.callParent();
 
-        me.on('afterrender', () => me.reload());
+        me.tree = me.down('#metaTree');
+        me.on('afterrender', function () {
+            me.syncButtons();
+            me.reload();
+        });
         me.pollTask = Ext.TaskManager.start({ run: () => me.poll(), interval: 5000, fireOnStart: false });
         me.on('destroy', function () {
             Ext.TaskManager.stop(me.pollTask);
             if (me.textWindow) {
                 me.textWindow.close();
             }
+            PVE.meta.Monaco.dispose(me.textEditor);
+            me.textEditor = null;
         });
     },
 
-    buildColumns: function () {
+    // --- chrome --------------------------------------------------------------
+
+    buildTreeCard: function () {
         let me = this;
+        return {
+            xtype: 'treepanel',
+            itemId: 'metaTree',
+            store: me.store,
+            rootVisible: false,
+            scrollable: true,
+            border: false,
+            animate: false,
+            useArrows: true,
+            emptyText: gettext('No metadata'),
+            viewConfig: { loadMask: false },
+            columns: me.buildColumns(),
+            listeners: {
+                selectionchange: () => me.syncButtons(),
+                itemdblclick: (view, rec) => me.editRow(rec),
+                itemkeydown: function (view, rec, item, index, e) {
+                    if (e.getKey() === e.ENTER && rec && rec.data.kind !== 'map') {
+                        e.stopEvent();
+                        me.editRow(rec);
+                        return false;
+                    }
+                    return true;
+                },
+                // ExtJS has no per-node "expanded icon", so swap the one it has.
+                itemexpand: function (node) {
+                    if (node.data.expandedCls) {
+                        node.set('iconCls', node.data.expandedCls);
+                    }
+                },
+                itemcollapse: function (node) {
+                    if (node.data.expandedCls) {
+                        node.set('iconCls', PVE.meta.Icons.map);
+                    }
+                },
+            },
+        };
+    },
+
+    buildTextCard: function () {
+        let me = this;
+        return {
+            xtype: 'panel',
+            itemId: 'metaText',
+            layout: 'fit',
+            border: false,
+            items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
+            bbar: [
+                {
+                    xtype: 'segmentedbutton',
+                    itemId: 'textLangBtn',
+                    value: 'yaml',
+                    items: [
+                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
+                    ],
+                    listeners: { change: (btn, value) => me.switchTextLang(value) },
+                },
+                '->',
+                {
+                    text: gettext('Apply'),
+                    itemId: 'textApplyBtn',
+                    iconCls: 'fa fa-check',
+                    handler: () => me.applyText(),
+                },
+                {
+                    text: gettext('Discard'),
+                    itemId: 'textDiscardBtn',
+                    iconCls: 'fa fa-undo',
+                    handler: () => me.discardText(),
+                },
+            ],
+        };
+    },
+
+    buildToolbar: function () {
+        let me = this;
+        return [
+            {
+                text: gettext('Add'),
+                itemId: 'addBtn',
+                iconCls: 'fa fa-plus',
+                handler: () => me.addKey(me.addTarget()),
+            },
+            {
+                text: gettext('Edit'),
+                itemId: 'editBtn',
+                iconCls: 'fa fa-pencil',
+                disabled: true,
+                handler: () => me.editRow(me.getSelection()[0]),
+            },
+            {
+                text: gettext('Remove'),
+                itemId: 'removeBtn',
+                iconCls: 'fa fa-trash-o',
+                disabled: true,
+                handler: () => me.removeKey(me.getSelection()[0]),
+            },
+            '-',
+            {
+                text: gettext('Edit selection as text'),
+                itemId: 'textSelBtn',
+                iconCls: 'fa fa-file-code-o',
+                disabled: true,
+                handler: () => me.editSelectionAsText(),
+            },
+            '-',
+            { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
+            '->',
+            // Only shown when the caller is restricted (DESIGN §8).
+            { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
+            {
+                xtype: 'segmentedbutton',
+                itemId: 'modeBtn',
+                value: 'tree',
+                items: [
+                    { text: gettext('Tree'), value: 'tree', ui: 'default-toolbar' },
+                    { text: gettext('Text'), value: 'text', ui: 'default-toolbar' },
+                ],
+                listeners: { change: (btn, value) => me.onModeChange(value) },
+            },
+        ];
+    },
+
+    buildColumns: function () {
         let U = PVE.meta.Utils;
         let fade = (rec, html) => (rec.data.present ? html : '<span class="faded">' + html + '</span>');
-        // The comment key that documents this row becomes its tooltip (DESIGN §8).
-        let qtip = function (rec, meta) {
-            if (rec.data.description) {
-                meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(Ext.htmlEncode(rec.data.description)) + '"';
+        // `html` is already content-encoded; this only escapes it for the attribute.
+        let tip = function (meta, html) {
+            if (html) {
+                meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(html) + '"';
             }
         };
+        // The grammar's description is the tooltip of every cell in the row (DESIGN §8).
+        let rowTip = (rec, meta) => tip(meta, Ext.htmlEncode(rec.data.grammarDescription || ''));
         let unsetText = function (rec) {
             let d = rec.data.defaultValue;
             return d === undefined
@@ -723,7 +933,7 @@ Ext.define('PVE.meta.TreePanel', {
                 dataIndex: 'key',
                 flex: 2,
                 renderer: function (value, meta, rec) {
-                    qtip(rec, meta);
+                    rowTip(rec, meta);
                     return fade(rec, Ext.htmlEncode(value));
                 },
             },
@@ -731,11 +941,8 @@ Ext.define('PVE.meta.TreePanel', {
                 text: gettext('Value'),
                 dataIndex: 'valueText',
                 flex: 3,
-                // A placeholder, only so CellEditing considers the column editable;
-                // onBeforeEdit() replaces it with the editor this row actually wants.
-                editor: { xtype: 'textfield' },
                 renderer: function (value, meta, rec) {
-                    qtip(rec, meta);
+                    rowTip(rec, meta);
                     if (rec.data.kind === 'map') {
                         return '';
                     }
@@ -745,67 +952,101 @@ Ext.define('PVE.meta.TreePanel', {
                 },
             },
             {
-                text: gettext('Owner'),
-                dataIndex: 'ownerText',
-                flex: 1,
-                renderer: (value, meta, rec) => fade(rec, Ext.htmlEncode(value || '')),
-            },
-            {
-                xtype: 'actioncolumn',
-                width: 60,
-                align: 'center',
-                items: [
-                    {
-                        tooltip: gettext('Add key here'),
-                        getClass: (v, meta, rec) =>
-                            rec.data.kind === 'map' && rec.data.editable
-                                ? 'fa fa-plus-circle'
-                                : 'x-hidden-display',
-                        handler: (view, r, c, item, e, rec) => me.addKey(rec.data.path),
-                    },
-                    {
-                        tooltip: gettext('Remove'),
-                        getClass: (v, meta, rec) =>
-                            rec.data.present && rec.data.editable ? 'fa fa-trash-o' : 'x-hidden-display',
-                        handler: (view, r, c, item, e, rec) => me.removeKey(rec),
-                    },
-                ],
-            },
-        ];
-    },
-
-    buildToolbar: function () {
-        let me = this;
-        return [
-            { text: gettext('Reload'), iconCls: 'fa fa-refresh', handler: () => me.reload() },
-            '-',
-            {
-                text: gettext('Add'),
-                iconCls: 'fa fa-plus',
-                handler: function () {
-                    let rec = me.getSelection()[0];
-                    me.addKey(rec ? (rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec)) : '');
+                // The row's own comment key (`k__`) if present, else nothing.
+                text: gettext('Description'),
+                dataIndex: 'description',
+                flex: 3,
+                renderer: function (value, meta, rec) {
+                    tip(
+                        meta,
+                        Ext.htmlEncode(rec.data.grammarDescription || value || ''),
+                    );
+                    return fade(rec, Ext.htmlEncode(value || ''));
                 },
             },
             {
-                xtype: 'proxmoxButton',
-                text: gettext('Remove'),
-                iconCls: 'fa fa-trash-o',
-                disabled: true,
-                // Proxmox.button.Button picks up the tree's selection model itself
-                // through parentXType; asking for it here would be too early.
-                parentXType: 'treepanel',
-                enableFn: (rec) => rec.data.present && rec.data.editable,
-                handler: (btn, e, rec) => me.removeKey(rec),
+                text: gettext('Access'),
+                dataIndex: 'accessText',
+                flex: 2,
+                renderer: function (value, meta, rec) {
+                    let list = rec.data.accessList || [];
+                    if (!list.length) {
+                        return '';
+                    }
+                    tip(
+                        meta,
+                        list
+                            .map((a) =>
+                                Ext.htmlEncode(a.name + ' (' + a.mode + ', ' + a.selector + ')'),
+                            )
+                            .join('<br>'),
+                    );
+                    return fade(
+                        rec,
+                        list
+                            .map((a) =>
+                                a.mode === 'ro'
+                                    ? '<span class="faded">' + Ext.htmlEncode(a.name) + ' (ro)</span>'
+                                    : Ext.htmlEncode(a.name),
+                            )
+                            .join(', '),
+                    );
+                },
             },
-            '-',
-            { text: gettext('Edit as Text'), iconCls: 'fa fa-file-code-o', handler: () => me.editAsText() },
-            '->',
-            { xtype: 'tbtext', reference: 'accessText' },
         ];
     },
 
+    // --- selection and buttons ----------------------------------------------
+
+    getRootNode: function () {
+        return this.store.getRoot();
+    },
+
+    getSelection: function () {
+        return this.tree ? this.tree.getSelection() : [];
+    },
+
+    setSelection: function (rec) {
+        if (this.tree) {
+            this.tree.setSelection(rec);
+        }
+    },
+
     parentPath: (rec) => (rec.parentNode && rec.parentNode.data.path) || '',
+
+    // Add goes into the selected map, the parent of a selected leaf, or the root.
+    addTarget: function () {
+        let rec = this.getSelection()[0];
+        return rec ? (rec.data.kind === 'map' ? rec.data.path : this.parentPath(rec)) : '';
+    },
+
+    syncButtons: function () {
+        let me = this;
+        let rec = me.getSelection()[0];
+        let d = rec ? rec.data : null;
+        let text = me.mode === 'text';
+        let set = function (id, disabled) {
+            let btn = me.down('#' + id);
+            if (btn) {
+                btn.setDisabled(disabled);
+            }
+        };
+        set('addBtn', text || !me.editableFor(me.addTarget()));
+        set('editBtn', text || !d || d.kind === 'map' || !d.editable);
+        set('removeBtn', text || !d || !d.present || !d.editable);
+        set('textSelBtn', text || !d);
+        set('reloadBtn', text);
+    },
+
+    setModeButton: function (value) {
+        let btn = this.down('#modeBtn');
+        if (!btn || btn.getValue() === value) {
+            return;
+        }
+        btn.suspendEvents();
+        btn.setValue(value);
+        btn.resumeEvents();
+    },
 
     // --- loading -----------------------------------------------------------
 
@@ -829,7 +1070,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     reload: function () {
         let me = this;
-        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow) {
+        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
             return;
         }
         Proxmox.Utils.setErrorMask(me, true);
@@ -841,7 +1082,7 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // /meta/operators is revision 5; against an older API it simply fails and the
-    // Owner column and the grammar-declared rows stay empty, rather than the page.
+    // Access column and the grammar-declared rows stay empty, rather than the page.
     loadOperators: function (next) {
         let me = this;
         me.request({
@@ -886,20 +1127,33 @@ Ext.define('PVE.meta.TreePanel', {
             params: me.dc ? { dc: 1 } : { vmid: me.vmid },
             success: function (response) {
                 me.access = response.result.data || { read: 0, write: 0, scopes: [] };
-                let scoped = (me.access.scopes || []).some((s) => s.mode === 'rw');
-                let label = me.down('[reference=accessText]');
-                (label || { setText: Ext.emptyFn }).setText(
-                    me.access.write
-                        ? gettext('Full write access')
-                        : scoped
-                          ? gettext('Scoped write access')
-                          : me.access.read
-                            ? gettext('Read only')
-                            : gettext('No access'),
-                );
+                me.syncAccessLabel();
                 next();
             },
         });
+    },
+
+    // The label is a restriction notice, so it says nothing at all for a caller with
+    // full write access (DESIGN §8).
+    syncAccessLabel: function () {
+        let me = this;
+        let modeBtn = me.down('#modeBtn');
+        if (modeBtn && modeBtn.items.getAt(1)) {
+            // The Text card is the whole document at the root view, and a scope-only
+            // principal may not read that at all (DESIGN §3): do not offer it.
+            modeBtn.items.getAt(1).setDisabled(!me.access.read);
+        }
+        let label = me.down('#accessText');
+        if (!label) {
+            return;
+        }
+        if (me.access.write) {
+            label.setVisible(false);
+            return;
+        }
+        let scoped = (me.access.scopes || []).some((s) => s.mode === 'rw');
+        label.setText(scoped ? gettext('Scoped write access') : gettext('Read-only'));
+        label.setVisible(true);
     },
 
     loadDocument: function (next) {
@@ -910,6 +1164,7 @@ Ext.define('PVE.meta.TreePanel', {
                 let d = response.result.data || {};
                 me.digest = d.digest || '';
                 me.buildTree(d.data || {});
+                me.syncButtons();
                 next();
             },
         });
@@ -917,7 +1172,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     poll: function () {
         let me = this;
-        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow) {
+        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
             return;
         }
         Proxmox.Utils.API2Request({
@@ -929,11 +1184,11 @@ Ext.define('PVE.meta.TreePanel', {
                 if (me.token === null) {
                     me.token = token;
                 } else if (token && token !== me.token) {
-                    // Re-check: an edit (or the text window) may have started while
+                    // Re-check: an edit (or a text editor) may have started while
                     // this request was in flight. Do *not* advance me.token here -
                     // leaving it stale means the next 5 s tick sees the same change
                     // and retries, instead of the reload being lost silently.
-                    if (me.isDestroyed || me.editing || me.textWindow) {
+                    if (me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
                         return;
                     }
                     me.token = token;
@@ -963,7 +1218,7 @@ Ext.define('PVE.meta.TreePanel', {
     // VM.Audit (DESIGN §5). A scope-only principal never has it, so also accept
     // a scope `/meta/access` already resolved for us: that endpoint resolves
     // selectors server-side without requiring VM.Audit, so it still surfaces our
-    // own declared rows and Owner label even when `me.tags` is empty. The
+    // own declared rows and Access entries even when `me.tags` is empty. The
     // registration is still the source of the label (name, selector text).
     applicableScopes: function () {
         let me = this;
@@ -987,23 +1242,36 @@ Ext.define('PVE.meta.TreePanel', {
         return out;
     },
 
-    ownerFor: function (path, scopes) {
-        let best = null;
+    // Every registration whose scope covers this row, `rw` first. Several principals
+    // may read a subtree; this is about who writes and who subscribes, not ownership.
+    accessFor: function (path, scopes) {
+        let U = PVE.meta.Utils;
+        let out = [];
+        // Registration names are operator-chosen strings, so no plain `{}` here.
+        let seen = Object.create(null);
         scopes.forEach(function (s) {
-            if (PVE.meta.Utils.covers(s.prefix, path) && (!best || s.prefix.length > best.prefix.length)) {
-                best = s;
+            if (!U.covers(s.prefix, path)) {
+                return;
             }
+            let name = s.registration.name || s.registration.authid || '';
+            let mode = s.mode === 'ro' ? 'ro' : 'rw';
+            let key = name + ' ' + mode;
+            if (seen[key]) {
+                return;
+            }
+            seen[key] = true;
+            out.push({
+                name: name,
+                mode: mode,
+                selector: U.selectorText(s.selector),
+                prefix: s.prefix,
+            });
         });
-        if (!best) {
-            return '';
-        }
-        let sel = best.selector || {};
-        return (
-            (best.registration.name || best.registration.authid || '') +
-            (sel.tag ? ' (tag: ' + sel.tag + ')' : '') +
-            (best.mode === 'ro' ? ' [ro]' : '')
-        );
+        out.sort((a, b) => (a.mode === b.mode ? 0 : a.mode === 'rw' ? -1 : 1));
+        return out;
     },
+
+    accessSummary: (list) => list.map((a) => a.name + (a.mode === 'ro' ? ' (ro)' : '')).join(', '),
 
     editableFor: function (path) {
         let me = this;
@@ -1077,7 +1345,9 @@ Ext.define('PVE.meta.TreePanel', {
             Object.keys(sch.properties).forEach(function (key) {
                 let ps = sch.properties[key] || {};
                 let child = me.entry(node, key, U.joinPath(node.path, key));
-                child.description = child.description || ps.description;
+                // The comment key stays the Description column; the grammar's own
+                // description is the tooltip (DESIGN §8), so they are two fields.
+                child.grammarDescription = child.grammarDescription || ps.description;
                 if (ps.type === 'object') {
                     child.kind = 'map';
                     walk(child, ps);
@@ -1108,6 +1378,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     buildTree: function (data) {
         let me = this;
+        let I = PVE.meta.Icons;
         let scopes = me.applicableScopes();
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
@@ -1119,6 +1390,7 @@ Ext.define('PVE.meta.TreePanel', {
                 .map(function (key) {
                     let c = entry.children[key];
                     let kind = c.kind || 'string';
+                    let access = me.accessFor(c.path, scopes);
                     let node = {
                         key: key,
                         text: key,
@@ -1126,18 +1398,23 @@ Ext.define('PVE.meta.TreePanel', {
                         kind: kind,
                         present: !!c.present,
                         description: c.description || '',
+                        grammarDescription: c.grammarDescription || '',
                         defaultValue: c.defaultValue,
                         enumValues: c.enumValues,
                         rawValue: c.value,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
-                        ownerText: me.ownerFor(c.path, scopes),
+                        accessList: access,
+                        accessText: me.accessSummary(access),
                         editable: me.editableFor(c.path),
-                        iconCls: 'x-hidden-display',
                         leaf: kind !== 'map',
                     };
                     if (kind === 'map') {
                         node.children = toNodes(c);
                         node.expanded = true;
+                        node.iconCls = I.mapExpanded;
+                        node.expandedCls = I.mapExpanded;
+                    } else {
+                        node.iconCls = I.leaf;
                     }
                     return node;
                 });
@@ -1146,7 +1423,7 @@ Ext.define('PVE.meta.TreePanel', {
         // Keyed by document path, so it gets the same treatment as `children`.
         let expanded = Object.create(null);
         let seen = false;
-        me.getRootNode().cascadeBy(function (n) {
+        me.store.getRoot().cascadeBy(function (n) {
             if (n.data.path && !n.isLeaf()) {
                 seen = true;
                 if (n.isExpanded()) {
@@ -1154,11 +1431,12 @@ Ext.define('PVE.meta.TreePanel', {
                 }
             }
         });
-        me.setRootNode({ expanded: true, children: toNodes(root) });
+        me.store.setRoot({ expanded: true, children: toNodes(root) });
         if (seen) {
-            me.getRootNode().cascadeBy(function (n) {
+            me.store.getRoot().cascadeBy(function (n) {
                 if (n.data.path && !n.isLeaf() && !expanded[n.data.path]) {
                     n.collapse();
+                    n.set('iconCls', PVE.meta.Icons.map);
                 }
             });
         }
@@ -1166,73 +1444,32 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- editing ------------------------------------------------------------
 
-    onBeforeEdit: function (e) {
+    editRow: function (rec) {
         let me = this;
-        let d = e.record.data;
-        if (e.field !== 'valueText' || d.kind === 'map' || !d.editable) {
-            return false;
-        }
-        // setColumnField also evicts CellEditing's per-column editor cache, which
-        // plain column.setEditor() does not - without it every row after the first
-        // would reuse the first row's editor.
-        let field = me.editorFor(d);
-        if (Ext.isFunction(me.cellEditing.setColumnField)) {
-            me.cellEditing.setColumnField(e.column, field);
-        } else {
-            e.column.setEditor(field);
-        }
-        if (d.present) {
-            e.value = d.kind === 'boolean' || d.kind === 'number' ? d.rawValue : d.valueText;
-        } else if (d.defaultValue !== undefined) {
-            e.value = d.defaultValue;
-        } else {
-            e.value = d.kind === 'boolean' ? false : '';
-        }
-        me.editing = true;
-        return true;
-    },
-
-    editorFor: function (d) {
-        if (d.enumValues) {
-            return {
-                xtype: 'combobox',
-                store: d.enumValues.map((v) => String(v)),
-                queryMode: 'local',
-                editable: false,
-                forceSelection: true,
-            };
-        } else if (d.kind === 'boolean') {
-            return { xtype: 'checkbox' };
-        } else if (d.kind === 'number') {
-            return { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
-        }
-        return { xtype: 'textfield', selectOnFocus: true };
-    },
-
-    onEdit: function (e) {
-        let me = this;
-        me.editing = false;
-        let d = e.record.data;
-        let value;
-        try {
-            value = PVE.meta.Utils.parseValue(e.value, d.kind);
-        } catch (err) {
-            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
-            me.reload();
+        if (!rec || rec.data.kind === 'map' || !rec.data.editable) {
             return;
         }
-        if (d.present && Ext.encode(value) === Ext.encode(d.rawValue)) {
-            return; // nothing actually changed
-        }
-        me.write({ view: d.path, mode: 'replace', data: Ext.encode(value), digest: me.digest });
+        me.editing = true;
+        let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
+        win.on('setvalue', (value) =>
+            me.write({ view: rec.data.path, mode: 'replace', data: Ext.encode(value), digest: me.digest }),
+        );
+        win.on('destroy', function () {
+            me.editing = false;
+        });
+        win.show();
     },
 
     addKey: function (parentPath) {
         let me = this;
+        me.editing = true;
         let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: parentPath || '' });
         win.on('addkey', (path, value) =>
             me.write({ view: path, mode: 'replace', data: Ext.encode(value), digest: me.digest }),
         );
+        win.on('destroy', function () {
+            me.editing = false;
+        });
         win.show();
     },
 
@@ -1253,10 +1490,14 @@ Ext.define('PVE.meta.TreePanel', {
         );
     },
 
-    editAsText: function () {
+    // "Edit selection as text": Monaco on the selected subtree, in its own window.
+    editSelectionAsText: function () {
         let me = this;
         let rec = me.getSelection()[0];
-        let view = rec ? (rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec)) : '';
+        if (!rec) {
+            return;
+        }
+        let view = rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec);
         me.request({
             url: me.baseUrl,
             params: { view: view, format: 'yaml' },
@@ -1273,6 +1514,223 @@ Ext.define('PVE.meta.TreePanel', {
                     me.reload();
                 });
                 me.textWindow.show();
+            },
+        });
+    },
+
+    // --- the Text card ------------------------------------------------------
+
+    onModeChange: function (value) {
+        let me = this;
+        if (value === me.mode) {
+            return;
+        }
+        if (value === 'text') {
+            me.enterTextMode();
+        } else {
+            me.leaveTextMode();
+        }
+    },
+
+    textIsDirty: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return false;
+        }
+        try {
+            return me.textEditor.getValue() !== me.textRendered(me.textLang);
+        } catch (_err) {
+            return true; // cannot tell: assume there is something to lose
+        }
+    },
+
+    // The loaded document rendered in `lang`; the diff's "original" side and the
+    // yardstick the dirty check uses.
+    textRendered: function (lang) {
+        let me = this;
+        if (lang !== 'json') {
+            return me.textOriginal;
+        }
+        return JSON.stringify(PVE.meta.Utils.yamlLoad(me.textOriginal), null, 2);
+    },
+
+    enterTextMode: function () {
+        let me = this;
+        me.mode = 'text';
+        me.syncButtons();
+        me.getLayout().setActiveItem(me.down('#metaText'));
+        Proxmox.Utils.setErrorMask(me, true);
+        me.request({
+            url: me.baseUrl,
+            params: { view: '', format: 'yaml' },
+            success: function (response) {
+                let d = response.result.data || {};
+                me.digest = d.digest || me.digest;
+                me.textOriginal = d.text || '';
+                me.showTextEditor();
+            },
+            failure: function (response) {
+                Proxmox.Utils.setErrorMask(me, false);
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error'));
+                me.abortTextMode();
+            },
+        });
+    },
+
+    showTextEditor: function () {
+        let me = this;
+        PVE.meta.Monaco.load().then(
+            function (monaco) {
+                if (me.isDestroyed || me.mode !== 'text') {
+                    return;
+                }
+                Proxmox.Utils.setErrorMask(me, false);
+                if (me.textEditor) {
+                    me.textEditor.setValue(me.textRendered(me.textLang));
+                    return;
+                }
+                me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
+                    value: me.textOriginal,
+                    language: 'yaml',
+                    theme: PVE.meta.Monaco.theme(),
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                });
+            },
+            function (err) {
+                Proxmox.Utils.setErrorMask(me, false);
+                Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                me.abortTextMode();
+            },
+        );
+    },
+
+    // Text mode could not be entered: fall back to the tree without asking.
+    abortTextMode: function () {
+        let me = this;
+        me.mode = 'tree';
+        me.setModeButton('tree');
+        me.getLayout().setActiveItem(me.down('#metaTree'));
+        me.syncButtons();
+    },
+
+    leaveTextMode: function () {
+        let me = this;
+        let finish = function () {
+            PVE.meta.Monaco.dispose(me.textEditor);
+            me.textEditor = null;
+            me.mode = 'tree';
+            me.setModeButton('tree');
+            me.getLayout().setActiveItem(me.down('#metaTree'));
+            me.syncButtons();
+            me.reload();
+        };
+        if (!me.textIsDirty()) {
+            finish();
+            return;
+        }
+        me.setModeButton('text'); // stay put until the question is answered
+        Ext.Msg.confirm(
+            gettext('Confirm'),
+            gettext('Discard the unapplied changes in the text editor?'),
+            (btn) => (btn === 'yes' ? finish() : undefined),
+        );
+    },
+
+    // Presentation only, exactly like the selection window's toggle.
+    switchTextLang: function (lang) {
+        let me = this;
+        let btn = me.down('#textLangBtn');
+        if (!me.textEditor || lang === me.textLang) {
+            return;
+        }
+        let value;
+        try {
+            value =
+                me.textLang === 'json'
+                    ? Ext.decode(me.textEditor.getValue())
+                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Error'),
+                Ext.String.format(
+                    gettext('Cannot convert to {0}: {1}'),
+                    lang.toUpperCase(),
+                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+                ),
+            );
+            btn.suspendEvents();
+            btn.setValue(me.textLang);
+            btn.resumeEvents();
+            return;
+        }
+        me.textLang = lang;
+        window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
+        me.textEditor.setValue(
+            lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value),
+        );
+    },
+
+    applyText: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let lang = me.textLang;
+        let edited = me.textEditor.getValue();
+        let original;
+        try {
+            original = me.textRendered(lang);
+        } catch (_err) {
+            lang = 'yaml'; // cannot render the original as JSON; diff the YAML
+            original = me.textOriginal;
+        }
+        if (edited === original) {
+            Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
+            return;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: gettext('(whole document)'),
+            original: original,
+            modified: edited,
+            lang: lang,
+            apply: function () {
+                // The whole document, at the root view. JSON is a subset of YAML, but
+                // `data` is the parameter that says "this is the JSON data model".
+                let params = { view: '', mode: 'replace', digest: me.digest };
+                params[me.textLang === 'json' ? 'data' : 'text'] = edited;
+                me.submit({ url: me.baseUrl, method: 'PUT', params: params }, () => me.refreshText());
+            },
+        });
+    },
+
+    discardText: function () {
+        let me = this;
+        if (!me.textIsDirty()) {
+            me.refreshText();
+            return;
+        }
+        Ext.Msg.confirm(
+            gettext('Confirm'),
+            gettext('Discard the unapplied changes in the text editor?'),
+            (btn) => (btn === 'yes' ? me.refreshText() : undefined),
+        );
+    },
+
+    // Re-read the document and put it back in the buffer (after Apply, or Discard).
+    refreshText: function () {
+        let me = this;
+        me.request({
+            url: me.baseUrl,
+            params: { view: '', format: 'yaml' },
+            success: function (response) {
+                let d = response.result.data || {};
+                me.digest = d.digest || me.digest;
+                me.textOriginal = d.text || '';
+                if (me.textEditor) {
+                    me.textEditor.setValue(me.textRendered(me.textLang));
+                }
             },
         });
     },
@@ -1300,7 +1758,11 @@ Ext.define('PVE.meta.TreePanel', {
                         // document since we read it: reload first, then say so.
                         let conflict = String((response.result || {}).status) === '409';
                         if (conflict) {
-                            me.reload();
+                            if (me.mode === 'text') {
+                                me.refreshText();
+                            } else {
+                                me.reload();
+                            }
                         }
                         Ext.Msg.alert(
                             conflict ? gettext('Conflict') : gettext('Error'),

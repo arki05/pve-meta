@@ -1,6 +1,6 @@
-// extjs-flows-check.js — the flows extjs-tab-check.js does not cover: applying the
-// Monaco diff, Add, Remove, the 5 s version poll, and the datacenter document.
-// Usage: node extjs-flows-check.js <host> <vmid>
+// headless-flows-check.js — the flows headless-tab-check.js does not cover: applying
+// the Monaco diff, Add, Remove, the 5 s version poll, and the datacenter document.
+// Usage: node headless-flows-check.js <host> <vmid>
 const puppeteer = require('puppeteer-core');
 const https = require('https');
 
@@ -121,7 +121,7 @@ async function main() {
             await page.evaluateOnNewDocument((c) => {
                 try {
                     sessionStorage.setItem('CSRFPreventionToken', c);
-                } catch (e) {}
+                } catch (_e) {}
             }, csrf);
             await page.goto(`https://${host}:8006/`, { waitUntil: 'networkidle2', timeout: 60000 });
             const ok = await page
@@ -179,7 +179,7 @@ async function main() {
         await sleep(3000);
         result.checks.afterRemove = (await rows(page)).filter((r) => r.startsWith('added'));
 
-        // --- 3. Apply from the text window, through the diff -----------------
+        // --- 3. Apply from the selection text window, through the diff -------
         await page.evaluate(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
             let n = null;
@@ -187,7 +187,7 @@ async function main() {
                 if (x.data.path === 'traefik') n = x;
             });
             p.setSelection(n);
-            p.editAsText();
+            p.editSelectionAsText();
         });
         await sleep(9000);
         result.checks.textWindow = await page.evaluate(() => {
@@ -241,19 +241,19 @@ async function main() {
         };
         await page.screenshot({ path: `${out}/extjs-after-poll.png` });
 
-        // The poll must never fire while a cell editor is open.
-        const cell = await page.evaluateHandle(() => {
+        // The poll must never fire while the row editor is open.
+        const rowCell = await page.evaluateHandle(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
             let n = null;
             p.getRootNode().cascadeBy((x) => {
-                if (!n && x.data.kind !== 'map' && x.data.path) n = x;
+                if (!n && x.data.kind !== 'map' && x.data.path && x.data.editable) n = x;
             });
-            const row = n && p.getView().getNode(n);
-            return row ? row.querySelectorAll('.x-grid-cell')[1] : null;
+            const row = n && p.tree.getView().getNode(n);
+            return row ? row.querySelectorAll('.x-grid-cell')[0] : null;
         });
-        if (cell.asElement()) {
-            await cell.asElement().click();
-            await sleep(800);
+        if (rowCell.asElement()) {
+            await rowCell.asElement().click({ clickCount: 2 });
+            await sleep(900);
         }
         result.checks.pollSuppressed = await page.evaluate(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
@@ -265,7 +265,7 @@ async function main() {
                 return orig.apply(this, arguments);
             };
             p.poll();
-            p.cellEditing.cancelEdit();
+            Ext.ComponentQuery.query('pveMetaEditValueWindow').forEach((w) => w.close());
             p.reload = orig;
             return { editingFlagSet: editing, reloadCalledWhileEditing: reloaded.length };
         });

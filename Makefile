@@ -116,6 +116,13 @@ install:
 	if ls ui-extjs/*.js >/dev/null 2>&1; then \
 		cp ui-extjs/*.js $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/; \
 	fi
+	# ui-extjs/vendor/: js-yaml's dist bundle plus its LICENSE, loaded lazily
+	# by pve-meta-tree.js from .../js/pve-meta-extjs/vendor/ (see
+	# debian/copyright's js-yaml stanza and ui-extjs/README.md).
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor
+	if [ -d ui-extjs/vendor ]; then \
+		cp -a ui-extjs/vendor/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor/; \
+	fi
 
 # `make deb` builds every package this repo ships, in one call:
 #   - pve-ext:                    its own source package, built via `make -C pve-ext deb`.

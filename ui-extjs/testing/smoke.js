@@ -1,13 +1,18 @@
 // Offline smoke test of the parts of pve-meta-tree.js that are pure JS: the
-// YAML codec, the value helpers, and the entry-merge that builds the rows.
-// A minimal Ext/PVE shim is enough - none of this touches the DOM.
+// YAML wrappers around the vendored js-yaml, the value helpers, and the
+// entry-merge that builds the rows. A minimal Ext/PVE shim is enough - none of
+// this touches the DOM.
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
+// The same file the panel loads lazily in the browser (vendor/js-yaml.min.js is
+// a UMD bundle, so `require` gets the exact build that ships in the package).
+const jsyaml = require(path.join(__dirname, '..', 'vendor', 'js-yaml.min.js'));
+
 const ctx = {
     console,
-    window: {},
+    window: { jsyaml },
     document: { createElement: () => ({}), head: { appendChild() {} } },
     Promise,
     gettext: (s) => s,
@@ -39,8 +44,8 @@ const ctx = {
         },
         data: { TreeModel: {} },
         window: { Window: {} },
-        tree: { Panel: {} },
-        grid: { plugin: { CellEditing: {} } },
+        panel: { Panel: {} },
+        button: { Segmented: {} },
     },
     Proxmox: { Utils: { format_boolean: (v) => (v ? 'Yes' : 'No') } },
     __defined: [],
@@ -70,6 +75,7 @@ console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
+    'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
 ]);
@@ -94,58 +100,233 @@ eq('parse array json', U.parseValue('["a","b"]', 'array'), ['a', 'b']);
 eq('parse array csv', U.parseValue('a, b', 'array'), ['a', 'b']);
 eq('parse array empty', U.parseValue('', 'array'), []);
 
-console.log('\n--- YAML round trip ---');
-// The exact canonical dump the live store produced for guest 200.
-const storeYaml = 'traefik:\n  spec:\n    host: ct200.example\nnetbird:\n  groups__: asdf\n  groups:\n  - lan\n';
+console.log('\n--- the row editor field comes from the grammar first ---');
+eq('editor enum', U.editorFor({ kind: 'string', enumValues: ['a'] }).xtype, 'combobox');
+eq('editor boolean', U.editorFor({ kind: 'boolean' }).xtype, 'proxmoxcheckbox');
+eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
+eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
+
+console.log('\n--- selector text (the Access tooltip) ---');
+eq('selector all', U.selectorText({ all: true }), 'all guests');
+eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');
+
+console.log('\n--- row icons (DESIGN §8) ---');
+eq('icons', ctx.PVE.meta.Icons, {
+    map: 'fa fa-folder',
+    mapExpanded: 'fa fa-folder-open',
+    leaf: 'fa fa-file-text-o',
+});
+
+console.log('\n--- YAML: the vendored js-yaml, through the panel wrappers ---');
+eq('vendored version', jsyaml.dump !== undefined && typeof jsyaml.load, 'function');
+// The exact canonical dump the live store produced for guest 200: js-yaml must
+// read what the server writes (the server stays the YAML authority).
+const storeYaml =
+    'traefik:\n  spec:\n    host: ct200.example\nnetbird:\n  groups__: asdf\n  groups:\n  - lan\n';
 const storeDoc = {
     traefik: { spec: { host: 'ct200.example' } },
     netbird: { groups__: 'asdf', groups: ['lan'] },
 };
-eq('parse store dump', U.yamlParse(storeYaml), storeDoc);
-eq('dump == store dump', U.yamlDump(storeDoc), storeYaml);
+eq('load the store dump', U.yamlLoad(storeYaml), storeDoc);
+eq('round trip the store document', U.yamlLoad(U.yamlDump(storeDoc)), storeDoc);
+eq('empty document is the empty map', U.yamlLoad(''), {});
+// noRefs: a repeated subtree must not come back as an anchor/alias.
+const shared = { a: 1 };
+eq('no anchors', U.yamlDump({ x: shared, y: shared }).indexOf('&') === -1, true);
+// lineWidth -1: a long scalar stays on one line.
+eq('no folding', U.yamlDump({ a: 'x'.repeat(300) }).split('\n').length, 2);
+// sortKeys false: documents are ordered maps (DESIGN §2).
+eq('key order preserved', Object.keys(U.yamlLoad(U.yamlDump({ b: 1, a: 2 }))), ['b', 'a']);
+// The safe (default) schema: no arbitrary JS types out of a document.
+let unsafeThrew = false;
+try {
+    U.yamlLoad('a: !!js/function "function () {}"\n');
+} catch (_e) {
+    unsafeThrew = true;
+}
+eq('default schema rejects !!js/function', unsafeThrew, true);
 
-const rich = {
-    s: 'plain',
-    quoted: 'has: colon',
-    n: 3,
-    f: 1.5,
-    b: true,
-    empty: {},
-    emptyList: [],
-    list: ['a', 'b'],
-    maps: [{ x: 1, y: 'z' }, { x: 2 }],
-    nested: { deep: { deeper: 'v' } },
-    'numeric-looking': '007',
-};
-eq('rich round trip', U.yamlParse(U.yamlDump(rich)), rich);
+console.log('\n--- YAML property test: load(dump(x)) deep-equals x ---');
+// A seeded PRNG, so a failure names a document that can be reproduced exactly.
+const rng = (seed) =>
+    function () {
+        seed |= 0;
+        seed = (seed + 0x6d2b79f5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
 
-const roundtrips = [
-    { a: '' },
-    { a: '#hash' },
-    { a: 'true' },
-    { a: 'a # b' },
-    { a: ' lead' },
-    { a: 'multi\nline' },
-    { a: { b: [{ c: [1, 2] }] } },
+// Keys and scalars that have historically broken hand-written YAML: structural
+// punctuation, quotes, comment markers, unicode, and strings that look like
+// numbers, booleans or nulls and must come back as strings.
+const KEYS = [
+    'plain',
+    'has:colon',
+    'colon: space',
+    "quo'te",
+    'dq"uote',
+    '#hash',
+    'trailing #hash',
+    'dash-key',
+    '-',
+    '? question',
+    '[bracket]',
+    '{brace}',
+    'a,b',
+    '&anchor',
+    '*alias',
+    '|pipe',
+    '>fold',
+    '%percent',
+    '@at',
+    '`tick',
+    '!bang',
+    'ünïcøde',
+    '日本語',
+    'Ελληνικά',
+    '🚀',
+    '007',
+    '1.5e3',
+    '0x10',
+    '-12',
+    'true',
+    'False',
+    'yes',
+    'no',
+    'on',
+    'off',
+    'null',
+    '~',
+    '',
+    ' leading',
+    'trailing ',
+    'inner  spaces',
+    'multi\nline',
+    'tab\there',
+    'documented__',
+    '__',
+    'constructor',
+    'hasOwnProperty',
+    'toString',
 ];
-roundtrips.forEach((v, i) => eq('roundtrip ' + i, U.yamlParse(U.yamlDump(v)), v));
+const SCALARS = [
+    '',
+    'plain',
+    'has: colon',
+    'ends with #',
+    "it's",
+    'say "hi"',
+    '- not a list',
+    '007',
+    '1e5',
+    '0b101',
+    'true',
+    'null',
+    '~',
+    'ünïcøde é',
+    '日本語のテキスト',
+    '🚀 launched',
+    'multi\nline\ntext',
+    'tab\tseparated',
+    ' padded ',
+    'x'.repeat(200),
+    0,
+    1,
+    -1,
+    42,
+    -0.25,
+    3.5,
+    1234567890,
+    true,
+    false,
+];
 
-console.log('\n--- YAML refusals (must throw, never silently mangle) ---');
-[
-    ['anchor', 'a: &x 1\nb: *x\n'],
-    ['flow map', 'a: {b: 1}\n'],
-    ['null', 'a: null\n'],
-    ['tab indent', 'a:\n\tb: 1\n'],
-].forEach(([name, text]) => {
-    let threw = false;
-    try {
-        U.yamlParse(text);
-    } catch (e) {
-        threw = true;
+const pick = (rnd, arr) => arr[Math.floor(rnd() * arr.length) % arr.length];
+
+const genValue = (rnd, depth) => {
+    const r = rnd();
+    if (depth <= 0 || r < 0.55) {
+        return pick(rnd, SCALARS);
+    } else if (r < 0.8) {
+        return genMap(rnd, depth - 1);
     }
-    // anchors are the one case a naive parser accepts as a string; note it either way
-    eq('refuses ' + name, threw, true);
-});
+    return genArray(rnd, depth - 1);
+};
+
+const genArray = (rnd, depth) => {
+    const n = Math.floor(rnd() * 4);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+        out.push(genValue(rnd, depth));
+    }
+    return out;
+};
+
+function genMap(rnd, depth) {
+    const n = Math.floor(rnd() * 5);
+    const out = {};
+    for (let i = 0; i < n; i++) {
+        // Not via a literal: `__proto__` as a key would be swallowed by the
+        // prototype setter rather than becoming a document key.
+        Object.defineProperty(out, pick(rnd, KEYS), {
+            value: genValue(rnd, depth),
+            enumerable: true,
+            writable: true,
+            configurable: true,
+        });
+    }
+    return out;
+}
+
+// A fixed corpus first, so the hostile shapes are exercised on every run and not
+// only when the generator happens to reach for them.
+const CORPUS = [
+    { '': 'empty key' },
+    { 'has:colon': 'a', 'colon: space': 'b' },
+    { "quo'te": "it's", 'dq"uote': 'say "hi"' },
+    { '#hash': 'ends with #', 'trailing #hash': '- not a list' },
+    { 'ünïcøde': 'é', 日本語: '値', '🚀': '🚀 launched' },
+    { '007': '007', '1.5e3': '1.5e3', '0x10': '0x10', '-12': '-12' },
+    { true: 'true', no: 'off', null: '~', '~': 'null' },
+    { 'multi\nline': 'c\nd', 'tab\there': ' padded ' },
+    { documented__: 'a note', __: 'about the map', constructor: 'x' },
+    { a: { b: [{ c: [1, 2, true, 'x', ''] }] }, e: {}, l: [] },
+    { n: -0.25, z: 0, big: 1234567890, long: 'x'.repeat(300) },
+];
+
+let propFails = 0;
+for (let i = 0; i < 500 + CORPUS.length; i++) {
+    const rnd = rng(0x5eed + i);
+    // Regenerating an empty map wastes a case, and rnd() has already advanced.
+    let doc = i < CORPUS.length ? CORPUS[i] : genMap(rnd, 3);
+    while (!Object.keys(doc).length) {
+        doc = genMap(rnd, 3);
+    }
+    let text;
+    let back;
+    try {
+        text = U.yamlDump(doc);
+        back = U.yamlLoad(text);
+    } catch (err) {
+        propFails++;
+        if (propFails <= 3) {
+            console.log(`FAIL seed ${i}: ${err.message}\n  doc  ${JSON.stringify(doc)}`);
+        }
+        continue;
+    }
+    // JSON.stringify compares structure, values *and* key order, which is what an
+    // ordered-map document model needs.
+    if (JSON.stringify(back) !== JSON.stringify(doc)) {
+        propFails++;
+        if (propFails <= 3) {
+            console.log(
+                `FAIL seed ${i}\n  doc  ${JSON.stringify(doc)}\n  yaml ${JSON.stringify(text)}\n  back ${JSON.stringify(back)}`,
+            );
+        }
+    }
+}
+eq('the corpus and 500 generated documents round trip', propFails, 0);
 
 console.log('\n--- row merge: document + grammar ---');
 const P = ctx.PVE.meta.TreePanel;
@@ -192,7 +373,8 @@ const panel = {
     'schemaKind',
     'applicableScopes',
     'resolvedScopeApplies',
-    'ownerFor',
+    'accessFor',
+    'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
@@ -210,7 +392,9 @@ eq('declared key is unset', spec.port.present, false);
 eq('display boolean', U.displayValue(1, 'boolean'), 'Yes');
 eq('declared default carried', spec.port.defaultValue, 80);
 eq('declared enum carried', spec.scheme.enumValues, ['http', 'https']);
-eq('grammar description', spec.host.description, 'Public host name');
+// The grammar's description is the tooltip, not the Description column (DESIGN §8).
+eq('grammar description is its own field', spec.host.grammarDescription, 'Public host name');
+eq('grammar description is not the comment', spec.host.description, undefined);
 eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
@@ -218,14 +402,31 @@ root.children.traefik.children.spec.children.host.kind = 'number';
 panel.addGrammar.call(panel, root, 'traefik', panel.registrations[0].scopes[0].grammar);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
-// Comment key becomes the sibling's description, never a row of its own.
+// Comment key becomes the sibling's Description, never a row of its own.
 eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['groups']);
-eq('comment is description', root.children.netbird.children.groups.description, 'asdf');
+eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
-eq('owner of grammar row', panel.ownerFor.call(panel, 'traefik.spec.port', scopes), 'traefik (tag: traefik)');
-eq('owner ro marked', panel.ownerFor.call(panel, 'netbird.groups', scopes), 'netbird [ro]');
-eq('owner of unclaimed', panel.ownerFor.call(panel, 'mine.key', scopes), '');
+console.log('\n--- Access: every registration whose scope covers the row ---');
+eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
+    { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
+]);
+eq('access ro marked', panel.accessSummary(panel.accessFor.call(panel, 'netbird.groups', scopes)), 'netbird (ro)');
+eq('access of an unclaimed row', panel.accessFor.call(panel, 'mine.key', scopes), []);
+// Several principals may cover the same subtree; rw sorts before ro.
+const overlapping = scopes.concat([
+    {
+        prefix: 'traefik',
+        mode: 'ro',
+        selector: { all: true },
+        registration: { name: 'audit', authid: 'svc@pve!audit' },
+    },
+]);
+eq(
+    'rw first, then ro',
+    panel.accessSummary(panel.accessFor.call(panel, 'traefik.spec.host', overlapping)),
+    'traefik, audit (ro)',
+);
 
 panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
 eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
@@ -245,9 +446,9 @@ eq('resolved-scope applicability (no tags visible)', scopedScopes.map((s) => s.p
     'traefik',
 ]);
 eq(
-    'owner label still comes from the registration',
-    panel.ownerFor.call(scopedPanel, 'traefik.spec.host', scopedScopes),
-    'traefik (tag: traefik)',
+    'access label still comes from the registration',
+    panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
+    'traefik',
 );
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');

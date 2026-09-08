@@ -1,9 +1,15 @@
-// extjs-tab-check.js — headless verification of PVE.meta.TreePanel inside the real
+// headless-tab-check.js — headless verification of PVE.meta.TreePanel inside the real
 // pve-manager SPA on node1, in both themes.
 //
-// Usage: node extjs-tab-check.js <host> <vmid> <theme: light|dark> [--operators]
-// --operators stubs a revision-5 GET /meta/operators payload (the endpoint is not
-// deployed yet) so the Owner column and the declared-but-unset rows can be seen.
+// Usage: node headless-tab-check.js <host> <vmid> <theme: light|dark>
+//            [--operators] [--readonly] [--scoped]
+// --operators stubs a GET /meta/operators payload, for a lab where the real
+//   registrations do not exercise every grammar shape.
+// --readonly skips everything that writes.
+// --scoped / --ro stub GET /meta/access with a restricted answer (an rw scope on
+//   `traefik` only, or full read and no write) so the "Scoped write access" and
+//   "Read-only" toolbar labels and the per-row editability can be seen without
+//   depending on a second lab principal's credentials. Both imply --readonly.
 const puppeteer = require('puppeteer-core');
 const https = require('https');
 
@@ -11,7 +17,12 @@ const host = process.argv[2] || '10.10.10.154';
 const vmid = process.argv[3] || '200';
 const theme = process.argv[4] || 'light';
 const stubOperators = process.argv.includes('--operators');
-const readOnly = process.argv.includes('--readonly');
+const scoped = process.argv.includes('--scoped');
+const roOnly = process.argv.includes('--ro');
+const readOnly = scoped || roOnly || process.argv.includes('--readonly');
+const ACCESS_STUB = scoped
+    ? { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }
+    : { read: 1, write: 0, scopes: [] };
 const out = '/root/headless/shots';
 
 const OPERATORS = [
@@ -47,6 +58,12 @@ const OPERATORS = [
         description: 'NetBird peer group assignment',
         scopes: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
     },
+    {
+        name: 'audit',
+        authid: 'svc@pve!audit',
+        description: 'Read-only observer of every guest',
+        scopes: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
+    },
 ];
 
 const ticket = () =>
@@ -67,7 +84,7 @@ const ticket = () =>
                 r.on('end', () => {
                     try {
                         resolve(JSON.parse(d).data);
-                    } catch (e) {
+                    } catch (_e) {
                         reject(new Error('ticket parse failed: ' + d));
                     }
                 });
@@ -79,6 +96,27 @@ const ticket = () =>
     });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The DOM cell of one row, by column index (0 Key, 1 Value, 2 Description, 3 Access).
+const cellHandle = (page, path, col) =>
+    page.evaluateHandle(
+        (pth, c) => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            let target = null;
+            p.getRootNode().cascadeBy((n) => {
+                if (n.data.path === pth) {
+                    target = n;
+                }
+            });
+            if (!target) {
+                return null;
+            }
+            const row = p.tree.getView().getNode(target);
+            return row ? row.querySelectorAll('.x-grid-cell')[c] : null;
+        },
+        path,
+        col,
+    );
 
 async function main() {
     const t = await ticket();
@@ -112,18 +150,24 @@ async function main() {
             await page.evaluateOnNewDocument((csrf) => {
                 try {
                     sessionStorage.setItem('CSRFPreventionToken', csrf);
-                } catch (e) {}
+                } catch (_e) {}
             }, t.CSRFPreventionToken);
 
-            if (stubOperators) {
+            if (stubOperators || scoped || roOnly) {
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
-                    if (/\/api2\/(extjs|json)\/meta\/operators/.test(req.url())) {
+                    const reply = (data) =>
                         req.respond({
                             status: 200,
                             contentType: 'application/json',
-                            body: JSON.stringify({ success: 1, data: OPERATORS }),
+                            body: JSON.stringify({ success: 1, data }),
                         });
+                    if (stubOperators && /\/api2\/(extjs|json)\/meta\/operators/.test(req.url())) {
+                        reply(OPERATORS);
+                        return;
+                    }
+                    if ((scoped || roOnly) && /\/api2\/(extjs|json)\/meta\/access/.test(req.url())) {
+                        reply(ACCESS_STUB);
                         return;
                     }
                     req.continue();
@@ -218,82 +262,132 @@ async function main() {
                     rows.push({
                         path: n.data.path,
                         value: n.data.valueText,
-                        owner: n.data.ownerText,
+                        desc: n.data.description,
+                        grammarDesc: n.data.grammarDescription,
+                        access: n.data.accessText,
+                        accessList: n.data.accessList,
+                        icon: n.data.iconCls,
+                        expandedCls: n.data.expandedCls,
                         present: n.data.present,
                         kind: n.data.kind,
                         editable: n.data.editable,
-                        desc: n.data.description,
                         def: n.data.defaultValue,
                     });
             });
+            const tb = p.getDockedItems('toolbar[dock=top]')[0];
             return {
                 vmid: p.vmid,
                 dc: p.dc,
+                mode: p.mode,
                 digest: p.digest,
                 access: p.access,
                 registrations: (p.registrations || []).length,
+                columns: p.tree.getColumns().map((c) => c.text),
                 rows,
-                toolbar: p.getDockedItems('toolbar[dock=top]')[0]
-                    ? p.getDockedItems('toolbar[dock=top]')[0].items.items.map((i) => i.text || i.xtype)
-                    : [],
+                toolbar: tb ? tb.items.items.map((i) => i.text || i.xtype) : [],
+                // Ext.toolbar.TextItem has setText() but no getText(), and its `text`
+                // property is not what ends up in the DOM - read the element.
+                accessLabel: p.down('#accessText').isVisible()
+                    ? p.down('#accessText').el.dom.textContent.trim()
+                    : null,
+                buttons: ['addBtn', 'editBtn', 'removeBtn', 'textSelBtn'].reduce((acc, id) => {
+                    acc[id] = p.down('#' + id).isDisabled();
+                    return acc;
+                }, {}),
             };
         });
 
-        await page.screenshot({ path: `${out}/extjs-tree-${theme}${stubOperators ? '-operators' : ''}.png` });
+        const shotName = scoped ? 'scoped' : roOnly ? 'readonly' : 'tree';
+        await page.screenshot({
+            path: `${out}/extjs-${shotName}-${theme}${stubOperators ? '-operators' : ''}.png`,
+        });
 
-        // A cell editor opened but not committed - what inline editing looks like.
+        // The Access tooltip: hover the Access cell of a covered row.
         {
-            const h = await page.evaluateHandle(() => {
+            // The row with the most entries, so the tooltip shows a real list.
+            const target = await page.evaluate(() => {
                 const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
                 let t = null;
                 p.getRootNode().cascadeBy((n) => {
-                    if (!t && n.data.kind !== 'map' && n.data.path) t = n;
+                    const len = (n.data.accessList || []).length;
+                    if (len && (!t || len > t.data.accessList.length)) t = n;
                 });
-                const row = t && p.getView().getNode(t);
-                return row ? row.querySelectorAll('.x-grid-cell')[1] : null;
+                return t ? t.data.path : null;
             });
-            if (h.asElement()) {
-                await h.asElement().click();
-                await sleep(900);
-                result.checks.openEditor = await page.evaluate(() => {
-                    const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-                    const ed = p.cellEditing.getActiveEditor();
-                    return ed ? ed.field.getXType() : null;
+            result.checks.accessTipRow = target;
+            if (target) {
+                const h = await cellHandle(page, target, 3);
+                if (h.asElement()) {
+                    const box = await h.asElement().boundingBox();
+                    await page.mouse.move(box.x + box.width / 3, box.y + box.height / 2);
+                    await sleep(1600);
+                    result.checks.accessTip = await page.evaluate(() => {
+                        const el = document.querySelector('.x-tip:not([style*="display: none"])');
+                        return el ? el.innerText.replace(/\s+/g, ' ').trim() : null;
+                    });
+                    await page.screenshot({ path: `${out}/extjs-access-tip-${theme}.png` });
+                    await page.mouse.move(5, 5);
+                    await sleep(500);
+                }
+            }
+        }
+
+        // The row editor, opened the way a user opens it: a double-click on the row.
+        {
+            const target = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                let t = null;
+                p.getRootNode().cascadeBy((n) => {
+                    if (!t && n.data.kind !== 'map' && n.data.path && n.data.editable) t = n;
                 });
-                await page.screenshot({ path: `${out}/extjs-celledit-${theme}.png` });
+                return t ? t.data.path : null;
+            });
+            const h = target && (await cellHandle(page, target, 0));
+            if (h && h.asElement()) {
+                await h.asElement().click({ clickCount: 2 });
+                await sleep(900);
+                result.checks.rowEditor = await page.evaluate(() => {
+                    const w = Ext.ComponentQuery.query('pveMetaEditValueWindow')[0];
+                    if (!w) return { open: false };
+                    return {
+                        open: true,
+                        title: w.title,
+                        field: w.down('#valueField').getXType(),
+                        value: w.down('#valueField').getValue(),
+                    };
+                });
+                await page.screenshot({ path: `${out}/extjs-rowedit-${theme}.png` });
                 await page.evaluate(() =>
-                    Ext.ComponentQuery.query('pveMetaTreePanel')[0].cellEditing.cancelEdit(),
+                    Ext.ComponentQuery.query('pveMetaEditValueWindow').forEach((w) => w.close()),
                 );
                 await sleep(400);
             }
         }
 
-        // Inline edits, the 409 path, and Monaco - all of which write.
+        // Row edits, the 409 path, and Monaco - all of which write.
         if (!stubOperators && !readOnly) {
-            // Inline edits, one per value type, each clicked like a user would.
+            // One write per value type, each through the row editor window.
             const editRow = async (path, value) => {
-                const h = await page.evaluateHandle((pth) => {
-                    const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-                    let target = null;
-                    p.getRootNode().cascadeBy((n) => {
-                        if (n.data.path === pth) target = n;
-                    });
-                    if (!target) return null;
-                    const row = p.getView().getNode(target);
-                    return row ? row.querySelectorAll('.x-grid-cell')[1] : null;
-                }, path);
-                if (!h.asElement()) return { path, result: 'row not found' };
-                await h.asElement().click();
-                await sleep(900);
-                const started = await page.evaluate((v) => {
-                    const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-                    const ed = p.cellEditing.getActiveEditor();
-                    if (!ed) return { result: 'no active editor' };
-                    const xtype = ed.field.getXType();
-                    ed.field.setValue(v);
-                    p.cellEditing.completeEdit();
-                    return { result: 'edited', editor: xtype };
-                }, value);
+                const started = await page.evaluate(
+                    (pth, v) => {
+                        const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                        let target = null;
+                        p.getRootNode().cascadeBy((n) => {
+                            if (n.data.path === pth) target = n;
+                        });
+                        if (!target) return { result: 'row not found' };
+                        p.setSelection(target);
+                        p.editRow(target);
+                        const w = Ext.ComponentQuery.query('pveMetaEditValueWindow')[0];
+                        if (!w) return { result: 'no editor window' };
+                        const xtype = w.down('#valueField').getXType();
+                        w.down('#valueField').setValue(v);
+                        w.submit();
+                        return { result: 'edited', editor: xtype };
+                    },
+                    path,
+                    value,
+                );
                 await sleep(2500);
                 const after = await page.evaluate((pth) => {
                     const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
@@ -330,7 +424,13 @@ async function main() {
             });
             await sleep(500);
 
-            // Monaco: the "Edit as Text" window on the traefik subtree.
+            // "Edit selection as text": Monaco on the traefik subtree, in its window.
+            result.checks.textSelDisabledWithoutSelection = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                p.tree.getSelectionModel().deselectAll();
+                p.syncButtons();
+                return p.down('#textSelBtn').isDisabled();
+            });
             await page.evaluate(() => {
                 const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
                 let n = null;
@@ -338,19 +438,20 @@ async function main() {
                     if (x.data.path === 'traefik') n = x;
                 });
                 p.setSelection(n);
-                p.editAsText();
+                p.editSelectionAsText();
             });
             await sleep(9000);
-            result.checks.monaco = await page.evaluate(() => {
+            result.checks.selectionText = await page.evaluate(() => {
                 const w = Ext.ComponentQuery.query('pveMetaTextWindow')[0];
                 return {
                     open: !!w,
+                    title: w ? w.title : null,
                     monacoLoaded: !!(window.monaco && window.monaco.editor),
+                    jsyamlLoaded: !!(window.jsyaml && window.jsyaml.load),
                     text: w && w.editor ? w.editor.getValue() : null,
-                    theme: w && w.editor ? null : null,
                 };
             });
-            await page.screenshot({ path: `${out}/extjs-monaco-${theme}.png` });
+            await page.screenshot({ path: `${out}/extjs-selection-text-${theme}.png` });
 
             // Toggle to JSON, then show the diff on a changed buffer.
             result.checks.toggle = await page.evaluate(() => {
@@ -360,7 +461,7 @@ async function main() {
                 return { lang: w.lang, text: w.editor.getValue() };
             });
             await sleep(1200);
-            await page.screenshot({ path: `${out}/extjs-monaco-json-${theme}.png` });
+            await page.screenshot({ path: `${out}/extjs-selection-text-json-${theme}.png` });
 
             await page.evaluate(() => {
                 const w = Ext.ComponentQuery.query('pveMetaTextWindow')[0];
@@ -375,13 +476,91 @@ async function main() {
                 () => !!document.querySelector('.monaco-diff-editor'),
             );
             await page.screenshot({ path: `${out}/extjs-diff-${theme}.png` });
+            await page.evaluate(() => {
+                const d = Ext.ComponentQuery.query('#pveMetaDiffWindow')[0];
+                if (d) d.close();
+                Ext.ComponentQuery.query('pveMetaTextWindow').forEach((w) => w.close());
+            });
+            await sleep(2500);
+        }
+
+        // The Tree | Text toggle: the whole document in Monaco, in the panel body.
+        // With a stubbed access answer there is nothing to write, so only the state of
+        // the toggle itself is checked.
+        if (readOnly) {
+            result.checks.textSegmentDisabled = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                return p.down('#modeBtn').items.getAt(1).isDisabled();
+            });
+        } else {
+            await page.evaluate(() => {
+                Ext.ComponentQuery.query('pveMetaTreePanel')[0].down('#modeBtn').setValue('text');
+            });
+            await sleep(9000);
+            result.checks.textMode = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                return {
+                    mode: p.mode,
+                    hasEditor: !!p.textEditor,
+                    text: p.textEditor ? p.textEditor.getValue() : null,
+                    activeCard: p.getLayout().getActiveItem().itemId,
+                    treeButtonsDisabled: ['addBtn', 'editBtn', 'removeBtn', 'textSelBtn', 'reloadBtn'].every(
+                        (id) => p.down('#' + id).isDisabled(),
+                    ),
+                };
+            });
+            await page.screenshot({ path: `${out}/extjs-text-${theme}.png` });
+
+            result.checks.textModeJson = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                p.down('#textLangBtn').setValue('json');
+                return { lang: p.textLang, text: p.textEditor ? p.textEditor.getValue() : null };
+            });
+            await sleep(1200);
+            await page.screenshot({ path: `${out}/extjs-text-json-${theme}.png` });
+
+            // Leaving Text with an edited buffer must ask first.
+            result.checks.dirtyGuard = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                p.down('#textLangBtn').setValue('yaml');
+                p.textEditor.setValue(p.textEditor.getValue() + 'dirty_probe: 1\n');
+                p.down('#modeBtn').setValue('tree');
+                return { dirty: p.textIsDirty() };
+            });
+            await sleep(900);
+            result.checks.dirtyGuardAsked = await page.evaluate(() => {
+                const b = Ext.ComponentQuery.query('messagebox')[0];
+                return b && b.isVisible() ? b.msgButtons.map((x) => x.text).join(',') : null;
+            });
+            await page.screenshot({ path: `${out}/extjs-text-dirty-${theme}.png` });
+            await page.evaluate(() => {
+                const b = Ext.ComponentQuery.query('messagebox')[0];
+                if (b) {
+                    const yes = b.query('button').find((x) => /yes/i.test(x.itemId || ''));
+                    if (yes) yes.el.dom.click();
+                }
+            });
+            await sleep(3000);
+            result.checks.backToTree = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                return {
+                    mode: p.mode,
+                    activeCard: p.getLayout().getActiveItem().itemId,
+                    editorDisposed: !p.textEditor,
+                    monacoModels: window.monaco ? window.monaco.editor.getModels().length : null,
+                };
+            });
         }
 
         result.console = result.console.filter(
-            (m) => m.type === 'error' || m.type === 'pageerror' || m.type === 'requestfailed',
+            (m) =>
+                (m.type === 'error' || m.type === 'pageerror' || m.type === 'requestfailed') &&
+                // A pve-manager flake unrelated to this panel, filtered here as in
+                // headless-flows-check.js.
+                !/Mapping\.Audit/.test(m.text),
         );
     } catch (e) {
-        result.error = e.message;
+        result.error = e.message + '\n' + String(e.stack).split('\n').slice(0, 5).join('\n');
     } finally {
         await browser.close();
     }

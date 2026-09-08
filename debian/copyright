@@ -42,6 +42,19 @@ Comment:
  https://github.com/microsoft/monaco-editor/blob/main/LICENSE.md for the
  upstream text, reproduced below under License: MIT.
 
+Files: ui-extjs/vendor/js-yaml.min.js
+       ui-extjs/vendor/LICENSE
+Copyright: 2011-2015, Vitaly Puzrin
+License: MIT
+Comment:
+ js-yaml 4.1.0's `dist/js-yaml.min.js`, downloaded verbatim from the upstream
+ release tag (https://github.com/nodeca/js-yaml) and vendored here because the
+ ExtJS editor has no build step. Shipped in the pve-meta package under
+ /usr/share/pve-manager/js/pve-meta-extjs/vendor/ (see the top-level Makefile's
+ `install` target) and loaded lazily by pve-meta-tree.js. The upstream licence
+ text travels with it as ui-extjs/vendor/LICENSE; it is the MIT licence
+ reproduced below.
+
 License: AGPL-3.0-or-later
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU Affero General Public License as published
