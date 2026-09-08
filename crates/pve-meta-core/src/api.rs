@@ -190,61 +190,100 @@ fn parse_view_format(name: &str) -> Result<Format, anyhow::Error> {
         .ok_or_else(|| bad_request(format!("invalid format '{name}': expected 'json' or 'yaml'")))
 }
 
-/// What one document read gave us: the parsed value (the *empty* document if
-/// the stored text does not parse), the digest of the bytes actually on disk,
-/// the parse failure if there was one, and the raw text behind that digest.
+/// What one document read gave us.
 struct Stored {
+    /// The stored document — or the **empty document** whenever
+    /// [`Stored::unrecoverable`] is set, since nothing else can be recovered.
     value: Value,
+    /// The digest of what is actually on disk (`""` for a document that does
+    /// not exist), so a repairing write can still carry its
+    /// compare-and-swap precondition.
     digest: String,
-    parse_error: Option<String>,
-    raw: String,
+    /// `Some(reason)` when a file exists but its content could not be
+    /// recovered *as a document*. Exactly one condition, with three causes
+    /// (`docs/DESIGN.md` §4):
+    ///
+    /// * it is not valid YAML (or not text at all);
+    /// * it is above the store's read cap, so it is never parsed;
+    /// * it parses to something that is not a mapping — `null` (an empty or
+    ///   comment-only file, the likeliest out-of-band corruption of all), a
+    ///   scalar, a list.
+    ///
+    /// They differ only in the message. Keying anything on the *parse* alone
+    /// let the third one through: a scalar- or list-rooted file has no
+    /// structure a narrower write could preserve either, so a root `merge`
+    /// would have replaced it wholesale while reporting the merge's own
+    /// touched paths.
+    unrecoverable: Option<String>,
+    /// The file's own text, or `None` when the bytes were never read (no
+    /// file, or one above the read cap). Never a stand-in: a caller that
+    /// renders this is showing the administrator the file they must repair.
+    raw: Option<String>,
 }
 
-/// Reads `id`'s document, or the empty document with digest `""` if it does
-/// not exist (`docs/DESIGN.md` §2: a non-existent document is an empty
-/// document; there is no explicit create).
-///
-/// A document whose text does not parse is *not* an error here: it comes back
-/// as the empty document with its real digest and a `parse_error`. Both write
-/// handlers read before they plan, so a fatal read would make a hand-edit typo
-/// unrepairable through the API; the real digest is what lets a repairing
-/// write still carry a compare-and-swap precondition.
-fn read_or_empty(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
-    match store.read(id) {
-        Ok(doc) => Ok(Stored {
-            value: doc.value,
-            digest: doc.digest,
-            parse_error: doc.parse_error,
-            raw: doc.raw,
-        }),
-        Err(CoreError::NotFound(_)) => Ok(Stored {
+impl Stored {
+    /// The empty document: what a caller sees for an id with no file at all
+    /// (`docs/DESIGN.md` §2 — a non-existent document is an empty document;
+    /// there is no explicit create).
+    fn absent() -> Stored {
+        Stored {
             value: Value::Object(Map::new()),
             digest: String::new(),
-            parse_error: None,
-            raw: String::new(),
-        }),
-        Err(e) => Err(api_err(e)),
+            unrecoverable: None,
+            raw: None,
+        }
     }
 }
 
-/// [`read_or_empty`] for every caller that must not be taken down by *one*
-/// unreadable document: the two write handlers, and [`list_guests`].
-///
-/// A document above the store's read cap is handled like unparseable content
-/// — the empty value plus a `parse_error` — with the digest hashed straight
-/// off the disk, so [`check_repairable`] lets through the same two whole-file
-/// shapes and nothing narrower, and a listing shows the document rather than
-/// 400-ing for everybody because of one oversized file.
-fn read_tolerant(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
-    match store.read(id) {
-        Err(e @ CoreError::TooLarge { .. }) => Ok(Stored {
-            value: Value::Object(Map::new()),
-            digest: store.digest_of(id).map_err(api_err)?.unwrap_or_default(),
-            parse_error: Some(e.to_string()),
-            raw: String::new(),
-        }),
-        _ => read_or_empty(store, id),
+/// The empty document plus `reason`, keeping `digest` and `raw` as they came
+/// off the disk.
+fn unrecoverable(digest: String, raw: Option<String>, reason: String) -> Stored {
+    Stored {
+        value: Value::Object(Map::new()),
+        digest,
+        unrecoverable: Some(reason),
+        raw,
     }
+}
+
+/// Reads `id`'s document without ever failing on the document's own content:
+/// the one read every handler uses.
+///
+/// Content that cannot be recovered is *not* an error — it comes back as the
+/// empty document with its real digest and a reason (see
+/// [`Stored::unrecoverable`]). Every write handler reads before it plans, so
+/// a fatal read would make an out-of-band hand-edit unrepairable through the
+/// API; and [`list_guests`] reads every guest in a loop, so one unreadable
+/// document would otherwise take the whole listing down for every principal.
+fn read_stored(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
+    let doc = match store.read(id) {
+        Ok(doc) => doc,
+        Err(CoreError::NotFound(_)) => return Ok(Stored::absent()),
+        // Above the read cap the bytes are never pulled in; the digest still
+        // is (`MetaStore::digest_of` caps the same way), so the file stays
+        // addressable by a compare-and-swap repair.
+        Err(e @ (CoreError::TooLarge { .. } | CoreError::Parse { .. })) => {
+            let digest = store.digest_of(id).map_err(api_err)?.unwrap_or_default();
+            return Ok(unrecoverable(digest, None, e.to_string()));
+        }
+        Err(e) => return Err(api_err(e)),
+    };
+    if let Some(err) = doc.parse_error {
+        return Ok(unrecoverable(doc.digest, Some(doc.raw), err));
+    }
+    if !doc.value.is_object() {
+        return Ok(unrecoverable(
+            doc.digest,
+            Some(doc.raw),
+            "the stored document is not a mapping".to_string(),
+        ));
+    }
+    Ok(Stored {
+        value: doc.value,
+        digest: doc.digest,
+        unrecoverable: None,
+        raw: Some(doc.raw),
+    })
 }
 
 fn touched_out(touched: &[Touched]) -> Vec<ApiTouched> {
@@ -414,7 +453,7 @@ pub fn list_guests(
             continue;
         }
 
-        let stored = read_tolerant(store, DocId::Guest(guest.vmid))?;
+        let stored = read_stored(store, DocId::Guest(guest.vmid))?;
         let visible = view::filter(&stored.value, &readable);
 
         if let Some(path) = &has_path {
@@ -444,16 +483,18 @@ pub fn list_guests(
 /// not an empty document with the real digest (which would be a
 /// change-detection oracle over content they may not see).
 ///
-/// **A document that does not parse** (`docs/DESIGN.md` §4): `format=yaml`
-/// answers `200` with the file's raw text plus `parse_error`, so an
-/// administrator can repair it; `format=json` — and any caller without full
-/// read, who has no business with the raw bytes and no structure to be shown
-/// — gets `422` with the parse error.
+/// **A document whose content could not be recovered** (`docs/DESIGN.md` §4
+/// and [`Stored::unrecoverable`] — it does not parse, it is above the read
+/// cap, or it is not a mapping): `format=yaml` for a full reader answers
+/// `200` with the file's raw text plus `parse_error`, so an administrator can
+/// see what to repair. Everyone else — `format=json`, any caller without full
+/// read, and anyone at all when the bytes were never read — gets `422`
+/// naming the condition. It is reported, never rendered as an empty document:
+/// the file is there, and the caller has to know that before writing over it.
 ///
 /// # Errors
-/// `400:` invalid id/view/format, or a stored document above the read size
-/// cap. `403:` no read grant, or a `view` that is not readable. `422:` the
-/// stored document does not parse.
+/// `400:` invalid id/view/format. `403:` no read grant, or a `view` that is
+/// not readable. `422:` the stored document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
     regs: &[Registration],
@@ -475,22 +516,24 @@ pub fn get_document(
         return Err(forbidden(&view_path));
     }
 
-    let stored = read_or_empty(store, doc_id)?;
+    let stored = read_stored(store, doc_id)?;
 
-    if let Some(err) = &stored.parse_error {
+    if let Some(err) = &stored.unrecoverable {
         if fmt == Format::Yaml && grants.full_read {
-            return Ok(ApiViewDocument {
-                id: id_str(doc_id),
-                view: view_out(view),
-                digest: stored.digest,
-                data: None,
-                text: Some(stored.raw),
-                parse_error: Some(err.clone()),
-            });
+            if let Some(raw) = &stored.raw {
+                return Ok(ApiViewDocument {
+                    id: id_str(doc_id),
+                    view: view_out(view),
+                    digest: stored.digest,
+                    data: None,
+                    text: Some(raw.clone()),
+                    parse_error: Some(err.clone()),
+                });
+            }
         }
         return Err(anyhow::anyhow!(
-            "422: the stored document is not valid YAML and cannot be rendered: {err} \
-             (read it with format=yaml to repair it)"
+            "422: the stored document cannot be rendered: {err} \
+             (replace it with a full document (no 'view', mode=replace) or delete it)"
         ));
     }
 
@@ -505,8 +548,9 @@ pub fn get_document(
         // The root view of a full reader renders the file's own text; every
         // other view is a canonical dump of what they may see.
         Format::Yaml => {
-            let text = if view.is_none() && grants.full_read && !stored.raw.is_empty() {
-                stored.raw.clone()
+            let own_text = stored.raw.as_deref().filter(|raw| !raw.is_empty());
+            let text = if let (None, true, Some(raw)) = (view, grants.full_read, own_text) {
+                raw.to_string()
             } else {
                 view::render(&result_value, Format::Yaml)
             };
@@ -525,8 +569,8 @@ pub fn get_document(
 }
 
 /// Refuses every write against a document whose content could not be
-/// recovered — it does not parse, or it is above the store's read cap —
-/// except the two that *replace the file whole*: a root `replace` and a root
+/// recovered — see [`Stored::unrecoverable`] for the three causes — except
+/// the two that *replace the file whole*: a root `replace` and a root
 /// `DELETE` (`docs/DESIGN.md` §4).
 ///
 /// The value planned against is the empty document (nothing else can be
@@ -534,12 +578,16 @@ pub fn get_document(
 /// file contains. `authorize_view_write` has already established that a root
 /// view requires `full_write`, so this is the documented repair path and
 /// nothing else.
+///
+/// One condition, one gate: whatever makes a document unrecoverable, the
+/// repair is the same two shapes and nothing narrower — a root `merge` very
+/// much included, since it is planned against the empty document too.
 fn check_repairable(
     stored: &Stored,
     view_path: &DocPath,
     is_merge: bool,
 ) -> Result<(), anyhow::Error> {
-    let Some(err) = &stored.parse_error else {
+    let Some(err) = &stored.unrecoverable else {
         return Ok(());
     };
     if view_path.is_root() && !is_merge {
@@ -647,7 +695,7 @@ pub fn put_document(
     };
 
     store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let stored = read_tolerant(store, doc_id)?;
+    let stored = read_stored(store, doc_id)?;
     check_repairable(&stored, &view_path, is_merge)?;
 
     // (2) Plan the mutation against a *copy*; the stored document is only
@@ -663,8 +711,19 @@ pub fn put_document(
 
     let text = format::dump(DISK_FORMAT, &planned);
 
-    // (3) Apply.
-    let new_digest = if dry_run {
+    // (3) Apply — unless there is nothing to apply. A write that changes no
+    //     path *and* would put back the bytes already on disk is skipped
+    //     entirely: rewriting the file advances its mtime and so
+    //     `version()`'s `changed`, while the content token correctly does not
+    //     move, and "a merge that touches nothing changes nothing"
+    //     (`docs/DESIGN.md` §4) is not true of a file whose timestamp jumped.
+    //     Both halves of the condition are needed: `touched: []` alone still
+    //     covers the repair of a document that reads back as empty because it
+    //     is unrecoverable, and a byte comparison alone would skip nothing a
+    //     canonical dump ever produces.
+    let unchanged =
+        touched.is_empty() && stored.unrecoverable.is_none() && stored.raw.as_deref() == Some(&text);
+    let new_digest = if dry_run || unchanged {
         crate::digest::digest(text.as_bytes())
     } else {
         store
@@ -707,8 +766,8 @@ pub fn delete_document(
     authorize_view_write(&grants, &view_path)?;
 
     store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let stored = read_tolerant(store, doc_id)?;
-    // A root DELETE removes the file whole, so it repairs an unparseable
+    let stored = read_stored(store, doc_id)?;
+    // A root DELETE removes the file whole, so it repairs an unrecoverable
     // document exactly like a root replace does.
     check_repairable(&stored, &view_path, false)?;
 
@@ -717,13 +776,17 @@ pub fn delete_document(
         view::remove(v, &view_path).map_err(api_err)
     })?;
 
-    let exists = store.locate(doc_id).map_err(api_err)?.is_some();
+    // "Is there a file?" is answered by the read that already happened — a
+    // missing document is the only one that reports an empty digest — rather
+    // than by a fresh `locate`, whose answer could already be stale by the
+    // time it is acted on. `MetaStore::delete` is idempotent for the same
+    // reason: losing the race to another `DELETE` or to the GC is this
+    // request's own outcome, not a 500.
+    let existed = !stored.digest.is_empty();
     let new_digest = if view_path.is_root() {
-        if exists {
-            store.delete(doc_id).map_err(api_err)?;
-        }
+        store.delete(doc_id).map_err(api_err)?;
         String::new()
-    } else if exists {
+    } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
         store
             .put_raw(doc_id, &text, digest)
@@ -742,25 +805,84 @@ pub fn delete_document(
     })
 }
 
-/// The GC (`docs/DESIGN.md` §6): removes every document **and snapshot copy**
-/// whose vmid is not in `vmids` — the vmlist Perl passes in. Returns the
-/// number of files removed.
+/// The GC (`docs/DESIGN.md` §6): every stored vmid that is **not** in
+/// `vmids`, the vmlist Perl passes in — the candidates for purging, in
+/// ascending order.
+///
+/// This is the first half of a two-phase GC, and the phases exist because
+/// they are locked differently. Writes serialize under
+/// `cfs_lock_domain("pve-meta-<vmid>")` and the GC pass under
+/// `cfs_lock_domain("pve-meta-gc")` — disjoint domains, so a whole-sweep GC
+/// could (and did) delete a document that was written after its vmlist
+/// snapshot was taken: destroy 999500, recreate a guest at 999500, `PUT` its
+/// metadata, and a GC pass already in flight purges the fresh document with
+/// the `PUT` long since answered `200`. Silent server-side data loss.
+///
+/// So the caller purges **one vmid at a time**, each under that vmid's own
+/// write lock, re-validating liveness inside it: see [`gc_purge`], and
+/// `libexec/gc` for the Perl that does it.
+///
+/// The datacenter document is never a guest and is never a candidate.
+pub fn gc_candidates(store: &MetaStore, vmids: &[u32]) -> Result<Vec<u32>, anyhow::Error> {
+    let live: std::collections::HashSet<u32> = vmids.iter().copied().collect();
+    Ok(store
+        .stored_vmids()
+        .map_err(api_err)?
+        .into_iter()
+        .filter(|vmid| !live.contains(vmid))
+        .collect())
+}
+
+/// The GC's second phase: purge one vmid's document **and every snapshot
+/// copy**, having re-checked it against `live` — a vmlist read *inside*
+/// `cfs_lock_domain("pve-meta-<vmid>")`, the same lock every write to that
+/// document holds. Returns the number of files removed, `0` if the vmid is
+/// live again.
+///
+/// The re-check is the whole point: the candidate list came from a snapshot
+/// taken before the lock, and a guest can be created (and its metadata
+/// written) in between. Under the lock, `live` is authoritative — a document
+/// written after the snapshot belongs to a guest that is now in the vmlist,
+/// and the purge does not happen.
+///
+/// # Errors
+/// `500:` `live` is empty. An empty vmlist means "every guest is gone", which
+/// is what a fresh process that has not called `PVE::Cluster::cfs_update()`,
+/// or one that hit a pmxcfs hiccup, also looks like. `libexec/gc` refuses it
+/// too; this is the guard on the destructive operation itself, so no future
+/// caller has to remember it.
+pub fn gc_purge(store: &MetaStore, vmid: u32, live: &[u32]) -> Result<usize, anyhow::Error> {
+    if live.is_empty() {
+        return Err(anyhow::anyhow!(
+            "500: refusing to garbage-collect {vmid} against an empty vmlist"
+        ));
+    }
+    if live.contains(&vmid) {
+        return Ok(0);
+    }
+    store.purge(vmid).map_err(api_err)
+}
+
+/// The whole-sweep GC: [`gc_candidates`] followed by an unvalidated
+/// [`MetaStore::purge`] of each, against the one `vmids` snapshot.
 ///
 /// This replaces the `on_destroy` hook *and* the whole orphan concept: there
 /// is no orphan listing, no orphan grant rule and no orphan delete in the
-/// API. A systemd timer runs it on every node under the cluster lock, so a
-/// document whose guest is gone — destroyed while its node was down, config
-/// removed by hand — stops being replicated by pmxcfs and can no longer be
-/// inherited by a future guest created at that vmid.
+/// API. A document whose guest is gone — destroyed while its node was down,
+/// config removed by hand — stops being replicated by pmxcfs and can no
+/// longer be inherited by a future guest created at that vmid.
+///
+/// **`libexec/gc` does not use this**, and neither should a new caller: it
+/// holds no per-vmid lock and re-validates nothing, so a document written
+/// after `vmids` was read is deleted without a trace. It stays because it is
+/// the exact behaviour the two-phase path has to be tested against, and
+/// because it is the one place `vmids` being empty legitimately means "purge
+/// every guest document" (`crates/pve-meta-perl/test/basic.pl`).
 ///
 /// The datacenter document is never a guest and is never touched.
 pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
-    let live: std::collections::HashSet<u32> = vmids.iter().copied().collect();
     let mut removed = 0;
-    for vmid in store.stored_vmids().map_err(api_err)? {
-        if live.contains(&vmid) {
-            continue;
-        }
+    for vmid in gc_candidates(store, vmids)? {
         removed += store.purge(vmid).map_err(api_err)?;
     }
     Ok(removed)
@@ -1221,9 +1343,16 @@ mod tests {
         let big = format!("a: \"{}\"\n", "x".repeat(4 * 1024 * 1024));
         std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
 
-        let err = get(&store, "100", None, "json", &full()).unwrap_err();
-        assert_eq!(status(&err), 400, "{err}");
-        assert!(err.to_string().contains("too large"), "{err}");
+        // A GET *reports* the condition rather than rendering the document
+        // or 400-ing on the size: the bytes were never read, so there is no
+        // `text` to hand back and every caller gets the same 422 naming the
+        // two repairs.
+        for fmt in ["json", "yaml"] {
+            let err = get(&store, "100", None, fmt, &full()).unwrap_err();
+            assert_eq!(status(&err), 422, "{fmt}: {err}");
+            assert!(err.to_string().contains("too large"), "{err}");
+            assert!(err.to_string().contains("mode=replace"), "{err}");
+        }
 
         // One oversized document does not take the listing down.
         seed(&store, "101", "traefik:\n  host: x\n");
@@ -1235,28 +1364,54 @@ mod tests {
         assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
         assert!(!listed[0].digest.is_empty(), "it still reports its real digest");
 
-        let err = put(&store, "100", Some("traefik"), "json", "{\"a\":1}", "replace", None, false, &full())
-            .unwrap_err();
-        assert_eq!(status(&err), 400, "{err}");
-        assert!(err.to_string().contains("repaired as a whole"), "{err}");
+        // Nothing narrower than a whole-file replace, a root merge included.
+        for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
+            let err = put(&store, "100", view, "json", "{\"a\":1}", mode, None, false, &full())
+                .unwrap_err();
+            assert_eq!(status(&err), 400, "{view:?}/{mode}: {err}");
+            assert!(err.to_string().contains("repaired as a whole"), "{err}");
+        }
 
         let stale = put(&store, "100", None, "yaml", "a: 1\n", "replace", Some("deadbeef"), false, &full())
             .unwrap_err();
         assert_eq!(status(&stale), 409, "{stale}");
-        put(&store, "100", None, "yaml", "a: 1\n", "replace", None, false, &full()).unwrap();
+        // The digest the listing reported is the one the repair's
+        // compare-and-swap accepts, even though the file was never read.
+        put(&store, "100", None, "yaml", "a: 1\n", "replace", Some(&listed[0].digest), false, &full())
+            .unwrap();
         assert_eq!(read_raw(&store, "100").unwrap(), "a: 1\n");
+
+        // ... and a root DELETE is the other repair shape.
+        std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
+        del(&store, "100", None, None, &full()).unwrap();
+        assert!(!dir.path().join("100.yaml").exists());
     }
 
     #[test]
-    fn a_document_that_is_not_a_map_is_empty_for_a_scoped_reader() {
-        let (dir, store) = store();
-        for text in ["- a\n- secret\n", "just a scalar\n"] {
+    fn a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole() {
+        // An empty or comment-only file parses *fine* — to `null` — so a
+        // repair path keyed on the parse alone let a narrower write through
+        // against a document with no structure to preserve. A root `merge`
+        // in particular would have replaced the file wholesale while
+        // reporting only the merge's own touched paths.
+        for text in ["", "# just a comment\n", "- a\n- secret\n", "just a scalar\n"] {
+            let (dir, store) = store();
             std::fs::write(dir.path().join("100.yaml"), text).unwrap();
 
-            let got = get(&store, "100", None, "json", &scoped(&["traefik"])).unwrap();
-            assert_eq!(got.data.unwrap(), json!({}), "{text:?} leaked");
-            let view = get(&store, "100", Some("traefik"), "json", &scoped(&["traefik"])).unwrap();
-            assert_eq!(view.data.unwrap(), json!({}));
+            // A full reader still sees exactly what is on disk, and is told
+            // why it is not a document.
+            let got = get(&store, "100", None, "yaml", &full()).unwrap();
+            assert_eq!(got.text.as_deref(), Some(text), "{text:?}");
+            assert!(got.parse_error.is_some(), "{text:?}");
+            assert!(!got.digest.is_empty(), "{text:?}");
+
+            // Nobody else gets it rendered as an empty document ...
+            for acl in [full(), scoped(&["traefik"])] {
+                let err = get(&store, "100", None, "json", &acl).unwrap_err();
+                assert_eq!(status(&err), 422, "{text:?}: {err}");
+                // ... and no content of it leaks in the message.
+                assert!(!err.to_string().contains("secret"), "{err}");
+            }
 
             // `?has=` cannot be used as an oracle over it either.
             let rows = vec![GuestInput { vmid: 100, ..Default::default() }];
@@ -1264,11 +1419,71 @@ mod tests {
                 .unwrap()
                 .is_empty());
 
-            // A full reader still sees exactly what is on disk ...
-            assert_eq!(get(&store, "100", None, "yaml", &full()).unwrap().text.as_deref(), Some(text));
-            // ... and the write gate refuses to store it again.
+            for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
+                let err = put(&store, "100", view, "json", "{\"host\":\"y\"}", mode, None, false, &full())
+                    .expect_err("must be refused");
+                assert_eq!(status(&err), 400, "{text:?} {view:?}/{mode}: {err}");
+                assert!(err.to_string().contains("repaired as a whole"), "{err}");
+            }
+            assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
+
+            // The two repairs, with the compare-and-swap precondition.
+            put(&store, "100", None, "yaml", "traefik:\n  host: y\n", "replace", Some(&got.digest), false, &full())
+                .unwrap_or_else(|e| panic!("{text:?}: repair refused: {e}"));
+            assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: y\n");
+
+            std::fs::write(dir.path().join("100.yaml"), text).unwrap();
+            del(&store, "100", None, None, &full()).unwrap();
+            assert!(!dir.path().join("100.yaml").exists(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_does_not_rewrite_the_file() {
+        // The `touched: []` corner: `version()`'s `token` correctly does not
+        // move for a no-op write, so `changed` must not either.
+        let (dir, store) = store();
+        seed(&store, "100", "traefik:\n  spec:\n    host: x\n");
+        let path = dir.path().join("100.yaml");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        for (view, mode, payload) in [
+            (Some("traefik.spec"), "merge", "{}"),
+            (Some("traefik.spec"), "merge", "{\"host\": \"x\"}"),
+            (Some("traefik.spec"), "replace", "{\"host\": \"x\"}"),
+            (Some("traefik.spec.gone"), "merge", "{\"nope\": null}"),
+        ] {
+            let r = put(&store, "100", view, "json", payload, mode, None, false, &full())
+                .unwrap_or_else(|e| panic!("{view:?}/{mode}/{payload}: {e}"));
+            assert!(r.touched.is_empty(), "{view:?}/{mode}/{payload}");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().modified().unwrap(),
+                before,
+                "{view:?}/{mode}/{payload} rewrote the file"
+            );
+            assert_eq!(r.digest, store.digest_of(DocId::Guest(100)).unwrap().unwrap());
+        }
+        assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    host: x\n");
+
+        // A no-op write against a file whose *bytes* are not what we would
+        // write still rewrites it: skipping is only ever a byte-for-byte
+        // no-op, never a silently declined canonicalisation.
+        std::fs::write(&path, "traefik:\n    spec:\n        host: x\n").unwrap();
+        put(&store, "100", Some("traefik.spec"), "json", "{}", "merge", None, false, &full()).unwrap();
+        assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    host: x\n");
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_map_can_never_be_written_back() {
+        // The read side of the same condition is
+        // `a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole`;
+        // this is the write gate that keeps one from being *stored*.
+        let (dir, store) = store();
+        for text in ["- a\n- secret\n", "just a scalar\n"] {
+            std::fs::write(dir.path().join("100.yaml"), text).unwrap();
             let err = put(&store, "100", None, "yaml", text, "replace", None, false, &full()).unwrap_err();
             assert_eq!(status(&err), 400, "{text:?}: {err}");
+            assert!(err.to_string().contains("top level must be an object"), "{err}");
             assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
         }
     }
@@ -1377,5 +1592,93 @@ mod tests {
         assert_eq!(gc(&store, &[]).unwrap(), 2);
         assert!(read_raw(&store, "100").is_none());
         assert!(read_raw(&store, "datacenter").is_some());
+    }
+
+    #[test]
+    fn gc_re_validates_liveness_inside_the_per_vmid_lock() {
+        // The reported race, as an in-crate reproduction: the vmlist snapshot
+        // the GC pass started from predates a `PUT` that has already been
+        // answered `200`, and the whole-sweep `gc()` deletes that fresh
+        // document without a trace. `libexec/gc` takes
+        // `cfs_lock_domain("pve-meta-<vmid>")` per candidate and re-reads the
+        // vmlist inside it; `gc_purge` is what that re-read is checked by.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: live\n");
+
+        // The snapshot Perl read before taking any lock. 999500 does not
+        // exist yet, so it is not in it.
+        let snapshot = [100u32];
+        assert!(gc_candidates(&store, &snapshot).unwrap().is_empty());
+
+        // ... then a guest is created at 999500 and its metadata written.
+        seed(&store, "999500", "traefik:\n  host: fresh\n");
+        store.snapshot(999500, "s1").unwrap();
+        assert_eq!(gc_candidates(&store, &snapshot).unwrap(), vec![999500]);
+
+        // Under the per-vmid lock, the *fresh* vmlist has it: nothing is
+        // purged, and the document the PUT stored survives.
+        let fresh = [100u32, 999500];
+        assert_eq!(gc_purge(&store, 999500, &fresh).unwrap(), 0);
+        assert_eq!(read_raw(&store, "999500").as_deref(), Some("traefik:\n  host: fresh\n"));
+        assert_eq!(store.list_snapshots(999500).unwrap(), vec!["s1".to_string()]);
+
+        // An empty fresh vmlist is refused rather than read as "every guest
+        // is gone" — the guard lives on the destructive call itself, not
+        // only in the one Perl caller.
+        let err = gc_purge(&store, 999500, &[]).unwrap_err();
+        assert_eq!(status(&err), 500, "{err}");
+        assert!(read_raw(&store, "999500").is_some());
+
+        // A vmid that really is gone is still purged, with its snapshots.
+        assert_eq!(gc_purge(&store, 999500, &[100]).unwrap(), 2);
+        assert!(read_raw(&store, "999500").is_none());
+        assert!(store.list_snapshots(999500).unwrap().is_empty());
+        // Idempotent: the loser of a race against another node's GC pass.
+        assert_eq!(gc_purge(&store, 999500, &[100]).unwrap(), 0);
+
+        // For contrast, the unvalidated whole sweep is what the report
+        // reproduced — it deletes against the stale snapshot alone.
+        seed(&store, "999500", "traefik:\n  host: fresh\n");
+        assert_eq!(gc(&store, &snapshot).unwrap(), 1);
+        assert!(read_raw(&store, "999500").is_none());
+    }
+
+    // -- a file that vanishes under a request is never a 500 ----------------
+
+    #[test]
+    fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
+        // Reads run unlocked while writes hold `pve-meta-<id>` and the GC
+        // holds `pve-meta-gc`, so a file can disappear between any two
+        // syscalls. Every one of these used to be an `Error::Io` → 500.
+        let (dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: x\n");
+        let digest = get(&store, "100", None, "json", &full()).unwrap().digest;
+        std::fs::remove_file(dir.path().join("100.yaml")).unwrap();
+
+        // A read of a document that is no longer there is the empty document.
+        let got = get(&store, "100", None, "json", &full()).unwrap();
+        assert_eq!(got.data.unwrap(), json!({}));
+        assert_eq!(got.digest, "");
+
+        // A listing does not 500 for the whole cluster because of one of them.
+        let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+        let listed = list_guests(&store, &regs(), "root@pam", &rows, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].digest, "");
+
+        // The version poll skips it rather than failing.
+        assert!(version(&store).is_ok());
+
+        // A DELETE of a document another caller already removed is that
+        // caller's request satisfied.
+        let r = del(&store, "100", None, None, &full()).unwrap();
+        assert_eq!(r.digest, "");
+        assert!(r.touched.is_empty());
+
+        // ... and the stale digest of the vanished document is still a
+        // precondition failure, not a 500.
+        let err = put(&store, "100", None, "yaml", "a: 1\n", "replace", Some(&digest), false, &full())
+            .unwrap_err();
+        assert_eq!(status(&err), 409, "{err}");
     }
 }

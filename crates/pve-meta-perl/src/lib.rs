@@ -7,7 +7,8 @@
 //!   `libpve-guest-common-perl`; `docs/DESIGN.md` §6). These are the only
 //!   lifecycle hooks that exist: destroy is a GC, clone and backup are not
 //!   carried;
-//! * **`gc`**, run by a systemd timer on every node under the cluster lock,
+//! * the **GC** (`gc_candidates`/`gc_purge`, and the unvalidated whole-sweep
+//!   `gc`), run by a systemd timer on every node under the cluster lock,
 //!   which removes documents and snapshot copies whose vmid has left the
 //!   vmlist; and
 //! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`
@@ -109,25 +110,52 @@ mod pve_rs_meta {
     /// Returns `1` if a copy existed and was removed, `0` otherwise.
     #[export]
     pub fn on_delsnap(vmid: u32, snapname: &str) -> Result<bool, Error> {
-        let store = open_store();
-        let existed = store.list_snapshots(vmid)?.iter().any(|n| n == snapname);
-        store.delete_snapshot(vmid, snapname)?;
-        Ok(existed)
+        Ok(open_store().delete_snapshot(vmid, snapname)?)
     }
 
     // -- garbage collection (`docs/DESIGN.md` §6) --------------------------
 
-    /// Removes every document **and snapshot copy** whose vmid is not in
-    /// `$vmids` — the vmlist the caller passes in as a native array ref.
-    /// Returns the number of files removed.
+    /// The stale vmids: everything the store holds a file for that is not in
+    /// `$vmids`, the vmlist the caller passes in as a native array ref.
+    /// Removes nothing.
+    ///
+    /// The first half of the two-phase GC `/usr/libexec/pve-meta/gc` runs:
+    /// this under `cfs_lock_domain('pve-meta-gc')`, then one
+    /// [`gc_purge`](Self::gc_purge) per vmid under that vmid's own
+    /// `cfs_lock_domain("pve-meta-$vmid")`. Splitting it is what closes the
+    /// window in which a `PUT` that landed after the vmlist was read had its
+    /// fresh document purged.
+    #[export]
+    pub fn gc_candidates(vmids: Vec<u32>) -> Result<Vec<u32>, Error> {
+        api::gc_candidates(&open_store(), &vmids)
+    }
+
+    /// Removes `$vmid`'s document **and every snapshot copy**, but only if
+    /// `$live` — a vmlist the caller re-read *inside*
+    /// `cfs_lock_domain("pve-meta-$vmid")` — still does not contain it.
+    /// Returns the number of files removed, `0` if the guest is live again.
+    ///
+    /// Dies if `$live` is empty: an empty vmlist means "every guest is gone",
+    /// which is also what a process that has not called
+    /// `PVE::Cluster::cfs_update()` sees.
+    #[export]
+    pub fn gc_purge(vmid: u32, live: Vec<u32>) -> Result<usize, Error> {
+        api::gc_purge(&open_store(), vmid, &live)
+    }
+
+    /// The unvalidated whole sweep: removes every document **and snapshot
+    /// copy** whose vmid is not in `$vmids`, in one pass, holding no
+    /// per-vmid lock. Returns the number of files removed.
     ///
     /// This is what replaces the `on_destroy` hook and, with it, the whole
     /// orphan concept: there is no orphan listing, no orphan grant rule and
-    /// no orphan delete in the API. A systemd timer runs it on every node;
-    /// the caller must hold the cluster lock, since `/etc/pve/meta` is one
-    /// pmxcfs directory shared by every node.
+    /// no orphan delete in the API. The datacenter document is never a guest
+    /// and is never removed.
     ///
-    /// The datacenter document is never a guest and is never removed.
+    /// **Not what the timer runs.** It cannot re-validate a candidate against
+    /// a vmlist read under that document's write lock, so a `PUT` that landed
+    /// after `$vmids` was read loses its document silently; new callers want
+    /// `gc_candidates` + `gc_purge`.
     #[export]
     pub fn gc(vmids: Vec<u32>) -> Result<usize, Error> {
         api::gc(&open_store(), &vmids)

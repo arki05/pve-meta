@@ -89,17 +89,24 @@ Grants for a caller on a guest document:
   not a wire contract; the UI sorts.
 * Writes: `data` (JSON string) or `text` (YAML) with `mode=replace` (the view's subtree
   is replaced; `{}` stores an empty map) or `mode=merge` (merge-patch, `null` deletes; a
-  merge that touches nothing changes nothing). One lint runs on the planned document;
+  write that touches nothing changes nothing — and rewrites nothing, so it does not move
+  `changed` either). One lint runs on the planned document;
   the write is refused with a 400 that names the offending path. `digest` is the
   optional expected file digest (409 on mismatch); `dry_run=1` plans and validates
   without writing.
-* Unparsable file: `format=yaml` returns the raw text plus `parse_error` (so an
-  administrator can repair it); `format=json` returns 422 with the parse error; a root
-  `replace` by a full writer repairs it. This is a per-document condition, never
-  cluster-wide.
+* Unrecoverable file — it does not parse, it is above the store's 4 MiB read cap, or it
+  parses to something that is not a mapping (`null` from an empty or comment-only file, a
+  scalar, a list): `format=yaml` returns the raw text plus `parse_error` where the bytes
+  were read at all (so an administrator can repair it); everything else returns 422
+  naming the condition. It is always reported, never rendered as an empty document. A
+  root `replace` or a root `DELETE` by a full writer repairs it, and **nothing narrower
+  is allowed** — a narrower write plans against the empty document, so it would silently
+  discard the file. This is a per-document condition, never cluster-wide.
 * Writes run under `PVE::Cluster::cfs_lock_domain("pve-meta-<id>")` with the digest
   check inside the lock; files are written atomically with node/pid/seq-unique temp
-  names. Errors name paths; there is no disclosure filtering.
+  names. Reads are unlocked, so a file can vanish under one: that is a 404 (or, in a
+  listing or a poll, a skipped entry), never a 500, and a `DELETE` of a document someone
+  else already removed succeeds. Errors name paths; there is no disclosure filtering.
 
 ## 5. API (native, `/api2/json/meta`, served by pveproxy/pvedaemon)
 
@@ -129,9 +136,17 @@ client-supplied `data` parameter is a JSON string, decoded once in Rust.
   `/etc/pve/meta/<vmid>.<snapname>.yaml` through one patched file,
   `PVE/AbstractConfig.pm` (package libpve-guest-common-perl), calling
   `PVE::RS::Meta::on_snapshot/on_rollback/on_delsnap`.
-* **Destroy**: no hook. A GC (`PVE::RS::Meta::gc`, run by a systemd timer on every node
-  under the cluster lock) removes documents and snapshot copies whose vmid is no longer
-  in the vmlist. There is no orphan concept in the API.
+* **Destroy**: no hook. A GC (`/usr/libexec/pve-meta/gc`, run by a systemd timer on
+  every node) removes documents and snapshot copies whose vmid is no longer in the
+  vmlist. There is no orphan concept in the API. It runs in **two phases under two
+  locks**: `PVE::RS::Meta::gc_candidates` nominates the stale vmids under
+  `cfs_lock_domain('pve-meta-gc')`, then each is purged individually by
+  `PVE::RS::Meta::gc_purge` under `cfs_lock_domain("pve-meta-<vmid>")` — the same lock a
+  write holds — re-validated against a vmlist read *inside* that lock. Without the
+  second phase a guest recreated at a freed vmid loses the metadata a `PUT` had already
+  stored, to a sweep whose vmlist read predates it. An empty vmlist is refused at both
+  phases: it means "every guest is gone", which is also what an unrefreshed pmxcfs
+  cache looks like.
 * **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up
   `/etc/pve`". The QEMU backup command cannot embed foreign blobs, so a partial guarantee
   is not offered.

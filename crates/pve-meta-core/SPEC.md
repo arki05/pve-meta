@@ -205,7 +205,7 @@ the tag is the deliberate act of granting the operator that guest.
   map comment has no subject and is not aliased. `covers` is `pub(crate)` because
   `view::filter` must give the same answer on the read side.
 * `check_write(&[])` is vacuously `Ok`, so it is **not** a security boundary on its own;
-  the API layer's up-front `can_write(view)` is (§9).
+  the API layer's up-front `can_write(view)` is (§10).
 * Scopes apply to guest documents only. `api::grants` returns an empty scope list for
   `DocId::Datacenter`, which is what keeps the registry from being able to reach it.
 
@@ -226,14 +226,14 @@ API (all synchronous, `Result<_, Error>`):
 
 * `locate(id) -> Option<PathBuf>`
 * `read(id) -> Document { id, path, raw, value, parse_error, digest, mtime }`
-  (`Error::NotFound` if absent, `Error::TooLarge` above `MAX_READ_BYTES`). **Reads never
-  lint and never fail on the document's own content**: the parse is `format::parse_raw`,
-  and text it rejects yields `parse_error: Some(msg)` with the empty document as `value`
-  and the file's real bytes and digest. Content can only be invalid out of band (a
-  hand-edited file, pmxcfs replication), and failing on it would make a typo
-  unrepairable through the API.
-* `digest_of(id) -> Option<String>` — the content digest without parsing (or keeping) the
-  document, so a write can still carry a compare-and-swap precondition against a file
+  (`Error::NotFound` if absent, `Error::TooLarge` above `MAX_READ_BYTES`, `Error::Parse`
+  for bytes that are not UTF-8 at all). **Reads never lint and never fail on the
+  document's own content**: the parse is `format::parse_raw`, and text it rejects yields
+  `parse_error: Some(msg)` with the empty document as `value` and the file's real bytes
+  and digest. Content can only be invalid out of band (a hand-edited file, pmxcfs
+  replication), and failing on it would make a typo unrepairable through the API.
+* `digest_of(id) -> Option<String>` — the content identity without parsing (or keeping)
+  the document, so a write can still carry a compare-and-swap precondition against a file
   `read` refuses to read.
 * `stored_vmids() -> Vec<u32>` — every vmid the store holds any file for, document or
   snapshot copy, ascending. The store's half of the GC (§10); a vmid whose *only* file is
@@ -247,16 +247,17 @@ API (all synchronous, `Result<_, Error>`):
   diffs as the empty document — since it is only read to diff against and must not be
   able to block a repair. `touched = diff(old, new)`; text is stored as given (only
   normalised to end with a single newline).
-* `delete(id)` — the **current document only**. `Error::NotFound` if absent.
+* `delete(id) -> bool` — the **current document only**. Idempotent: `false` if there was
+  nothing to remove.
 * `purge(vmid) -> usize` — the document *and every snapshot copy*, idempotent, returning
   the number of files removed. Only the GC calls this; the REST `DELETE` calls `delete`.
 * `snapshot(vmid, name)` (no-op `Ok(false)` without a document), `rollback(vmid, name)`
   (→ `RollbackOutcome::Restored | RemovedNoSnapshot | NoOp`), `delete_snapshot(vmid,
-  name)` (idempotent), `list_snapshots(vmid) -> Vec<String>`.
+  name) -> bool` (idempotent), `list_snapshots(vmid) -> Vec<String>`.
 * `version() -> StoreVersion { token, changed }` — token = SHA-256 over the sorted list of
-  `(file name, content digest)`, hashed from the files' actual bytes on **every** call.
-  There is no `(mtime, len)` cache: the bindings build a fresh store per request so it
-  could never hit, and pmxcfs's mtime granularity cannot distinguish two same-length
+  `(file name, content identity)`, computed from the files' actual bytes on **every**
+  call. There is no `(mtime, len)` cache: the bindings build a fresh store per request so
+  it could never hit, and pmxcfs's mtime granularity cannot distinguish two same-length
   writes in one tick so it would be unsound if it did. Documents are tiny.
 * Size limits: `WARN_BYTES = 256 KiB`, `MAX_BYTES = 512 KiB` (writes) and
   `MAX_READ_BYTES = 4 MiB` (reads) → `Error::TooLarge`. The read cap bounds what an
@@ -266,6 +267,20 @@ API (all synchronous, `Result<_, Error>`):
   about that size first (measured: 520 000 B through, 530 000 B → "for data too large",
   HTTP 501). It bounds a hand-written or replicated file being rewritten, and the pmxcfs
   size budget.
+* **One identity function, `identify(path)`, and the read cap applies to all of it.**
+  `digest_of`, `check_precondition`/`put_raw`'s precondition and `version`'s per-file
+  entry all go through it, so the digest a caller reads out of a `GET` is the string
+  their next `PUT`'s precondition is compared against. Below the cap it is the SHA-256 of
+  the bytes; above it, a domain-separated SHA-256 over `(len, mtime)` — a surrogate, so
+  that a single multi-megabyte file dropped in out of band is not read and hashed by
+  every 5 s poll and every listing. It still moves when the file does, which is all the
+  token and the compare-and-swap need of it.
+* **A file that is not there is never an `Error::Io`.** Reads are unlocked, writes hold
+  `pve-meta-<id>` and the GC holds `pve-meta-gc` — disjoint domains — so a file can
+  vanish between any two syscalls. `read` answers `NotFound` (no `locate`-then-read
+  pair), `delete`/`delete_snapshot` are idempotent, and the directory walks (`version`,
+  `stored_vmids`) skip an entry that disappeared under them. There is no
+  `exists()`-then-act pair left in the module.
 
 The digest precondition is enforced **here and only here**: `check_digest` treats `None`
 as "no precondition" and `Some("")` as matching a *missing* document, which is what makes
@@ -292,6 +307,7 @@ boundary and must be unit-testable without `libperl-dev` and without a cluster.
   `get_document(store, regs, id, view, format, acl)`,
   `put_document(store, regs, id, view, format, payload, mode, digest, dry_run, acl)`,
   `delete_document(store, regs, id, view, digest, acl)`,
+  `gc_candidates(store, vmids) -> Vec<u32>`, `gc_purge(store, vmid, live) -> usize`,
   `gc(store, vmids) -> usize`.
 * Errors are `anyhow::Error`s whose `Display` is `"NNN: message"` (an HTTP status prefix);
   `PVE::API2::Ext::Meta::_call` parses that and re-raises through `PVE::Exception`.
@@ -307,11 +323,14 @@ contract — the tree UI sorts.
 
 **Write authorization** — decided from the request, never from a diff:
 
-0. a write against a document whose content could not be recovered (it does not parse, or
-   it is above the read cap) is refused with 400 unless it *replaces the file whole* — a
-   root `replace` or a root `DELETE`, both of which already require `full_write`. The
-   value planned against is the empty document, so anything narrower would silently
-   discard the file;
+0. a write against a document whose content could not be recovered is refused with 400
+   unless it *replaces the file whole* — a root `replace` or a root `DELETE`, both of
+   which already require `full_write`. The value planned against is the empty document,
+   so anything narrower (a root `merge` included) would silently discard the file. **One
+   condition, three causes**: the file does not parse (or is not UTF-8), it is above the
+   read cap, or it parses to something that is not a mapping — `null` from an empty or
+   comment-only file, a scalar, a list. Keying this on the parse alone let the third
+   through;
 1. `can_write(view)` must hold before anything is computed, and a caller without
    `full_write` may not write the root view at all;
 2. the mutation is planned against a **clone** and every path the plan touches is checked
@@ -326,11 +345,20 @@ document with the real digest (which would be a change-detection oracle). A call
 *partial* grant does get the whole document's digest — scoped writers need it for
 compare-and-swap PUTs.
 
-**Unparseable documents** (`docs/DESIGN.md` §4) are a per-document condition, never
+**Unrecoverable documents** (`docs/DESIGN.md` §4) are a per-document condition, never
 cluster-wide — nothing reads `datacenter.yaml` on a guest request any more.
 `format=yaml` for a caller with `full_read` answers 200 with the file's raw `text` plus
-`parse_error`, so an administrator can repair it; `format=json`, and any caller without
-full read, gets **422** with the parse error. A root `replace` or `DELETE` repairs it.
+`parse_error`, so an administrator can repair it; `format=json`, any caller without full
+read, and everyone when the bytes were never read at all (above the cap) gets **422**
+naming the condition and the two repairs. It is always *reported*, never rendered as an
+empty document: the file is there, and a caller has to know that before writing over it.
+A root `replace` or `DELETE` repairs it.
+
+**A write that changes nothing writes nothing.** When the plan touches no path *and* the
+canonical dump equals the bytes already on disk, the write is skipped: rewriting the file
+would advance its mtime and so `version()`'s `changed`, while the content `token`
+correctly does not move. Both halves are required — `touched: []` alone also describes
+the repair of a document that reads back as empty because it is unrecoverable.
 
 **View addressing** (`parse_view`) parses a path and does nothing else. No key is
 reserved, no segment is special, and there is no mid-path comment-key rejection: a view
@@ -347,10 +375,23 @@ digest, rather than 400-ing `GET /meta/guests` for every principal.
 guest-config parsing is not re-implemented in a second language. `node`, `name` and
 `tags` are returned only to a caller with `VM.Audit` on that guest.
 
-`gc(store, vmids)` removes every document **and snapshot copy** whose vmid is not in the
-vmlist Perl passes in, returning the number of files removed. It replaces the destroy
-hook *and* the entire orphan concept — there is no orphan listing, no orphan grant rule
-and no orphan delete anywhere. The datacenter document is never a guest.
+**The GC is two-phase, because its phases are locked differently.** Writes serialize
+under `cfs_lock_domain("pve-meta-<vmid>")` and a GC pass under
+`cfs_lock_domain('pve-meta-gc')` — disjoint, so a whole-sweep GC deletes a document
+written after its vmlist snapshot was taken (destroy 999500, recreate a guest there, PUT
+its metadata; the GC pass already in flight purges the fresh document with the PUT
+answered 200). So `gc_candidates(store, vmids)` only *nominates* — the stored vmids
+absent from the vmlist — and `libexec/gc` purges them **one at a time**, each under that
+vmid's own write lock, calling `gc_purge(store, vmid, live)` with a vmlist re-read inside
+that lock. `gc_purge` re-checks the vmid against `live` and refuses an empty `live`
+outright, so the guard is on the destructive call rather than only in its one caller.
+
+`gc(store, vmids)` is the unvalidated whole sweep those two replace: candidates plus an
+immediate `purge` of each, holding no per-vmid lock. It stays because it is what the
+two-phase path is tested against, and because it is the one place an empty `vmids`
+legitimately means "purge every guest document" (`test/basic.pl`). Together they replace
+the destroy hook *and* the entire orphan concept — there is no orphan listing, no orphan
+grant rule and no orphan delete anywhere. The datacenter document is never a guest.
 
 ## 11. Errors (`error.rs`)
 
@@ -392,8 +433,12 @@ scenarios:
   read and distinguishes same-length writes, no temp files left behind; an out-of-band
   invalid document is still readable and still repairable; a document whose *syntax* is
   broken reads as `parse_error` + the empty value + the real digest; a file above the
-  read cap is `TooLarge` on read and still replaceable; there is one write gate and it is
-  the document lint; `stored_vmids` covers documents and snapshot copies alike;
+  read cap is `TooLarge` on read, is never read by `version`/`digest_of`, and is still
+  replaceable against the identity they report; `delete` is idempotent and says whether
+  it removed anything; a file that vanished between syscalls is `NotFound`, not
+  `Error::Io`, and `version` skips it under a concurrent deleter; there is one write gate
+  and it is the document lint; `stored_vmids` covers documents and snapshot copies
+  alike;
 * **api**: selectors resolve against the guest's tags and scopes never apply to the
   datacenter document; a zero-grant (and a wrongly-scoped) token cannot create structure
   through an empty merge or a `{}` replace at any prefix, and cannot write the root view;
@@ -405,8 +450,11 @@ scenarios:
   own prefixes and never the bare `__`; a full read of the root view returns the file's
   own text; an unparseable document is yaml+`parse_error` / 422 / root-repairable; a
   document above the read cap is refused on read, listed without taking the listing down,
-  and repairable; a list- or scalar-rooted document is empty for a scope-only caller
-  through both the view-less GET and `?has=`; `list_guests` gates node/name/tags on
-  `VM.Audit`; `access` reports resolved scopes; `operators` lists every registration;
-  `gc` removes documents and snapshot copies whose vmid is gone, is idempotent, and never
-  touches the datacenter document.
+  and repairable through the digest the listing reported; a document that parses to
+  `null`, a scalar or a list is the same condition — reported, not rendered, repairable
+  only as a whole — and cannot be used as an oracle through `?has=`; a write that changes
+  nothing does not rewrite the file; a document that vanished mid-request is 404-shaped,
+  never a 500; `list_guests` gates node/name/tags on `VM.Audit`; `access` reports
+  resolved scopes; `operators` lists every registration; `gc` removes documents and
+  snapshot copies whose vmid is gone, is idempotent, and never touches the datacenter
+  document; `gc_purge` keeps a vmid the re-read vmlist has and refuses an empty one.

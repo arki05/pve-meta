@@ -12,10 +12,22 @@
 # no orphan concept anywhere else in the API -- see docs/DESIGN.md section 6
 # and docs/LIFECYCLE-PATCHES.md.
 #
-# Runs under PVE::Cluster::cfs_lock_domain('pve-meta-gc', ...) so concurrent
-# runs on different nodes (the timer fires on every node) never race each
-# other; PVE::RS::Meta::gc() itself does the actual file removal and
-# reports how many documents (including snapshot copies) it removed.
+# Two locks, two phases, because one lock is not enough:
+#
+#   * the outer PVE::Cluster::cfs_lock_domain('pve-meta-gc', ...) serialises
+#     GC runs against each other -- the timer fires on every node, and
+#     /etc/pve/meta is one pmxcfs directory shared by all of them;
+#   * an inner cfs_lock_domain("pve-meta-$vmid", ...) per stale vmid
+#     serialises the purge against *writes*, which is a different lock domain
+#     (PVE::API2::Ext::Meta holds exactly that one around every read-modify-
+#     write). Without it a guest destroyed, recreated at the same vmid and
+#     given fresh metadata by a PUT that already answered 200 would have that
+#     fresh document deleted by a GC pass whose vmlist read predates it.
+#
+# The candidate list therefore only nominates; the vmlist is read *again*
+# inside each per-vmid lock and PVE::RS::Meta::gc_purge re-checks the vmid
+# against it before removing anything. A vmid that came back to life between
+# the two reads is skipped.
 
 use strict;
 use warnings;
@@ -26,27 +38,57 @@ use Sys::Syslog qw(openlog syslog closelog);
 
 my $LOCK_TIMEOUT = 30;
 
+# The vmlist, freshly refreshed. cfs_update() is not optional: a process that
+# has not refreshed the cached cluster filesystem state -- and this one is
+# freshly spawned by the timer -- sees an empty list, and an empty vmlist
+# means "every guest is gone" to anything that consumes it.
+sub live_vmids {
+    PVE::Cluster::cfs_update();
+    my $vmlist = PVE::Cluster::get_vmlist() || {};
+    # int() is not decoration: hash keys are strings, and perlmod deserialises
+    # the array ref into Vec<u32> strictly -- a bare "201" dies with
+    # "invalid type: string".
+    return sort { $a <=> $b } map { int($_) } keys %{ $vmlist->{ids} // {} };
+}
+
 openlog('pve-meta-gc', 'pid', 'daemon');
 
-my $removed = eval {
-    PVE::Cluster::cfs_lock_domain(
-        'pve-meta-gc',
-        $LOCK_TIMEOUT,
-        sub {
-            # Must be read inside the lock: cfs_lock_domain refreshes the
-            # cached cluster filesystem state, and a vmlist read beforehand
-            # (or cached from an earlier, unlocked call) can observe an
-            # empty list on a pmxcfs hiccup. An empty vmlist is refused
-            # outright rather than passed through: gc() treats "no vmids"
-            # as "every guest is gone", which would delete every document
-            # in the store instead of the handful actually orphaned.
-            my $vmlist = PVE::Cluster::get_vmlist();
-            my @vmids = sort { $a <=> $b } keys %{ $vmlist->{ids} // {} };
-            die "refusing to gc with an empty vmlist\n" if !@vmids;
-            return PVE::RS::Meta::gc(\@vmids);
-        },
-    );
-};
+my $removed = 0;
+my $skipped = 0;
+
+# NOTE: cfs_lock_domain() catches the callback's die and re-raises it by
+# assigning $@, so every call has to be followed by an explicit `die $@ if $@`
+# -- wrapping it in an eval{} instead would clear $@ on the way out and
+# swallow the failure silently.
+PVE::Cluster::cfs_lock_domain(
+    'pve-meta-gc',
+    $LOCK_TIMEOUT,
+    sub {
+        my @vmids = live_vmids();
+        die "refusing to gc with an empty vmlist\n" if !@vmids;
+
+        my $stale = PVE::RS::Meta::gc_candidates(\@vmids);
+        for my $vmid (@$stale) {
+            # The document's own write lock. Nested inside 'pve-meta-gc',
+            # which is safe: a writer only ever takes "pve-meta-$vmid", never
+            # 'pve-meta-gc', so there is no lock-order cycle.
+            my $n = PVE::Cluster::cfs_lock_domain(
+                "pve-meta-$vmid",
+                $LOCK_TIMEOUT,
+                sub {
+                    my @fresh = live_vmids();
+                    die "refusing to gc $vmid with an empty vmlist\n" if !@fresh;
+                    # Re-validated in here, against a vmlist no writer can
+                    # have changed since, because we hold the lock they need.
+                    return PVE::RS::Meta::gc_purge($vmid, \@fresh);
+                },
+            );
+            die $@ if $@;
+            $removed += $n // 0;
+            $skipped++ if !$n;
+        }
+    },
+);
 my $err = $@;
 
 if ($err) {
@@ -55,7 +97,9 @@ if ($err) {
     die $err;
 }
 
-syslog('info', "removed %d stale document(s)", $removed // 0);
+syslog('info', "removed %d stale document(s)", $removed);
+syslog('info', "%d candidate(s) purged nothing (live again, or already gone)", $skipped)
+    if $skipped;
 closelog();
 
 exit 0;

@@ -119,7 +119,35 @@ is(PVE::RS::Meta::gc([9100]), 0, 'gc is idempotent');
 is(PVE::RS::Meta::gc([9100, 999500]), 0, 'a vmid back in the vmlist is not removed');
 is(PVE::RS::Meta::gc([]), 2, 'an empty vmlist removes every guest document and snapshot');
 ok(file_exists('datacenter.yaml'), '... still never the datacenter document');
-unlink("$root/datacenter.yaml");
+
+# The two-phase GC /usr/libexec/pve-meta/gc actually runs: nominate under
+# 'pve-meta-gc', then purge one vmid at a time under "pve-meta-$vmid" with the
+# vmlist re-read *inside* that lock. Without the re-check, a document written
+# after the outer vmlist read is deleted with its PUT already answered 200.
+write_file('9100.yaml', "traefik:\n  host: live\n");
+PVE::RS::Meta::on_snapshot(9100, 'keep');
+is_deeply(PVE::RS::Meta::gc_candidates([9100]), [], 'nothing is stale against the live vmlist');
+
+# ... the guest at 999500 is created and its metadata written afterwards.
+write_file('999500.yaml', "traefik:\n  host: fresh\n");
+is_deeply(PVE::RS::Meta::gc_candidates([9100]), [999500],
+    'gc_candidates nominates the vmid missing from the snapshot');
+is(PVE::RS::Meta::gc_purge(999500, [9100, 999500]), 0,
+    'gc_purge keeps a vmid the re-read vmlist has');
+ok(file_exists('999500.yaml'), 'the document written after the snapshot survives');
+
+$res = eval { PVE::RS::Meta::gc_purge(999500, []) };
+ok(!defined($res), 'gc_purge refuses an empty vmlist rather than purging');
+like($@, qr/empty vmlist/, '... and says why');
+ok(file_exists('999500.yaml'), '... and removed nothing');
+
+is(PVE::RS::Meta::gc_purge(999500, [9100]), 1, 'gc_purge removes a vmid that really is gone');
+ok(!file_exists('999500.yaml'), '... the document is gone');
+is(PVE::RS::Meta::gc_purge(999500, [9100]), 0, 'gc_purge is idempotent');
+ok(file_exists('9100.yaml'), 'a live guest is never touched by gc_purge');
+ok(file_exists('datacenter.yaml'), '... and neither is the datacenter document');
+
+unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
 # =========================================================================
 # The perlmod boundary: native hashes and arrays.
@@ -500,15 +528,86 @@ for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: 
     ok(!file_exists('9500.yaml'), "[$label] a root DELETE removes it");
 }
 
-# A document above the read cap is refused on read and still replaceable.
+# A document that parses fine but is not a mapping -- an empty or
+# comment-only file above all -- is the same condition as an unparseable one:
+# there is no structure a narrower write could preserve (docs/DESIGN.md §4).
+for my $text ("", "# only a comment\n", "- a\n- b\n", "just a scalar\n") {
+    (my $label = $text) =~ s/\n/\\n/g;
+    write_file('9505.yaml', $text);
+
+    my $doc = PVE::RS::Meta::api_get('9505', undef, 'yaml', $FULL);
+    ok(defined($doc->{parse_error}), "[$label] a full reader is told it is not a document");
+    is($doc->{text}, $text, "[$label] ... with the raw text to repair from");
+
+    $res = eval { PVE::RS::Meta::api_get('9505', undef, 'json', $FULL) };
+    ok(!defined($res), "[$label] format=json is refused");
+    like($@, api_error_status(422), "[$label] ... with 422:");
+
+    for my $shape ([ 'x', 'replace' ], [ 'x', 'merge' ], [ undef, 'merge' ]) {
+        my ($view, $mode) = @$shape;
+        $res = eval { PVE::RS::Meta::api_put('9505', $view, 'json', '{"a":1}', $mode, undef, 0, $FULL) };
+        ok(!defined($res), "[$label] a $mode narrower than a whole-file replace is refused");
+        like($@, qr/repaired as a whole/, "[$label] ... and says how to repair it");
+    }
+    is(read_file('9505.yaml'), $text, "[$label] and nothing was written");
+
+    PVE::RS::Meta::api_put('9505', undef, 'yaml', "a: 1\n", 'replace', $doc->{digest}, 0, $FULL);
+    is(read_file('9505.yaml'), "a: 1\n", "[$label] a root replace repairs it");
+
+    write_file('9505.yaml', $text);
+    PVE::RS::Meta::api_delete('9505', undef, undef, $FULL);
+    ok(!file_exists('9505.yaml'), "[$label] a root DELETE removes it");
+}
+
+# A document above the read cap: reported, never rendered, and repairable by
+# exactly the same two whole-file shapes. Its bytes are never read -- not by
+# the GET, not by the listing, and not by the version poll.
 write_file('9504.yaml', "a: \"" . ('x' x (4 * 1024 * 1024)) . "\"\n");
-$res = eval { PVE::RS::Meta::api_get('9504', undef, 'json', $FULL) };
-ok(!defined($res), 'a document above the read cap is refused');
-like($@, qr/too large/, 'and says why');
-PVE::RS::Meta::api_put('9504', undef, 'json', '{"a":1}', 'replace', undef, 0, $FULL);
+for my $fmt (qw(json yaml)) {
+    $res = eval { PVE::RS::Meta::api_get('9504', undef, $fmt, $FULL) };
+    ok(!defined($res), "a document above the read cap is reported, not rendered ($fmt)");
+    like($@, api_error_status(422), "... with 422: ($fmt)");
+    like($@, qr/too large/, "... and says why ($fmt)");
+}
+my ($listed_big) = grep { $_->{vmid} == 9504 }
+    @{ PVE::RS::Meta::api_list_guests('root@pam', [guest_row(9504, read => 1)], undef) };
+ok(defined($listed_big), 'one oversized document does not take the listing down');
+isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
+ok(defined(PVE::RS::Meta::api_version()->{token}), '... nor the version poll');
+
+$res = eval { PVE::RS::Meta::api_put('9504', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
+ok(!defined($res), 'a view write against an oversized document is refused');
+like($@, qr/repaired as a whole/, '... and says how to repair it');
+
+PVE::RS::Meta::api_put('9504', undef, 'json', '{"a":1}', 'replace', $listed_big->{digest}, 0, $FULL);
 is_deeply(PVE::RS::Meta::api_get('9504', undef, 'json', $FULL)->{data}, { a => 1 },
-    'and a root replace still repairs it');
+    'and a root replace repairs it, against the digest the listing reported');
 PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
+
+# A write that changes no path and would put back the bytes already on disk
+# is skipped: `version()`'s token does not move for it, so `changed` must not
+# either.
+write_file('9506.yaml', "traefik:\n  spec:\n    host: x\n");
+my $noop_before = PVE::RS::Meta::api_version();
+my $noop = PVE::RS::Meta::api_put('9506', 'traefik.spec', 'json', '{}', 'merge', undef, 0, $FULL);
+is_deeply($noop->{touched}, [], 'a no-op merge touches nothing');
+is_deeply(PVE::RS::Meta::api_version(), $noop_before, '... and moves neither token nor changed');
+is(read_file('9506.yaml'), "traefik:\n  spec:\n    host: x\n", '... and rewrites nothing');
+unlink("$root/9506.yaml");
+
+# A document another caller removed under us is a 404-shaped absence, never a
+# 500: reads are unlocked, so a DELETE or the GC can win any race.
+write_file('9507.yaml', "traefik:\n  host: x\n");
+my $vanishing = PVE::RS::Meta::api_get('9507', undef, 'json', $FULL);
+unlink("$root/9507.yaml");
+is_deeply(PVE::RS::Meta::api_get('9507', undef, 'json', $FULL)->{data}, {},
+    'a document that vanished reads as the empty document');
+is(PVE::RS::Meta::api_delete('9507', undef, undef, $FULL)->{digest}, '',
+    'and deleting it again is that request satisfied');
+$res = eval { PVE::RS::Meta::api_put('9507', undef, 'yaml', "a: 1\n", 'replace',
+    $vanishing->{digest}, 0, $FULL) };
+ok(!defined($res), 'its stale digest is still a precondition failure');
+like($@, api_error_status(409), '... a 409, not a 500');
 
 # api_delete: a view removes a subtree, the root removes the file.
 my $before_del = PVE::RS::Meta::api_get('9400', undef, 'json', $FULL);

@@ -231,11 +231,14 @@ my $VIEW_RETURNS = {
         parse_error => {
             type => 'string',
             optional => 1,
-            description => "Present only when the stored document is not valid YAML "
-                . "(docs/DESIGN.md §4): the parser's message. 'text' is then the file's raw "
-                . "text, so an administrator can repair it with a whole-document PUT "
-                . "(no 'view', mode=replace) or remove it with DELETE. With format=json, "
-                . "and for a caller without full read, the same condition is a 422 instead.",
+            description => "Present only when the stored document's content could not be "
+                . "recovered (docs/DESIGN.md §4): it is not valid YAML, it is above the "
+                . "store's read cap, or it parses to something that is not a mapping. "
+                . "'text' is then the file's raw text, so an administrator can repair it "
+                . "with a whole-document PUT (no 'view', mode=replace) or remove it with "
+                . "DELETE -- nothing narrower is accepted. With format=json, for a caller "
+                . "without full read, and whenever the bytes were never read at all, the "
+                . "same condition is a 422 instead.",
         },
     },
 };

@@ -227,7 +227,7 @@ mod tests {
         assert_eq!(Format::from_ext("YAML"), Some(Format::Yaml));
         assert_eq!(Format::from_ext("json"), Some(Format::Json));
         assert_eq!(Format::from_ext("ini"), None);
-        // TOML is gone entirely (docs/DESIGN.md §8: YAML only on disk).
+        // TOML is gone entirely (docs/DESIGN.md §2: YAML on disk).
         assert_eq!(Format::from_ext("toml"), None);
     }
 

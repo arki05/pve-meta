@@ -121,9 +121,89 @@ fn delete_removes_document() {
 }
 
 #[test]
-fn delete_missing_is_not_found() {
+fn delete_is_idempotent_and_says_whether_it_removed_anything() {
+    // Deleting a document is a request for it to be gone; it being already
+    // gone -- because a concurrent DELETE or the GC won the race -- is that
+    // request satisfied. The old `locate`-then-remove pair turned the loser
+    // of that race into an `Error::Io`, which the API layer maps to 500.
     let (_dir, store) = store();
-    assert!(matches!(store.delete(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    assert!(!store.delete(DocId::Guest(100)).unwrap());
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    assert!(store.delete(DocId::Guest(100)).unwrap());
+    assert!(!store.delete(DocId::Guest(100)).unwrap());
+    assert!(!store.delete_snapshot(100, "nope").unwrap());
+}
+
+#[test]
+fn a_file_that_vanishes_between_syscalls_is_not_found_not_an_io_error() {
+    // Reads run unlocked, writes hold `pve-meta-<id>` and the GC holds
+    // `pve-meta-gc`: three disjoint domains, so a file can disappear between
+    // any two syscalls of a read. Simulated here by removing it before the
+    // read rather than mid-read -- the point is that every path answers
+    // NotFound rather than propagating `io::ErrorKind::NotFound` as
+    // `Error::Io`.
+    let (dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    std::fs::remove_file(dir.path().join("100.yaml")).unwrap();
+
+    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    assert_eq!(store.digest_of(DocId::Guest(100)).unwrap(), None);
+    assert!(store.check_precondition(DocId::Guest(100), Some("")).is_ok());
+    assert!(!store.snapshot(100, "s").unwrap());
+    assert_eq!(store.purge(100).unwrap(), 0);
+    assert!(store.version().is_ok());
+}
+
+#[test]
+fn version_skips_a_file_that_disappears_under_the_walk() {
+    // A `readdir` entry is a name, not a file: the GC or a DELETE can remove
+    // it before the walk gets to its `stat`. A 5 s poll must not 500 for it.
+    let (dir, store) = store();
+    for vmid in 100..140u32 {
+        store.put_raw(DocId::Guest(vmid), "a: 1\n", None).unwrap();
+    }
+    let deleter = {
+        let root = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            for vmid in 100..140u32 {
+                let _ = std::fs::remove_file(root.join(format!("{vmid}.yaml")));
+            }
+        })
+    };
+    for _ in 0..200 {
+        store.version().expect("a vanishing file is not a version() failure");
+    }
+    deleter.join().unwrap();
+    assert!(store.version().is_ok());
+}
+
+#[test]
+fn version_does_not_read_a_file_above_the_read_cap() {
+    // The 5 s poll's cost is bounded by the same rule document reads are:
+    // one multi-megabyte file dropped in out of band must not be SHA-256'd
+    // by every open UI, forever. Its identity becomes a surrogate over
+    // (len, mtime) -- which still moves when the file does.
+    let (dir, store) = store();
+    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    let path = dir.path().join("999500.yaml");
+    std::fs::write(&path, format!("a: \"{}\"\n", "x".repeat(MAX_READ_BYTES as usize))).unwrap();
+
+    let v1 = store.version().unwrap();
+    assert_eq!(store.version().unwrap().token, v1.token, "stable across polls");
+
+    // `digest_of` answers for it without reading it, and it is the same
+    // string the compare-and-swap precondition compares against.
+    let dig = store.digest_of(DocId::Guest(999500)).unwrap().unwrap();
+    assert_eq!(dig.len(), 64);
+    assert!(store.check_precondition(DocId::Guest(999500), Some(&dig)).is_ok());
+    assert!(matches!(
+        store.check_precondition(DocId::Guest(999500), Some("deadbeef")),
+        Err(Error::DigestMismatch { .. })
+    ));
+
+    // ... and the token still moves when the oversized file changes.
+    std::fs::write(&path, format!("a: \"{}\"\n", "y".repeat(MAX_READ_BYTES as usize + 9))).unwrap();
+    assert_ne!(store.version().unwrap().token, v1.token);
 }
 
 #[test]

@@ -84,26 +84,60 @@ machinery, which is gone with the orphan concept.
 
 ### Garbage collection
 
-* `gc($vmids)` → removes every document **and snapshot copy** whose vmid is not in
-  `$vmids`, an array ref of integers — the vmlist the caller passes in. Returns the
-  number of files removed. Rust never reads `/etc/pve/.vmlist` itself.
+Rust never reads `/etc/pve/.vmlist` itself; the caller passes the vmlist in, as a native
+array ref of integers.
 
-  Run by a systemd timer on every node. The caller holds the cluster lock and passes a
-  vmlist it has actually refreshed:
+* `gc_candidates($vmids)` → the stale vmids: everything the store holds a file for that
+  is not in `$vmids`. Removes nothing.
+* `gc_purge($vmid, $live)` → removes `$vmid`'s document **and every snapshot copy**, but
+  only if `$live` still does not contain it. Returns the number of files removed, `0` if
+  the guest is live again. **Dies if `$live` is empty.**
+* `gc($vmids)` → the unvalidated whole sweep: every stale vmid purged in one pass,
+  holding no per-vmid lock. Returns the number of files removed.
 
-  ```perl
-  PVE::Cluster::cfs_update();
-  my $ids = (PVE::Cluster::get_vmlist() || {})->{ids} || {};
-  my $vmids = [ map { int($_) } keys %$ids ];
-  die "refusing to gc against an empty vmlist\n" if !@$vmids;
-  my $removed = PVE::Cluster::cfs_lock_domain("pve-meta-gc", 10, sub {
-      return PVE::RS::Meta::gc($vmids);
-  });
-  ```
+**Two locks, two phases** — `/usr/libexec/pve-meta/gc` (and any other caller) must use
+`gc_candidates` + `gc_purge`, not `gc`. Writes serialize under
+`cfs_lock_domain("pve-meta-$vmid")` and a GC pass under `cfs_lock_domain('pve-meta-gc')`,
+which are disjoint: a guest destroyed, recreated at the same vmid and given fresh
+metadata by a `PUT` that already answered `200` has that document deleted by a sweep
+whose vmlist read predates it. So the candidate list only nominates, and each vmid is
+purged under **its own write lock**, against a vmlist re-read inside it:
 
-  The `cfs_update()` and the empty-vmlist guard are not optional: a fresh process that
-  has not refreshed sees an empty vmlist, and an empty vmlist means "every document is
-  stale". The datacenter document is never a guest and is never removed.
+```perl
+sub live_vmids {
+    PVE::Cluster::cfs_update();
+    my $vmlist = PVE::Cluster::get_vmlist() || {};
+    return sort { $a <=> $b } keys %{ $vmlist->{ids} // {} };
+}
+
+PVE::Cluster::cfs_lock_domain('pve-meta-gc', 30, sub {
+    my @vmids = live_vmids();
+    die "refusing to gc with an empty vmlist\n" if !@vmids;
+    for my $vmid (@{ PVE::RS::Meta::gc_candidates(\@vmids) }) {
+        my $n = PVE::Cluster::cfs_lock_domain("pve-meta-$vmid", 30, sub {
+            my @fresh = live_vmids();
+            die "refusing to gc $vmid with an empty vmlist\n" if !@fresh;
+            return PVE::RS::Meta::gc_purge($vmid, \@fresh);
+        });
+        die $@ if $@;
+    }
+});
+die $@ if $@;
+```
+
+Three things in that shape are not optional. `cfs_update()` before every vmlist read: a
+fresh process that has not refreshed sees an empty vmlist. The **empty-vmlist guard**,
+because an empty vmlist means "every document is stale" — `gc_purge` refuses one too, so
+the guard sits on the destructive call and not only on its caller. And the explicit
+`die $@ if $@` after each `cfs_lock_domain`, which catches its callback's `die` and
+re-raises it by assigning `$@`: wrapping the call in an `eval {}` instead clears `$@` on
+the way out and swallows the failure silently.
+
+Nesting `"pve-meta-$vmid"` inside `'pve-meta-gc'` cannot deadlock: a writer only ever
+takes the per-document lock, never the GC one, so there is no lock-order cycle. The
+datacenter document is never a guest and is never removed.
+
+### Build identification
 
 * `version()` → the crate version string. Used by `test/basic.pl` and available to
   operators for checking which build a running pvedaemon/pveproxy has loaded.
@@ -128,9 +162,12 @@ authorization rules and `DESIGN.md` §5 for the endpoints). They die with
   `[{vmid, node, type, name, tags, read, write}]`, as a native array of hashes.
   `node`/`name`/`tags` come back only for guests the caller has `VM.Audit` on.
 * `api_get($id, $view, $format, $acl)` → `{ id, view, digest, data | text, parse_error? }`.
-  `data` is a native structure. A document that does not parse answers with the raw
-  `text` plus `parse_error` for `format=yaml` and a full reader, and **422** otherwise
-  (`DESIGN.md` §4).
+  `data` is a native structure. A document whose content could not be recovered — it does
+  not parse, it is above the read cap, or it parses to something that is not a mapping —
+  answers with the raw `text` plus `parse_error` for `format=yaml` and a full reader, and
+  **422** otherwise, including for everyone when the bytes were never read at all
+  (`DESIGN.md` §4). Such a document is only ever repairable by a root `replace` or a root
+  `DELETE`; anything narrower is a 400 that says so.
 * `api_put($id, $view, $format, $payload, $mode, $digest, $dry_run, $acl)` →
   `{ id, view, digest, touched }`. `$payload` is the one string crossing.
 * `api_delete($id, $view, $digest, $acl)` → the same shape. Removes the current document
@@ -154,7 +191,10 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   directly, sets `PVE_META_ROOT` and `PVE_META_OPERATOR_DIRS` to temp dirs, and exercises
   every export: the three snapshot hooks and their `die` behaviour; that the seven
   removed exports really are gone; `gc` (a stale document plus both its snapshot copies,
-  idempotence, never the datacenter document); the perlmod truthiness conversion in all
+  idempotence, never the datacenter document) and the two-phase `gc_candidates` +
+  `gc_purge` (a document written after the candidate snapshot survives the re-check, an
+  empty `$live` is refused, a vmid that really is gone is purged with its snapshots);
+  the perlmod truthiness conversion in all
   six shapes; the `api_*` contract with native hash arguments and native results
   (including that integers, floats, booleans and lists survive the boundary); tag
   selectors on and off, on `access`, on reads and on writes; a read-only scope; the root
@@ -162,7 +202,12 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   scopes never reaching the datacenter document; a malformed registration file being
   skipped without disturbing a valid one; `api_list_guests` gating node/name/tags on
   `VM.Audit` and `has` filtering on visible data; the one lint for both a full and a
-  scoped caller with no redaction; parse failures (yaml+`parse_error`, 422, root replace
-  and root DELETE as the two repairs); the read cap; and digest/dry_run/delete semantics.
+  scoped caller with no redaction; unrecoverable documents in all three of their causes
+  (yaml+`parse_error`, 422, root replace and root DELETE as the two repairs, nothing
+  narrower); the read cap, including that an oversized document is listed and polled
+  without being read and is repairable against the identity the listing reported; that a
+  write changing nothing rewrites nothing and moves neither `token` nor `changed`; that a
+  document another caller removed is 404-shaped rather than a 500; and
+  digest/dry_run/delete semantics.
 * The Debian package `libpve-meta-rs-perl` is the second binary package of the `pve-meta`
   source package; see `crates/pve-meta-perl/PACKAGING.md`.

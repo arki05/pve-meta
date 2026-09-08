@@ -8,10 +8,12 @@ use crate::error::Error;
 /// Returns `true` if `s` is a syntactically valid path/object-key segment:
 /// `^[A-Za-z0-9_@!-]+$`. `@` and `!` are allowed (in addition to the base
 /// `^[A-Za-z0-9_-]+$` object-key charset) specifically so a PVE authid
-/// (`user@realm`, or `user@realm!tokenid`) can be used verbatim as a key --
-/// e.g. the datacenter document's `scopes` map, keyed by authid
-/// (`docs/DESIGN.md` §2). Neither character is a path separator (those are
-/// `.` and `/`), so this does not introduce any addressing ambiguity.
+/// (`user@realm`, or `user@realm!tokenid`) can be used verbatim as a key.
+/// No key is reserved (`docs/DESIGN.md` §2), so an authid-shaped key is
+/// ordinary document data -- revision 4's reserved, authid-keyed `scopes`
+/// map is gone, and access-control data lives outside documents entirely
+/// (§3). Neither character is a path separator (those are `.` and `/`), so
+/// this does not introduce any addressing ambiguity.
 pub(crate) fn is_valid_segment(s: &str) -> bool {
     !s.is_empty()
         && s.chars()
@@ -177,8 +179,8 @@ mod tests {
     #[test]
     fn authid_shaped_segments_allowed() {
         // `@` and `!` are allowed so a PVE authid can be used as a segment
-        // (a datacenter `scopes` key, `docs/DESIGN.md` §2), and are not path
-        // separators (those are `.` and `/`).
+        // of an ordinary document key (`docs/DESIGN.md` §2: no key is
+        // reserved), and are not path separators (those are `.` and `/`).
         assert!(is_valid_segment("svc@pve!traefik"));
         assert!(is_valid_segment("scoped@pve"));
         let p = Path::parse("scopes/svc@pve!traefik").unwrap();

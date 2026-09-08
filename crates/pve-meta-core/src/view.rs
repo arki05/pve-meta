@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn replace_with_empty_object_stores_an_empty_map() {
-        // docs/DESIGN.md §8: `replace` with `{}` stores an empty map;
+        // docs/DESIGN.md §4: `replace` with `{}` stores an empty map;
         // deleting a view is `DELETE ?view=`.
         let mut doc = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
         let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();

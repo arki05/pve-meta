@@ -12,12 +12,27 @@
 //! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §4), and the digest
 //! precondition enforced here ([`MetaStore::put_raw`]'s `expected_digest`) is
 //! the single owner of the compare-and-swap rule.
+//!
+//! ## A file that is not there is never a 500
+//!
+//! Reads run unlocked, writes hold `pve-meta-<id>` and the GC holds
+//! `pve-meta-gc` — three disjoint lock domains, so no reader is ever excluded
+//! from a directory a `DELETE` or the GC is working on. Every operation here
+//! is therefore written so that a file disappearing between two syscalls is
+//! an ordinary outcome, never an `io::ErrorKind::NotFound` propagated as
+//! [`Error::Io`] (which the API layer maps to HTTP 500): a read reports
+//! [`Error::NotFound`], [`MetaStore::delete`] and [`MetaStore::delete_snapshot`]
+//! are idempotent and say whether they removed anything, and the directory
+//! walks ([`MetaStore::version`], [`MetaStore::stored_vmids`],
+//! [`MetaStore::list_snapshots`]) skip an entry that vanished under them.
+//! There is deliberately no `exists()`-then-act pair left in this file.
 
 use std::fmt;
 use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use sha2::{Digest as _, Sha256};
@@ -54,6 +69,13 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// band, and the slack means a document that was legally written can always
 /// still be read back (and therefore repaired) even if the write limit is
 /// lowered later.
+///
+/// The cap is applied by **every** path that would otherwise pull a file's
+/// bytes into memory, not just [`MetaStore::read`]: [`MetaStore::digest_of`],
+/// the compare-and-swap precondition and [`MetaStore::version`] all go
+/// through [`identify`], which substitutes a surrogate identity for a file
+/// above the cap rather than hashing megabytes on every 5 s poll and every
+/// listing.
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
@@ -167,6 +189,66 @@ pub fn is_valid_snapshot_name(name: &str) -> bool {
     snapshot_name_regex().is_match(name) && Format::from_ext(name).is_none()
 }
 
+/// `Ok(None)` for an `io::ErrorKind::NotFound`, `Ok(Some(v))` otherwise.
+///
+/// The one idiom for "the file was not there (any more)": every caller in
+/// this module treats that as an outcome rather than an error, because a
+/// concurrent `DELETE` or GC pass can remove a file between any two syscalls
+/// (see the module docs).
+fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The identity of one file's content: the SHA-256 of its bytes, or — for a
+/// file above [`MAX_READ_BYTES`] — a *surrogate* derived from its size and
+/// mtime, computed without reading it. `Ok(None)` if the file is not there.
+///
+/// Everything that needs a file's identity goes through here:
+/// [`MetaStore::digest_of`], the compare-and-swap precondition, and
+/// [`MetaStore::version`]'s per-file entry. One function means the digest a
+/// caller reads out of a `GET` is the same string the precondition of their
+/// next `PUT` is compared against — including for a file the store refuses
+/// to read, which is exactly the file that has to stay repairable.
+///
+/// The surrogate is only ever produced above the read cap, i.e. for a file
+/// nothing in this store could have written (`MAX_BYTES` is an eighth of the
+/// cap) and that pmxcfs itself cannot hold. Such a file's only legal write is
+/// a whole-file replace or a `DELETE`, so the surrogate has one job: change
+/// when the file changes. Two different oversized contents of identical
+/// length written within the same mtime tick would collide; the consequence
+/// is a compare-and-swap that accepts a replacement of unreadable content by
+/// a document, which is what the caller asked for either way.
+fn identify(path: &std::path::Path) -> Result<Option<String>> {
+    let Some(meta) = gone_is_none(fs::metadata(path))? else {
+        return Ok(None);
+    };
+    if meta.len() > MAX_READ_BYTES {
+        return Ok(Some(oversized_identity(meta.len(), meta.modified()?)));
+    }
+    Ok(gone_is_none(fs::read(path))?
+        .as_deref()
+        .map(digest::digest))
+}
+
+/// The surrogate identity of a file above [`MAX_READ_BYTES`]: a domain-separated
+/// SHA-256 over `(len, mtime)`. Deliberately shaped like a real digest — it is
+/// compared, never parsed.
+fn oversized_identity(len: u64, mtime: SystemTime) -> String {
+    let nanos = mtime
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut hasher = Sha256::new();
+    hasher.update(b"pve-meta:above-read-cap:");
+    hasher.update(len.to_le_bytes());
+    hasher.update(nanos.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// A process-wide counter making [`MetaStore::write_atomic`]'s temp file name
 /// unique per call (the hostname and pid alone are not: two writes from one
 /// pvedaemon worker would otherwise collide, and pmxcfs shares one directory
@@ -200,6 +282,13 @@ impl MetaStore {
     }
 
     /// Locates `id`'s document file, if it exists.
+    ///
+    /// **An observation, not a guarantee**, and deliberately no longer used by
+    /// anything in this module: `locate(id)` followed by an operation on the
+    /// path it returned is a check-then-act pair, and the racing loser of that
+    /// pair is what turned a concurrent `DELETE` into an
+    /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500 (see the module
+    /// docs). Call the operation itself and handle its outcome.
     pub fn locate(&self, id: DocId) -> Result<Option<PathBuf>> {
         let path = self.path_for(id);
         Ok(path.is_file().then_some(path))
@@ -266,18 +355,34 @@ impl MetaStore {
     /// whole document to repair it).
     ///
     /// # Errors
-    /// [`Error::TooLarge`] if the file exceeds [`MAX_READ_BYTES`], and I/O
-    /// errors. Never [`Error::Parse`] or [`Error::Lint`].
+    /// [`Error::NotFound`] if the file is not there — including the case
+    /// where it vanished between this function's own `stat` and its read,
+    /// which is a racing `DELETE` or GC pass and must answer 404, not 500
+    /// (see the module docs). [`Error::TooLarge`] if the file exceeds
+    /// [`MAX_READ_BYTES`], and I/O errors. [`Error::Parse`] only for bytes
+    /// that are not UTF-8 at all — a YAML syntax error is
+    /// [`Document::parse_error`], not an error. Never [`Error::Lint`].
     fn read_document(&self, id: DocId, path: &std::path::Path) -> Result<Document> {
-        let meta = fs::metadata(path)?;
+        let Some(meta) = gone_is_none(fs::metadata(path))? else {
+            return Err(Error::NotFound(id));
+        };
         // Checked from the metadata, before the bytes are read: the point is
         // not to pull a multi-megabyte file into memory (and hash it) on
         // every request that touches this document.
         Self::check_read_size(meta.len())?;
         let mtime = meta.modified()?;
-        let bytes = fs::read(path)?;
-        let raw = String::from_utf8(bytes.clone())
-            .map_err(|e| Error::Other(anyhow::anyhow!("{}: invalid utf-8: {e}", path.display())))?;
+        let Some(bytes) = gone_is_none(fs::read(path))? else {
+            return Err(Error::NotFound(id));
+        };
+        // Bytes that are not text have no `raw` to report and nothing to
+        // parse, so they are the one read failure that is not a per-document
+        // `parse_error`: [`Error::Parse`] (a 400/repairable condition), never
+        // [`Error::Other`] (a 500 on every GET of the document, and an
+        // unrepairable one, since every write reads before it plans).
+        let raw = String::from_utf8(bytes.clone()).map_err(|e| Error::Parse {
+            format: DISK_FORMAT,
+            msg: format!("invalid utf-8: {e}"),
+        })?;
         let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
             Ok(value) => (value, None),
             Err(e) => {
@@ -313,44 +418,43 @@ impl MetaStore {
     /// (`docs/DESIGN.md` §4).
     ///
     /// # Errors
-    /// [`Error::NotFound`] if it does not exist; [`Error::TooLarge`] if the
-    /// file is bigger than [`MAX_READ_BYTES`].
+    /// [`Error::NotFound`] if it does not exist (or ceases to, mid-read);
+    /// [`Error::TooLarge`] if the file is bigger than [`MAX_READ_BYTES`].
     pub fn read(&self, id: DocId) -> Result<Document> {
-        let path = self.locate(id)?.ok_or(Error::NotFound(id))?;
-        self.read_document(id, &path)
+        // Deliberately no `locate` first: an `is_file()` followed by a read
+        // is a check-then-act pair, and the racing loser of that pair used to
+        // surface as an `Error::Io` (HTTP 500) instead of a 404.
+        self.read_document(id, &self.path_for(id))
     }
 
-    /// `id`'s current content digest without parsing (or even keeping) the
-    /// document, or `None` if it does not exist.
+    /// `id`'s current content identity without parsing (or even keeping) the
+    /// document, or `None` if it does not exist. See [`identify`].
     ///
     /// This is what lets a write repair a document [`MetaStore::read`]
     /// refuses to read — one above [`MAX_READ_BYTES`] — while still carrying
     /// a compare-and-swap precondition: the caller needs the digest, and the
     /// digest is the one thing about such a file that is cheap and safe to
-    /// compute.
+    /// compute. Above the read cap it is a surrogate over `(len, mtime)`, so
+    /// this never reads a file the store refuses to read.
     pub fn digest_of(&self, id: DocId) -> Result<Option<String>> {
-        match fs::read(self.path_for(id)) {
-            Ok(bytes) => Ok(Some(digest::digest(&bytes))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        identify(&self.path_for(id))
     }
 
     /// The digest precondition, enforced in exactly one place: `None`
     /// means "no precondition";
     /// `Some("")` matches a *missing* document (that is the digest
-    /// `GET` reports for one, `docs/DESIGN.md` §2, so the documented
+    /// `GET` reports for one, `docs/DESIGN.md` §5, so the documented
     /// GET-then-PUT create flow works); any other `Some(_)` must equal the
     /// current file's digest.
-    fn check_digest(current: Option<&[u8]>, expected: Option<&str>) -> Result<()> {
+    fn check_digest(current: Option<&str>, expected: Option<&str>) -> Result<()> {
         let Some(expected) = expected else {
             return Ok(());
         };
-        let actual = current.map(digest::digest).unwrap_or_default();
+        let actual = current.unwrap_or_default();
         if actual != expected {
             return Err(Error::DigestMismatch {
                 expected: expected.to_string(),
-                actual,
+                actual: actual.to_string(),
             });
         }
         Ok(())
@@ -368,12 +472,7 @@ impl MetaStore {
         if expected.is_none() {
             return Ok(());
         }
-        let current = match fs::read(self.path_for(id)) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        Self::check_digest(current.as_deref(), expected)
+        Self::check_digest(self.digest_of(id)?.as_deref(), expected)
     }
 
     /// Replaces `id`'s document with `text` verbatim (only normalized to end
@@ -396,33 +495,24 @@ impl MetaStore {
         expected_digest: Option<&str>,
     ) -> Result<PutResult> {
         let path = self.path_for(id);
-        let existing = match fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        Self::check_digest(existing.as_deref(), expected_digest)?;
+        Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
 
         // The *old* content is only read to diff against, so it is parsed
         // leniently: an out-of-band edit that broke it must not stop an
         // administrator from writing the repair (`docs/DESIGN.md` §4).
         // That includes a *syntax* error: it is the last thing that would
         // otherwise stand between a hand-edited document and its repair.
-        // Unparseable old content diffs as the empty
-        // document: the repair reports everything it writes as newly set,
-        // which is exactly true of a document that had no readable structure.
-        let old_value = match &existing {
-            // Above the read cap the old content is not parsed at all: the
-            // point of the cap is that nothing pulls a multi-megabyte
-            // document through the YAML parser, and this is the path that
-            // replaces such a file.
-            Some(bytes) if bytes.len() as u64 <= MAX_READ_BYTES => {
-                let old_raw = String::from_utf8(bytes.clone())
-                    .map_err(|e| Error::Other(anyhow::anyhow!("invalid utf-8: {e}")))?;
-                format::parse_raw(DISK_FORMAT, &old_raw)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+        // Unparseable old content — and content that vanished under us, and
+        // content above the read cap, which is never pulled through the YAML
+        // parser — diffs as the empty document: the repair reports everything
+        // it writes as newly set, which is exactly true of a document that had
+        // no readable structure.
+        let old_value = match self.read_document(id, &path) {
+            Ok(doc) => doc.value,
+            Err(Error::NotFound(_) | Error::TooLarge { .. } | Error::Parse { .. }) => {
+                Value::Object(serde_json::Map::new())
             }
-            _ => Value::Object(serde_json::Map::new()),
+            Err(e) => return Err(e),
         };
 
         let normalized = normalize_trailing_newline(text);
@@ -435,7 +525,13 @@ impl MetaStore {
 
         let touched = patch::diff(&old_value, &new_value);
         let dig = digest::digest(normalized.as_bytes());
-        let mtime = fs::metadata(&path)?.modified()?;
+        // The file we just wrote can already be gone again (a racing DELETE
+        // or GC pass): report the write's own moment rather than 500-ing on
+        // a `stat` of something that is no longer there.
+        let mtime = match gone_is_none(fs::metadata(&path))? {
+            Some(meta) => meta.modified()?,
+            None => SystemTime::now(),
+        };
         Ok(PutResult {
             document: Document {
                 id,
@@ -455,12 +551,14 @@ impl MetaStore {
     /// copies are owned by the snapshot hooks (`docs/DESIGN.md` §6) and are
     /// removed by [`MetaStore::purge`], never by this.
     ///
-    /// # Errors
-    /// [`Error::NotFound`] if it does not exist.
-    pub fn delete(&self, id: DocId) -> Result<()> {
-        let path = self.locate(id)?.ok_or(Error::NotFound(id))?;
-        fs::remove_file(&path)?;
-        Ok(())
+    /// **Idempotent**: returns `Ok(false)` if there was nothing to remove.
+    /// Deleting a document is a request for it to be gone, and it being
+    /// already gone — because a concurrent `DELETE` or the GC won the race —
+    /// is that request satisfied, not a failure. The old `locate`-then-remove
+    /// pair turned the loser of that race into an
+    /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500.
+    pub fn delete(&self, id: DocId) -> Result<bool> {
+        Ok(gone_is_none(fs::remove_file(self.path_for(id)))?.is_some())
     }
 
     /// Every vmid the store holds *any* file for — a live document, a
@@ -479,7 +577,12 @@ impl MetaStore {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') || !entry.file_type()?.is_file() {
+            // An entry that vanished between the `readdir` and the `stat` is
+            // simply not there to collect.
+            let Some(file_type) = gone_is_none(entry.file_type())? else {
+                continue;
+            };
+            if name.starts_with('.') || !file_type.is_file() {
                 continue;
             }
             // `<vmid>.yaml` or `<vmid>.<snapname>.yaml`: the vmid is the
@@ -536,10 +639,9 @@ impl MetaStore {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let Some(path) = self.locate(DocId::Guest(vmid))? else {
+        let Some(bytes) = gone_is_none(fs::read(self.path_for(DocId::Guest(vmid))))? else {
             return Ok(false);
         };
-        let bytes = fs::read(&path)?;
         self.write_atomic(&self.snapshot_path(vmid, name), &bytes)?;
         Ok(true)
     }
@@ -555,32 +657,26 @@ impl MetaStore {
         }
         let snap = self.snapshot_path(vmid, name);
         let target = self.path_for(DocId::Guest(vmid));
-        if snap.is_file() {
-            let bytes = fs::read(&snap)?;
+        if let Some(bytes) = gone_is_none(fs::read(&snap))? {
             self.write_atomic(&target, &bytes)?;
             Ok(RollbackOutcome::Restored)
-        } else if target.is_file() {
-            fs::remove_file(&target)?;
+        } else if gone_is_none(fs::remove_file(&target))?.is_some() {
             Ok(RollbackOutcome::RemovedNoSnapshot)
         } else {
             Ok(RollbackOutcome::NoOp)
         }
     }
 
-    /// Deletes a guest's snapshot. Idempotent: does nothing if it does not
-    /// exist.
+    /// Deletes a guest's snapshot. Idempotent: returns `Ok(false)` if there
+    /// was nothing to remove.
     ///
     /// # Errors
     /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
-    pub fn delete_snapshot(&self, vmid: u32, name: &str) -> Result<()> {
+    pub fn delete_snapshot(&self, vmid: u32, name: &str) -> Result<bool> {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let path = self.snapshot_path(vmid, name);
-        if path.is_file() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
+        Ok(gone_is_none(fs::remove_file(self.snapshot_path(vmid, name)))?.is_some())
     }
 
     /// Removes `vmid`'s document **and every snapshot copy** — the guest is
@@ -591,13 +687,13 @@ impl MetaStore {
     /// not an error.
     pub fn purge(&self, vmid: u32) -> Result<usize> {
         let mut removed = 0;
-        if self.locate(DocId::Guest(vmid))?.is_some() {
-            self.delete(DocId::Guest(vmid))?;
+        if self.delete(DocId::Guest(vmid))? {
             removed += 1;
         }
         for name in self.list_snapshots(vmid)? {
-            self.delete_snapshot(vmid, &name)?;
-            removed += 1;
+            if self.delete_snapshot(vmid, &name)? {
+                removed += 1;
+            }
         }
         Ok(removed)
     }
@@ -607,11 +703,21 @@ impl MetaStore {
     /// otherwise (including across mere reads).
     ///
     /// The token is a SHA-256 over the sorted list of `(file name, content
-    /// digest)`, hashed from the files' actual bytes on every call. There is
-    /// deliberately no `(mtime, len)` cache: the bindings build a fresh
+    /// identity)`, hashed from the files' actual bytes on every call. There
+    /// is deliberately no `(mtime, len)` cache: the bindings build a fresh
     /// `MetaStore` per request (so it could never hit), and pmxcfs's mtime
     /// granularity cannot distinguish two same-length writes within one tick
     /// (so it would be unsound if it did). Documents are tiny.
+    ///
+    /// "Tiny" is what [`MAX_READ_BYTES`] enforces, and this poll is the
+    /// reason it has to: a single multi-megabyte file dropped into
+    /// `/etc/pve/meta` out of band would otherwise be read and SHA-256'd by
+    /// every open UI's 5 s poll, forever. Above the cap the file contributes
+    /// [`identify`]'s surrogate instead, which still changes when it does.
+    ///
+    /// An entry that disappears mid-walk is skipped: the store is not locked
+    /// against a concurrent `DELETE` or GC pass, and a poll must not 500
+    /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
         let mut latest: Option<SystemTime> = None;
@@ -619,11 +725,19 @@ impl MetaStore {
             for entry in fs::read_dir(&self.root)? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') || !entry.file_type()?.is_file() {
+                let Some(file_type) = gone_is_none(entry.file_type())? else {
+                    continue;
+                };
+                if name.starts_with('.') || !file_type.is_file() {
                     continue;
                 }
-                let mtime = entry.metadata()?.modified()?;
-                let dig = digest::digest(&fs::read(entry.path())?);
+                let Some(meta) = gone_is_none(entry.metadata())? else {
+                    continue;
+                };
+                let mtime = meta.modified()?;
+                let Some(dig) = identify(&entry.path())? else {
+                    continue;
+                };
                 entries.push((name, dig));
                 latest = Some(match latest {
                     Some(t) if t >= mtime => t,
