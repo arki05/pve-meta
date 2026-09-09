@@ -183,6 +183,33 @@ PVE.meta.Utils = {
         }
     },
 
+    // The namespace governing `path`: the one whose prefix is the LONGEST that covers
+    // it. Most-specific wins and schemas never merge (DESIGN section 3.1).
+    //
+    // The single implementation of that rule on this side. It had three call sites --
+    // the row builder, the linter and the hover index -- and lived in two of them; the
+    // third simply did not prune, so a parent namespace's `properties` reached into a
+    // child namespace's subtree and set its row kind. One function, three callers.
+    //
+    // `namespaces` must be sorted longest-prefix-first, so this is the first match.
+    governing: function (path, namespaces) {
+        let list = namespaces || [];
+        for (let i = 0; i < list.length; i++) {
+            if (PVE.meta.Utils.covers(list[i].prefix, path)) {
+                return list[i];
+            }
+        }
+        return null;
+    },
+
+    // Longest prefix first, then by name: the order `governing` relies on.
+    bySpecificity: function (namespaces) {
+        return (namespaces || []).slice().sort(function (a, b) {
+            let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
+            return d !== 0 ? d : String(a.prefix).localeCompare(String(b.prefix));
+        });
+    },
+
     // Segment count of a dotted prefix -- how "specific" it is. `''` is 0.
     depth: function (prefix) {
         let p = String(prefix || '');
@@ -319,22 +346,9 @@ PVE.meta.Lint = {
     // The namespaces that carry a schema, longest prefix first. Shape comes from
     // namespaces, never from grants (DESIGN section 3.1).
     applicable: function (namespaces) {
-        return (namespaces || [])
-            .filter((ns) => ns && ns.schema && ns.prefix)
-            .map((ns) => [ns.prefix, ns.schema])
-            .sort((a, b) => PVE.meta.Utils.depth(b[0]) - PVE.meta.Utils.depth(a[0]));
-    },
-
-    // The entry of `applicable` governing `path`: the longest prefix covering it.
-    // `applicable` is sorted longest-first, so this is the first match.
-    governing: function (path, applicable) {
-        let list = applicable || [];
-        for (let i = 0; i < list.length; i++) {
-            if (PVE.meta.Utils.covers(list[i][0], path)) {
-                return list[i];
-            }
-        }
-        return null;
+        return PVE.meta.Utils.bySpecificity(
+            (namespaces || []).filter((ns) => ns && ns.schema && ns.prefix),
+        );
     },
 
     valueAt: function (data, path) {
@@ -355,11 +369,10 @@ PVE.meta.Lint = {
     findings: function (data, applicable) {
         let out = [];
         let list = applicable || [];
-        list.forEach(function (entry) {
-            let [prefix, schema] = entry;
-            let value = PVE.meta.Lint.valueAt(data, prefix);
+        list.forEach(function (ns) {
+            let value = PVE.meta.Lint.valueAt(data, ns.prefix);
             if (value !== undefined) {
-                PVE.meta.Lint.walk(value, schema, prefix, out, list, entry);
+                PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, list, ns);
             }
         });
         out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -382,7 +395,7 @@ PVE.meta.Lint = {
         Object.keys(value).forEach(function (key) {
             if (Object.prototype.hasOwnProperty.call(props, key)) {
                 let child = path ? path + '.' + key : key;
-                if (owner && PVE.meta.Lint.governing(child, list) !== owner) {
+                if (owner && PVE.meta.Utils.governing(child, list) !== owner) {
                     return; // a more specific namespace owns this subtree
                 }
                 PVE.meta.Lint.walk(value[key], props[key], child, out, list, owner);
@@ -526,7 +539,7 @@ PVE.meta.Lint = {
         let out = Object.create(null);
         let list = applicable || [];
         let collect = function (schema, path, owner) {
-            if (owner && PVE.meta.Lint.governing(path, list) !== owner) {
+            if (owner && PVE.meta.Utils.governing(path, list) !== owner) {
                 return;
             }
             out[path] = schema;
@@ -538,7 +551,7 @@ PVE.meta.Lint = {
                 collect(props[k], path ? path + '.' + k : k, owner),
             );
         };
-        list.forEach((entry) => collect(entry[1], entry[0], entry));
+        list.forEach((ns) => collect(ns.schema, ns.prefix, ns));
         return out;
     },
 
@@ -1512,12 +1525,9 @@ Ext.define('PVE.meta.TreePanel', {
             url: '/meta/namespaces',
             success: function (response) {
                 // Served most-specific first (DESIGN section 3.1) -- the order
-                // `governingNamespace` relies on. Sorted again here so the UI does not
+                // `Utils.governing` relies on. Sorted again here so the UI does not
                 // depend on the server's ordering for correctness.
-                me.namespaces = (response.result.data || []).slice().sort(function (a, b) {
-                    let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
-                    return d !== 0 ? d : String(a.prefix).localeCompare(String(b.prefix));
-                });
+                me.namespaces = PVE.meta.Utils.bySpecificity(response.result.data || []);
                 next();
             },
             failure: function () {
@@ -1679,21 +1689,6 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    // The namespace governing `path`: the longest prefix that covers it. Most-specific
-    // wins and schemas never merge (DESIGN section 3.1) -- with both `homelab` and
-    // `homelab.docker` declared, `homelab.docker.compose` is governed by the child
-    // alone. `applicableNamespaces()` is sorted longest-first, so this is the first
-    // match.
-    governingNamespace: function (path, applicable) {
-        let list = applicable || this.applicableNamespaces();
-        for (let i = 0; i < list.length; i++) {
-            if (PVE.meta.Utils.covers(list[i].prefix, path)) {
-                return list[i];
-            }
-        }
-        return null;
-    },
-
     // The grant entries that reach this guest. Grants decide *access*, and unlike
     // namespaces they accumulate by containment: a grant on `homelab` covers
     // `homelab.docker` (DESIGN section 3.2).
@@ -1804,7 +1799,13 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // A grammar is a PVE::JSONSchema object rooted at its scope's prefix.
-    addGrammar: function (root, prefix, schema) {
+    // `namespaces`/`owner`, when given, enforce most-specific-wins: the walk stops
+    // where a *different* namespace governs, so a parent's `properties` never reach
+    // into a child namespace's subtree and rewrite its row kind. The same rule
+    // `Lint.findings` and `Lint.schemaIndex` apply, through the same
+    // `Utils.governing` -- it lived in two of the three and this was the one that
+    // silently merged (DESIGN section 3.1).
+    addGrammar: function (root, prefix, schema, namespaces, owner) {
         let me = this;
         let U = PVE.meta.Utils;
         let entry = root;
@@ -1820,8 +1821,12 @@ Ext.define('PVE.meta.TreePanel', {
             }
             node.kind = node.kind || 'map';
             Object.keys(sch.properties).forEach(function (key) {
+                let childPath = U.joinPath(node.path, key);
+                if (owner && U.governing(childPath, namespaces) !== owner) {
+                    return; // a more specific namespace owns this subtree
+                }
                 let ps = sch.properties[key] || {};
-                let child = me.entry(node, key, U.joinPath(node.path, key));
+                let child = me.entry(node, key, childPath);
                 // The comment key stays the Description column; the grammar's own
                 // description is the tooltip (DESIGN §8), so they are two fields.
                 child.grammarDescription = child.grammarDescription || ps.description;
@@ -1876,10 +1881,8 @@ Ext.define('PVE.meta.TreePanel', {
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
         namespaces.forEach(function (ns) {
-            // A namespace shadowed at its own prefix by a more specific one contributes
-            // nothing there; the child's schema governs that subtree entirely.
-            if (ns.schema && me.governingNamespace(ns.prefix, namespaces) === ns) {
-                me.addGrammar(root, ns.prefix, ns.schema);
+            if (ns.schema) {
+                me.addGrammar(root, ns.prefix, ns.schema, namespaces, ns);
             }
         });
 

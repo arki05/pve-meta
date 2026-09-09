@@ -401,7 +401,6 @@ const panel = {
     'schemaKind',
     'applicableNamespaces',
     'applicableGrants',
-    'governingNamespace',
     'resolvedScopeApplies',
     'accessFor',
     'accessSummary',
@@ -487,10 +486,11 @@ eq(
 
 console.log('\n--- grammar findings for the text editor (mirrors ui/src/lint.rs) ---');
 const L = ctx.PVE.meta.Lint;
-const GRAMMAR = [
-    [
-        'traefik',
-        {
+// Namespace objects, the same shape GET /meta/namespaces returns.
+const GRAMMAR = L.applicable([
+    {
+        prefix: 'traefik',
+        schema: {
             type: 'object',
             properties: {
                 spec: {
@@ -504,8 +504,8 @@ const GRAMMAR = [
                 },
             },
         },
-    ],
-];
+    },
+]);
 
 eq('a clean document has no findings',
     L.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } },
@@ -528,8 +528,8 @@ eq('but 2 is', L.findings({ traefik: { spec: { enabled: 2 } } }, GRAMMAR).length
 eq('keys no grammar describes are left alone',
     L.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }, GRAMMAR), []);
 eq('a prefix with nothing under it contributes nothing', L.findings({}, GRAMMAR), []);
-eq('a scope with no grammar contributes nothing',
-    L.applicable([{ prefix: 'netbird', mode: 'rw' }]), []);
+eq('a namespace with no schema contributes nothing',
+    L.applicable([{ prefix: 'netbird' }]), []);
 
 const YAML = [
     'traefik:',
@@ -608,13 +608,15 @@ const NESTED = L.applicable([
         schema: { type: 'object', properties: { compose: { type: 'string' } } },
     },
 ]);
-eq('applicable sorts longest prefix first', NESTED.map((e) => e[0]), ['homelab.docker', 'homelab']);
+eq('applicable sorts longest prefix first', NESTED.map((n) => n.prefix), ['homelab.docker', 'homelab']);
+// One implementation of the rule, in Utils, shared by the row builder, the linter
+// and the hover index.
 eq('governing picks the child for the child subtree',
-    L.governing('homelab.docker.compose', NESTED)[0], 'homelab.docker');
-eq('governing picks the parent elsewhere', L.governing('homelab.notes', NESTED)[0], 'homelab');
+    U.governing('homelab.docker.compose', NESTED).prefix, 'homelab.docker');
+eq('governing picks the parent elsewhere', U.governing('homelab.notes', NESTED).prefix, 'homelab');
 eq('governing picks the child for the boundary itself',
-    L.governing('homelab.docker', NESTED)[0], 'homelab.docker');
-eq('governing returns null off-namespace', L.governing('unrelated.x', NESTED), null);
+    U.governing('homelab.docker', NESTED).prefix, 'homelab.docker');
+eq('governing returns null off-namespace', U.governing('unrelated.x', NESTED), null);
 
 // The parent declares `docker: string` and the document has a map there. That is a
 // finding only if the parent is allowed to reach into the child -- it is not.
@@ -639,8 +641,44 @@ eq('hover at the boundary comes from the child',
 eq('hover below the boundary is the child\'s', NESTED_IDX['homelab.docker.compose'].type, 'string');
 eq('hover elsewhere is the parent\'s', NESTED_IDX['homelab.notes'].type, 'string');
 
+console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
+{
+    const nsPanel = Object.assign({}, panel);
+    nsPanel.namespaces = [
+        {
+            prefix: 'homelab.docker',
+            selector: { all: true },
+            schema: { type: 'object', properties: { compose: { type: 'string' } } },
+        },
+        {
+            prefix: 'homelab',
+            selector: { all: true },
+            // The parent has an opinion about `docker` and must not get one: the child
+            // namespace governs that subtree entirely (DESIGN section 3.1).
+            schema: {
+                type: 'object',
+                properties: {
+                    notes: { type: 'string' },
+                    docker: { type: 'string', description: 'the parent should not win here' },
+                },
+            },
+        },
+    ];
+    const nsList = nsPanel.applicableNamespaces.call(nsPanel);
+    const r = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    nsPanel.addData.call(nsPanel, r, { homelab: { docker: { compose: 'x' } } });
+    // Exactly what buildTree does: no call-site guard any more, the walk prunes itself.
+    nsList.forEach((ns) =>
+        ns.schema ? nsPanel.addGrammar.call(nsPanel, r, ns.prefix, ns.schema, nsList, ns) : null,
+    );
+    const dockerRow = r.children.homelab.children.docker;
+    eq('the child governs the boundary row kind', dockerRow.kind, 'map');
+    eq('the parent does not describe the child row', dockerRow.grammarDescription, undefined);
+    eq('the child declares its own keys', Object.keys(dockerRow.children).sort(), ['compose']);
+    eq('the parent still declares its own', r.children.homelab.children.notes.kind, 'string');
+}
+
 console.log('\n--- round trip: a view toggle must not invent changes ---');
-const U2 = ctx.PVE.meta.Utils;
 // serde_yaml and js-yaml lay the same document out differently, so re-dumping on the
 // way back from JSON made a *presentation* toggle report unsaved changes.
 const SERVER_YAML = [
@@ -652,17 +690,17 @@ const SERVER_YAML = [
     '  - rule: Host(`a`)',
     '',
 ].join('\n');
-const parsed = U2.yamlLoad(SERVER_YAML);
+const parsed = U.yamlLoad(SERVER_YAML);
 eq('a js-yaml redump differs from the server text (the bug\'s premise)',
-    U2.yamlDump(parsed) !== SERVER_YAML, true);
+    U.yamlDump(parsed) !== SERVER_YAML, true);
 eq('sameDocument sees through the layout difference',
-    U2.sameDocument(parsed, SERVER_YAML), true);
+    U.sameDocument(parsed, SERVER_YAML), true);
 eq('sameDocument says no when a value really changed',
-    U2.sameDocument({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
+    U.sameDocument({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
 eq('sameDocument says no when only the key order changed (order is data)',
-    U2.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
+    U.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
 eq('sameDocument on unparseable text is not a match',
-    U2.sameDocument({}, 'a:\n  - [\n'), false);
+    U.sameDocument({}, 'a:\n  - [\n'), false);
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
