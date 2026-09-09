@@ -11,7 +11,7 @@ use tempfile::tempdir;
 /// directories under `<root>/registry/` rather than the real
 /// `/usr/share/pve-meta` and `/etc/pve/meta.d` that `MetaStore::new` would
 /// resolve. Without that a run of this suite on an actual PVE node would read
-/// the live cluster's namespaces (and, worse, write to them).
+/// the live cluster's prefixes (and, worse, write to them).
 ///
 /// They are plain subdirectories of the root on purpose: the root walks skip
 /// anything that is not a file, so their presence changes nothing the other
@@ -20,26 +20,26 @@ fn store() -> (tempfile::TempDir, MetaStore) {
     let dir = tempdir().unwrap();
     let store = MetaStore::with_registry_dirs(
         dir.path(),
-        vec![packaged_namespace_dir(dir.path()), cluster_namespace_dir(dir.path())],
+        vec![packaged_prefix_dir(dir.path()), cluster_prefix_dir(dir.path())],
         vec![cluster_grant_dir(dir.path())],
     );
     (dir, store)
 }
 
-fn packaged_namespace_dir(root: &std::path::Path) -> std::path::PathBuf {
-    root.join("registry/namespaces-packaged")
+fn packaged_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("registry/prefixes-packaged")
 }
 
-fn cluster_namespace_dir(root: &std::path::Path) -> std::path::PathBuf {
-    root.join("registry/namespaces-cluster")
+fn cluster_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("registry/prefixes-cluster")
 }
 
 fn cluster_grant_dir(root: &std::path::Path) -> std::path::PathBuf {
     root.join("registry/grants")
 }
 
-fn namespace(name: &str) -> DocId {
-    DocId::Registry(RegistryKind::Namespace, name.to_string())
+fn prefix(name: &str) -> DocId {
+    DocId::Registry(RegistryKind::PrefixDef, name.to_string())
 }
 
 #[test]
@@ -642,30 +642,30 @@ fn too_large_document_is_rejected() {
 fn a_registry_document_is_written_to_its_own_directory_not_the_root() {
     let (dir, store) = store();
     store
-        .put_raw(&namespace("homelab"), "description: Home\n", None)
+        .put_raw(&prefix("homelab"), "description: Home\n", None)
         .unwrap();
 
-    assert!(cluster_namespace_dir(dir.path()).join("homelab.yaml").is_file());
+    assert!(cluster_prefix_dir(dir.path()).join("homelab.yaml").is_file());
     assert!(!dir.path().join("homelab.yaml").exists());
-    assert_eq!(store.read(&namespace("homelab")).unwrap().raw, "description: Home\n");
+    assert_eq!(store.read(&prefix("homelab")).unwrap().raw, "description: Home\n");
 }
 
 #[test]
 fn a_registry_write_creates_the_override_and_leaves_the_packaged_file_alone() {
     let (dir, store) = store();
-    let packaged = packaged_namespace_dir(dir.path());
+    let packaged = packaged_prefix_dir(dir.path());
     std::fs::create_dir_all(&packaged).unwrap();
     std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
 
     // A read sees the packaged file, and its digest is what a write must carry.
-    let read = store.read(&namespace("traefik")).unwrap();
+    let read = store.read(&prefix("traefik")).unwrap();
     assert_eq!(read.raw, "description: packaged\n");
     assert_eq!(read.path, packaged.join("traefik.yaml"));
 
     // The compare-and-swap is against what was read, so overriding a packaged
     // file is an ordinary write and not a spurious conflict.
     store
-        .put_raw(&namespace("traefik"), "description: cluster\n", Some(&read.digest))
+        .put_raw(&prefix("traefik"), "description: cluster\n", Some(&read.digest))
         .unwrap();
 
     assert_eq!(
@@ -673,50 +673,50 @@ fn a_registry_write_creates_the_override_and_leaves_the_packaged_file_alone() {
         "description: packaged\n",
         "the packaged file belongs to its .deb and must not be touched",
     );
-    let after = store.read(&namespace("traefik")).unwrap();
+    let after = store.read(&prefix("traefik")).unwrap();
     assert_eq!(after.raw, "description: cluster\n");
-    assert_eq!(after.path, cluster_namespace_dir(dir.path()).join("traefik.yaml"));
+    assert_eq!(after.path, cluster_prefix_dir(dir.path()).join("traefik.yaml"));
 }
 
 #[test]
 fn deleting_a_registry_override_falls_back_to_the_packaged_file() {
     let (dir, store) = store();
-    let packaged = packaged_namespace_dir(dir.path());
+    let packaged = packaged_prefix_dir(dir.path());
     std::fs::create_dir_all(&packaged).unwrap();
     std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
     store
-        .put_raw(&namespace("traefik"), "description: cluster\n", None)
+        .put_raw(&prefix("traefik"), "description: cluster\n", None)
         .unwrap();
 
-    assert!(store.delete(&namespace("traefik")).unwrap());
+    assert!(store.delete(&prefix("traefik")).unwrap());
     assert_eq!(
-        store.read(&namespace("traefik")).unwrap().raw,
+        store.read(&prefix("traefik")).unwrap().raw,
         "description: packaged\n",
-        "deleting the override reverts to the packaged namespace",
+        "deleting the override reverts to the packaged prefix",
     );
 
     // And there is nothing left of ours to delete: the packaged file stays.
-    assert!(!store.delete(&namespace("traefik")).unwrap());
+    assert!(!store.delete(&prefix("traefik")).unwrap());
     assert!(packaged.join("traefik.yaml").is_file());
 }
 
 #[test]
 fn a_missing_registry_document_is_not_found() {
     let (_dir, store) = store();
-    let err = store.read(&namespace("nope")).unwrap_err();
-    assert!(matches!(err, Error::NotFound(DocId::Registry(RegistryKind::Namespace, ref n)) if n == "nope"));
-    assert_eq!(store.digest_of(&namespace("nope")).unwrap(), None);
+    let err = store.read(&prefix("nope")).unwrap_err();
+    assert!(matches!(err, Error::NotFound(DocId::Registry(RegistryKind::PrefixDef, ref n)) if n == "nope"));
+    assert_eq!(store.digest_of(&prefix("nope")).unwrap(), None);
 }
 
 #[test]
 fn version_lists_a_shadowed_registry_document_once_and_still_notices_it() {
     let (dir, store) = store();
-    let packaged = packaged_namespace_dir(dir.path());
+    let packaged = packaged_prefix_dir(dir.path());
     std::fs::create_dir_all(&packaged).unwrap();
     std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let cluster = store
-        .put_raw(&namespace("traefik"), "description: cluster\n", None)
+        .put_raw(&prefix("traefik"), "description: cluster\n", None)
         .unwrap()
         .document
         .digest;
@@ -729,7 +729,7 @@ fn version_lists_a_shadowed_registry_document_once_and_still_notices_it() {
         .collect();
     assert_eq!(
         registry,
-        vec![&(namespace("traefik"), cluster)],
+        vec![&(prefix("traefik"), cluster)],
         "one document, with the digest of the file the loader would read",
     );
 
@@ -743,13 +743,13 @@ fn version_lists_a_shadowed_registry_document_once_and_still_notices_it() {
 #[test]
 fn a_registry_write_leaves_no_temp_files_behind_in_its_own_directory() {
     let (dir, store) = store();
-    store.put_raw(&namespace("homelab"), "description: a\n", None).unwrap();
-    let d = store.read(&namespace("homelab")).unwrap().digest;
+    store.put_raw(&prefix("homelab"), "description: a\n", None).unwrap();
+    let d = store.read(&prefix("homelab")).unwrap().digest;
     store
-        .put_raw(&namespace("homelab"), "description: b\n", Some(&d))
+        .put_raw(&prefix("homelab"), "description: b\n", Some(&d))
         .unwrap();
 
-    let leftovers: Vec<String> = std::fs::read_dir(cluster_namespace_dir(dir.path()))
+    let leftovers: Vec<String> = std::fs::read_dir(cluster_prefix_dir(dir.path()))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with('.'))
@@ -758,15 +758,15 @@ fn a_registry_write_leaves_no_temp_files_behind_in_its_own_directory() {
 }
 
 #[test]
-fn a_nested_namespace_is_a_dotted_file_name_and_still_one_document() {
+fn a_nested_prefix_is_a_dotted_file_name_and_still_one_document() {
     let (dir, store) = store();
     // `homelab.docker.yaml` declares the prefix `homelab.docker` -- the file
     // name *is* the prefix, so dots in it are ordinary.
-    let nested = DocId::Registry(RegistryKind::Namespace, "homelab.docker".to_string());
+    let nested = DocId::Registry(RegistryKind::PrefixDef, "homelab.docker".to_string());
     let written = store.put_raw(&nested, "selector: {all: true}\n", None).unwrap();
     assert_eq!(
         written.document.path,
-        cluster_namespace_dir(dir.path()).join("homelab.docker.yaml"),
+        cluster_prefix_dir(dir.path()).join("homelab.docker.yaml"),
     );
 
     // And the version walk maps that file name back to the same id, which is
@@ -775,7 +775,7 @@ fn a_nested_namespace_is_a_dotted_file_name_and_still_one_document() {
     let v = store.version().unwrap();
     assert!(
         v.documents.iter().any(|(id, _)| *id == nested),
-        "the nested namespace is missing from {:?}",
+        "the nested prefix is missing from {:?}",
         v.documents,
     );
 }

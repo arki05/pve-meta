@@ -52,7 +52,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Grant, Namespace};
+use crate::registry::{self, Grant, PrefixDef};
 use crate::scopes::{Grants, Scope};
 use crate::store::{DocId, MetaStore, RegistryKind, DISK_FORMAT};
 use crate::view;
@@ -156,12 +156,12 @@ pub fn grants(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> Grants 
 }
 
 /// Parses an API `id` into a [`DocId`]: a vmid, the literal `"datacenter"`, or
-/// a registry document as `namespaces/<name>` / `grants/<name>`.
+/// a registry document as `prefixes/<name>` / `grants/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
 /// [`registry::is_valid_file_name`]: dotted, because **the file name is the
-/// prefix** and `homelab.docker` is a legitimate namespace, but never a slash,
+/// prefix** and `homelab.docker` is a legitimate prefix, but never a slash,
 /// a leading dot or a `..`, so an id can never address a file outside its
 /// directory.
 pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
@@ -170,11 +170,11 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     }
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
-            "namespaces" => RegistryKind::Namespace,
+            "prefixes" => RegistryKind::PrefixDef,
             "grants" => RegistryKind::Grant,
             other => {
                 return Err(bad_request(format!(
-                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'namespaces' or 'grants')"
+                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'prefixes' or 'grants')"
                 )))
             }
         };
@@ -187,7 +187,7 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'datacenter',              'namespaces/<name>' or 'grants/<name>'"
+            "invalid id '{id}': must be a vmid, 'datacenter',              'prefixes/<name>' or 'grants/<name>'"
         ))
     })
 }
@@ -463,8 +463,8 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
 }
 
 /// `GET /meta/schemas`: the two registry file formats as schemas
-/// (`crate::metaschema`), so the editor can show a namespace or grant file as a
-/// typed tree the way a namespace's own schema does for a guest document.
+/// (`crate::metaschema`), so the editor can show a prefix or grant file as a
+/// typed tree the way a prefix's own schema does for a guest document.
 pub fn schemas() -> Value {
     crate::metaschema::schemas()
 }
@@ -488,10 +488,10 @@ pub fn grants_list(grant_files: &[Grant]) -> Vec<Grant> {
     grant_files.to_vec()
 }
 
-/// `GET /meta/namespaces`: every namespace, most-specific first, readable by
+/// `GET /meta/prefixes`: every prefix, most-specific first, readable by
 /// every authenticated user.
-pub fn namespaces_list(namespaces: &[Namespace]) -> Vec<Namespace> {
-    namespaces.to_vec()
+pub fn prefixes_list(prefixes: &[PrefixDef]) -> Vec<PrefixDef> {
+    prefixes.to_vec()
 }
 
 /// `GET /meta/guests`: for every guest Perl passed in, the metadata the
@@ -721,12 +721,12 @@ fn plan_write(
 
 /// The extra gate a registry document passes and the other two do not: the
 /// text about to be written must parse as the kind it is
-/// (`registry::parse_namespace` / `registry::parse_grant`).
+/// (`registry::parse_prefix` / `registry::parse_grant`).
 ///
 /// The loader **skips** a malformed file with a warning and carries on -- that
 /// isolation is why this data left `datacenter.yaml` -- so without this check
 /// the editor's most likely mistake (a typo in `selector:`) would be answered
-/// by the namespace silently disappearing from the list, with a 200 on the
+/// by the prefix silently disappearing from the list, with a 200 on the
 /// write that removed it. The rule is the parser itself, not a copy of it, so
 /// what the API accepts and what the loader reads back cannot drift.
 ///
@@ -737,12 +737,12 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), anyhow::Error>
         return Ok(());
     };
     let parsed = match kind {
-        RegistryKind::Namespace => registry::parse_namespace(name, text).map(|_| ()),
+        RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
         RegistryKind::Grant => registry::parse_grant(name, text).map(|_| ()),
     };
     parsed.map_err(|e| {
         let kind = match kind {
-            RegistryKind::Namespace => "namespace",
+            RegistryKind::PrefixDef => "prefix",
             RegistryKind::Grant => "grant",
         };
         bad_request(format!(
@@ -1024,7 +1024,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MetaStore::with_registry_dirs(
             dir.path(),
-            vec![dir.path().join("registry/namespaces")],
+            vec![dir.path().join("registry/prefixes")],
             vec![dir.path().join("registry/grants")],
         );
         (dir, store)
@@ -1837,28 +1837,28 @@ fn version_detail_names_the_documents_that_changed() {
     #[test]
     fn parse_id_reads_a_registry_id_and_refuses_anything_that_could_leave_the_directory() {
         assert_eq!(
-            parse_id("namespaces/traefik").unwrap(),
-            DocId::Registry(RegistryKind::Namespace, "traefik".to_string()),
+            parse_id("prefixes/traefik").unwrap(),
+            DocId::Registry(RegistryKind::PrefixDef, "traefik".to_string()),
         );
         assert_eq!(
             parse_id("grants/scoped").unwrap(),
             DocId::Registry(RegistryKind::Grant, "scoped".to_string()),
         );
-        // The file name *is* the prefix, so a nested namespace is a dotted file
+        // The file name *is* the prefix, so a nested prefix is a dotted file
         // name and has to be addressable: `homelab.docker.yaml` declares
         // `homelab.docker`, and refusing that id would put every nested
-        // namespace out of the editor's reach.
+        // prefix out of the editor's reach.
         assert_eq!(
-            parse_id("namespaces/homelab.docker").unwrap(),
-            DocId::Registry(RegistryKind::Namespace, "homelab.docker".to_string()),
+            parse_id("prefixes/homelab.docker").unwrap(),
+            DocId::Registry(RegistryKind::PrefixDef, "homelab.docker".to_string()),
         );
         for bad in [
-            "namespaces/../../etc/passwd",
-            "namespaces/a/b",
-            "namespaces/.hidden",
-            "namespaces/",
-            "namespaces/a..b",
-            "namespaces/a b",
+            "prefixes/../../etc/passwd",
+            "prefixes/a/b",
+            "prefixes/.hidden",
+            "prefixes/",
+            "prefixes/a..b",
+            "prefixes/a b",
             "operators/traefik",
         ] {
             let err = parse_id(bad).unwrap_err();
@@ -1867,11 +1867,11 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
-    fn a_namespace_is_read_and_written_like_any_other_document() {
+    fn a_prefix_is_read_and_written_like_any_other_document() {
         let (_dir, store) = store();
         let created = put(
             &store,
-            "namespaces/homelab",
+            "prefixes/homelab",
             None,
             "yaml",
             "selector:\n  all: true\ndescription: Home\n",
@@ -1881,14 +1881,14 @@ fn version_detail_names_the_documents_that_changed() {
             &full(),
         )
         .unwrap();
-        assert_eq!(created.id, "namespaces/homelab");
+        assert_eq!(created.id, "prefixes/homelab");
 
         // A view write reaches into it like into any document, with the same
         // digest compare-and-swap.
-        let doc = get(&store, "namespaces/homelab", None, "json", &full()).unwrap();
+        let doc = get(&store, "prefixes/homelab", None, "json", &full()).unwrap();
         put(
             &store,
-            "namespaces/homelab",
+            "prefixes/homelab",
             Some("schema.type"),
             "json",
             "\"object\"",
@@ -1901,8 +1901,8 @@ fn version_detail_names_the_documents_that_changed() {
 
         // And what came back out is what the loader parses -- the check that
         // matters, since a file it rejects is a file it silently skips.
-        let raw = read_raw(&store, "namespaces/homelab").unwrap();
-        let ns = registry::parse_namespace("homelab", &raw).unwrap();
+        let raw = read_raw(&store, "prefixes/homelab").unwrap();
+        let ns = registry::parse_prefix("homelab", &raw).unwrap();
         assert_eq!(ns.prefix.to_string(), "homelab");
         assert_eq!(ns.description.as_deref(), Some("Home"));
         assert_eq!(ns.schema.unwrap()["type"], json!("object"));
@@ -1911,11 +1911,11 @@ fn version_detail_names_the_documents_that_changed() {
     #[test]
     fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
         let (_dir, store) = store();
-        // No selector: `parse_namespace` refuses it, so the loader would skip
-        // the file and the namespace would vanish on a 200.
+        // No selector: `parse_prefix` refuses it, so the loader would skip
+        // the file and the prefix would vanish on a 200.
         let err = put(
             &store,
-            "namespaces/homelab",
+            "prefixes/homelab",
             None,
             "yaml",
             "description: Home\n",
@@ -1926,13 +1926,13 @@ fn version_detail_names_the_documents_that_changed() {
         )
         .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
-        assert!(format!("{err}").contains("not be a valid namespace"), "{err}");
-        assert_eq!(read_raw(&store, "namespaces/homelab"), None, "nothing was written");
+        assert!(format!("{err}").contains("not be a valid prefix"), "{err}");
+        assert_eq!(read_raw(&store, "prefixes/homelab"), None, "nothing was written");
 
         // A dry run is refused for the same reason, and by the same check.
         let err = put(
             &store,
-            "namespaces/homelab",
+            "prefixes/homelab",
             None,
             "yaml",
             "description: Home\n",
@@ -1993,7 +1993,7 @@ fn version_detail_names_the_documents_that_changed() {
         let (_dir, store) = store();
         put(
             &store,
-            "namespaces/traefik",
+            "prefixes/traefik",
             None,
             "yaml",
             "selector: {all: true}\n",
@@ -2008,12 +2008,30 @@ fn version_detail_names_the_documents_that_changed() {
         // document gets no scopes at all, so this is the same 403 the
         // datacenter document gives it.
         let acl = scoped(&["traefik"]);
-        assert!(grants(&regs(), &parse_id("namespaces/traefik").unwrap(), &acl).scopes.is_empty());
-        let err = get(&store, "namespaces/traefik", None, "yaml", &acl).unwrap_err();
+        let id = parse_id("prefixes/traefik").unwrap();
+        assert!(grants(&regs(), &id, &acl).scopes.is_empty());
+
+        // `access` passes the ACL answers through untouched for these documents --
+        // which is the point: the two bits differ from the datacenter document's
+        // (a registry file is readable by every authenticated user, while writing
+        // one is Sys.Modify), so the caller has to say which document it is asking
+        // about. `GET /meta/access?id=` is that question; asking `?dc=1` instead
+        // answered `read: 0` for a file the caller could certainly read.
+        let admin = CallerAcl {
+            authid: "writer@pve".to_string(),
+            read: true,
+            write: true,
+            tags: vec![],
+        };
+        let a = access(&regs(), &id, &admin);
+        assert!(a.read && a.write && a.scopes.is_empty());
+        let nobody = access(&regs(), &id, &none());
+        assert!(!nobody.read && !nobody.write);
+        let err = get(&store, "prefixes/traefik", None, "yaml", &acl).unwrap_err();
         assert_eq!(status(&err), 403, "{err}");
         let err = put(
             &store,
-            "namespaces/traefik",
+            "prefixes/traefik",
             Some("traefik"),
             "json",
             "1",

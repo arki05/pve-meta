@@ -1,13 +1,13 @@
 //! The **meta-schema**: the two registry file formats described in the same
-//! dialect a namespace uses to describe a guest's subtree (`docs/DESIGN.md`
+//! dialect a prefix uses to describe a guest's subtree (`docs/DESIGN.md`
 //! §3.6).
 //!
-//! Since revision 6 a namespace or grant file is an ordinary document
+//! Since revision 6 a prefix or grant file is an ordinary document
 //! ([`crate::store::DocId::Registry`]), so the editor can show it as a tree and
 //! lint it as it is typed -- but only if something says what shape it has. That
-//! is what this module is: `namespace.yaml` and `grant.yaml` written out as
+//! is what this module is: `prefix.yaml` and `grant.yaml` written out as
 //! schemas, served by `GET /meta/schemas`, and used by the editor exactly the
-//! way a namespace's own `schema` is used on a guest document.
+//! way a prefix's own `schema` is used on a guest document.
 //!
 //! One rule it cannot express: a selector is **exactly one of** `all` or `tag`
 //! (`registry::parse_selector`). The dialect has no "one of these" keyword, so
@@ -16,14 +16,14 @@
 //! means the editor will happily *offer* you both rows. The test below pins that
 //! as a known limit rather than leaving it to be rediscovered.
 //!
-//! It is deliberately **not** the validator. `registry::parse_namespace` and
+//! It is deliberately **not** the validator. `registry::parse_prefix` and
 //! `registry::parse_grant` decide what is storable, on the way in, in one place
 //! (`api::check_registry_shape`); this is the affordance that tells a human
 //! what to type before they try. The test at the bottom is what keeps the two
 //! from drifting: every property this schema marks as required is one the
 //! parser actually refuses to do without.
 //!
-//! The `schema:` property of a namespace is described as a free-form object on
+//! The `schema:` property of a prefix is described as a free-form object on
 //! purpose. It is a schema in its own right, in an open-ended dialect, and the
 //! editor's honest offer for it is the text editor (a map row opens Monaco on
 //! its own subtree, DESIGN §8) rather than a form that would only ever cover
@@ -32,21 +32,21 @@
 use crate::format::{self, Format};
 use crate::model::Value;
 
-/// The namespace file format (`docs/DESIGN.md` §3.1).
-const NAMESPACE: &str = r#"
+/// The prefix file format (`docs/DESIGN.md` §3.1).
+const PREFIX: &str = r#"
 type: object
 description: >-
-  A namespace: what a prefix is. The file name is the prefix, so there is no
-  'prefix' field for it to disagree with.
+  A prefix definition: what a prefix is, and which guests it reaches. Its file name
+  is the prefix it declares, so there is no field here for the two to disagree about.
 properties:
   description:
     type: string
     optional: 1
-    description: What this prefix is for. Shown in the namespace list and on hover.
+    description: What this prefix is for. Shown in the prefix list and on hover.
   selector:
     type: object
     description: >-
-      Which guests this namespace reaches. Exactly one of 'all' or 'tag'. This is a
+      Which guests this prefix reaches. Exactly one of 'all' or 'tag'. This is a
       selector, not a permission boundary.
     properties:
       all:
@@ -103,9 +103,9 @@ fn parse(text: &str, what: &str) -> Value {
         .unwrap_or_else(|e| panic!("the built-in {what} meta-schema does not parse: {e}"))
 }
 
-/// The namespace file's schema.
-pub fn namespace() -> Value {
-    parse(NAMESPACE, "namespace")
+/// The prefix file's schema.
+pub fn prefix() -> Value {
+    parse(PREFIX, "prefix")
 }
 
 /// The grant file's schema.
@@ -116,7 +116,7 @@ pub fn grant() -> Value {
 /// Both, keyed by kind: what `GET /meta/schemas` returns.
 pub fn schemas() -> Value {
     let mut map = serde_json::Map::new();
-    map.insert("namespace".to_string(), namespace());
+    map.insert("prefix".to_string(), prefix());
     map.insert("grant".to_string(), grant());
     Value::Object(map)
 }
@@ -142,7 +142,7 @@ mod tests {
         // rather than return a Result, so this test is the thing that stops a
         // typo in them from reaching pvedaemon.
         assert_eq!(schemas().as_object().unwrap().len(), 2);
-        assert_eq!(namespace()["type"], "object");
+        assert_eq!(prefix()["type"], "object");
         assert_eq!(grant()["type"], "object");
     }
 
@@ -154,16 +154,16 @@ mod tests {
     #[test]
     fn required_properties_are_the_ones_the_parser_refuses_to_do_without() {
         let ns = "description: d\nselector: {all: true}\nschema: {type: object}\n";
-        assert!(registry::parse_namespace("x", ns).is_ok(), "the full example parses");
-        for (key, optional) in properties(&namespace()) {
+        assert!(registry::parse_prefix("x", ns).is_ok(), "the full example parses");
+        for (key, optional) in properties(&prefix()) {
             let value: serde_json::Value = format::parse_raw(Format::Yaml, ns).unwrap();
             let mut without = value.as_object().unwrap().clone();
             without.remove(&key);
             let text = format::dump(Format::Yaml, &Value::Object(without));
             assert_eq!(
-                registry::parse_namespace("x", &text).is_ok(),
+                registry::parse_prefix("x", &text).is_ok(),
                 optional,
-                "namespace: dropping '{key}' (optional: {optional}) does not match the parser",
+                "prefix: dropping '{key}' (optional: {optional}) does not match the parser",
             );
         }
 
@@ -191,7 +191,7 @@ mod tests {
     /// required, would have passed silently.
     #[test]
     fn the_selector_is_described_the_way_the_parser_reads_it() {
-        let selector = &namespace()["properties"]["selector"];
+        let selector = &prefix()["properties"]["selector"];
         assert_eq!(selector["type"], "object");
         let inner = properties(selector);
         assert_eq!(
@@ -204,7 +204,7 @@ mod tests {
         // actual rule and only the parser has it -- so it is asserted here, against
         // the parser, rather than described in a schema that cannot hold it.
         let with = |sel: &str| {
-            registry::parse_namespace("x", &format!("selector: {sel}\n")).is_ok()
+            registry::parse_prefix("x", &format!("selector: {sel}\n")).is_ok()
         };
         assert!(with("{all: true}"), "one alternative is a selector");
         assert!(with("{tag: web}"), "so is the other");
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn no_property_is_invented() {
-        let ns: Vec<String> = properties(&namespace()).into_iter().map(|(k, _)| k).collect();
+        let ns: Vec<String> = properties(&prefix()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(ns, ["description", "selector", "schema"]);
         let g: Vec<String> = properties(&grant()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(g, ["authid", "description", "grants"]);

@@ -65,7 +65,7 @@ impl FromStr for Format {
 /// Used by [`parse`] (which adds the lint), by the store's tolerant read, by
 /// [`crate::view::parse`]/[`crate::view::parse_patch`] (a view's payload is
 /// linted where it lands, as part of the planned document) and by
-/// [`crate::registry::parse_namespace`] / [`crate::registry::parse_grant`].
+/// [`crate::registry::parse_prefix`] / [`crate::registry::parse_grant`].
 ///
 /// # Errors
 /// [`Error::Parse`] on a syntax error (or a format-specific rejection: YAML

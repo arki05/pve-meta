@@ -78,8 +78,11 @@ install:
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
-	# pve-ext UI-page manifest (see pages/pve-meta.json, pve-ext/README.md).
+	# pve-ext UI-page manifests (see pages/, pve-ext/README.md). Two of them, one
+	# per target shape: a guest tab is one document's editor, the datacenter tab is
+	# that plus the two registry lists, and a manifest carries a single `xtype`.
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
+	install -D -m 0644 pages/pve-meta-dc.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-dc.json
 	# pve-ext managed-patch manifest for the guest-lifecycle snapshot hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
 	# lifecycle is snapshot-only, see docs/LIFECYCLE-PATCHES.md).
@@ -104,23 +107,26 @@ install:
 	# out of band, or a destroy that never ran because its node was down --
 	# and an administrator runs it by hand.
 	install -D -m 0755 libexec/gc $(DESTDIR)$(PREFIX)/libexec/pve-meta/gc
-	# Packaged example namespaces (docs/DESIGN.md section 3.1); none are
+	# Packaged example prefixes (docs/DESIGN.md section 3.1); none are
 	# required for pve-meta to work, so this directory may be empty in a
 	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
 	# copy, never a hard failure.
 	#
 	# There is deliberately no packaged *grants* directory: an operator's
-	# package may ship a namespace (a declaration) but must never ship its
+	# package may ship a prefix (a declaration) but must never ship its
 	# own grant, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
-	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/namespaces
-	if [ -d namespaces ] && ls namespaces/*.yaml >/dev/null 2>&1; then \
-		cp namespaces/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/namespaces/; \
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes
+	if [ -d prefixes ] && ls prefixes/*.yaml >/dev/null 2>&1; then \
+		cp prefixes/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/; \
 	fi
-	# pve-ext UI-page manifest for the editor (see pages/pve-meta.json,
-	# docs/DESIGN.md section 8) and its static files. The manifest is the
-	# `script`+`xtype` form: pve-ext's loader defines the class and puts a
-	# native ExtJS panel in the tab, so there is no iframe and no wasm.
+	# pve-ext UI-page manifests for the editor (see pages/, docs/DESIGN.md
+	# section 8) and its static files. Both are the `script`+`xtype` form: pve-ext's
+	# loader defines the class and puts a native ExtJS panel in the tab, so there is
+	# no iframe and no wasm. Two manifests, one file: they name different `xtype`s
+	# (a guest's document editor, and the datacenter's three sub-tabs) out of the
+	# same script, which the loader fetches once.
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
+	install -D -m 0644 pages/pve-meta-dc.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-dc.json
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs
 	if ls ui-extjs/*.js >/dev/null 2>&1; then \
 		cp ui-extjs/*.js $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/; \

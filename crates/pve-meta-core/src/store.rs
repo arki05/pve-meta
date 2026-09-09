@@ -86,18 +86,18 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 /// (`crate::registry`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RegistryKind {
-    /// A namespace: what a prefix is (`crate::registry::Namespace`).
-    Namespace,
+    /// A prefix: what a prefix is (`crate::registry::PrefixDef`).
+    PrefixDef,
     /// A grant: who may touch one (`crate::registry::Grant`).
     Grant,
 }
 
 impl RegistryKind {
     /// The kind's wire name, and the first segment of a registry document's
-    /// API id: `namespaces` / `grants`.
+    /// API id: `prefixes` / `grants`.
     pub fn as_str(&self) -> &'static str {
         match self {
-            RegistryKind::Namespace => "namespaces",
+            RegistryKind::PrefixDef => "prefixes",
             RegistryKind::Grant => "grants",
         }
     }
@@ -131,7 +131,7 @@ pub enum DocId {
     Guest(u32),
     /// The datacenter's metadata document, named `datacenter.yaml`.
     Datacenter,
-    /// A namespace or grant file, named `<name>.yaml` in its kind's directory.
+    /// A prefix or grant file, named `<name>.yaml` in its kind's directory.
     /// The name is a single path segment (`crate::path::is_valid_segment`), so
     /// it can never contain a slash or escape that directory.
     Registry(RegistryKind, String),
@@ -316,16 +316,16 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// Three directories, not one: `root` holds the guest and datacenter documents
 /// and the snapshot copies, and the two registry drop-directory *lists* hold
-/// the namespace and grant files ([`DocId::Registry`]). The lists are ordered
+/// the prefix and grant files ([`DocId::Registry`]). The lists are ordered
 /// lowest precedence first, exactly as `crate::registry` loads them, so the
 /// **last** entry of each is the one a write goes to -- the cluster directory,
-/// with the packaged one below it staying read-only. Writing a namespace whose
+/// with the packaged one below it staying read-only. Writing a prefix whose
 /// name a packaged file already uses therefore creates the cluster override
 /// rather than editing the package's file, and deleting it falls back to the
 /// packaged one, which is the same rule the loader has always applied.
 pub struct MetaStore {
     root: PathBuf,
-    namespace_dirs: Vec<PathBuf>,
+    prefix_dirs: Vec<PathBuf>,
     grant_dirs: Vec<PathBuf>,
 }
 
@@ -333,7 +333,7 @@ impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
     /// to exist yet), with the registry directories `crate::registry` itself
     /// would load -- the packaged and cluster defaults, or whatever
-    /// `PVE_META_NAMESPACE_DIRS`/`PVE_META_GRANT_DIRS` say.
+    /// `PVE_META_PREFIX_DIRS`/`PVE_META_GRANT_DIRS` say.
     ///
     /// Reading those two variables here, once, is deliberate: the alternative
     /// is reading them again deeper in the call path, where a test (or a
@@ -344,7 +344,7 @@ impl MetaStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         MetaStore {
             root: root.into(),
-            namespace_dirs: crate::registry::namespace_dirs(),
+            prefix_dirs: crate::registry::prefix_dirs(),
             grant_dirs: crate::registry::grant_dirs(),
         }
     }
@@ -354,12 +354,12 @@ impl MetaStore {
     /// knows its directories and does not want the environment consulted.
     pub fn with_registry_dirs(
         root: impl Into<PathBuf>,
-        namespace_dirs: Vec<PathBuf>,
+        prefix_dirs: Vec<PathBuf>,
         grant_dirs: Vec<PathBuf>,
     ) -> Self {
         MetaStore {
             root: root.into(),
-            namespace_dirs,
+            prefix_dirs,
             grant_dirs,
         }
     }
@@ -367,7 +367,7 @@ impl MetaStore {
     /// The directories a registry kind is loaded from, lowest precedence first.
     fn registry_dirs(&self, kind: RegistryKind) -> &[PathBuf] {
         match kind {
-            RegistryKind::Namespace => &self.namespace_dirs,
+            RegistryKind::PrefixDef => &self.prefix_dirs,
             RegistryKind::Grant => &self.grant_dirs,
         }
     }
@@ -401,7 +401,7 @@ impl MetaStore {
 
     /// Where `id` is **read** from: the highest-precedence directory that
     /// actually has the file, which for a registry document is the same file
-    /// `crate::registry::load_namespaces` would have picked. Falls back to
+    /// `crate::registry::load_prefixes` would have picked. Falls back to
     /// [`MetaStore::path_for`] when none has it, so a "not found" error names
     /// the place a write would create it.
     fn read_path_for(&self, id: &DocId) -> PathBuf {
@@ -714,10 +714,10 @@ impl MetaStore {
     /// pair turned the loser of that race into an
     /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500.
     /// A registry document is removed from the **write** directory only: a
-    /// packaged namespace belongs to its `.deb`, and deleting the cluster file
+    /// packaged prefix belongs to its `.deb`, and deleting the cluster file
     /// that shadowed it is a revert to the packaged one, not a removal. When
     /// only the packaged file exists there is nothing of ours to remove and
-    /// this returns `Ok(false)`, with the namespace still there afterwards --
+    /// this returns `Ok(false)`, with the prefix still there afterwards --
     /// `api::delete_document` says so rather than reporting a deletion that
     /// did not happen.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
@@ -883,10 +883,10 @@ impl MetaStore {
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
-        // A map, not a list: a namespace present in both the packaged and the
+        // A map, not a list: a prefix present in both the packaged and the
         // cluster directory is *one* document, and the effective one is the
         // last write wins here because the directories are walked lowest
-        // precedence first -- the same rule `registry::load_namespaces` applies
+        // precedence first -- the same rule `registry::load_prefixes` applies
         // by file name. The shadowed file still contributes to `entries`, so
         // editing it moves the token even though no document's digest changed:
         // over-notifying a poll is a reload, under-notifying it is a stale UI.
@@ -902,7 +902,7 @@ impl MetaStore {
             &document_id,
         )?;
         for (kind, dirs) in [
-            (RegistryKind::Namespace, &self.namespace_dirs),
+            (RegistryKind::PrefixDef, &self.prefix_dirs),
             (RegistryKind::Grant, &self.grant_dirs),
         ] {
             for dir in dirs {
@@ -942,7 +942,7 @@ impl MetaStore {
     ///
     /// An entry that disappears mid-walk is skipped rather than failing the
     /// poll, and a directory that does not exist contributes nothing -- the
-    /// packaged namespace directory is absent on a node with no operator
+    /// packaged prefix directory is absent on a node with no operator
     /// package installed, which is not a condition to report.
     fn scan_for_version(
         &self,

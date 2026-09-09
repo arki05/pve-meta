@@ -31,7 +31,7 @@
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
 //! `test/basic.pl`); the registration directories likewise with
-//! `PVE_META_NAMESPACE_DIRS`/`PVE_META_GRANT_DIRS`.
+//! `PVE_META_PREFIX_DIRS`/`PVE_META_GRANT_DIRS`.
 
 use std::path::PathBuf;
 
@@ -63,24 +63,24 @@ mod pve_rs_meta {
     use anyhow::Error;
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
-    use pve_meta_core::registry::{self, Grant, Namespace};
+    use pve_meta_core::registry::{self, Grant, PrefixDef};
 
     use super::{open_store, RollbackOutcome};
 
     /// Every grant (`docs/DESIGN.md` §3.2). Cluster-only on purpose: an
-    /// operator's `.deb` may ship a namespace but must never ship its own
+    /// operator's `.deb` may ship a prefix but must never ship its own
     /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
     /// a stale grant is a wrong answer about who may write.
     fn open_grants() -> Vec<Grant> {
         registry::load_grants_default()
     }
 
-    /// Every namespace, packaged then cluster-wide, most-specific prefix first
+    /// Every prefix, packaged then cluster-wide, most-specific prefix first
     /// (`docs/DESIGN.md` §3.1). Read per request, like the grants: the
-    /// directories are tiny, pmxcfs caches them, and a stale namespace would be
+    /// directories are tiny, pmxcfs caches them, and a stale prefix would be
     /// a stale schema.
-    fn open_namespaces() -> Vec<Namespace> {
-        registry::load_namespaces_default()
+    fn open_prefixes() -> Vec<PrefixDef> {
+        registry::load_prefixes_default()
     }
 
     // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
@@ -236,14 +236,14 @@ mod pve_rs_meta {
         Ok(api::grants_list(&open_grants()))
     }
 
-    /// `GET /meta/namespaces` -> every namespace, most-specific first.
+    /// `GET /meta/prefixes` -> every prefix, most-specific first.
     #[export]
-    pub fn api_namespaces() -> Result<Vec<Namespace>, Error> {
-        Ok(api::namespaces_list(&open_namespaces()))
+    pub fn api_prefixes() -> Result<Vec<PrefixDef>, Error> {
+        Ok(api::prefixes_list(&open_prefixes()))
     }
 
-    /// `GET /meta/schemas` -> `{ namespace, grant }`, the two registry file
-    /// formats described in the same dialect a namespace uses, so the editor
+    /// `GET /meta/schemas` -> `{ prefix, grant }`, the two registry file
+    /// formats described in the same dialect a prefix uses, so the editor
     /// can show one as a typed tree.
     #[export]
     pub fn api_schemas() -> Result<pve_meta_core::model::Value, Error> {

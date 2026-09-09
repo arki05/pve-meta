@@ -33,13 +33,13 @@
 //!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
 //! - [`metaschema`] — the two registry file formats, written as schemas in the
-//!   same dialect a namespace uses, so the editor can show a namespace or grant
+//!   same dialect a prefix uses, so the editor can show a prefix or grant
 //!   file as a typed tree (`docs/DESIGN.md` §3.6).
-//! - [`registry`] — the two drop-directories: **namespaces**
-//!   (`/usr/share/pve-meta/namespaces`, `/etc/pve/meta.d/namespaces`), which
+//! - [`registry`] — the two drop-directories: **prefixes**
+//!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which
 //!   say what a prefix is and carry its schema, and **grants**
 //!   (`/etc/pve/meta.d/grants`, cluster-only), which say who may touch one
-//!   (`docs/DESIGN.md` §3). They nest by opposite rules: namespaces shadow
+//!   (`docs/DESIGN.md` §3). They nest by opposite rules: prefixes shadow
 //!   most-specific-first ([`registry::governing`]), grants accumulate by
 //!   containment ([`registry::scopes_for`]).
 //! - [`scopes`] — [`scopes::Grants`], a principal's effective access to one
