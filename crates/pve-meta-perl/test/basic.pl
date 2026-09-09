@@ -7,7 +7,7 @@
 # directly -- see `-I.` above and `Makefile`'s `all` target).
 #
 # The point of this file, beyond the contract itself, is the **boundary**
-# (`docs/DESIGN.md` §5): grants, guest lists and results cross as native Perl
+# (`docs/DESIGN.md` §5): permissions, guest lists and results cross as native Perl
 # hashes and arrays, and only the client's `data` parameter is a JSON string.
 # So everything below passes real hash refs and inspects real hash refs; the
 # only `encode_json` here is for that one parameter.
@@ -26,7 +26,7 @@ my $nsdir = tempdir(CLEANUP => 1);
 my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
-$ENV{PVE_META_GRANT_DIRS} = $grantdir;
+$ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -52,7 +52,7 @@ sub write_prefix {
     close($fh);
 }
 
-sub write_grant {
+sub write_permission {
     my ($name, $content) = @_;
     open(my $fh, '>', "$grantdir/$name.yaml") or die "failed to write $grantdir/$name.yaml: $!\n";
     print {$fh} $content;
@@ -125,8 +125,8 @@ like($@, qr/invalid name/i, 'invalid-name error is readable');
 
 # The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. Two names are
 # deliberately *not* in this list: `on_destroy` came back with the create/destroy hooks
-# (§6), and `api_grants` came back in revision 6 meaning something else entirely -- the
-# grant-file listing behind GET /meta/grants, not revision 5's caller-scope lookup.
+# (§6), and `api_permissions` came back in revision 6 meaning something else entirely -- the
+# grant-file listing behind GET /meta/permissions, not revision 5's caller-scope lookup.
 for my $gone (qw(on_clone export_for_backup import_from_backup
                  list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
@@ -195,7 +195,7 @@ unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
 # `$acl` is a native hash. perlmod converts a Perl scalar to a Rust bool by
 # *truthiness*, so 1/0/''/undef all mean what a Perl programmer expects --
-# this is the bug class the old hand-built `_grants_json` existed to avoid
+# this is the bug class the old hand-built `_permissions_json` existed to avoid
 # (encode_json rendered 1/0 as JSON numbers, and serde wanted true/false).
 sub acl {
     my (%opts) = @_;
@@ -342,13 +342,13 @@ isnt(PVE::RS::Meta::api_put('9300', 'traefik', 'json', '{"host":"new"}', 'replac
     '', 'PUT with the empty digest creates the document instead of 409-ing forever');
 PVE::RS::Meta::api_delete('9300', undef, undef, $FULL);
 
-# reads require a grant
+# reads require a permission
 $res = eval { PVE::RS::Meta::api_get('9101', undef, 'json', $NONE) };
-ok(!defined($res), 'a caller with no grant at all cannot read a document');
+ok(!defined($res), 'a caller with no permission at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Prefixes, grants, selectors and tags (docs/DESIGN.md §3).
+# Prefixes, permissions, selectors and tags (docs/DESIGN.md §3).
 # =========================================================================
 
 # The file name is the prefix; there is no `prefix:` field to disagree with it.
@@ -381,10 +381,10 @@ is_deeply($traefik_ns->{selector}, { tag => 'traefik' }, 'and the selector, as a
 ok($traefik_ns->{schema}, 'and the schema, passed through verbatim');
 ok(!exists $traefik_ns->{authid}, 'a prefix names no principal');
 
-write_grant('scoped', <<'YAML');
+write_permission('scoped', <<'YAML');
 authid: scoped@pve!t1
 description: The scoped test principal
-grants:
+rules:
   - prefix: traefik
     mode: rw
     selector: { tag: traefik }
@@ -393,17 +393,17 @@ grants:
     selector: { all: true }
 YAML
 
-my $gs = PVE::RS::Meta::api_grants();
-is(scalar(@$gs), 1, 'api_grants lists the grant');
+my $gs = PVE::RS::Meta::api_permissions();
+is(scalar(@$gs), 1, 'api_permissions lists the permission');
 is($gs->[0]->{name}, 'scoped', 'with the file name as its name');
 is($gs->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
 is($gs->[0]->{description}, 'The scoped test principal', 'and the description');
-is_deeply($gs->[0]->{grants}->[0]->{selector}, { tag => 'traefik' },
+is_deeply($gs->[0]->{rules}->[0]->{selector}, { tag => 'traefik' },
     'and the selector, as a native hash');
-ok($gs->[0]->{grants}->[1]->{selector}->{all},
+ok($gs->[0]->{rules}->[1]->{selector}->{all},
     '... and { all: true } is a hash spelled the way the file spells it, not a bare string');
-is($gs->[0]->{grants}->[1]->{prefix}, 'netbird', 'and every grant entry');
-ok(!exists $gs->[0]->{grants}->[0]->{schema}, 'a grant carries no schema');
+is($gs->[0]->{rules}->[1]->{prefix}, 'netbird', 'and every rule');
+ok(!exists $gs->[0]->{rules}->[0]->{schema}, 'a permission carries no schema');
 
 sub scoped_acl {
     my (@tags) = @_;
@@ -488,11 +488,11 @@ like($@, api_error_status(403), 'that read is refused with 403:');
 
 # A malformed file is skipped with a warning and contributes nothing; it never
 # takes another file's grants away. Both directories, independently.
-write_grant('broken', "authid: nope-not-an-authid\n");
-write_grant('alsobroken', "authid: a\@pve\ngrants:\n  - prefix: x\n    mode: sideways\n");
+write_permission('broken', "authid: nope-not-an-authid\n");
+write_permission('alsobroken', "authid: a\@pve\nrules:\n  - prefix: x\n    mode: sideways\n");
 write_prefix('brokenns', "selector: { nonsense: true }\n");
 write_prefix('a b', "selector: { all: true }\n"); # not a valid prefix, so not a definition
-is(scalar(@{ PVE::RS::Meta::api_grants() }), 1, 'a malformed grant file is skipped');
+is(scalar(@{ PVE::RS::Meta::api_permissions() }), 1, 'a malformed permission file is skipped');
 is(scalar(@{ PVE::RS::Meta::api_prefixes() }), 3, 'a malformed prefix file is skipped');
 is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
     '... and the valid ones still grant exactly what they did');
@@ -721,7 +721,7 @@ ok(!file_exists('9400.yaml'), 'api_delete without a view actually removes the fi
 
 my $schemas = PVE::RS::Meta::api_schemas();
 is(ref($schemas), 'HASH', 'api_schemas returns a native hash');
-is_deeply([sort keys %$schemas], ['grant', 'prefix'], '... one schema per registry kind');
+is_deeply([sort keys %$schemas], ['permission', 'prefix'], '... one schema per registry kind');
 is($schemas->{prefix}->{properties}->{selector}->{type}, 'object',
     'the prefix schema describes its selector');
 ok(!defined($schemas->{prefix}->{properties}->{selector}->{optional}),
@@ -740,7 +740,7 @@ $res = eval { PVE::RS::Meta::api_put('prefixes/bothsel', undef, 'yaml',
 ok(!defined($res), 'a selector with both alternatives is refused');
 like($@, api_error_status(400), '... with a 400');
 
-# -- registry documents: prefixes and grants are documents too --------------
+# -- registry documents: prefixes and permissions are documents too --------------
 #
 # Same three functions, a third kind of id (`prefixes/<name>`), and one rule
 # they do not share with the other two: what is written has to parse as the kind
@@ -786,22 +786,22 @@ like($@, api_error_status(400), '... with a 400');
 ok(!-e "$nsdir/broken.yaml", '... and wrote nothing');
 
 my $g_put = PVE::RS::Meta::api_put(
-    'grants/ops', undef, 'yaml',
-    "authid: ops\@pve!t1\ngrants:\n  - prefix: labtest\n    mode: rw\n    selector: {all: true}\n",
+    'permissions/ops', undef, 'yaml',
+    "authid: ops\@pve!t1\nrules:\n  - prefix: labtest\n    mode: rw\n    selector: {all: true}\n",
     'replace', '', 0, $ADMIN,
 );
-is($g_put->{id}, 'grants/ops', 'api_put creates a grant document');
-my ($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
-is($ops->{authid}, 'ops@pve!t1', 'the grant loader picks it up too');
+is($g_put->{id}, 'permissions/ops', 'api_put creates a permission document');
+my ($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_permissions() };
+is($ops->{authid}, 'ops@pve!t1', 'the permission loader picks it up too');
 
 # A partial delete is a write, and the same rule holds on that path.
-$res = eval { PVE::RS::Meta::api_delete('grants/ops', 'authid', undef, $ADMIN) };
-ok(!defined($res), 'api_delete refuses to strip a grant of its authid');
+$res = eval { PVE::RS::Meta::api_delete('permissions/ops', 'authid', undef, $ADMIN) };
+ok(!defined($res), 'api_delete refuses to strip a permission of its authid');
 like($@, api_error_status(400), '... with a 400');
-($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
-ok($ops, 'the grant still loads');
+($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_permissions() };
+ok($ops, 'the permission still loads');
 
-is(PVE::RS::Meta::api_delete('grants/ops', undef, undef, $ADMIN)->{digest}, '',
+is(PVE::RS::Meta::api_delete('permissions/ops', undef, undef, $ADMIN)->{digest}, '',
     'removing the whole file is an ordinary delete');
 ok(!-e "$grantdir/ops.yaml", '... and the file is gone');
 

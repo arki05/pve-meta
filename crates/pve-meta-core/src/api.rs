@@ -19,11 +19,11 @@
 //! Authorization is decided **from the request, never from a diff**
 //! (`docs/DESIGN.md` §3):
 //!
-//! 1. [`Grants::can_write`] must hold for the view before anything is
+//! 1. [`Effective::can_write`] must hold for the view before anything is
 //!    computed, and a caller without `full_write` may not write the root view
 //!    at all;
 //! 2. the mutation is planned against a **clone** of the stored document and
-//!    every path the plan touches is checked with [`Grants::check_write`];
+//!    every path the plan touches is checked with [`Effective::check_write`];
 //! 3. the planned document is linted — once, the same way for every caller
 //!    (`docs/DESIGN.md` §4);
 //! 4. only then is the planned value written.
@@ -52,8 +52,8 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Grant, PrefixDef};
-use crate::scopes::{Grants, Scope};
+use crate::registry::{self, Permission, PrefixDef};
+use crate::scopes::{Effective, Scope};
 use crate::store::{DocId, MetaStore, RegistryKind, DISK_FORMAT};
 use crate::view;
 
@@ -134,21 +134,21 @@ pub struct CallerAcl {
     pub tags: Vec<String>,
 }
 
-/// The caller's effective [`Grants`] on `doc_id`.
+/// The caller's effective [`Effective`] on `doc_id`.
 ///
 /// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
 /// datacenter document is governed by ACLs alone, which is what keeps the
 /// registry from being able to grant access to it.
-pub fn grants(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> Grants {
+pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> Effective {
     let scopes = match doc_id {
-        DocId::Guest(_) => registry::scopes_for(grant_files, &acl.authid, &acl.tags),
+        DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
         // The datacenter document is governed by ACLs alone -- that is what
         // keeps the registry from being able to grant access to it -- and a
-        // registry document for the same reason one turn further: a grant that
-        // could reach the grant files would be able to widen itself.
+        // registry document for the same reason one turn further: a permission that
+        // could reach the permission files would be able to widen itself.
         DocId::Datacenter | DocId::Registry(..) => Vec::new(),
     };
-    Grants {
+    Effective {
         full_read: acl.read,
         full_write: acl.write,
         scopes,
@@ -156,7 +156,7 @@ pub fn grants(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> Grants 
 }
 
 /// Parses an API `id` into a [`DocId`]: a vmid, the literal `"datacenter"`, or
-/// a registry document as `prefixes/<name>` / `grants/<name>`.
+/// a registry document as `prefixes/<name>` / `permissions/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
@@ -171,10 +171,10 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
             "prefixes" => RegistryKind::PrefixDef,
-            "grants" => RegistryKind::Grant,
+            "permissions" => RegistryKind::Permission,
             other => {
                 return Err(bad_request(format!(
-                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'prefixes' or 'grants')"
+                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'prefixes' or 'permissions')"
                 )))
             }
         };
@@ -187,7 +187,7 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'datacenter',              'prefixes/<name>' or 'grants/<name>'"
+            "invalid id '{id}': must be a vmid, 'datacenter',              'prefixes/<name>' or 'permissions/<name>'"
         ))
     })
 }
@@ -463,15 +463,15 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
 }
 
 /// `GET /meta/schemas`: the two registry file formats as schemas
-/// (`crate::metaschema`), so the editor can show a prefix or grant file as a
+/// (`crate::metaschema`), so the editor can show a prefix or permission file as a
 /// typed tree the way a prefix's own schema does for a guest document.
 pub fn schemas() -> Value {
     crate::metaschema::schemas()
 }
 
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
-pub fn access(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
-    let g = grants(grant_files, doc_id, acl);
+pub fn access(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
+    let g = effective(permission_files, doc_id, acl);
     ApiAccess {
         read: g.full_read,
         write: g.full_write,
@@ -479,13 +479,13 @@ pub fn access(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> ApiAcce
     }
 }
 
-/// `GET /meta/grants`: every grant, readable by every authenticated user.
+/// `GET /meta/permissions`: every permission, readable by every authenticated user.
 ///
-/// Not filtered per caller: a grant says who may touch which prefix, which is
+/// Not filtered per caller: a permission says who may touch which prefix, which is
 /// exactly what the UI's Access column shows for every row, and the threat
 /// model puts listings out of scope (`docs/DESIGN.md` §1).
-pub fn grants_list(grant_files: &[Grant]) -> Vec<Grant> {
-    grant_files.to_vec()
+pub fn permissions_list(permission_files: &[Permission]) -> Vec<Permission> {
+    permission_files.to_vec()
 }
 
 /// `GET /meta/prefixes`: every prefix, most-specific first, readable by
@@ -505,7 +505,7 @@ pub fn prefixes_list(prefixes: &[PrefixDef]) -> Vec<PrefixDef> {
 /// `400:` if `has` is not a valid path.
 pub fn list_guests(
     store: &MetaStore,
-    grant_files: &[Grant],
+    permission_files: &[Permission],
     authid: &str,
     guests: &[GuestInput],
     has: Option<&str>,
@@ -520,7 +520,7 @@ pub fn list_guests(
             write: guest.write,
             tags: guest.tags.clone(),
         };
-        let g = grants(grant_files, &DocId::Guest(guest.vmid), &acl);
+        let g = effective(permission_files, &DocId::Guest(guest.vmid), &acl);
         let readable = g.readable_prefixes();
         if readable.is_empty() {
             continue;
@@ -549,9 +549,9 @@ pub fn list_guests(
 
 /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter`.
 ///
-/// With a `view`, requires read access to it ([`Grants::can_read`]); without
+/// With a `view`, requires read access to it ([`Effective::can_read`]); without
 /// one, returns the union of the caller's readable subtrees
-/// ([`Grants::readable_prefixes`] + [`view::filter`]) — the whole document
+/// ([`Effective::readable_prefixes`] + [`view::filter`]) — the whole document
 /// for a full-read grant. A caller with **no** read grant at all gets a 403,
 /// not an empty document with the real digest (which would be a
 /// change-detection oracle over content they may not see).
@@ -570,29 +570,29 @@ pub fn list_guests(
 /// not readable. `422:` the stored document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
-    grant_files: &[Grant],
+    permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     format_name: &str,
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, &doc_id, acl);
+    let access = effective(permission_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
-    let readable = grants.readable_prefixes();
+    let readable = access.readable_prefixes();
     if readable.is_empty() {
         return Err(forbidden(&view_path));
     }
-    if view.is_some() && !grants.can_read(&view_path) {
+    if view.is_some() && !access.can_read(&view_path) {
         return Err(forbidden(&view_path));
     }
 
     let stored = read_stored(store, &doc_id)?;
 
     if let Some(err) = &stored.unrecoverable {
-        if fmt == Format::Yaml && grants.full_read {
+        if fmt == Format::Yaml && access.full_read {
             if let Some(raw) = &stored.raw {
                 return Ok(ApiViewDocument {
                     id: id_str(&doc_id),
@@ -622,7 +622,7 @@ pub fn get_document(
         // other view is a canonical dump of what they may see.
         Format::Yaml => {
             let own_text = stored.raw.as_deref().filter(|raw| !raw.is_empty());
-            let text = if let (None, true, Some(raw)) = (view, grants.full_read, own_text) {
+            let text = if let (None, true, Some(raw)) = (view, access.full_read, own_text) {
                 raw.to_string()
             } else {
                 view::render(&result_value, Format::Yaml)
@@ -675,21 +675,21 @@ fn check_repairable(
 /// Every write's up-front, request-shaped authorization gate: the caller must
 /// be able to write the view they named, and only a caller with full write
 /// access may write the root view (`docs/DESIGN.md` §3).
-fn authorize_view_write(grants: &Grants, view_path: &DocPath) -> Result<(), anyhow::Error> {
-    if view_path.is_root() && !grants.full_write {
+fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), anyhow::Error> {
+    if view_path.is_root() && !access.full_write {
         return Err(anyhow::anyhow!(
             "403: not permitted: writing the whole document requires full write access; \
              name an explicit view inside a writable prefix"
         ));
     }
-    if !grants.can_write(view_path) {
+    if !access.can_write(view_path) {
         return Err(forbidden(view_path));
     }
     Ok(())
 }
 
 /// Runs the planned mutation against `planned` (already a clone of the
-/// stored document), checks every touched path against the caller's grants,
+/// stored document), checks every touched path against the caller's permissions,
 /// and runs **the** lint on the result.
 ///
 /// The lint lives here, before the `dry_run` branch, so a dry run validates
@@ -698,12 +698,12 @@ fn authorize_view_write(grants: &Grants, view_path: &DocPath) -> Result<(), anyh
 /// (`docs/DESIGN.md` §4).
 fn plan_write(
     planned: &mut Value,
-    grants: &Grants,
+    access: &Effective,
     mutate: impl FnOnce(&mut Value) -> Result<Vec<Touched>, anyhow::Error>,
 ) -> Result<Vec<Touched>, anyhow::Error> {
     let touched = mutate(planned)?;
 
-    if let Err(denied) = grants.check_write(&touched) {
+    if let Err(denied) = access.check_write(&touched) {
         return Err(forbidden(&denied));
     }
 
@@ -721,7 +721,7 @@ fn plan_write(
 
 /// The extra gate a registry document passes and the other two do not: the
 /// text about to be written must parse as the kind it is
-/// (`registry::parse_prefix` / `registry::parse_grant`).
+/// (`registry::parse_prefix` / `registry::parse_permission`).
 ///
 /// The loader **skips** a malformed file with a warning and carries on -- that
 /// isolation is why this data left `datacenter.yaml` -- so without this check
@@ -738,12 +738,12 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), anyhow::Error>
     };
     let parsed = match kind {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
-        RegistryKind::Grant => registry::parse_grant(name, text).map(|_| ()),
+        RegistryKind::Permission => registry::parse_permission(name, text).map(|_| ()),
     };
     parsed.map_err(|e| {
         let kind = match kind {
             RegistryKind::PrefixDef => "prefix",
-            RegistryKind::Grant => "grant",
+            RegistryKind::Permission => "grant",
         };
         bad_request(format!(
             "the result would not be a valid {kind}: {e}              (the loader would skip the file, so the write is refused instead)"
@@ -760,11 +760,11 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), anyhow::Error>
 /// # Errors
 /// `400:` invalid id/view/format/mode/payload, or the planned document fails
 /// the lint. `409:` digest mismatch. `403:` the view is not writable, or a
-/// planned touched path is outside the caller's write grants.
+/// planned touched path is outside the caller's write permissions.
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
 pub fn put_document(
     store: &MetaStore,
-    grant_files: &[Grant],
+    permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -775,12 +775,12 @@ pub fn put_document(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, &doc_id, acl);
+    let access = effective(permission_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
     // (1) Authorize the *request* before computing anything.
-    authorize_view_write(&grants, &view_path)?;
+    authorize_view_write(&access, &view_path)?;
 
     // A merge payload is a patch (`null` deletes); a replace payload is
     // document content.
@@ -806,7 +806,7 @@ pub fn put_document(
     // (2) Plan the mutation against a *copy*; the stored document is only
     //     touched once the plan has passed every check.
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &grants, |v| {
+    let touched = plan_write(&mut planned, &access, |v| {
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(api_err)
         } else {
@@ -856,20 +856,20 @@ pub fn put_document(
 ///
 /// # Errors
 /// `400:` invalid id/view. `409:` digest mismatch. `403:` the view is not
-/// writable, or a planned touched path is outside the caller's write grants.
+/// writable, or a planned touched path is outside the caller's write permissions.
 pub fn delete_document(
     store: &MetaStore,
-    grant_files: &[Grant],
+    permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     digest: Option<&str>,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, &doc_id, acl);
+    let access = effective(permission_files, &doc_id, acl);
     let view_path = parse_view(view)?;
 
-    authorize_view_write(&grants, &view_path)?;
+    authorize_view_write(&access, &view_path)?;
 
     store.check_precondition(&doc_id, digest).map_err(api_err)?;
     let stored = read_stored(store, &doc_id)?;
@@ -878,7 +878,7 @@ pub fn delete_document(
     check_repairable(&stored, &view_path, false)?;
 
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &grants, |v| {
+    let touched = plan_write(&mut planned, &access, |v| {
         view::remove(v, &view_path).map_err(api_err)
     })?;
 
@@ -1013,7 +1013,7 @@ pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Grant;
+    use crate::registry::Permission;
     use serde_json::json;
 
     /// A store over a fresh tempdir, with its registry directories inside it
@@ -1032,11 +1032,11 @@ mod tests {
 
     /// The grants used throughout: `scoped@pve!t1` holds `traefik` rw on
     /// guests tagged `traefik`, and `netbird` ro on every guest.
-    fn regs() -> Vec<Grant> {
-        vec![registry::parse_grant(
+    fn regs() -> Vec<Permission> {
+        vec![registry::parse_permission(
             "scoped",
             "authid: scoped@pve!t1\n\
-             grants:\n\
+             rules:\n\
              \x20 - prefix: traefik\n    mode: rw\n    selector: {tag: traefik}\n\
              \x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
         )
@@ -1139,13 +1139,13 @@ fn version_detail_names_the_documents_that_changed() {
         fn a_selector_resolves_against_the_guests_tags() {
         // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
         // granting the operator that guest.
-        let grant_files = regs();
-        let untagged = grants(&grant_files, &DocId::Guest(100), &scoped(&[]));
+        let permission_files = regs();
+        let untagged = effective(&permission_files, &DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
         assert_eq!(untagged.scopes[0].prefix.to_string(), "netbird");
         assert!(!untagged.can_write(&DocPath::parse("traefik").unwrap()));
 
-        let tagged = grants(&grant_files, &DocId::Guest(100), &scoped(&["traefik"]));
+        let tagged = effective(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
         assert!(tagged.can_write(&DocPath::parse("traefik.spec").unwrap()));
         assert!(tagged.can_read(&DocPath::parse("netbird").unwrap()));
         assert!(!tagged.can_write(&DocPath::parse("netbird").unwrap()));
@@ -1155,21 +1155,21 @@ fn version_detail_names_the_documents_that_changed() {
     fn scopes_never_apply_to_the_datacenter_document() {
         // `docs/DESIGN.md` §3: the datacenter document is governed by ACLs
         // alone, so no registration can ever reach it.
-        let g = grants(&regs(), &DocId::Datacenter, &scoped(&["traefik"]));
+        let g = effective(&regs(), &DocId::Datacenter, &scoped(&["traefik"]));
         assert!(g.scopes.is_empty());
         assert!(g.readable_prefixes().is_empty());
     }
 
     #[test]
-    fn a_registration_for_another_authid_grants_nothing() {
-        let g = grants(&regs(), &DocId::Guest(100), &none());
+    fn a_registration_for_another_authid_permissions_nothing() {
+        let g = effective(&regs(), &DocId::Guest(100), &none());
         assert!(g.readable_prefixes().is_empty());
     }
 
     // -- write authorization ------------------------------------------------
 
     #[test]
-    fn zero_grant_token_cannot_create_structure_through_an_empty_merge() {
+    fn zero_permission_token_cannot_create_structure_through_an_empty_merge() {
         // A `PUT ?view=zzz.deep&mode=merge` with `{}` must not write
         // `zzz: {deep: {}}` while reporting `touched: []`: `check_write([])`
         // is vacuously Ok, so the up-front view check is what stops it.
@@ -1192,7 +1192,7 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
-    fn zero_grant_token_cannot_write_the_root_view() {
+    fn zero_permission_token_cannot_write_the_root_view() {
         let (_dir, store) = store();
         seed(&store, "100", "traefik:\n  host: x\n");
         let before = read_raw(&store, "100").unwrap();
@@ -1331,7 +1331,7 @@ fn version_detail_names_the_documents_that_changed() {
     // -- reads --------------------------------------------------------------
 
     #[test]
-    fn no_grant_read_is_forbidden_not_an_empty_document_with_a_real_digest() {
+    fn no_permission_read_is_forbidden_not_an_empty_document_with_a_real_digest() {
         let (_dir, store) = store();
         seed(&store, "100", "traefik:\n  host: x\n");
         let err = get(&store, "100", None, "json", &none()).unwrap_err();
@@ -1690,25 +1690,25 @@ fn version_detail_names_the_documents_that_changed() {
 
     #[test]
     fn access_reports_resolved_scopes() {
-        let grant_files = regs();
-        let tagged = access(&grant_files, &DocId::Guest(100), &scoped(&["traefik"]));
+        let permission_files = regs();
+        let tagged = access(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
         assert!(!tagged.read && !tagged.write);
         assert_eq!(
             tagged.scopes.iter().map(|s| s.prefix.to_string()).collect::<Vec<_>>(),
             vec!["traefik", "netbird"]
         );
-        let untagged = access(&grant_files, &DocId::Guest(100), &scoped(&[]));
+        let untagged = access(&permission_files, &DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
-        let dc = access(&grant_files, &DocId::Datacenter, &full());
+        let dc = access(&permission_files, &DocId::Datacenter, &full());
         assert!(dc.read && dc.write && dc.scopes.is_empty());
     }
 
     #[test]
-    fn grants_list_returns_every_grant() {
-        let gs = grants_list(&regs());
+    fn permissions_list_returns_every_permission() {
+        let gs = permissions_list(&regs());
         assert_eq!(gs.len(), 1);
         assert_eq!(gs[0].authid, "scoped@pve!t1");
-        assert_eq!(gs[0].grants.len(), 2);
+        assert_eq!(gs[0].rules.len(), 2);
     }
 
     #[test]
@@ -1841,8 +1841,8 @@ fn version_detail_names_the_documents_that_changed() {
             DocId::Registry(RegistryKind::PrefixDef, "traefik".to_string()),
         );
         assert_eq!(
-            parse_id("grants/scoped").unwrap(),
-            DocId::Registry(RegistryKind::Grant, "scoped".to_string()),
+            parse_id("permissions/scoped").unwrap(),
+            DocId::Registry(RegistryKind::Permission, "scoped".to_string()),
         );
         // The file name *is* the prefix, so a nested prefix is a dotted file
         // name and has to be addressable: `homelab.docker.yaml` declares
@@ -1944,13 +1944,13 @@ fn version_detail_names_the_documents_that_changed() {
         .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
 
-        // An authid that is not an authid is refused on the grant side.
+        // An authid that is not an authid is refused on the permission side.
         let err = put(
             &store,
-            "grants/ops",
+            "permissions/ops",
             None,
             "yaml",
-            "authid: not-an-authid\ngrants: []\n",
+            "authid: not-an-authid\nrules: []\n",
             "replace",
             Some(""),
             false,
@@ -1962,14 +1962,14 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
-    fn a_partial_delete_that_would_break_a_grant_file_is_refused() {
+    fn a_partial_delete_that_would_break_a_permission_file_is_refused() {
         let (_dir, store) = store();
         put(
             &store,
-            "grants/ops",
+            "permissions/ops",
             None,
             "yaml",
-            "authid: ops@pve!t1\ngrants:\n  - prefix: homelab\n    mode: rw\n    selector: {all: true}\n",
+            "authid: ops@pve!t1\nrules:\n  - prefix: homelab\n    mode: rw\n    selector: {all: true}\n",
             "replace",
             Some(""),
             false,
@@ -1977,19 +1977,19 @@ fn version_detail_names_the_documents_that_changed() {
         )
         .unwrap();
 
-        let err = del(&store, "grants/ops", Some("authid"), None, &full()).unwrap_err();
+        let err = del(&store, "permissions/ops", Some("authid"), None, &full()).unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
-        let raw = read_raw(&store, "grants/ops").unwrap();
-        assert!(registry::parse_grant("ops", &raw).is_ok(), "the file still loads");
+        let raw = read_raw(&store, "permissions/ops").unwrap();
+        assert!(registry::parse_permission("ops", &raw).is_ok(), "the file still loads");
 
         // Removing the file whole is fine: that is an administrator revoking a
         // grant, not a half-written one.
-        del(&store, "grants/ops", None, None, &full()).unwrap();
-        assert_eq!(read_raw(&store, "grants/ops"), None);
+        del(&store, "permissions/ops", None, None, &full()).unwrap();
+        assert_eq!(read_raw(&store, "permissions/ops"), None);
     }
 
     #[test]
-    fn a_grant_never_reaches_the_registry_documents() {
+    fn a_permission_never_reaches_the_registry_documents() {
         let (_dir, store) = store();
         put(
             &store,
@@ -2009,7 +2009,7 @@ fn version_detail_names_the_documents_that_changed() {
         // datacenter document gives it.
         let acl = scoped(&["traefik"]);
         let id = parse_id("prefixes/traefik").unwrap();
-        assert!(grants(&regs(), &id, &acl).scopes.is_empty());
+        assert!(effective(&regs(), &id, &acl).scopes.is_empty());
 
         // `access` passes the ACL answers through untouched for these documents --
         // which is the point: the two bits differ from the datacenter document's

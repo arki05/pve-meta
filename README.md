@@ -25,7 +25,7 @@ backup:
   retention: 7
 ```
 
-## Views, prefixes and grants
+## Views, prefixes and permissions
 
 A caller reads or writes the document through a **view**: a key-path prefix, dotted, any
 depth, through maps only. A view of `backup` is the `backup` subtree, returned with the
@@ -57,19 +57,19 @@ A prefix names **no principal**. Declaring that a prefix exists and has a shape 
 useful with no operator, no token and no automation anywhere near it — a structured
 notes field with a schema is a complete use of this system.
 
-**A grant says who may touch one** — `/etc/pve/meta.d/grants/<name>.yaml`:
+**A permission file says who may touch one** — `/etc/pve/meta.d/permissions/<name>.yaml`:
 
 ```yaml
 authid: svc@pve!traefik
-grants:
+rules:
   - prefix: traefik
     mode: rw                 # ro | rw
     selector: { tag: traefik }
 ```
 
-Grants are **cluster-only: there is deliberately no packaged grants directory.** An
+Permissions are **cluster-only: there is deliberately no packaged permissions directory.** An
 operator's own package may ship a prefix, because a schema is a declaration; it must
-never ship its own grant, because that is self-registration. dpkg cannot write into
+never ship its own, because that is self-registration. dpkg cannot write into
 pmxcfs, so "an operator declares what it expects, only an administrator grants it" is
 enforced by where the files live rather than by a rule someone has to remember.
 
@@ -80,13 +80,13 @@ enforced by where the files live rather than by a rule someone has to remember.
   the tag is the deliberate, manual act of including that guest; pve-meta does not
   enforce anything about the tag itself, it only filters by it.
 * Both apply to guest documents only; the datacenter document is governed by ACLs alone.
-* A grant on prefix `p` also covers the sibling comment key `p__` — the only
+* A rule on prefix `p` also covers the sibling comment key `p__` — the only
   comment-key access rule.
 
 **The two nest by opposite rules, deliberately.** Prefixes: *most-specific wins, and
 schemas never merge* — with both `homelab` and `homelab.docker` declared,
 `homelab.docker.compose` is governed by the child alone and the parent's own
-`properties.docker` is shadowed, not combined. Grants: *containment, additive* — a grant
+`properties.docker` is shadowed, not combined. Permissions: *containment, additive* — a rule
 on `homelab` covers `homelab.docker`, because "you may write `homelab`" not implying its
 subtree would be surprising. Shape has one owner, so it shadows; permission is a union,
 so it adds. Those two rules cannot live on one object, which is why this is two
@@ -96,11 +96,11 @@ Grants for a caller on a guest document:
 
 * Full read = `VM.Audit` on `/vms/<vmid>`; full write = `VM.Config.Options` (datacenter:
   `Sys.Audit` / `Sys.Modify` on `/`).
-* Scopes = the union of grant entries whose `authid` is the caller and whose selector
+* Scopes = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
 * Reading view `P` needs full read or a scope covering `P`; writing needs full write or
   a `rw` scope covering every path the write touches; a write to the root view needs
-  full write. A caller with no grant at all gets 403 on read.
+  full write. A caller with no rule at all gets 403 on read.
 
 This is a blast-radius limiter, not a security boundary against an adversary — see
 `docs/DESIGN.md` §1 for the threat model.
@@ -115,17 +115,17 @@ are `protected` and run in pvedaemon.
 | GET | `/meta/version` | `detail` | `{ token, changed }` — content hash over the store; poll it |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags, digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's grants, 400 on invalid content |
+| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's permissions, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
 | GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
-| GET | `/meta/grants` | — | `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
-| GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/grants/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix/grant. `Sys.Modify` on `/` to write |
-| GET | `/meta/schemas` | — | `{ prefix, grant }` — the two registry file formats described as schemas, which is what lets the editor show a prefix file as a typed tree |
+| GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
+| GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/permissions/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix definition/permission file. `Sys.Modify` on `/` to write |
+| GET | `/meta/schemas` | — | `{ prefix, permission }` — the two registry file formats described as schemas, which is what lets the editor show a prefix file as a typed tree |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
-`data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust
+`data` is a JSON-encoded string parameter; permissions and guest lists cross the Perl/Rust
 boundary as native hashes/arrays, not JSON strings.
 
 `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over the Rust core
@@ -141,7 +141,7 @@ keys present and the keys the governing prefix definition declares; an unset dec
 renders greyed with its default and a **Set to default** button, which is the only thing
 that ever writes one. Columns: key, value (an editor chosen by the value's shape — inline
 for a scalar, a text box for a string with newlines, Monaco for a map or an array of
-maps), description (the row's own `k__` comment key) and access (every grant whose prefix
+maps), description (the row's own `k__` comment key) and access (every rule whose prefix
 covers the row). A row whose value does not match its schema is marked amber in place.
 
 Edits are **staged**, not written one key at a time: the tree shows the document as it
@@ -154,7 +154,7 @@ selector is exactly one of the two. Editability is per row, from `/meta/access`.
 
 On the Datacenter panel it is three sub-tabs: **Document** (the same editor, on the
 datacenter document), **Prefixes** and **Grants** — two grids over `/meta/prefixes` and
-`/meta/grants`, with columns a tree could not show (which guests a prefix reaches,
+`/meta/permissions`, with columns a tree could not show (which guests a prefix reaches,
 whether it carries a schema, and whether the file is a package's or yours on top of one).
 Editing a row opens that file in the same document editor, because a prefix definition is
 a document like any other.
@@ -218,7 +218,7 @@ dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
 
 Installing/configuring `pve-meta` runs its `postinst`: `pve-ext-patch apply
 pve-meta-lifecycle` (dpkg-diverts `PVE/AbstractConfig.pm`, applies the diff, gates on
-`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/{prefixes,grants}` when `/etc/pve`
+`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/{prefixes,permissions}` when `/etc/pve`
 is mounted, and restarts `pvedaemon`/`pveproxy`. The API module and the UI tabs need no
 action — pve-ext discovers
 the API module at process startup and re-reads page manifests on every `/ext/pages`
@@ -244,7 +244,7 @@ account system of its own:
 | A guest's document | `VM.Audit` on `/vms/<vmid>` | `VM.Config.Options` on `/vms/<vmid>` |
 | Datacenter document | `Sys.Audit` on `/` | `Sys.Modify` on `/` |
 
-A grant (above) additionally grants a prefix, read-only or read-write, on the
+A permission file (above) additionally grants a prefix, read-only or read-write, on the
 guests its selector matches, to a principal that may hold no VM privilege at all.
 
 ## Building
@@ -263,7 +263,7 @@ live node.
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, views, prefixes/grants/selectors, lint, api layer, store, gc — pure Rust |
+| `crates/pve-meta-core` | Document model, views, prefixes/permissions/selectors, lint, api layer, store, gc — pure Rust |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `prefixes/` | Packaged example prefixes (none required) |

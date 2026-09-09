@@ -36,7 +36,7 @@ segmented button at the right end of the toolbar.
   Description column.
 * **Arrays are one text leaf**, shown as JSON. On commit, JSON is parsed if the text
   starts with `[`, otherwise a comma-separated list is split.
-* **Access** lists *every* grant from `GET /meta/prefixes` and `GET /meta/grants` whose scope covers the
+* **Access** lists *every* grant from `GET /meta/prefixes` and `GET /meta/permissions` whose scope covers the
   row — `rw` ones by name in normal text, `ro` ones muted with `(ro)`, `rw` first. The
   cell tooltip spells each one out with its selector (`example-traefik (rw, all
   guests)`). Several principals may read a subtree; this column is about who writes and
@@ -168,7 +168,7 @@ repository copy's header still says otherwise.
 * `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
   Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
-  [--scoped] [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` and `GET /meta/grants` payload; `--scoped` and
+  [--scoped] [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` and `GET /meta/permissions` payload; `--scoped` and
   `--ro` stub `GET /meta/access` so the restricted toolbar labels and the per-row
   editability can be seen without a second principal's credentials. They need
   `puppeteer-core` and a chromium binary and write their screenshots to

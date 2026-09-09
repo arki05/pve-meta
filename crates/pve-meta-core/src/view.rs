@@ -22,7 +22,7 @@
 //! [`patch::diff`]/[`patch::apply_patch`]): unlike [`patch::apply_patch`]'s
 //! "replacing/deleting a whole subtree yields its root path" convention
 //! (which exists to keep a merge-patch's own change summary concise), this
-//! module's touched list feeds [`crate::scopes::Grants::check_write`], which
+//! module's touched list feeds [`crate::scopes::Effective::check_write`], which
 //! must be able to reject a write that reaches outside the caller's scope
 //! inside a replaced or removed subtree. Where a whole subtree disappears at
 //! once the report names that subtree's own path, not each leaf under it —
@@ -149,7 +149,7 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
             patch::diff_at(&Value::Object(Map::new()), &subtree, prefix, &mut touched);
             // Creating a key whose value is an empty map is a real change
             // even though the content diff is empty: report it, so it can
-            // never slip past `Grants::check_write`.
+            // never slip past `Effective::check_write`.
             if touched.is_empty() {
                 touched.push(Touched {
                     path: prefix.clone(),
@@ -282,7 +282,7 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
 /// best-effort union over whatever prefixes a caller happens to have).
 ///
 /// Inclusion is decided with [`crate::scopes::covers`] — the same predicate
-/// [`crate::scopes::Grants::can_read`] answers with — so a key is emitted
+/// [`crate::scopes::Effective::can_read`] answers with — so a key is emitted
 /// exactly when an explicit view of it would be allowed. That single rule is
 /// all comment keys need: `p__` travels with a readable `p` (the one
 /// sibling rule, `docs/DESIGN.md` §3), while a map's bare `__` documents the
@@ -756,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_never_emits_a_bare_map_comment_the_grant_cannot_read() {
+    fn filter_never_emits_a_bare_map_comment_the_permission_cannot_read() {
         // Reproduced live with a zero-ACL scoped
         // token: the document-root `__` documents the *whole* document, so a
         // scope on one key must not disclose it -- `?view=__` is a 403, and
@@ -774,11 +774,11 @@ mod tests {
     }
 
     #[test]
-    fn filter_emits_only_comment_keys_the_same_grant_can_read() {
+    fn filter_emits_only_comment_keys_the_same_permission_can_read() {
         // The paired invariant, checked over a document
         // that has a comment key at every interesting position: whatever
-        // `filter` emits, `Grants::can_read` must also allow as a view.
-        use crate::scopes::{Grants, Mode, Scope};
+        // `filter` emits, `Effective::can_read` must also allow as a view.
+        use crate::scopes::{Effective, Mode, Scope};
 
         let doc = json!({
             "__": "the whole document",
@@ -797,7 +797,7 @@ mod tests {
             vec![p("u")],
             vec![],
         ] {
-            let grants = Grants {
+            let access = Effective {
                 scopes: prefixes
                     .iter()
                     .map(|prefix| Scope { prefix: prefix.clone(), mode: Mode::Ro })
@@ -809,7 +809,7 @@ mod tests {
             collect_comment_paths(&filtered, &Path::root(), &mut offenders);
             for path in offenders {
                 assert!(
-                    grants.can_read(&path),
+                    access.can_read(&path),
                     "filter({prefixes:?}) emitted {path}, which can_read refuses"
                 );
             }

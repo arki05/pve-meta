@@ -33,19 +33,19 @@
 //! definition is only the "give this one a bit more structure" piece, for the
 //! operators and hook scripts that want it.
 //!
-//! # Grants
+//! # Effective
 //!
-//! * `/etc/pve/meta.d/grants/<name>.yaml` — cluster only. **There is
-//!   deliberately no packaged grants directory**: an operator's `.deb` may ship
+//! * `/etc/pve/meta.d/permissions/<name>.yaml` — cluster only. **There is
+//!   deliberately no packaged permissions directory**: an operator's `.deb` may ship
 //!   a prefix definition (what it expects) but must never ship its own grant,
 //!   which would be self-registration. dpkg cannot write into pmxcfs, so "an operator
 //!   declares what it expects; only an administrator grants it" is enforced by
 //!   where files live rather than by a rule.
 //!
 //! ```yaml
-//! # grants/traefik.yaml
+//! # permissions/traefik.yaml
 //! authid: svc@pve!traefik
-//! grants:
+//! rules:
 //!   - prefix: traefik
 //!     mode: rw
 //!     selector: { tag: traefik }
@@ -56,7 +56,7 @@
 //! [`governing`]: **most-specific wins, schemas never merge.** The longest
 //! declared prefix covering a path governs it; no other contributes.
 //!
-//! [`scopes_for`]: **grants accumulate by containment.** A grant on `homelab`
+//! [`scopes_for`]: **permissions accumulate by containment.** A grant on `homelab`
 //! covers `homelab.docker`, because "you may write `homelab`" not implying its
 //! subtree would be surprising.
 //!
@@ -80,14 +80,14 @@ pub const PREFIX_PACKAGED_DIR: &str = "/usr/share/pve-meta/prefixes";
 /// The cluster-wide prefix directory (pmxcfs); overrides
 /// [`PREFIX_PACKAGED_DIR`] by file name.
 pub const PREFIX_CLUSTER_DIR: &str = "/etc/pve/meta.d/prefixes";
-/// The grants directory. Cluster only, on purpose — see the module docs.
-pub const GRANT_CLUSTER_DIR: &str = "/etc/pve/meta.d/grants";
+/// The permissions directory. Cluster only, on purpose — see the module docs.
+pub const PERMISSION_CLUSTER_DIR: &str = "/etc/pve/meta.d/permissions";
 
 /// Environment variable overriding the prefix directories with a
 /// colon-separated list, lowest precedence first. Tests and `test/basic.pl`.
 pub const PREFIX_DIRS_ENV: &str = "PVE_META_PREFIX_DIRS";
-/// Environment variable overriding the grants directories, likewise.
-pub const GRANT_DIRS_ENV: &str = "PVE_META_GRANT_DIRS";
+/// Environment variable overriding the permissions directories, likewise.
+pub const PERMISSION_DIRS_ENV: &str = "PVE_META_PERMISSION_DIRS";
 
 /// Which guests something applies to (`docs/DESIGN.md` §3). Room is left in
 /// the format for `{ pool: <name> }`; it is deliberately not implemented.
@@ -167,9 +167,9 @@ pub enum Origin {
     Cluster,
 }
 
-/// One `grants:` entry.
+/// One `rules:` entry.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct GrantEntry {
+pub struct Rule {
     /// The key-path prefix, any depth. Non-empty.
     pub prefix: Path,
     /// What it grants.
@@ -180,7 +180,7 @@ pub struct GrantEntry {
 
 /// One grants file: what a principal may touch.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Grant {
+pub struct Permission {
     /// The file's base name without the extension — the override key.
     pub name: String,
     /// The PVE user or token id this grant is for.
@@ -189,12 +189,12 @@ pub struct Grant {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// What it grants.
-    pub grants: Vec<GrantEntry>,
+    pub rules: Vec<Rule>,
     /// Which directory this one was read from. Always `Cluster` today: there is
-    /// no packaged grants directory, deliberately (see the module docs).
+    /// no packaged permissions directory, deliberately (see the module docs).
     pub origin: Origin,
     /// `true` when it displaced a same-named file from a lower-precedence
-    /// directory. Always `false` while there is only one grants directory.
+    /// directory. Always `false` while there is only one permissions directory.
     pub overrides: bool,
 }
 
@@ -213,17 +213,17 @@ struct RawPrefixDef {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawGrant {
+struct RawPermission {
     authid: String,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    grants: Vec<RawGrantEntry>,
+    rules: Vec<RawRule>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawGrantEntry {
+struct RawRule {
     prefix: String,
     mode: String,
     #[serde(default)]
@@ -357,9 +357,9 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
 ///
 /// # Errors
 /// As [`parse_prefix`].
-pub fn parse_grant(name: &str, text: &str) -> Result<Grant> {
+pub fn parse_permission(name: &str, text: &str) -> Result<Permission> {
     let value = format::parse_raw(Format::Yaml, text)?;
-    let raw: RawGrant = serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
+    let raw: RawPermission = serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
 
     if !is_authid(&raw.authid) {
         return Err(bad(format!(
@@ -368,15 +368,15 @@ pub fn parse_grant(name: &str, text: &str) -> Result<Grant> {
         )));
     }
 
-    let mut grants = Vec::with_capacity(raw.grants.len());
-    for (i, g) in raw.grants.into_iter().enumerate() {
-        let where_ = format!("{name}: grants.{i}");
+    let mut rules = Vec::with_capacity(raw.rules.len());
+    for (i, g) in raw.rules.into_iter().enumerate() {
+        let where_ = format!("{name}: rules.{i}");
         let prefix = Path::parse(&g.prefix)
             .map_err(|_| bad(format!("{where_}: invalid prefix '{}'", g.prefix)))?;
         if prefix.is_root() {
             return Err(bad(format!(
                 "{where_}: 'prefix' must not be empty (whole-document access comes \
-                 from PVE ACLs, never from a grant)"
+                 from PVE ACLs, never from a permission)"
             )));
         }
         let mode = match g.mode.as_str() {
@@ -389,16 +389,16 @@ pub fn parse_grant(name: &str, text: &str) -> Result<Grant> {
             }
         };
         let selector = parse_selector(&where_, g.selector)?;
-        grants.push(GrantEntry { prefix, mode, selector });
+        rules.push(Rule { prefix, mode, selector });
     }
 
-    Ok(Grant {
+    Ok(Permission {
         origin: Origin::Cluster,
         overrides: false,
         name: name.to_string(),
         authid: raw.authid,
         description: raw.description,
-        grants,
+        rules,
     })
 }
 
@@ -416,9 +416,9 @@ pub fn prefix_dirs() -> Vec<PathBuf> {
     dirs_from(PREFIX_DIRS_ENV, &[PREFIX_PACKAGED_DIR, PREFIX_CLUSTER_DIR])
 }
 
-/// The grants directories. One, and cluster-only — see the module docs.
-pub fn grant_dirs() -> Vec<PathBuf> {
-    dirs_from(GRANT_DIRS_ENV, &[GRANT_CLUSTER_DIR])
+/// The permissions directories. One, and cluster-only — see the module docs.
+pub fn permission_dirs() -> Vec<PathBuf> {
+    dirs_from(PERMISSION_DIRS_ENV, &[PERMISSION_CLUSTER_DIR])
 }
 
 /// Loads one drop-directory list, later directories overriding earlier by file
@@ -486,8 +486,8 @@ pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
 }
 
 /// Every grant in `dirs`, sorted by file name.
-pub fn load_grants(dirs: &[PathBuf]) -> Vec<Grant> {
-    load_dirs(dirs, "grant", parse_grant, |g, origin, over| {
+pub fn load_permissions(dirs: &[PathBuf]) -> Vec<Permission> {
+    load_dirs(dirs, "permission", parse_permission, |g, origin, over| {
         g.origin = origin;
         g.overrides = over;
     })
@@ -501,9 +501,9 @@ pub fn load_prefixes_default() -> Vec<PrefixDef> {
     load_prefixes(&prefix_dirs())
 }
 
-/// [`load_grants`] over [`grant_dirs`].
-pub fn load_grants_default() -> Vec<Grant> {
-    load_grants(&grant_dirs())
+/// [`load_permissions`] over [`permission_dirs`].
+pub fn load_permissions_default() -> Vec<Permission> {
+    load_permissions(&permission_dirs())
 }
 
 fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
@@ -559,21 +559,21 @@ pub fn governing<'a>(
 }
 
 /// The scopes `authid` holds on a guest carrying `tags`: the union of every
-/// grant entry for that authid whose selector matches (`docs/DESIGN.md` §3.4).
+/// rule for that authid whose selector matches (`docs/DESIGN.md` §3.4).
 ///
-/// Grants **accumulate**: a grant on `homelab` covers `homelab.docker`, because
+/// Effective **accumulate**: a rule on `homelab` covers `homelab.docker`, because
 /// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
 /// prefixes nest, and deliberately so — permission is a union, shape is not.
 ///
-/// Grants apply to **guest documents only**; the datacenter document is
+/// Effective apply to **guest documents only**; the datacenter document is
 /// governed by ACLs alone, so this is never called for it.
-pub fn scopes_for(grants: &[Grant], authid: &str, tags: &[String]) -> Vec<Scope> {
+pub fn scopes_for(files: &[Permission], authid: &str, tags: &[String]) -> Vec<Scope> {
     let mut out = Vec::new();
-    for g in grants {
+    for g in files {
         if g.authid != authid {
             continue;
         }
-        for e in &g.grants {
+        for e in &g.rules {
             if e.selector.matches(tags) {
                 out.push(Scope {
                     prefix: e.prefix.clone(),
@@ -603,9 +603,9 @@ schema:
         port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
 ";
 
-    const GRANT: &str = "\
+    const PERMISSION_FILE: &str = "\
 authid: svc@pve!traefik
-grants:
+rules:
   - prefix: traefik
     mode: rw
     selector: { tag: traefik }
@@ -710,18 +710,18 @@ grants:
         assert!(parse_prefix("x", "selector: {all: true}\nnope: 1\n").is_err());
         assert!(parse_prefix("x", "description: no selector\n").is_err());
         assert!(parse_prefix("x", "selector: {all: true, tag: t}\n").is_err());
-        assert!(parse_grant("g", "authid: not-an-authid\ngrants: []\n").is_err());
-        assert!(parse_grant("g", "authid: a@pve\ngrants: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
-        assert!(parse_grant("g", "authid: a@pve\ngrants: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
-        assert!(parse_grant("g", "authid: a@pve\ngrants: [{prefix: p, mode: rw}]\n").is_err());
+        assert!(parse_permission("g", "authid: not-an-authid\nrules: []\n").is_err());
+        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
+        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
+        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: rw}]\n").is_err());
     }
 
     #[test]
-    fn a_grant_has_no_schema_and_a_prefix_has_no_authid() {
+    fn a_permission_has_no_schema_and_a_prefix_has_no_authid() {
         // The split, asserted: neither file can express the other's job.
-        assert!(parse_grant(
+        assert!(parse_permission(
             "g",
-            "authid: a@pve\ngrants: [{prefix: p, mode: rw, selector: {all: true}, schema: {}}]\n"
+            "authid: a@pve\nrules: [{prefix: p, mode: rw, selector: {all: true}, schema: {}}]\n"
         )
         .is_err());
         assert!(parse_prefix("x", "selector: {all: true}\nauthid: a@pve\n").is_err());
@@ -799,17 +799,17 @@ grants:
     }
 
     #[test]
-    fn grants_accumulate_by_containment_which_is_the_opposite_of_prefixes() {
-        let g = parse_grant("traefik", GRANT).unwrap();
+    fn permissions_accumulate_by_containment_which_is_the_opposite_of_prefixes() {
+        let g = parse_permission("traefik", PERMISSION_FILE).unwrap();
         let scopes = scopes_for(std::slice::from_ref(&g), "svc@pve!traefik", &["traefik".to_string()]);
         assert_eq!(scopes.len(), 2, "both entries, the tag one having matched");
 
-        // A grant on `traefik` covers everything under it -- containment, not
+        // A rule on `traefik` covers everything under it -- containment, not
         // most-specific-wins (`docs/DESIGN.md` §3.2).
-        let grants = crate::scopes::Grants { full_read: false, full_write: false, scopes };
-        assert!(grants.can_write(&Path::parse("traefik.spec.host").unwrap()));
-        assert!(grants.can_read(&Path::parse("netbird.groups").unwrap()));
-        assert!(!grants.can_write(&Path::parse("netbird.groups").unwrap()), "ro stays ro");
+        let access = crate::scopes::Effective { full_read: false, full_write: false, scopes };
+        assert!(access.can_write(&Path::parse("traefik.spec.host").unwrap()));
+        assert!(access.can_read(&Path::parse("netbird.groups").unwrap()));
+        assert!(!access.can_write(&Path::parse("netbird.groups").unwrap()), "ro stays ro");
 
         // The selector still gates: no tag, no traefik scope.
         let untagged = scopes_for(&[g], "svc@pve!traefik", &[]);
@@ -829,7 +829,7 @@ grants:
     #[test]
     fn a_missing_directory_is_not_an_error() {
         assert!(load_prefixes(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
-        assert!(load_grants(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
+        assert!(load_permissions(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
     }
 
     #[test]

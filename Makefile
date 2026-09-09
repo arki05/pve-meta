@@ -112,9 +112,9 @@ install:
 	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
 	# copy, never a hard failure.
 	#
-	# There is deliberately no packaged *grants* directory: an operator's
+	# There is deliberately no packaged *permissions* directory: an operator's
 	# package may ship a prefix (a declaration) but must never ship its
-	# own grant, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
+	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes
 	if [ -d prefixes ] && ls prefixes/*.yaml >/dev/null 2>&1; then \
 		cp prefixes/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/; \

@@ -62,7 +62,7 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// [`MAX_BYTES`] only ever applied to *writes*, so a multi-megabyte file
 /// dropped into `/etc/pve/meta` out of band (a bad rsync, a replicated file
 /// from a future version, a mistake) was read and SHA-256'd on every request
-/// that touched it — including `api::grants`, which reads `datacenter.yaml`
+/// that touched it — including `api::permissions`, which reads `datacenter.yaml`
 /// on every request that touched it.
 ///
 /// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
@@ -88,17 +88,17 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 pub enum RegistryKind {
     /// A prefix: what a prefix is (`crate::registry::PrefixDef`).
     PrefixDef,
-    /// A grant: who may touch one (`crate::registry::Grant`).
-    Grant,
+    /// A permission file: who may touch one (`crate::registry::Permission`).
+    Permission,
 }
 
 impl RegistryKind {
     /// The kind's wire name, and the first segment of a registry document's
-    /// API id: `prefixes` / `grants`.
+    /// API id: `prefixes` / `permissions`.
     pub fn as_str(&self) -> &'static str {
         match self {
             RegistryKind::PrefixDef => "prefixes",
-            RegistryKind::Grant => "grants",
+            RegistryKind::Permission => "permissions",
         }
     }
 }
@@ -121,8 +121,8 @@ impl fmt::Display for RegistryKind {
 /// the shape of every wrong-result bug this project has had.
 ///
 /// Two things are *not* uniform, and both live outside this type: a registry
-/// document is governed by ACLs alone (`api::grants` gives it no scopes -- a
-/// grant file that could widen its own grants would be self-registration), and
+/// document is governed by ACLs alone (`api::permissions` gives it no scopes -- a
+/// permission file that could widen its own grants would be self-registration), and
 /// its content must additionally parse as the kind it claims to be, which
 /// `api::put_document` checks before writing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -131,7 +131,7 @@ pub enum DocId {
     Guest(u32),
     /// The datacenter's metadata document, named `datacenter.yaml`.
     Datacenter,
-    /// A prefix or grant file, named `<name>.yaml` in its kind's directory.
+    /// A prefix or permission file, named `<name>.yaml` in its kind's directory.
     /// The name is a single path segment (`crate::path::is_valid_segment`), so
     /// it can never contain a slash or escape that directory.
     Registry(RegistryKind, String),
@@ -316,7 +316,7 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 ///
 /// Three directories, not one: `root` holds the guest and datacenter documents
 /// and the snapshot copies, and the two registry drop-directory *lists* hold
-/// the prefix and grant files ([`DocId::Registry`]). The lists are ordered
+/// the prefix and permission files ([`DocId::Registry`]). The lists are ordered
 /// lowest precedence first, exactly as `crate::registry` loads them, so the
 /// **last** entry of each is the one a write goes to -- the cluster directory,
 /// with the packaged one below it staying read-only. Writing a prefix whose
@@ -326,14 +326,14 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct MetaStore {
     root: PathBuf,
     prefix_dirs: Vec<PathBuf>,
-    grant_dirs: Vec<PathBuf>,
+    permission_dirs: Vec<PathBuf>,
 }
 
 impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
     /// to exist yet), with the registry directories `crate::registry` itself
     /// would load -- the packaged and cluster defaults, or whatever
-    /// `PVE_META_PREFIX_DIRS`/`PVE_META_GRANT_DIRS` say.
+    /// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` say.
     ///
     /// Reading those two variables here, once, is deliberate: the alternative
     /// is reading them again deeper in the call path, where a test (or a
@@ -345,7 +345,7 @@ impl MetaStore {
         MetaStore {
             root: root.into(),
             prefix_dirs: crate::registry::prefix_dirs(),
-            grant_dirs: crate::registry::grant_dirs(),
+            permission_dirs: crate::registry::permission_dirs(),
         }
     }
 
@@ -355,12 +355,12 @@ impl MetaStore {
     pub fn with_registry_dirs(
         root: impl Into<PathBuf>,
         prefix_dirs: Vec<PathBuf>,
-        grant_dirs: Vec<PathBuf>,
+        permission_dirs: Vec<PathBuf>,
     ) -> Self {
         MetaStore {
             root: root.into(),
             prefix_dirs,
-            grant_dirs,
+            permission_dirs,
         }
     }
 
@@ -368,7 +368,7 @@ impl MetaStore {
     fn registry_dirs(&self, kind: RegistryKind) -> &[PathBuf] {
         match kind {
             RegistryKind::PrefixDef => &self.prefix_dirs,
-            RegistryKind::Grant => &self.grant_dirs,
+            RegistryKind::Permission => &self.permission_dirs,
         }
     }
 
@@ -488,7 +488,7 @@ impl MetaStore {
     /// Every API write is already lint-gated, so invalid content can only
     /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
     /// backup, pmxcfs replication). Linting on the way *in* made one bad key
-    /// anywhere in `datacenter.yaml` a cluster-wide outage — `api::grants`
+    /// anywhere in `datacenter.yaml` a cluster-wide outage — `api::permissions`
     /// reads that document on every guest request — and, worse, blocked the
     /// administrator's own repair, since they could neither read the document
     /// to see the problem nor write over it. Strict validation belongs to the
@@ -500,7 +500,7 @@ impl MetaStore {
     /// an anchor or an explicit tag still 400'd every endpoint for everyone.
     /// A syntax error is now reported per document, in
     /// [`Document::parse_error`], with the empty document as the value — the
-    /// caller decides (`api::grants` grants nothing and warns; a read answers
+    /// caller decides (`api::permissions` grants nothing and warns; a read answers
     /// with `parse_error` and no data; a full-write caller may replace the
     /// whole document to repair it).
     ///
@@ -903,7 +903,7 @@ impl MetaStore {
         )?;
         for (kind, dirs) in [
             (RegistryKind::PrefixDef, &self.prefix_dirs),
-            (RegistryKind::Grant, &self.grant_dirs),
+            (RegistryKind::Permission, &self.permission_dirs),
         ] {
             for dir in dirs {
                 // The full directory path, not just the kind: two directories

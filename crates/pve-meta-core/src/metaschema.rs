@@ -2,7 +2,7 @@
 //! dialect a prefix uses to describe a guest's subtree (`docs/DESIGN.md`
 //! §3.6).
 //!
-//! Since revision 6 a prefix or grant file is an ordinary document
+//! Since revision 6 a prefix or permission file is an ordinary document
 //! ([`crate::store::DocId::Registry`]), so the editor can show it as a tree and
 //! lint it as it is typed -- but only if something says what shape it has. That
 //! is what this module is: `prefix.yaml` and `grant.yaml` written out as
@@ -17,7 +17,7 @@
 //! as a known limit rather than leaving it to be rediscovered.
 //!
 //! It is deliberately **not** the validator. `registry::parse_prefix` and
-//! `registry::parse_grant` decide what is storable, on the way in, in one place
+//! `registry::parse_permission` decide what is storable, on the way in, in one place
 //! (`api::check_registry_shape`); this is the affordance that tells a human
 //! what to type before they try. The test at the bottom is what keeps the two
 //! from drifting: every property this schema marks as required is one the
@@ -68,8 +68,8 @@ properties:
       format, plus 'multiline' as an editor hint. Free-form, so it is edited as text.
 "#;
 
-/// The grant file format (`docs/DESIGN.md` §3.2).
-const GRANT: &str = r#"
+/// The permission file format (`docs/DESIGN.md` §3.2).
+const PERMISSION: &str = r#"
 type: object
 description: >-
   A grant: who may touch which prefix. Cluster-only, because an operator's own
@@ -84,12 +84,12 @@ properties:
     type: string
     optional: 1
     description: What this principal is, for whoever reads the file next.
-  grants:
+  rules:
     type: array
     optional: 1
     description: >-
       The entries this principal gets: each one a prefix, a mode ('ro' or 'rw') and a
-      selector. Grants accumulate by containment, so an entry on 'homelab' also covers
+      selector. Effective accumulate by containment, so an entry on 'homelab' also covers
       'homelab.docker'. Optional because a file with none is a principal that may touch
       nothing, which is a legitimate (if pointless) state -- and the misspelling that
       would otherwise produce it by accident is already refused, since an unknown key
@@ -108,16 +108,16 @@ pub fn prefix() -> Value {
     parse(PREFIX, "prefix")
 }
 
-/// The grant file's schema.
-pub fn grant() -> Value {
-    parse(GRANT, "grant")
+/// The permission file's schema.
+pub fn permission() -> Value {
+    parse(PERMISSION, "permission")
 }
 
 /// Both, keyed by kind: what `GET /meta/schemas` returns.
 pub fn schemas() -> Value {
     let mut map = serde_json::Map::new();
     map.insert("prefix".to_string(), prefix());
-    map.insert("grant".to_string(), grant());
+    map.insert("permission".to_string(), permission());
     Value::Object(map)
 }
 
@@ -143,7 +143,7 @@ mod tests {
         // typo in them from reaching pvedaemon.
         assert_eq!(schemas().as_object().unwrap().len(), 2);
         assert_eq!(prefix()["type"], "object");
-        assert_eq!(grant()["type"], "object");
+        assert_eq!(permission()["type"], "object");
     }
 
     /// The point of the module: what it says is required has to be what the
@@ -167,15 +167,15 @@ mod tests {
             );
         }
 
-        let grant_text = "authid: a@pve!t1\ndescription: d\ngrants: []\n";
-        assert!(registry::parse_grant("x", grant_text).is_ok());
-        for (key, optional) in properties(&grant()) {
-            let value: serde_json::Value = format::parse_raw(Format::Yaml, grant_text).unwrap();
+        let permissions_text = "authid: a@pve!t1\ndescription: d\nrules: []\n";
+        assert!(registry::parse_permission("x", permissions_text).is_ok());
+        for (key, optional) in properties(&permission()) {
+            let value: serde_json::Value = format::parse_raw(Format::Yaml, permissions_text).unwrap();
             let mut without = value.as_object().unwrap().clone();
             without.remove(&key);
             let text = format::dump(Format::Yaml, &Value::Object(without));
             assert_eq!(
-                registry::parse_grant("x", &text).is_ok(),
+                registry::parse_permission("x", &text).is_ok(),
                 optional,
                 "grant: dropping '{key}' (optional: {optional}) does not match the parser",
             );
@@ -217,7 +217,7 @@ mod tests {
     fn no_property_is_invented() {
         let ns: Vec<String> = properties(&prefix()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(ns, ["description", "selector", "schema"]);
-        let g: Vec<String> = properties(&grant()).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(g, ["authid", "description", "grants"]);
+        let g: Vec<String> = properties(&permission()).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(g, ["authid", "description", "rules"]);
     }
 }

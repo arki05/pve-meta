@@ -12,7 +12,7 @@
  *     carry a folder icon (open when expanded), value rows a document icon, both at the
  *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
  *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
- *     one text leaf. Access lists every grant whose prefix covers the row.
+ *     one text leaf. Access lists every permission whose prefix covers the row.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
  *     toggle), Apply through a diff dialog and Discard.
@@ -400,7 +400,7 @@ PVE.meta.Utils = {
 
     // Plain containment: `p` itself, or anything under `p.`. Deliberately NOT
     // `covers`, which additionally aliases the sibling comment key `p__` -- that is a
-    // *grant* rule (a scope on `p` may write the note about `p`), and it does not
+    // *permission* rule (a scope on `p` may write the note about `p`), and it does not
     // belong here. With prefixes `a` and `a__` both declared, `covers` would have
     // said `a` governs the whole `a__` prefix; Rust's `registry::governing` uses
     // plain containment and would have said `a__`. Two predicates, two jobs.
@@ -568,7 +568,7 @@ PVE.meta.Yaml = {
 
 PVE.meta.Lint = {
     // The prefixes that carry a schema, longest prefix first. Shape comes from
-    // prefixes, never from grants (DESIGN section 3.1).
+    // prefixes, never from permissions (DESIGN section 3.1).
     applicable: function (prefixes) {
         return PVE.meta.Utils.bySpecificity(
             (prefixes || []).filter((ns) => ns && ns.schema && ns.prefix),
@@ -1182,7 +1182,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
 // operator fills it in, or there is a reason it is not there -- and a `default` is an
 // offer the row makes ("Set to default"), never something written behind your back.
 // (`optional` survives in the meta-schema, DESIGN §3.6, because *those* files really do
-// have required fields: a grant without an `authid` is refused on the way in.)
+// have required fields: a permission file without an `authid` is refused on the way in.)
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DeclareKeyWindow', {
@@ -1643,7 +1643,7 @@ Ext.define('PVE.meta.TreePanel', {
         me.vmid = me.vmid || sel.vmid;
         me.dc = !me.vmid;
         // This panel is ONE document's editor, named by `docId`: a guest's, the
-        // datacenter's, or a prefix/grant file's -- they are all documents (DESIGN
+        // datacenter's, or a prefix/permission file's -- they are all documents (DESIGN
         // §3.5), so the same tree, markers, text editor and diff serve all three, and
         // the registry grids open one of these in a window rather than reimplementing
         // any of it.
@@ -1660,7 +1660,7 @@ Ext.define('PVE.meta.TreePanel', {
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0, scopes: [] };
         me.prefixes = [];
-        me.grants = [];
+        me.permissions = [];
         me.tags = [];
         me.token = null;
         me.editing = false; // a row editor is open
@@ -2070,8 +2070,8 @@ Ext.define('PVE.meta.TreePanel', {
         if (id.indexOf('prefixes/') === 0) {
             return 'prefix';
         }
-        if (id.indexOf('grants/') === 0) {
-            return 'grant';
+        if (id.indexOf('permissions/') === 0) {
+            return 'permission';
         }
         return 'guest';
     },
@@ -2176,7 +2176,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     // What describes this document's shape. A guest document is described by the
     // prefixes that reach it, most-specific first (they shadow); a prefix or
-    // grant file by the one meta-schema for its kind, rooted at the document itself;
+    // permission file by the one meta-schema for its kind, rooted at the document itself;
     // the datacenter document by nothing at all -- prefixes are guest-only
     // (DESIGN §3.3), which is what keeps a prefix from painting rows onto it.
     grammarFor: function (id) {
@@ -2185,10 +2185,10 @@ Ext.define('PVE.meta.TreePanel', {
         if (kind === 'guest') {
             return me.applicablePrefixes();
         }
-        if (kind !== 'prefix' && kind !== 'grant') {
+        if (kind !== 'prefix' && kind !== 'permission') {
             return []; // the datacenter document: nothing describes its shape
         }
-        let schema = kind === 'prefix' ? me.schemas.prefix : me.schemas.grant;
+        let schema = kind === 'prefix' ? me.schemas.prefix : me.schemas.permission;
         // A pseudo-prefix at the root. Its prefix is empty, so it governs the
         // whole document and there is nothing for it to shadow -- which is why it is
         // never passed as the shadowing list: `governing` answers about prefixes, and
@@ -2345,7 +2345,7 @@ Ext.define('PVE.meta.TreePanel', {
         }
         Proxmox.Utils.setErrorMask(me, true);
         me.loadPrefixes(() =>
-            me.loadGrants(() =>
+            me.loadPermissions(() =>
                 me.loadTags(() =>
                     me.loadAccess(() =>
                         me.loadSchemas(() =>
@@ -2357,7 +2357,7 @@ Ext.define('PVE.meta.TreePanel', {
         );
     },
 
-    // /meta/prefixes and /meta/grants are revision 6; against an older API they
+    // /meta/prefixes and /meta/permissions are revision 6; against an older API they
     // simply fail and the Access column and the schema-declared rows stay empty,
     // rather than the page.
     loadPrefixes: function (next) {
@@ -2378,16 +2378,16 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    loadGrants: function (next) {
+    loadPermissions: function (next) {
         let me = this;
         me.request({
-            url: '/meta/grants',
+            url: '/meta/permissions',
             success: function (response) {
-                me.grants = response.result.data || [];
+                me.permissions = response.result.data || [];
                 next();
             },
             failure: function () {
-                me.grants = [];
+                me.permissions = [];
                 next();
             },
         });
@@ -2401,7 +2401,7 @@ Ext.define('PVE.meta.TreePanel', {
             (list || []).some((e) => (e[key] || []).some((x) => x.selector && x.selector.tag));
         let needed =
             (me.prefixes || []).some((n) => n.selector && n.selector.tag) ||
-            hasTagSelector(me.grants, 'grants');
+            hasTagSelector(me.permissions, 'rules');
         if (me.dc || !needed) {
             next();
             return;
@@ -2423,7 +2423,7 @@ Ext.define('PVE.meta.TreePanel', {
             url: '/meta/access',
             // Ask about the document this panel is actually showing. `dc: 1` used to
             // stand in for "not a guest", which stopped being true the moment a
-            // prefix or grant file could be the document: those are readable by every
+            // prefix or permission file could be the document: those are readable by every
             // authenticated user, and asking about the datacenter document instead
             // answered with Sys.Audit -- disabling Text mode on a file the caller may
             // certainly read (DESIGN §3.5).
@@ -2549,7 +2549,7 @@ Ext.define('PVE.meta.TreePanel', {
     // on `/vms/<vmid>` never sees the guest in the resource tree at all
     // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
     // panel has tags we cannot read. A scope-only principal is still bound by
-    // its grants -- they are enforced server-side, on the API it actually uses.
+    // its permissions -- they are enforced server-side, on the API it actually uses.
 
     // The prefixes that reach this guest, most-specific first. Prefixes decide
     // *shape*: which declared-but-unset rows appear and which schema governs a path.
@@ -2564,29 +2564,29 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    // The grant entries that reach this guest. Grants decide *access*, and unlike
-    // prefixes they accumulate by containment: a grant on `homelab` covers
+    // The permission rules that reach this guest. Permissions decide *access*, and
+    // unlike prefixes they accumulate by containment: a rule on `homelab` covers
     // `homelab.docker` (DESIGN section 3.2).
-    applicableGrants: function () {
+    applicablePermissions: function () {
         let me = this;
         let out = [];
         if (me.dc) {
-            return out; // grants apply to guest documents only
+            return out; // permissions apply to guest documents only
         }
-        (me.grants || []).forEach(function (grant) {
-            (grant.grants || []).forEach(function (entry) {
+        (me.permissions || []).forEach(function (file) {
+            (file.rules || []).forEach(function (entry) {
                 let sel = entry.selector || {};
                 let matches =
                     entry.prefix && (sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1));
                 if (matches) {
-                    out.push(Ext.apply({ grant: grant }, entry));
+                    out.push(Ext.apply({ file: file }, entry));
                 }
             });
         });
         return out;
     },
 
-    // Every grant whose prefix covers this row, `rw` first. Several principals
+    // Every rule whose prefix covers this row, `rw` first. Several principals
     // may read a subtree; this is about who writes and who subscribes, not ownership.
     accessFor: function (path, scopes) {
         let U = PVE.meta.Utils;
@@ -2597,7 +2597,7 @@ Ext.define('PVE.meta.TreePanel', {
             if (!U.covers(s.prefix, path)) {
                 return;
             }
-            let name = s.grant.name || s.grant.authid || '';
+            let name = s.file.name || s.file.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
             let key = name + '\u0000' + mode;
             if (seen[key]) {
@@ -2799,9 +2799,9 @@ Ext.define('PVE.meta.TreePanel', {
     buildTree: function () {
         let me = this;
         let I = PVE.meta.Icons;
-        // Grants decide access, and they reach guest documents only, so the Access
+        // Permissions reach guest documents only, so the Access
         // column is empty on the datacenter tab by construction (DESIGN §3.3).
-        let scopes = me.applicableGrants();
+        let scopes = me.applicablePermissions();
 
         let findings = me.findingsFor();
         // What is staged, by path, so a changed row can show `stored -> pending`.
@@ -3583,7 +3583,7 @@ Ext.define('PVE.meta.TreePanel', {
 // One document in a window — what a registry grid opens.
 //
 // It is the ordinary editor panel, unchanged: tree, row editors, markers, the
-// Tree | Text toggle, the diff. A prefix definition or a grant file is a document
+// Tree | Text toggle, the diff. A prefix definition or a permission file is a document
 // (DESIGN §3.5), so "edit one" was never a thing that needed its own editor.
 // ---------------------------------------------------------------------------
 
@@ -3595,7 +3595,7 @@ Ext.define('PVE.meta.DocumentWindow', {
     width: 860,
     height: 560,
     layout: 'fit',
-    // configs: docId ('prefixes/<name>' or 'grants/<name>')
+    // configs: docId ('prefixes/<name>' or 'permissions/<name>')
 
     initComponent: function () {
         let me = this;
@@ -3605,7 +3605,7 @@ Ext.define('PVE.meta.DocumentWindow', {
                 {
                     xtype: 'pveMetaTreePanel',
                     // `dc: true` says "this is not a guest": no tags to resolve
-                    // and no grants to apply. Which ACL answers apply is decided by
+                    // and no permissions to apply. Which ACL answers apply is decided by
                     // `docId`, which `loadAccess` sends as-is.
                     dc: true,
                     docId: me.docId,
@@ -3638,7 +3638,7 @@ Ext.define('PVE.meta.NewRegistryWindow', {
     initComponent: function () {
         let me = this;
         let isPrefix = me.kind === 'prefixes';
-        me.title = isPrefix ? gettext('New Prefix') : gettext('New Grant');
+        me.title = isPrefix ? gettext('New Prefix') : gettext('New Permission');
         let items = [
             {
                 xtype: 'textfield',
@@ -3705,15 +3705,15 @@ Ext.define('PVE.meta.NewRegistryWindow', {
         me.on('show', () => me.down('[name=name]').focus(true, 50));
     },
 
-    // The smallest file the loader will read back. A grant is created with no
-    // entries on purpose: it grants nothing until an administrator says what.
+    // The smallest file the loader will read back. A permission file is created with
+    // no rules on purpose: it permits nothing until an administrator says what.
     contentFrom: function (v) {
-        if (this.kind === 'grants') {
+        if (this.kind === 'permissions') {
             let out = { authid: v.authid };
             if (v.description) {
                 out.description = v.description;
             }
-            out.grants = [];
+            out.rules = [];
             return out;
         }
         let out = {};
@@ -3754,7 +3754,7 @@ Ext.define('PVE.meta.RegistryGrid', {
     extend: 'Ext.grid.Panel',
     xtype: 'pveMetaRegistryGrid',
 
-    kind: 'prefixes', // or 'grants'
+    kind: 'prefixes', // or 'permissions'
     border: false,
     emptyText: gettext('No entries'),
 
@@ -3764,15 +3764,15 @@ Ext.define('PVE.meta.RegistryGrid', {
         rowsFrom: function (kind, list) {
             let U = PVE.meta.Utils;
             return (list || []).map(function (e) {
-                if (kind === 'grants') {
+                if (kind === 'permissions') {
                     return {
                         name: e.name,
-                        id: 'grants/' + e.name,
+                        id: 'permissions/' + e.name,
                         authid: e.authid || '',
                         description: e.description || '',
-                        // What it actually grants, in one line: prefix, mode and the
+                        // What it actually permits, in one line: prefix, mode and the
                         // selector that decides which guests it reaches.
-                        summary: (e.grants || [])
+                        summary: (e.rules || [])
                             .map((g) => g.prefix + ' (' + g.mode + ', ' + U.selectorText(g.selector) + ')')
                             .join(', '),
                         origin: e.origin || 'cluster',
@@ -3828,7 +3828,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         } else {
             columns.push(
                 { text: gettext('Auth ID'), dataIndex: 'authid', flex: 2, renderer: Ext.htmlEncode },
-                { text: gettext('Grants'), dataIndex: 'summary', flex: 3, renderer: Ext.htmlEncode },
+                { text: gettext('Rules'), dataIndex: 'summary', flex: 3, renderer: Ext.htmlEncode },
             );
         }
         columns.push(
@@ -4001,7 +4001,7 @@ Ext.define('PVE.meta.RegistryGrid', {
 // The datacenter tab: the datacenter document, and the two registry lists.
 //
 // Three sub-tabs rather than one tree of everything. They are three different
-// kinds of thing -- one document, a list of prefix definitions, a list of grants --
+// kinds of thing -- one document, a list of prefix definitions, a list of permissions --
 // and drawing them as branches of a single tree claimed a relationship they do
 // not have, while hiding the columns that make a list worth reading.
 // ---------------------------------------------------------------------------
@@ -4030,10 +4030,10 @@ Ext.define('PVE.meta.DatacenterPanel', {
                     kind: 'prefixes',
                 },
                 {
-                    title: gettext('Grants'),
+                    title: gettext('Permissions'),
                     iconCls: 'fa fa-key',
                     xtype: 'pveMetaRegistryGrid',
-                    kind: 'grants',
+                    kind: 'permissions',
                 },
             ],
         });

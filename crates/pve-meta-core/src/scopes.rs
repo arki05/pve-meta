@@ -1,17 +1,17 @@
-//! Grants: a principal's effective access to one document
+//! Effective: a principal's effective access to one document
 //! (`docs/DESIGN.md` §3).
 //!
-//! A [`Grants`] is built per request by [`crate::api`] from two inputs: the
+//! A [`Effective`] is built per request by [`crate::api`] from two inputs: the
 //! PVE ACL answers Perl passes in (`full_read`/`full_write`) and the scope
 //! entries of the [registrations](crate::registry) whose `authid` is the
 //! caller and whose selector matches the guest. Scopes are **additive**: they
 //! never restrict a principal that already holds the ACL, and they apply to
 //! guest documents only — the datacenter document is governed by ACLs alone.
 //!
-//! This module turns that into yes/no decisions ([`Grants::can_read`],
-//! [`Grants::can_write`]), the prefix list for an unscoped read
-//! ([`Grants::readable_prefixes`], see [`crate::view::filter`]) and the
-//! write-time enforcement ([`Grants::check_write`]).
+//! This module turns that into yes/no decisions ([`Effective::can_read`],
+//! [`Effective::can_write`]), the prefix list for an unscoped read
+//! ([`Effective::readable_prefixes`], see [`crate::view::filter`]) and the
+//! write-time enforcement ([`Effective::check_write`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ pub struct Scope {
 
 /// A principal's effective access for one document.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Grants {
+pub struct Effective {
     /// `true` if the principal has full read access (`VM.Audit` on the
     /// guest, or `Sys.Audit` on `/` for the datacenter document).
     #[serde(default)]
@@ -51,7 +51,7 @@ pub struct Grants {
     /// on the guest, or `Sys.Modify` on `/` for the datacenter document).
     #[serde(default)]
     pub full_write: bool,
-    /// Prefix-scoped grants, in addition to (never subtracted from) full
+    /// Prefix-scoped permissions, in addition to (never subtracted from) full
     /// access.
     #[serde(default)]
     pub scopes: Vec<Scope>,
@@ -91,7 +91,7 @@ pub(crate) fn covers(prefix: &Path, path: &Path) -> bool {
     prefix.is_prefix_of(&Path::new(segments))
 }
 
-impl Grants {
+impl Effective {
     /// `true` if `path` is readable: full read access, or a scope (of
     /// either mode) whose prefix covers it (see [`covers`]).
     pub fn can_read(&self, path: &Path) -> bool {
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn full_access_reads_and_writes_everything() {
-        let g = Grants {
+        let g = Effective {
             full_read: true,
             full_write: true,
             scopes: vec![],
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn no_access_by_default() {
-        let g = Grants::default();
+        let g = Effective::default();
         assert!(!g.can_read(&p("a")));
         assert!(!g.can_write(&p("a")));
         assert!(g.readable_prefixes().is_empty());
@@ -203,8 +203,8 @@ mod tests {
     }
 
     #[test]
-    fn ro_scope_grants_read_but_not_write() {
-        let g = Grants {
+    fn ro_scope_permissions_read_but_not_write() {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("netbird"), mode: Mode::Ro }],
             ..Default::default()
         };
@@ -215,8 +215,8 @@ mod tests {
     }
 
     #[test]
-    fn rw_scope_grants_read_and_write_within_prefix_only() {
-        let g = Grants {
+    fn rw_scope_permissions_read_and_write_within_prefix_only() {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
         };
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn readable_prefixes_lists_every_scope_regardless_of_mode() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![
                 Scope { prefix: p("traefik"), mode: Mode::Rw },
                 Scope { prefix: p("netbird"), mode: Mode::Ro },
@@ -243,7 +243,7 @@ mod tests {
 
     #[test]
     fn full_read_ignores_any_scopes_in_readable_prefixes() {
-        let g = Grants {
+        let g = Effective {
             full_read: true,
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn check_write_ok_when_every_touched_path_is_writable() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
         };
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn check_write_reports_first_denied_path() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
         };
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn check_write_denies_ro_scope() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("netbird"), mode: Mode::Ro }],
             ..Default::default()
         };
@@ -287,12 +287,12 @@ mod tests {
         // own: the API layer must independently require `can_write(view)`
         // before it computes anything, and `crate::view`'s operations must
         // never change a document while reporting no touched paths.
-        assert_eq!(Grants::default().check_write(&[]), Ok(()));
+        assert_eq!(Effective::default().check_write(&[]), Ok(()));
     }
 
     #[test]
     fn scope_covers_the_sibling_comment_key_of_its_own_prefix() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
         };
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn comment_key_aliasing_does_not_leak_to_other_keys() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("traefik"), mode: Mode::Rw }],
             ..Default::default()
         };
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn nested_scope_covers_its_own_comment_key_at_the_same_depth() {
-        let g = Grants {
+        let g = Effective {
             scopes: vec![Scope { prefix: p("a.b"), mode: Mode::Ro }],
             ..Default::default()
         };

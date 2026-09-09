@@ -388,22 +388,22 @@ const panel = {
     dc: false,
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, grants
+    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, permissions
     // decide access.
     prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
     ],
-    grants: [
+    permissions: [
         {
             name: 'traefik',
             authid: 'svc@pve!traefik',
-            grants: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
+            rules: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
         },
         {
             name: 'netbird',
             authid: 'svc@pve!netbird',
-            grants: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
+            rules: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
         },
     ],
 };
@@ -413,7 +413,7 @@ const panel = {
     'addGrammar',
     'schemaKind',
     'applicablePrefixes',
-    'applicableGrants',
+    'applicablePermissions',
     'accessFor',
     'accessSummary',
     'editableFor',
@@ -421,8 +421,8 @@ const panel = {
 
 const prefixes = panel.applicablePrefixes.call(panel);
 eq('applicable prefixes', prefixes.map((n) => n.prefix), ['traefik', 'netbird']);
-const scopes = panel.applicableGrants.call(panel);
-eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+const scopes = panel.applicablePermissions.call(panel);
+eq('applicable permissions', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
@@ -454,7 +454,7 @@ eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['gr
 eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
-console.log('\n--- Access: every grant whose prefix covers the row ---');
+console.log('\n--- Access: every rule whose prefix covers the row ---');
 eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
     { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
 ]);
@@ -466,7 +466,7 @@ const overlapping = scopes.concat([
         prefix: 'traefik',
         mode: 'ro',
         selector: { all: true },
-        grant: { name: 'audit', authid: 'svc@pve!audit' },
+        file: { name: 'audit', authid: 'svc@pve!audit' },
     },
 ]);
 eq(
@@ -482,13 +482,13 @@ eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), fals
 console.log('\n--- S6: a guest that does not carry the tag ---');
 // A tag selector resolves against this guest's tags and nothing else. Holding a
 // `traefik` rw scope of our own must not drag another principal's tag-selected
-// grant onto a guest that is not tagged `traefik` -- the Access column would
+// rule onto a guest that is not tagged `traefik` -- the Access column would
 // then name a writer who cannot in fact write here.
 const untagged = Object.assign({}, panel);
 untagged.tags = [];
 untagged.access = { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const untaggedScopes = panel.applicableGrants.call(untagged);
-eq('a tag grant needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
+const untaggedScopes = panel.applicablePermissions.call(untagged);
+eq('a tag rule needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
 eq(
     'no Access row for the prefix whose selector missed',
     panel.accessFor.call(untagged, 'traefik.spec.host', untaggedScopes),
@@ -708,7 +708,7 @@ eq('an unquoted integer is still a number', U.yamlLoad('v: 1\n'), { v: 1 });
 eq('booleans still parse', U.yamlLoad('v: true\n'), { v: true });
 eq('an empty document is the empty map, not null', U.yamlLoad(''), {});
 
-console.log('\n--- governing uses containment, not the grant predicate ---');
+console.log('\n--- governing uses containment, not the permission predicate ---');
 // `covers` aliases the sibling comment key `p__` -- that is a GRANT rule. Using it to
 // pick a governing prefix made `a` govern the whole `a__` prefix, where Rust's
 // registry::governing (plain containment) says `a__`.
@@ -781,11 +781,11 @@ const D = ctx.PVE.meta.DeclareKeyWindow;
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('the datacenter id', P.urlFor.call(P, 'datacenter'), '/meta/datacenter');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
-eq('a grant id', P.urlFor.call(P, 'grants/scoped'), '/meta/grants/scoped');
+eq('a permission id', P.urlFor.call(P, 'permissions/scoped'), '/meta/permissions/scoped');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of the datacenter', P.docKind.call(P, 'datacenter'), 'datacenter');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
-eq('kind of a grant', P.docKind.call(P, 'grants/scoped'), 'grant');
+eq('kind of a permission file', P.docKind.call(P, 'permissions/scoped'), 'permission');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
 
 // Per-document digests. One shared field would have sent a prefix's digest with a
@@ -798,7 +798,7 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
     panelM.docId = 'datacenter';
     eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
     eq('and its own data', panelM.dataOf('datacenter'), { a: 1 });
-    eq('an unknown document has no digest', panelM.digestOf('grants/nope'), '');
+    eq('an unknown document has no digest', panelM.digestOf('permissions/nope'), '');
     eq('a row names its document', panelM.docOf({ data: { docId: 'prefixes/x' } }), 'prefixes/x');
     eq('no row means the default one', panelM.docOf(null), 'datacenter');
 }
@@ -976,25 +976,25 @@ console.log('\n--- the registry lists ---');
     eq('an administrator\'s own', G.originText(rows[1]), 'cluster');
     eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
 
-    const grants = G.rowsFrom('grants', [
+    const permRows = G.rowsFrom('permissions', [
         {
             name: 'scoped',
             authid: 'svc@pve!t1',
-            grants: [
+            rules: [
                 { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
                 { prefix: 'netbird', mode: 'ro', selector: { all: true } },
             ],
             origin: 'cluster',
         },
     ]);
-    eq('a grant row is addressed the same way', grants[0].id, 'grants/scoped');
+    eq('a permission row is addressed the same way', permRows[0].id, 'permissions/scoped');
     eq(
-        'and says what it actually grants',
-        grants[0].summary,
+        'and says what it actually permits',
+        permRows[0].summary,
         'traefik (rw, tag: traefik), netbird (ro, all guests)',
     );
     // An older API returns neither field; the list must still render.
-    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('grants', [{ name: 'x' }])[0]), 'cluster');
+    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
 }
 
 console.log('\n--- creating a registry file: the least that parses ---');
@@ -1010,7 +1010,7 @@ console.log('\n--- creating a registry file: the least that parses ---');
     );
     // A grant is created granting nothing: it names a principal, and an
     // administrator says what it may touch afterwards.
-    eq('a grant starts empty', make('grants', { authid: 'a@pve!t1' }), { authid: 'a@pve!t1', grants: [] });
+    eq('a permission file starts empty', make('permissions', { authid: 'a@pve!t1' }), { authid: 'a@pve!t1', rules: [] });
 }
 
 console.log('\n--- reloading must not fold the tree up ---');
@@ -1021,12 +1021,12 @@ console.log('\n--- reloading must not fold the tree up ---');
     // reload because `Grants` had won the shared key.
     const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
     const prefixes = { data: { docId: null, path: '', key: 'Prefixes' } };
-    const grants = { data: { docId: null, path: '', key: 'Grants' } };
+    const permissions = { data: { docId: null, path: '', key: 'Permissions' } };
     const dcRoot = { data: { docId: 'datacenter', path: '', key: 'datacenter' } };
     const nsRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
     const same = { data: { docId: 'prefixes/homelab', path: 'selector', key: 'selector' } };
-    const other = { data: { docId: 'grants/scoped', path: 'selector', key: 'selector' } };
-    const keys = [prefixes, grants, dcRoot, nsRoot, same, other].map(key);
+    const other = { data: { docId: 'permissions/scoped', path: 'selector', key: 'selector' } };
+    const keys = [prefixes, permissions, dcRoot, nsRoot, same, other].map(key);
     eq('every row has a key of its own', new Set(keys).size, keys.length);
 }
 
