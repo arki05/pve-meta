@@ -28,6 +28,7 @@
 //! There is deliberately no `exists()`-then-act pair left in this file.
 
 use std::fmt;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -81,15 +82,59 @@ pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 /// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
 pub const DISK_FORMAT: Format = Format::Yaml;
 
-/// Identifies a top-level document in the store (a guest's metadata, or the
-/// datacenter's). Snapshots are addressed separately, by `(vmid, name)`, via
-/// the dedicated snapshot methods.
+/// Which of the two drop directories a [`DocId::Registry`] document lives in
+/// (`crate::registry`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RegistryKind {
+    /// A namespace: what a prefix is (`crate::registry::Namespace`).
+    Namespace,
+    /// A grant: who may touch one (`crate::registry::Grant`).
+    Grant,
+}
+
+impl RegistryKind {
+    /// The kind's wire name, and the first segment of a registry document's
+    /// API id: `namespaces` / `grants`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RegistryKind::Namespace => "namespaces",
+            RegistryKind::Grant => "grants",
+        }
+    }
+}
+
+impl fmt::Display for RegistryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Identifies a top-level document in the store: a guest's metadata, the
+/// datacenter's, or one registry file. Snapshots are addressed separately, by
+/// `(vmid, name)`, via the dedicated snapshot methods.
+///
+/// A registry file is a document like any other **on purpose**: it is YAML, it
+/// is read, replaced and deleted whole or by view, and it wants exactly the
+/// machinery the other two already have -- the digest compare-and-swap, the
+/// lint, the version poll, and in the editor the tree, the markers and the
+/// diff. The alternative was a second write path beside the first, which is
+/// the shape of every wrong-result bug this project has had.
+///
+/// Two things are *not* uniform, and both live outside this type: a registry
+/// document is governed by ACLs alone (`api::grants` gives it no scopes -- a
+/// grant file that could widen its own grants would be self-registration), and
+/// its content must additionally parse as the kind it claims to be, which
+/// `api::put_document` checks before writing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
     Guest(u32),
     /// The datacenter's metadata document, named `datacenter.yaml`.
     Datacenter,
+    /// A namespace or grant file, named `<name>.yaml` in its kind's directory.
+    /// The name is a single path segment (`crate::path::is_valid_segment`), so
+    /// it can never contain a slash or escape that directory.
+    Registry(RegistryKind, String),
 }
 
 impl DocId {
@@ -97,6 +142,7 @@ impl DocId {
         match self {
             DocId::Guest(vmid) => vmid.to_string(),
             DocId::Datacenter => "datacenter".to_string(),
+            DocId::Registry(_, name) => name.clone(),
         }
     }
 }
@@ -106,6 +152,7 @@ impl fmt::Display for DocId {
         match self {
             DocId::Guest(vmid) => write!(f, "guest {vmid}"),
             DocId::Datacenter => write!(f, "datacenter"),
+            DocId::Registry(kind, name) => write!(f, "{kind}/{name}"),
         }
     }
 }
@@ -266,19 +313,109 @@ fn oversized_identity(len: u64, mtime: SystemTime) -> String {
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The on-disk metadata store.
+///
+/// Three directories, not one: `root` holds the guest and datacenter documents
+/// and the snapshot copies, and the two registry drop-directory *lists* hold
+/// the namespace and grant files ([`DocId::Registry`]). The lists are ordered
+/// lowest precedence first, exactly as `crate::registry` loads them, so the
+/// **last** entry of each is the one a write goes to -- the cluster directory,
+/// with the packaged one below it staying read-only. Writing a namespace whose
+/// name a packaged file already uses therefore creates the cluster override
+/// rather than editing the package's file, and deleting it falls back to the
+/// packaged one, which is the same rule the loader has always applied.
 pub struct MetaStore {
     root: PathBuf,
+    namespace_dirs: Vec<PathBuf>,
+    grant_dirs: Vec<PathBuf>,
 }
 
 impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
-    /// to exist yet).
+    /// to exist yet), with the registry directories `crate::registry` itself
+    /// would load -- the packaged and cluster defaults, or whatever
+    /// `PVE_META_NAMESPACE_DIRS`/`PVE_META_GRANT_DIRS` say.
+    ///
+    /// Reading those two variables here, once, is deliberate: the alternative
+    /// is reading them again deeper in the call path, where a test (or a
+    /// caller that changed them between constructing a store and using it)
+    /// would get a store whose reads and writes disagree about where a file
+    /// lives. Tests that want their own directories pass them explicitly with
+    /// [`MetaStore::with_registry_dirs`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        MetaStore { root: root.into() }
+        MetaStore {
+            root: root.into(),
+            namespace_dirs: crate::registry::namespace_dirs(),
+            grant_dirs: crate::registry::grant_dirs(),
+        }
     }
 
-    fn path_for(&self, id: DocId) -> PathBuf {
-        self.root.join(format!("{}.{}", id.base_name(), DISK_FORMAT.ext()))
+    /// [`MetaStore::new`] with the registry directories given explicitly,
+    /// lowest precedence first. For tests, and for any caller that already
+    /// knows its directories and does not want the environment consulted.
+    pub fn with_registry_dirs(
+        root: impl Into<PathBuf>,
+        namespace_dirs: Vec<PathBuf>,
+        grant_dirs: Vec<PathBuf>,
+    ) -> Self {
+        MetaStore {
+            root: root.into(),
+            namespace_dirs,
+            grant_dirs,
+        }
+    }
+
+    /// The directories a registry kind is loaded from, lowest precedence first.
+    fn registry_dirs(&self, kind: RegistryKind) -> &[PathBuf] {
+        match kind {
+            RegistryKind::Namespace => &self.namespace_dirs,
+            RegistryKind::Grant => &self.grant_dirs,
+        }
+    }
+
+    /// The one directory of `kind` a write may land in: the highest-precedence
+    /// one.
+    ///
+    /// An empty list -- `PVE_META_*_DIRS` set to nothing, or
+    /// [`MetaStore::with_registry_dirs`] given none -- means no directory was
+    /// configured, and falls back **inside `root`** rather than to the
+    /// compiled-in `/etc/pve` default. A caller that went out of its way to
+    /// have no registry directories (a test, a `--root` sandbox) must not have
+    /// its writes land in the live cluster because of it.
+    fn registry_write_dir(&self, kind: RegistryKind) -> PathBuf {
+        self.registry_dirs(kind)
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.root.join("meta.d").join(kind.as_str()))
+    }
+
+    /// Where `id` is **written**, and where it is read from unless a
+    /// lower-precedence registry directory is the only one that has it (see
+    /// [`MetaStore::read_path_for`]).
+    fn path_for(&self, id: &DocId) -> PathBuf {
+        let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
+        match id {
+            DocId::Registry(kind, _) => self.registry_write_dir(*kind).join(file),
+            _ => self.root.join(file),
+        }
+    }
+
+    /// Where `id` is **read** from: the highest-precedence directory that
+    /// actually has the file, which for a registry document is the same file
+    /// `crate::registry::load_namespaces` would have picked. Falls back to
+    /// [`MetaStore::path_for`] when none has it, so a "not found" error names
+    /// the place a write would create it.
+    fn read_path_for(&self, id: &DocId) -> PathBuf {
+        let DocId::Registry(kind, _) = id else {
+            return self.path_for(id);
+        };
+        let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
+        for dir in self.registry_dirs(*kind).iter().rev() {
+            let candidate = dir.join(&file);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        self.path_for(id)
     }
 
     fn snapshot_path(&self, vmid: u32, name: &str) -> PathBuf {
@@ -294,8 +431,8 @@ impl MetaStore {
     /// pair is what turned a concurrent `DELETE` into an
     /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500 (see the module
     /// docs). Call the operation itself and handle its outcome.
-    pub fn locate(&self, id: DocId) -> Result<Option<PathBuf>> {
-        let path = self.path_for(id);
+    pub fn locate(&self, id: &DocId) -> Result<Option<PathBuf>> {
+        let path = self.read_path_for(id);
         Ok(path.is_file().then_some(path))
     }
 
@@ -317,15 +454,23 @@ impl MetaStore {
     /// The temp name carries the node's hostname, the pid *and* a per-call
     /// counter, because `/etc/pve/meta` is one pmxcfs directory shared by
     /// every node in the cluster: `.<name>.tmp.<host>.<pid>.<seq>`.
+    ///
+    /// The sibling is created in **`path`'s own directory**, not in `root`:
+    /// `rename` is only atomic within one filesystem, and a registry document
+    /// lives in `/etc/pve/meta.d/...`, a directory away from the documents.
+    /// Writing the temp file next to its target keeps the rename atomic
+    /// wherever the target is, and keeps a failed write's leftovers in the
+    /// directory an administrator would look in.
     fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-        fs::create_dir_all(&self.root)?;
+        let dir = path.parent().unwrap_or(&self.root).to_path_buf();
+        fs::create_dir_all(&dir)?;
         let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or_else(|| Error::Other(anyhow::anyhow!("path has no file name: {path:?}")))?;
         let host = hostname_tag();
         let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = self.root.join(format!(
+        let tmp_path = dir.join(format!(
             ".{file_name}.tmp.{host}.{}.{seq}",
             std::process::id()
         ));
@@ -367,9 +512,9 @@ impl MetaStore {
     /// [`MAX_READ_BYTES`], and I/O errors. [`Error::Parse`] only for bytes
     /// that are not UTF-8 at all — a YAML syntax error is
     /// [`Document::parse_error`], not an error. Never [`Error::Lint`].
-    fn read_document(&self, id: DocId, path: &std::path::Path) -> Result<Document> {
+    fn read_document(&self, id: &DocId, path: &std::path::Path) -> Result<Document> {
         let Some(meta) = gone_is_none(fs::metadata(path))? else {
-            return Err(Error::NotFound(id));
+            return Err(Error::NotFound(id.clone()));
         };
         // Checked from the metadata, before the bytes are read: the point is
         // not to pull a multi-megabyte file into memory (and hash it) on
@@ -377,7 +522,7 @@ impl MetaStore {
         Self::check_read_size(meta.len())?;
         let mtime = meta.modified()?;
         let Some(bytes) = gone_is_none(fs::read(path))? else {
-            return Err(Error::NotFound(id));
+            return Err(Error::NotFound(id.clone()));
         };
         // Bytes that are not text have no `raw` to report and nothing to
         // parse, so they are the one read failure that is not a per-document
@@ -397,7 +542,7 @@ impl MetaStore {
         };
         let dig = digest::digest(&bytes);
         Ok(Document {
-            id,
+            id: id.clone(),
             path: path.to_path_buf(),
             raw,
             value,
@@ -425,11 +570,11 @@ impl MetaStore {
     /// # Errors
     /// [`Error::NotFound`] if it does not exist (or ceases to, mid-read);
     /// [`Error::TooLarge`] if the file is bigger than [`MAX_READ_BYTES`].
-    pub fn read(&self, id: DocId) -> Result<Document> {
+    pub fn read(&self, id: &DocId) -> Result<Document> {
         // Deliberately no `locate` first: an `is_file()` followed by a read
         // is a check-then-act pair, and the racing loser of that pair used to
         // surface as an `Error::Io` (HTTP 500) instead of a 404.
-        self.read_document(id, &self.path_for(id))
+        self.read_document(id, &self.read_path_for(id))
     }
 
     /// `id`'s current content identity without parsing (or even keeping) the
@@ -441,8 +586,8 @@ impl MetaStore {
     /// digest is the one thing about such a file that is cheap and safe to
     /// compute. Above the read cap it is a surrogate over `(len, mtime)`, so
     /// this never reads a file the store refuses to read.
-    pub fn digest_of(&self, id: DocId) -> Result<Option<String>> {
-        identify(&self.path_for(id))
+    pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
+        identify(&self.read_path_for(id))
     }
 
     /// The digest precondition, enforced in exactly one place: `None`
@@ -473,7 +618,7 @@ impl MetaStore {
     ///
     /// # Errors
     /// [`Error::DigestMismatch`].
-    pub fn check_precondition(&self, id: DocId, expected: Option<&str>) -> Result<()> {
+    pub fn check_precondition(&self, id: &DocId, expected: Option<&str>) -> Result<()> {
         if expected.is_none() {
             return Ok(());
         }
@@ -495,11 +640,17 @@ impl MetaStore {
     /// [`Error::TooLarge`] if `text` exceeds [`MAX_BYTES`].
     pub fn put_raw(
         &self,
-        id: DocId,
+        id: &DocId,
         text: &str,
         expected_digest: Option<&str>,
     ) -> Result<PutResult> {
+        // Written where a write goes; compared and diffed against where a read
+        // comes from. For a guest or the datacenter those are the same file.
+        // For a registry document shadowing a packaged one they are not: the
+        // precondition is checked against the content the caller actually saw
+        // (the packaged file), and the write creates the cluster override.
         let path = self.path_for(id);
+        let read_path = self.read_path_for(id);
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
 
         // The *old* content is only read to diff against, so it is parsed
@@ -512,7 +663,7 @@ impl MetaStore {
         // parser — diffs as the empty document: the repair reports everything
         // it writes as newly set, which is exactly true of a document that had
         // no readable structure.
-        let old_value = match self.read_document(id, &path) {
+        let old_value = match self.read_document(id, &read_path) {
             Ok(doc) => doc.value,
             Err(Error::NotFound(_) | Error::TooLarge { .. } | Error::Parse { .. }) => {
                 Value::Object(serde_json::Map::new())
@@ -539,7 +690,7 @@ impl MetaStore {
         };
         Ok(PutResult {
             document: Document {
-                id,
+                id: id.clone(),
                 path,
                 raw: normalized,
                 value: new_value,
@@ -562,7 +713,14 @@ impl MetaStore {
     /// is that request satisfied, not a failure. The old `locate`-then-remove
     /// pair turned the loser of that race into an
     /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500.
-    pub fn delete(&self, id: DocId) -> Result<bool> {
+    /// A registry document is removed from the **write** directory only: a
+    /// packaged namespace belongs to its `.deb`, and deleting the cluster file
+    /// that shadowed it is a revert to the packaged one, not a removal. When
+    /// only the packaged file exists there is nothing of ours to remove and
+    /// this returns `Ok(false)`, with the namespace still there afterwards --
+    /// `api::delete_document` says so rather than reporting a deletion that
+    /// did not happen.
+    pub fn delete(&self, id: &DocId) -> Result<bool> {
         Ok(gone_is_none(fs::remove_file(self.path_for(id)))?.is_some())
     }
 
@@ -644,7 +802,7 @@ impl MetaStore {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let Some(bytes) = gone_is_none(fs::read(self.path_for(DocId::Guest(vmid))))? else {
+        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))))? else {
             return Ok(false);
         };
         self.write_atomic(&self.snapshot_path(vmid, name), &bytes)?;
@@ -661,7 +819,7 @@ impl MetaStore {
             return Err(Error::InvalidName(name.to_string()));
         }
         let snap = self.snapshot_path(vmid, name);
-        let target = self.path_for(DocId::Guest(vmid));
+        let target = self.path_for(&DocId::Guest(vmid));
         if let Some(bytes) = gone_is_none(fs::read(&snap))? {
             self.write_atomic(&target, &bytes)?;
             Ok(RollbackOutcome::Restored)
@@ -692,7 +850,7 @@ impl MetaStore {
     /// not an error.
     pub fn purge(&self, vmid: u32) -> Result<usize> {
         let mut removed = 0;
-        if self.delete(DocId::Guest(vmid))? {
+        if self.delete(&DocId::Guest(vmid))? {
             removed += 1;
         }
         for name in self.list_snapshots(vmid)? {
@@ -725,35 +883,44 @@ impl MetaStore {
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
-        let mut documents: Vec<(DocId, String)> = Vec::new();
+        // A map, not a list: a namespace present in both the packaged and the
+        // cluster directory is *one* document, and the effective one is the
+        // last write wins here because the directories are walked lowest
+        // precedence first -- the same rule `registry::load_namespaces` applies
+        // by file name. The shadowed file still contributes to `entries`, so
+        // editing it moves the token even though no document's digest changed:
+        // over-notifying a poll is a reload, under-notifying it is a stale UI.
+        let mut documents: BTreeMap<DocId, String> = BTreeMap::new();
         let mut latest: Option<SystemTime> = None;
-        if self.root.is_dir() {
-            for entry in fs::read_dir(&self.root)? {
-                let entry = entry?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let Some(file_type) = gone_is_none(entry.file_type())? else {
-                    continue;
-                };
-                if name.starts_with('.') || !file_type.is_file() {
-                    continue;
-                }
-                let Some(meta) = gone_is_none(entry.metadata())? else {
-                    continue;
-                };
-                let mtime = meta.modified()?;
-                let Some(dig) = identify(&entry.path())? else {
-                    continue;
-                };
-                if let Some(id) = document_id(&name) {
-                    documents.push((id, dig.clone()));
-                }
-                entries.push((name, dig));
-                latest = Some(match latest {
-                    Some(t) if t >= mtime => t,
-                    _ => mtime,
-                });
+
+        self.scan_for_version(
+            &self.root.clone(),
+            "",
+            &mut entries,
+            &mut documents,
+            &mut latest,
+            &document_id,
+        )?;
+        for (kind, dirs) in [
+            (RegistryKind::Namespace, &self.namespace_dirs),
+            (RegistryKind::Grant, &self.grant_dirs),
+        ] {
+            for dir in dirs {
+                // The full directory path, not just the kind: two directories
+                // of the same kind hold same-named files on purpose, and the
+                // token must be able to tell them apart.
+                let prefix = format!("{}/", dir.display());
+                self.scan_for_version(
+                    &dir.clone(),
+                    &prefix,
+                    &mut entries,
+                    &mut documents,
+                    &mut latest,
+                    &|name| registry_document_id(kind, name),
+                )?;
             }
         }
+
         entries.sort();
         let mut hasher = Sha256::new();
         for (name, dig) in &entries {
@@ -762,18 +929,74 @@ impl MetaStore {
             hasher.update(dig.as_bytes());
         }
         let token = hex::encode(hasher.finalize());
-        documents.sort();
         Ok(StoreVersion {
             token,
             changed: latest.unwrap_or(SystemTime::UNIX_EPOCH),
-            documents,
+            documents: documents.into_iter().collect(),
         })
+    }
+
+    /// One directory's contribution to [`MetaStore::version`]: every file in it
+    /// as a `(prefix + name, identity)` entry, and every file that addresses a
+    /// document as a `(DocId, identity)` too.
+    ///
+    /// An entry that disappears mid-walk is skipped rather than failing the
+    /// poll, and a directory that does not exist contributes nothing -- the
+    /// packaged namespace directory is absent on a node with no operator
+    /// package installed, which is not a condition to report.
+    fn scan_for_version(
+        &self,
+        dir: &std::path::Path,
+        prefix: &str,
+        entries: &mut Vec<(String, String)>,
+        documents: &mut BTreeMap<DocId, String>,
+        latest: &mut Option<SystemTime>,
+        id_of: &dyn Fn(&str) -> Option<DocId>,
+    ) -> Result<()> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(file_type) = gone_is_none(entry.file_type())? else {
+                continue;
+            };
+            if name.starts_with('.') || !file_type.is_file() {
+                continue;
+            }
+            let Some(meta) = gone_is_none(entry.metadata())? else {
+                continue;
+            };
+            let mtime = meta.modified()?;
+            let Some(dig) = identify(&entry.path())? else {
+                continue;
+            };
+            if let Some(id) = id_of(&name) {
+                documents.insert(id, dig.clone());
+            }
+            entries.push((format!("{prefix}{name}"), dig));
+            *latest = Some(match *latest {
+                Some(t) if t >= mtime => t,
+                _ => mtime,
+            });
+        }
+        Ok(())
     }
 }
 
 /// The [`DocId`] a store file name addresses, or `None` when it addresses no
 /// document: a snapshot copy (`<vmid>.<snapname>.yaml`), a temp file, or
 /// anything else that happens to be in the directory.
+/// The [`DocId`] a registry file name addresses, or `None` for anything that
+/// is not a `<name>.yaml` the loader would read: the same filter
+/// `registry::yaml_files` applies, so the poll and the loader agree on what a
+/// registry document is.
+fn registry_document_id(kind: RegistryKind, name: &str) -> Option<DocId> {
+    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
+    crate::registry::is_valid_file_name(stem).then(|| DocId::Registry(kind, stem.to_string()))
+}
+
 fn document_id(name: &str) -> Option<DocId> {
     let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
     if stem == "datacenter" {

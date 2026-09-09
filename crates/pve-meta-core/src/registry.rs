@@ -271,6 +271,21 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
 /// # Errors
 /// [`Error::Registry`] describing the first problem; [`Error::Parse`] if
 /// the text is not YAML at all.
+/// Whether `name` is a usable registry **file** name (the part before `.yaml`).
+///
+/// One rule, because three places need it and they must agree: `parse_id`
+/// turns an API id into a file name, `MetaStore::version` turns a file name
+/// back into a document id, and the loader decides which files it reads at all.
+///
+/// A name is one or more [`crate::path::is_valid_segment`] segments joined by
+/// dots -- which is exactly a namespace prefix, since **the file name is the
+/// prefix**: `homelab.docker.yaml` declares `homelab.docker`. That admits the
+/// dots a prefix needs while still refusing everything that could address
+/// another directory (`/`, `..`, a leading dot) or another file type.
+pub fn is_valid_file_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(crate::path::is_valid_segment)
+}
+
 pub fn parse_namespace(name: &str, text: &str) -> Result<Namespace> {
     // Dotted form only. `Path::parse` also accepts `a/b`, which must never be a
     // namespace name: the name is used as a file name, so accepting a separator
@@ -536,6 +551,26 @@ grants:
 
     fn write(dir: &std::path::Path, name: &str, text: &str) {
         std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn a_registry_file_name_is_a_dotted_prefix_and_never_a_path() {
+        for good in ["traefik", "homelab.docker", "a-b_c", "svc@pve!t1"] {
+            assert!(is_valid_file_name(good), "{good} was refused");
+        }
+        for bad in ["", ".", "..", ".hidden", "a/b", "a b", "a..b", "a.", ".a"] {
+            assert!(!is_valid_file_name(bad), "{bad} was accepted");
+        }
+        // The two halves of "the file name is the prefix" have to agree: a name
+        // this accepts must parse as a prefix, and one it refuses must not.
+        assert_eq!(
+            parse_namespace("homelab.docker", "selector: {all: true}\n")
+                .unwrap()
+                .prefix
+                .to_string(),
+            "homelab.docker",
+        );
+        assert!(parse_namespace("a b", "selector: {all: true}\n").is_err());
     }
 
     #[test]

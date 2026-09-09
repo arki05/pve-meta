@@ -150,6 +150,47 @@ exactly one place, `PVE::API2::ACL::update_acl`, and the `user.cfg` *parser* onl
 an opening: unsupported, invisible to the Permissions UI, and one upstream edit from
 breaking silently. Making it legitimate would mean patching a fourth package.
 
+### 3.5 The registry files are documents too
+
+A namespace or grant file is addressed as a document: `namespaces/<name>` and
+`grants/<name>` are ids like `100` and `datacenter`, reachable at
+`/meta/namespaces/{name}` and `/meta/grants/{name}` with the same `view`, `format`,
+`mode`, `digest` and `dry_run` the other two take. That is not an aesthetic choice: the
+editor's tree, its markers, its diff, the digest compare-and-swap and the version poll
+are all written against *a document*, and the alternative was a second read/write path
+beside the first — the shape of every wrong-result bug this project has had.
+
+Four things are specific to them:
+
+* **Writes land in the cluster directory**, always. Editing a namespace that a package
+  shipped creates `/etc/pve/meta.d/namespaces/<name>.yaml` and leaves the packaged file
+  alone; a `DELETE` removes only the cluster file, so it is a *revert* to the packaged
+  namespace rather than a removal, and a following `GET` returns the packaged one again.
+  The compare-and-swap is checked against the file the caller actually read, so
+  overriding a packaged file is an ordinary write and not a spurious 409.
+* **The result must parse as what it claims to be.** The loader deliberately skips a
+  malformed file (§3.3), which is exactly why a write that produced one must not answer
+  200: the namespace would silently disappear. `parse_namespace`/`parse_grant` — the
+  loader's own parsers, not a copy — gate every write, including a `dry_run` and a
+  narrow `DELETE ?view=authid`. The ordinary document lint (§4) applies on top, to the
+  `schema:` subtree as much as anywhere else — a property name the lint refuses is a
+  property no document could ever hold — so a registry file that already contains
+  something it rejects is repaired the same way any document is: one whole-document
+  replace. (That is not hypothetical. The lab's `homelab.docker` namespace held
+  `compose: { type: string, description: The compose file, as text }`, where the unquoted
+  comma inside a flow mapping had silently made a second key `as text: null`. The loader
+  never looked inside `schema`, so nothing had complained for weeks.)
+* **No grant ever reaches them.** These documents get no scopes at all, so an operator
+  holding `rw` on a prefix cannot edit the grant that gave it that prefix, nor the
+  namespace that declares it. Self-registration is refused by there being no way to
+  express it. Read is open to every authenticated user, matching the two list endpoints,
+  which return the same content; writing is `Sys.Modify` on `/`.
+* **They move the version token.** The poll walks the registry directories as well as
+  the store, so an editor open on a guest notices a namespace change within one tick.
+  A file shadowed by a higher-precedence one still moves the token while contributing no
+  document of its own: over-notifying a poll costs a reload, under-notifying it leaves a
+  stale UI.
+
 ## 4. Documents on the wire
 
 * Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a namespace schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
@@ -190,6 +231,8 @@ breaking silently. Making it legitimate would mean patching a fourth package.
 | GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
 | GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every namespace, readable by every authenticated user |
 | GET | `/meta/grants` | — | `[{ name, authid, grants: [{ prefix, mode, selector }] }]` — every grant, readable by every authenticated user |
+| GET/PUT/DELETE | `/meta/namespaces/{name}` | same as a document | the namespace **file** as a document, with `id: "namespaces/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a namespace is a 400, never a 200 (§3.5) |
+| GET/PUT/DELETE | `/meta/grants/{name}` | same | the grant file, `id: "grants/<name>"`, same rules |
 
 PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
 404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow

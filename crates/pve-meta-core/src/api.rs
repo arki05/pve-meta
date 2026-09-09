@@ -54,7 +54,7 @@ use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
 use crate::registry::{self, Grant, Namespace};
 use crate::scopes::{Grants, Scope};
-use crate::store::{DocId, MetaStore, DISK_FORMAT};
+use crate::store::{DocId, MetaStore, RegistryKind, DISK_FORMAT};
 use crate::view;
 
 fn unix_secs(t: SystemTime) -> u64 {
@@ -139,10 +139,14 @@ pub struct CallerAcl {
 /// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
 /// datacenter document is governed by ACLs alone, which is what keeps the
 /// registry from being able to grant access to it.
-pub fn grants(grant_files: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
+pub fn grants(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> Grants {
     let scopes = match doc_id {
         DocId::Guest(_) => registry::scopes_for(grant_files, &acl.authid, &acl.tags),
-        DocId::Datacenter => Vec::new(),
+        // The datacenter document is governed by ACLs alone -- that is what
+        // keeps the registry from being able to grant access to it -- and a
+        // registry document for the same reason one turn further: a grant that
+        // could reach the grant files would be able to widen itself.
+        DocId::Datacenter | DocId::Registry(..) => Vec::new(),
     };
     Grants {
         full_read: acl.read,
@@ -151,21 +155,48 @@ pub fn grants(grant_files: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
     }
 }
 
-/// Parses an API `id` (a vmid, or the literal `"datacenter"`) into a
-/// [`DocId`].
+/// Parses an API `id` into a [`DocId`]: a vmid, the literal `"datacenter"`, or
+/// a registry document as `namespaces/<name>` / `grants/<name>`.
+///
+/// The registry form is the API path it is reached at, so the id a caller sends
+/// back is the one it read. `<name>` is the file's name, checked with
+/// [`registry::is_valid_file_name`]: dotted, because **the file name is the
+/// prefix** and `homelab.docker` is a legitimate namespace, but never a slash,
+/// a leading dot or a `..`, so an id can never address a file outside its
+/// directory.
 pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     if id == "datacenter" {
         return Ok(DocId::Datacenter);
     }
-    id.parse::<u32>()
-        .map(DocId::Guest)
-        .map_err(|_| bad_request(format!("invalid id '{id}': must be a vmid or 'datacenter'")))
+    if let Some((kind, name)) = id.split_once('/') {
+        let kind = match kind {
+            "namespaces" => RegistryKind::Namespace,
+            "grants" => RegistryKind::Grant,
+            other => {
+                return Err(bad_request(format!(
+                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'namespaces' or 'grants')"
+                )))
+            }
+        };
+        if !registry::is_valid_file_name(name) {
+            return Err(bad_request(format!(
+                "invalid id '{id}': '{name}' is not a valid {kind} name"
+            )));
+        }
+        return Ok(DocId::Registry(kind, name.to_string()));
+    }
+    id.parse::<u32>().map(DocId::Guest).map_err(|_| {
+        bad_request(format!(
+            "invalid id '{id}': must be a vmid, 'datacenter',              'namespaces/<name>' or 'grants/<name>'"
+        ))
+    })
 }
 
-fn id_str(id: DocId) -> String {
+fn id_str(id: &DocId) -> String {
     match id {
         DocId::Guest(vmid) => vmid.to_string(),
         DocId::Datacenter => "datacenter".to_string(),
+        DocId::Registry(kind, name) => format!("{kind}/{name}"),
     }
 }
 
@@ -255,7 +286,7 @@ fn unrecoverable(digest: String, raw: Option<String>, reason: String) -> Stored 
 /// a fatal read would make an out-of-band hand-edit unrepairable through the
 /// API; and [`list_guests`] reads every guest in a loop, so one unreadable
 /// document would otherwise take the whole listing down for every principal.
-fn read_stored(store: &MetaStore, id: DocId) -> Result<Stored, anyhow::Error> {
+fn read_stored(store: &MetaStore, id: &DocId) -> Result<Stored, anyhow::Error> {
     let doc = match store.read(id) {
         Ok(doc) => doc,
         Err(CoreError::NotFound(_)) => return Ok(Stored::absent()),
@@ -423,7 +454,7 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
             v.documents
                 .into_iter()
                 .map(|(id, digest)| ApiDocumentDigest {
-                    id: id_str(id),
+                    id: id_str(&id),
                     digest,
                 })
                 .collect()
@@ -432,7 +463,7 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
 }
 
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
-pub fn access(grant_files: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
+pub fn access(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
     let g = grants(grant_files, doc_id, acl);
     ApiAccess {
         read: g.full_read,
@@ -482,13 +513,13 @@ pub fn list_guests(
             write: guest.write,
             tags: guest.tags.clone(),
         };
-        let g = grants(grant_files, DocId::Guest(guest.vmid), &acl);
+        let g = grants(grant_files, &DocId::Guest(guest.vmid), &acl);
         let readable = g.readable_prefixes();
         if readable.is_empty() {
             continue;
         }
 
-        let stored = read_stored(store, DocId::Guest(guest.vmid))?;
+        let stored = read_stored(store, &DocId::Guest(guest.vmid))?;
         let visible = view::filter(&stored.value, &readable);
 
         if let Some(path) = &has_path {
@@ -539,7 +570,7 @@ pub fn get_document(
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, doc_id, acl);
+    let grants = grants(grant_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
@@ -551,13 +582,13 @@ pub fn get_document(
         return Err(forbidden(&view_path));
     }
 
-    let stored = read_stored(store, doc_id)?;
+    let stored = read_stored(store, &doc_id)?;
 
     if let Some(err) = &stored.unrecoverable {
         if fmt == Format::Yaml && grants.full_read {
             if let Some(raw) = &stored.raw {
                 return Ok(ApiViewDocument {
-                    id: id_str(doc_id),
+                    id: id_str(&doc_id),
                     view: view_out(view),
                     digest: stored.digest,
                     data: None,
@@ -594,7 +625,7 @@ pub fn get_document(
     };
 
     Ok(ApiViewDocument {
-        id: id_str(doc_id),
+        id: id_str(&doc_id),
         view: view_out(view),
         digest: stored.digest,
         data,
@@ -681,6 +712,38 @@ fn plan_write(
     Ok(touched)
 }
 
+/// The extra gate a registry document passes and the other two do not: the
+/// text about to be written must parse as the kind it is
+/// (`registry::parse_namespace` / `registry::parse_grant`).
+///
+/// The loader **skips** a malformed file with a warning and carries on -- that
+/// isolation is why this data left `datacenter.yaml` -- so without this check
+/// the editor's most likely mistake (a typo in `selector:`) would be answered
+/// by the namespace silently disappearing from the list, with a 200 on the
+/// write that removed it. The rule is the parser itself, not a copy of it, so
+/// what the API accepts and what the loader reads back cannot drift.
+///
+/// Guest and datacenter documents have no shape beyond `model::lint`: they
+/// hold whatever an administrator puts in them, which is the point of them.
+fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), anyhow::Error> {
+    let DocId::Registry(kind, name) = doc_id else {
+        return Ok(());
+    };
+    let parsed = match kind {
+        RegistryKind::Namespace => registry::parse_namespace(name, text).map(|_| ()),
+        RegistryKind::Grant => registry::parse_grant(name, text).map(|_| ()),
+    };
+    parsed.map_err(|e| {
+        let kind = match kind {
+            RegistryKind::Namespace => "namespace",
+            RegistryKind::Grant => "grant",
+        };
+        bad_request(format!(
+            "the result would not be a valid {kind}: {e}              (the loader would skip the file, so the write is refused instead)"
+        ))
+    })
+}
+
 /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
 ///
 /// `mode` is `"replace"` (default: the view's subtree is replaced by
@@ -705,7 +768,7 @@ pub fn put_document(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, doc_id, acl);
+    let grants = grants(grant_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
@@ -729,8 +792,8 @@ pub fn put_document(
         view::parse(payload, fmt).map_err(api_err)?
     };
 
-    store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let stored = read_stored(store, doc_id)?;
+    store.check_precondition(&doc_id, digest).map_err(api_err)?;
+    let stored = read_stored(store, &doc_id)?;
     check_repairable(&stored, &view_path, is_merge)?;
 
     // (2) Plan the mutation against a *copy*; the stored document is only
@@ -745,6 +808,7 @@ pub fn put_document(
     })?;
 
     let text = format::dump(DISK_FORMAT, &planned);
+    check_registry_shape(&doc_id, &text)?;
 
     // (3) Apply — unless there is nothing to apply. A write that changes no
     //     path *and* would put back the bytes already on disk is skipped
@@ -762,14 +826,14 @@ pub fn put_document(
         crate::digest::digest(text.as_bytes())
     } else {
         store
-            .put_raw(doc_id, &text, digest)
+            .put_raw(&doc_id, &text, digest)
             .map_err(api_err)?
             .document
             .digest
     };
 
     Ok(ApiPutResult {
-        id: id_str(doc_id),
+        id: id_str(&doc_id),
         view: view_out(view),
         digest: new_digest,
         touched: touched_out(&touched),
@@ -795,13 +859,13 @@ pub fn delete_document(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(grant_files, doc_id, acl);
+    let grants = grants(grant_files, &doc_id, acl);
     let view_path = parse_view(view)?;
 
     authorize_view_write(&grants, &view_path)?;
 
-    store.check_precondition(doc_id, digest).map_err(api_err)?;
-    let stored = read_stored(store, doc_id)?;
+    store.check_precondition(&doc_id, digest).map_err(api_err)?;
+    let stored = read_stored(store, &doc_id)?;
     // A root DELETE removes the file whole, so it repairs an unrecoverable
     // document exactly like a root replace does.
     check_repairable(&stored, &view_path, false)?;
@@ -819,12 +883,17 @@ pub fn delete_document(
     // request's own outcome, not a 500.
     let existed = !stored.digest.is_empty();
     let new_digest = if view_path.is_root() {
-        store.delete(doc_id).map_err(api_err)?;
+        store.delete(&doc_id).map_err(api_err)?;
         String::new()
     } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
+        // A partial delete is a write, and a write of a registry document must
+        // still leave a file its own loader will read: dropping `authid` from a
+        // grant is a `DELETE ?view=authid`, and the same rule has to hold on
+        // this path as on `put_document`'s.
+        check_registry_shape(&doc_id, &text)?;
         store
-            .put_raw(doc_id, &text, digest)
+            .put_raw(&doc_id, &text, digest)
             .map_err(api_err)?
             .document
             .digest
@@ -833,7 +902,7 @@ pub fn delete_document(
     };
 
     Ok(ApiPutResult {
-        id: id_str(doc_id),
+        id: id_str(&doc_id),
         view: view_out(view),
         digest: new_digest,
         touched: touched_out(&touched),
@@ -940,11 +1009,17 @@ mod tests {
     use crate::registry::Grant;
     use serde_json::json;
 
-    /// A store over a fresh tempdir. No global state: every test owns its
-    /// own root, so the suite runs in parallel like the rest of the crate's.
+    /// A store over a fresh tempdir, with its registry directories inside it
+    /// rather than the machine's real ones (see `tests/store.rs` for why). No
+    /// global state: every test owns its own root, so the suite runs in
+    /// parallel like the rest of the crate's.
     fn store() -> (tempfile::TempDir, MetaStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = MetaStore::new(dir.path());
+        let store = MetaStore::with_registry_dirs(
+            dir.path(),
+            vec![dir.path().join("registry/namespaces")],
+            vec![dir.path().join("registry/grants")],
+        );
         (dir, store)
     }
 
@@ -987,11 +1062,11 @@ mod tests {
     }
 
     fn seed(store: &MetaStore, id: &str, text: &str) {
-        store.put_raw(parse_id(id).unwrap(), text, None).unwrap();
+        store.put_raw(&parse_id(id).unwrap(), text, None).unwrap();
     }
 
     fn read_raw(store: &MetaStore, id: &str) -> Option<String> {
-        store.read(parse_id(id).unwrap()).ok().map(|d| d.raw)
+        store.read(&parse_id(id).unwrap()).ok().map(|d| d.raw)
     }
 
     fn status(err: &anyhow::Error) -> u16 {
@@ -1038,8 +1113,8 @@ mod tests {
     #[test]
 fn version_detail_names_the_documents_that_changed() {
         let (_dir, store) = store();
-        store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-        store.put_raw(DocId::Datacenter, "b: 2\n", None).unwrap();
+        store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+        store.put_raw(&DocId::Datacenter, "b: 2\n", None).unwrap();
 
         // Without `detail` the shape is unchanged: no `documents` on the wire.
         let plain = version(&store, false).unwrap();
@@ -1049,7 +1124,7 @@ fn version_detail_names_the_documents_that_changed() {
         let docs = detailed.documents.expect("detail asked for");
         let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, vec!["100", "datacenter"]);
-        assert_eq!(docs[0].digest, store.read(DocId::Guest(100)).unwrap().digest);
+        assert_eq!(docs[0].digest, store.read(&DocId::Guest(100)).unwrap().digest);
         assert_eq!(detailed.token, plain.token, "detail does not change the token");
     }
 
@@ -1058,12 +1133,12 @@ fn version_detail_names_the_documents_that_changed() {
         // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
         // granting the operator that guest.
         let grant_files = regs();
-        let untagged = grants(&grant_files, DocId::Guest(100), &scoped(&[]));
+        let untagged = grants(&grant_files, &DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
         assert_eq!(untagged.scopes[0].prefix.to_string(), "netbird");
         assert!(!untagged.can_write(&DocPath::parse("traefik").unwrap()));
 
-        let tagged = grants(&grant_files, DocId::Guest(100), &scoped(&["traefik"]));
+        let tagged = grants(&grant_files, &DocId::Guest(100), &scoped(&["traefik"]));
         assert!(tagged.can_write(&DocPath::parse("traefik.spec").unwrap()));
         assert!(tagged.can_read(&DocPath::parse("netbird").unwrap()));
         assert!(!tagged.can_write(&DocPath::parse("netbird").unwrap()));
@@ -1073,14 +1148,14 @@ fn version_detail_names_the_documents_that_changed() {
     fn scopes_never_apply_to_the_datacenter_document() {
         // `docs/DESIGN.md` §3: the datacenter document is governed by ACLs
         // alone, so no registration can ever reach it.
-        let g = grants(&regs(), DocId::Datacenter, &scoped(&["traefik"]));
+        let g = grants(&regs(), &DocId::Datacenter, &scoped(&["traefik"]));
         assert!(g.scopes.is_empty());
         assert!(g.readable_prefixes().is_empty());
     }
 
     #[test]
     fn a_registration_for_another_authid_grants_nothing() {
-        let g = grants(&regs(), DocId::Guest(100), &none());
+        let g = grants(&regs(), &DocId::Guest(100), &none());
         assert!(g.readable_prefixes().is_empty());
     }
 
@@ -1525,7 +1600,7 @@ fn version_detail_names_the_documents_that_changed() {
                 before,
                 "{view:?}/{mode}/{payload} rewrote the file"
             );
-            assert_eq!(r.digest, store.digest_of(DocId::Guest(100)).unwrap().unwrap());
+            assert_eq!(r.digest, store.digest_of(&DocId::Guest(100)).unwrap().unwrap());
         }
         assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    host: x\n");
 
@@ -1609,15 +1684,15 @@ fn version_detail_names_the_documents_that_changed() {
     #[test]
     fn access_reports_resolved_scopes() {
         let grant_files = regs();
-        let tagged = access(&grant_files, DocId::Guest(100), &scoped(&["traefik"]));
+        let tagged = access(&grant_files, &DocId::Guest(100), &scoped(&["traefik"]));
         assert!(!tagged.read && !tagged.write);
         assert_eq!(
             tagged.scopes.iter().map(|s| s.prefix.to_string()).collect::<Vec<_>>(),
             vec!["traefik", "netbird"]
         );
-        let untagged = access(&grant_files, DocId::Guest(100), &scoped(&[]));
+        let untagged = access(&grant_files, &DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
-        let dc = access(&grant_files, DocId::Datacenter, &full());
+        let dc = access(&grant_files, &DocId::Datacenter, &full());
         assert!(dc.read && dc.write && dc.scopes.is_empty());
     }
 
@@ -1748,5 +1823,199 @@ fn version_detail_names_the_documents_that_changed() {
         let err = put(&store, "100", None, "yaml", "a: 1\n", "replace", Some(&digest), false, &full())
             .unwrap_err();
         assert_eq!(status(&err), 409, "{err}");
+    }
+
+    // -- registry documents ------------------------------------------------
+
+    #[test]
+    fn parse_id_reads_a_registry_id_and_refuses_anything_that_could_leave_the_directory() {
+        assert_eq!(
+            parse_id("namespaces/traefik").unwrap(),
+            DocId::Registry(RegistryKind::Namespace, "traefik".to_string()),
+        );
+        assert_eq!(
+            parse_id("grants/scoped").unwrap(),
+            DocId::Registry(RegistryKind::Grant, "scoped".to_string()),
+        );
+        // The file name *is* the prefix, so a nested namespace is a dotted file
+        // name and has to be addressable: `homelab.docker.yaml` declares
+        // `homelab.docker`, and refusing that id would put every nested
+        // namespace out of the editor's reach.
+        assert_eq!(
+            parse_id("namespaces/homelab.docker").unwrap(),
+            DocId::Registry(RegistryKind::Namespace, "homelab.docker".to_string()),
+        );
+        for bad in [
+            "namespaces/../../etc/passwd",
+            "namespaces/a/b",
+            "namespaces/.hidden",
+            "namespaces/",
+            "namespaces/a..b",
+            "namespaces/a b",
+            "operators/traefik",
+        ] {
+            let err = parse_id(bad).unwrap_err();
+            assert_eq!(status(&err), 400, "{bad} was accepted: {err}");
+        }
+    }
+
+    #[test]
+    fn a_namespace_is_read_and_written_like_any_other_document() {
+        let (_dir, store) = store();
+        let created = put(
+            &store,
+            "namespaces/homelab",
+            None,
+            "yaml",
+            "selector:\n  all: true\ndescription: Home\n",
+            "replace",
+            Some(""),
+            false,
+            &full(),
+        )
+        .unwrap();
+        assert_eq!(created.id, "namespaces/homelab");
+
+        // A view write reaches into it like into any document, with the same
+        // digest compare-and-swap.
+        let doc = get(&store, "namespaces/homelab", None, "json", &full()).unwrap();
+        put(
+            &store,
+            "namespaces/homelab",
+            Some("schema.type"),
+            "json",
+            "\"object\"",
+            "replace",
+            Some(&doc.digest),
+            false,
+            &full(),
+        )
+        .unwrap();
+
+        // And what came back out is what the loader parses -- the check that
+        // matters, since a file it rejects is a file it silently skips.
+        let raw = read_raw(&store, "namespaces/homelab").unwrap();
+        let ns = registry::parse_namespace("homelab", &raw).unwrap();
+        assert_eq!(ns.prefix.to_string(), "homelab");
+        assert_eq!(ns.description.as_deref(), Some("Home"));
+        assert_eq!(ns.schema.unwrap()["type"], json!("object"));
+    }
+
+    #[test]
+    fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
+        let (_dir, store) = store();
+        // No selector: `parse_namespace` refuses it, so the loader would skip
+        // the file and the namespace would vanish on a 200.
+        let err = put(
+            &store,
+            "namespaces/homelab",
+            None,
+            "yaml",
+            "description: Home\n",
+            "replace",
+            Some(""),
+            false,
+            &full(),
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(format!("{err}").contains("not be a valid namespace"), "{err}");
+        assert_eq!(read_raw(&store, "namespaces/homelab"), None, "nothing was written");
+
+        // A dry run is refused for the same reason, and by the same check.
+        let err = put(
+            &store,
+            "namespaces/homelab",
+            None,
+            "yaml",
+            "description: Home\n",
+            "replace",
+            Some(""),
+            true,
+            &full(),
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+
+        // An authid that is not an authid is refused on the grant side.
+        let err = put(
+            &store,
+            "grants/ops",
+            None,
+            "yaml",
+            "authid: not-an-authid\ngrants: []\n",
+            "replace",
+            Some(""),
+            false,
+            &full(),
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(format!("{err}").contains("not be a valid grant"), "{err}");
+    }
+
+    #[test]
+    fn a_partial_delete_that_would_break_a_grant_file_is_refused() {
+        let (_dir, store) = store();
+        put(
+            &store,
+            "grants/ops",
+            None,
+            "yaml",
+            "authid: ops@pve!t1\ngrants:\n  - prefix: homelab\n    mode: rw\n    selector: {all: true}\n",
+            "replace",
+            Some(""),
+            false,
+            &full(),
+        )
+        .unwrap();
+
+        let err = del(&store, "grants/ops", Some("authid"), None, &full()).unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        let raw = read_raw(&store, "grants/ops").unwrap();
+        assert!(registry::parse_grant("ops", &raw).is_ok(), "the file still loads");
+
+        // Removing the file whole is fine: that is an administrator revoking a
+        // grant, not a half-written one.
+        del(&store, "grants/ops", None, None, &full()).unwrap();
+        assert_eq!(read_raw(&store, "grants/ops"), None);
+    }
+
+    #[test]
+    fn a_grant_never_reaches_the_registry_documents() {
+        let (_dir, store) = store();
+        put(
+            &store,
+            "namespaces/traefik",
+            None,
+            "yaml",
+            "selector: {all: true}\n",
+            "replace",
+            Some(""),
+            false,
+            &full(),
+        )
+        .unwrap();
+
+        // `scoped@pve!t1` holds `traefik` rw -- on *guests*. A registry
+        // document gets no scopes at all, so this is the same 403 the
+        // datacenter document gives it.
+        let acl = scoped(&["traefik"]);
+        assert!(grants(&regs(), &parse_id("namespaces/traefik").unwrap(), &acl).scopes.is_empty());
+        let err = get(&store, "namespaces/traefik", None, "yaml", &acl).unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
+        let err = put(
+            &store,
+            "namespaces/traefik",
+            Some("traefik"),
+            "json",
+            "1",
+            "replace",
+            None,
+            false,
+            &acl,
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
     }
 }

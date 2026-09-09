@@ -248,7 +248,7 @@ mod pve_rs_meta {
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
-        Ok(api::access(&open_grants(), doc_id, &acl))
+        Ok(api::access(&open_grants(), &doc_id, &acl))
     }
 
     /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already

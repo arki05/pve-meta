@@ -121,6 +121,7 @@ are `protected` and run in pvedaemon.
 | GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
 | GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
 | GET | `/meta/grants` | — | `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
+| GET/PUT/DELETE | `/meta/namespaces/{name}`<br>`/meta/grants/{name}` | same as a document | the file itself as a document (`id: "namespaces/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a namespace/grant. `Sys.Modify` on `/` to write |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
 `data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust

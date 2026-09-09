@@ -88,6 +88,29 @@ sub _datacenter_acl {
     };
 }
 
+# A registry document -- one namespace or grant file (docs/DESIGN.md §3) --
+# is an administrator's to edit and nobody else's.
+#
+# Read is open to every authenticated user, because it has to agree with the
+# two list endpoints below: they already return the same files' content to
+# everyone, and a document read that was stricter than the list of the same
+# thing would be a rule with two answers. Write is Sys.Modify on '/', the same
+# as the datacenter document.
+#
+# There is deliberately no scope path here at all: `api::grants` gives a
+# registry document no scopes, so an operator holding `rw` on some prefix
+# cannot edit the grant file that gave it that prefix, nor the namespace that
+# declares it. Self-registration is refused by there being no way to express it.
+sub _registry_acl {
+    my ($rpcenv, $authuser) = @_;
+    return {
+        authid => $authuser,
+        read => 1,
+        write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
+        tags => [],
+    };
+}
+
 # -- helpers ------------------------------------------------------------
 
 # Calls a `PVE::RS::Meta::api_*` function, catching its "NNN: message" die
@@ -474,6 +497,151 @@ __PACKAGE__->register_method({
         return _call(\&PVE::RS::Meta::api_grants);
     },
 });
+
+# -- registry documents ------------------------------------------------------
+
+# The file name, which for a namespace *is* its prefix -- so it is dotted when
+# the prefix is nested. The same shape `pve_meta_core::registry::is_valid_file_name`
+# accepts, which is what the Rust layer re-checks when it parses the id: this
+# pattern is the friendly 400, that check is the real one.
+my $REGISTRY_NAME_SCHEMA = {
+    type => 'string',
+    pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',
+    maxLength => 128,
+    description => "The file's name, without the '.yaml' suffix. For a namespace this "
+        . "is the prefix it declares (docs/DESIGN.md §3.1): 'homelab.docker' is the "
+        . "file 'homelab.docker.yaml' and declares the prefix homelab.docker.",
+};
+
+# The six endpoints below are generated rather than written twice: a namespace
+# and a grant are the same document to everything but the parser that validates
+# what is written (`api::check_registry_shape`), and two copies of a read/write
+# pair is how this project has produced every wrong-result bug it has had.
+for my $kind (['namespaces', 'namespace'], ['grants', 'grant']) {
+    my ($dir, $one) = @$kind;
+    my $where = $one eq 'namespace'
+        ? "/etc/pve/meta.d/namespaces, overriding the packaged file of the same name in "
+          . "/usr/share/pve-meta/namespaces if there is one"
+        : "/etc/pve/meta.d/grants";
+
+    __PACKAGE__->register_method({
+        name => "get_$one",
+        path => "$dir/{name}",
+        method => 'GET',
+        permissions => {
+            description => "Readable by every authenticated user, exactly as the "
+                . "GET /meta/$dir listing is (docs/DESIGN.md §1).",
+            user => 'all',
+        },
+        description => "Gets one $one file as a document (or a view/prefix of it). "
+            . "Unlike the GET /meta/$dir listing, which returns what the loader "
+            . "parsed, this returns the file itself -- including a file the loader "
+            . "would skip, so a malformed one can be seen and repaired.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                format => $FORMAT_SCHEMA,
+            },
+        },
+        returns => $VIEW_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return $get_view->(
+                "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+            );
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "put_$one",
+        protected => 1,
+        path => "$dir/{name}",
+        method => 'PUT',
+        permissions => {
+            description => "Requires Sys.Modify on / (docs/DESIGN.md §3).",
+            user => 'all',
+        },
+        description => "Writes one $one file (or a view/prefix of it), in $where. "
+            . "The result must parse as a $one: a file the loader would skip is "
+            . "refused with a 400 rather than written, because a write that made the "
+            . "$one silently disappear would otherwise answer 200.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                data => $DATA_SCHEMA,
+                text => $TEXT_SCHEMA,
+                mode => $MODE_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+                dry_run => {
+                    type => 'boolean',
+                    optional => 1,
+                    default => 0,
+                    description => "Validate and diff without writing.",
+                },
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return _locked("$one-$param->{name}", sub {
+                return $put_view->(
+                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+                );
+            });
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "delete_$one",
+        protected => 1,
+        path => "$dir/{name}",
+        method => 'DELETE',
+        permissions => {
+            description => "Requires Sys.Modify on / for the view and every touched "
+                . "path, same as PUT.",
+            user => 'all',
+        },
+        description => "Removes one $one file, or the subtree at 'view'. "
+            . ($one eq 'namespace'
+                ? "A packaged namespace is never removed: deleting the cluster file "
+                  . "that overrode it reverts to the packaged one, which is then what "
+                  . "a following GET returns."
+                : "Grants are cluster-only, so this removes the file."),
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return _locked("$one-$param->{name}", sub {
+                return $delete_view->(
+                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+                );
+            });
+        },
+    });
+}
 
 # -- guests -------------------------------------------------------------
 

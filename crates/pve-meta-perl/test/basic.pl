@@ -230,6 +230,14 @@ for my $case (
 # api_* : reads and writes
 # =========================================================================
 
+# The GC section above emptied the store, and a `documents` assertion against an
+# empty list passes for the wrong reason -- `grep` over nothing found nothing.
+# So seed one of each thing the walk has to tell apart: a guest document, the
+# datacenter document, and a snapshot copy, which is *not* a document.
+write_file('datacenter.yaml', "note: keep me\n");
+write_file('9100.yaml', "a: 1\n");
+write_file('9100.keep.yaml', "a: 1\n");
+
 my $v = PVE::RS::Meta::api_version(0);
 like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
 ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
@@ -238,10 +246,10 @@ ok(!defined($v->{documents}), 'no `documents` without detail');
 my $vd = PVE::RS::Meta::api_version(1);
 is($vd->{token}, $v->{token}, 'detail does not change the token');
 ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
-ok((grep { $_->{id} eq 'datacenter' } @{ $vd->{documents} }),
-    'the datacenter document is listed by id');
-ok((!grep { $_->{id} =~ /\./ } @{ $vd->{documents} }),
-    'snapshot copies are not listed as documents');
+is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200', 'datacenter'],
+    'every guest and the datacenter document are listed by id, and the snapshot copy is not');
+
+unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
 # A missing document is the empty document with digest "".
 my $missing = PVE::RS::Meta::api_get('9101', undef, 'json', $FULL);
@@ -708,5 +716,84 @@ my $wipe = PVE::RS::Meta::api_delete('9400', undef,
     PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{digest}, $FULL);
 is($wipe->{digest}, '', 'api_delete without a view leaves digest "" (the file is gone)');
 ok(!file_exists('9400.yaml'), 'api_delete without a view actually removes the file');
+
+# -- registry documents: namespaces and grants are documents too --------------
+#
+# Same three functions, a third kind of id (`namespaces/<name>`), and one rule
+# they do not share with the other two: what is written has to parse as the kind
+# it claims to be, because the loader *skips* a file it cannot parse. A 200 on a
+# write that made the namespace disappear from api_namespaces() would be the
+# worst possible answer, so it is a 400 instead.
+
+my $ADMIN = { authid => 'root@pam', read => 1, write => 1, tags => [] };
+
+my $ns_put = PVE::RS::Meta::api_put(
+    'namespaces/labtest', undef, 'yaml',
+    "selector:\n  all: true\ndescription: Home lab\n",
+    'replace', '', 0, $ADMIN,
+);
+is($ns_put->{id}, 'namespaces/labtest', 'api_put creates a namespace document');
+ok(-f "$nsdir/labtest.yaml", 'the file lands in the namespace directory, not the store root');
+ok(!file_exists('labtest.yaml'), '... and nothing appeared beside the guest documents');
+
+my ($labtest) = grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_namespaces() };
+ok($labtest, 'the loader picks up what the write produced');
+is($labtest->{description}, 'Home lab', '... with the description it was given');
+
+my $ns_doc = PVE::RS::Meta::api_get('namespaces/labtest', undef, 'json', $ADMIN);
+is($ns_doc->{digest}, $ns_put->{digest}, 'api_get of a namespace agrees with the write');
+is(ref($ns_doc->{data}->{selector}), 'HASH',
+    'api_get returns it as a native hash like any other document');
+# A YAML boolean crosses the boundary as a plain Perl truth value, not as a
+# JSON::PP object -- the same convention the `types` round trip above checks.
+ok($ns_doc->{data}->{selector}->{all} && !ref($ns_doc->{data}->{selector}->{all}),
+    'and `selector: { all: true }` arrives as a plain true scalar');
+
+# A view write reaches into it, with the same digest compare-and-swap.
+PVE::RS::Meta::api_put('namespaces/labtest', 'schema.type', 'json', '"object"',
+    'replace', $ns_doc->{digest}, 0, $ADMIN);
+($labtest) = grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_namespaces() };
+is($labtest->{schema}->{type}, 'object', 'a view write reached into the namespace file');
+
+# The gate: a namespace with no selector is one the loader would skip.
+$res = eval { PVE::RS::Meta::api_put('namespaces/broken', undef, 'yaml',
+    "description: nothing else\n", 'replace', '', 0, $ADMIN) };
+ok(!defined($res), 'api_put refuses a namespace the loader could not read back');
+like($@, api_error_status(400), '... with a 400');
+ok(!-e "$nsdir/broken.yaml", '... and wrote nothing');
+
+my $g_put = PVE::RS::Meta::api_put(
+    'grants/ops', undef, 'yaml',
+    "authid: ops\@pve!t1\ngrants:\n  - prefix: labtest\n    mode: rw\n    selector: {all: true}\n",
+    'replace', '', 0, $ADMIN,
+);
+is($g_put->{id}, 'grants/ops', 'api_put creates a grant document');
+my ($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
+is($ops->{authid}, 'ops@pve!t1', 'the grant loader picks it up too');
+
+# A partial delete is a write, and the same rule holds on that path.
+$res = eval { PVE::RS::Meta::api_delete('grants/ops', 'authid', undef, $ADMIN) };
+ok(!defined($res), 'api_delete refuses to strip a grant of its authid');
+like($@, api_error_status(400), '... with a 400');
+($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
+ok($ops, 'the grant still loads');
+
+is(PVE::RS::Meta::api_delete('grants/ops', undef, undef, $ADMIN)->{digest}, '',
+    'removing the whole file is an ordinary delete');
+ok(!-e "$grantdir/ops.yaml", '... and the file is gone');
+
+# A nested namespace is a dotted file name, and has to be addressable: the
+# file name *is* the prefix, and `homelab.docker` was declared above.
+my $nested = PVE::RS::Meta::api_get('namespaces/homelab.docker', undef, 'json', $ADMIN);
+is($nested->{id}, 'namespaces/homelab.docker', 'a nested namespace is addressable by its file name');
+is_deeply($nested->{data}->{schema}, { type => 'object' },
+    '... and reads back the file the loader reads');
+
+# An id that could address a file outside the directory is not an id.
+for my $bad ('namespaces/../../etc/passwd', 'namespaces/a/b', 'namespaces/a..b', 'operators/traefik') {
+    $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
+    ok(!defined($res), "api_get refuses the id '$bad'");
+    like($@, api_error_status(400), "... with a 400");
+}
 
 done_testing();
