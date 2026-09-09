@@ -358,39 +358,39 @@ eq('the corpus and 500 generated documents round trip', propFails, 0);
 
 console.log('\n--- row merge: document + grammar ---');
 const P = ctx.PVE.meta.TreePanel;
+const TRAEFIK_SCHEMA = {
+    type: 'object',
+    properties: {
+        spec: {
+            type: 'object',
+            properties: {
+                host: { type: 'string', description: 'Public host name' },
+                port: { type: 'integer', default: 80 },
+                scheme: { type: 'string', enum: ['http', 'https'] },
+            },
+        },
+    },
+};
 const panel = {
     dc: false,
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    registrations: [
+    // Two lists now, two rules (DESIGN section 3): namespaces decide shape, grants
+    // decide access.
+    namespaces: [
+        { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
+        { prefix: 'netbird', selector: { all: true } },
+    ],
+    grants: [
         {
             name: 'traefik',
             authid: 'svc@pve!traefik',
-            scopes: [
-                {
-                    prefix: 'traefik',
-                    mode: 'rw',
-                    selector: { tag: 'traefik' },
-                    grammar: {
-                        type: 'object',
-                        properties: {
-                            spec: {
-                                type: 'object',
-                                properties: {
-                                    host: { type: 'string', description: 'Public host name' },
-                                    port: { type: 'integer', default: 80 },
-                                    scheme: { type: 'string', enum: ['http', 'https'] },
-                                },
-                            },
-                        },
-                    },
-                },
-            ],
+            grants: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
         },
         {
             name: 'netbird',
             authid: 'svc@pve!netbird',
-            scopes: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
+            grants: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
         },
     ],
 };
@@ -399,19 +399,25 @@ const panel = {
     'addData',
     'addGrammar',
     'schemaKind',
-    'applicableScopes',
+    'applicableNamespaces',
+    'applicableGrants',
+    'governingNamespace',
     'resolvedScopeApplies',
     'accessFor',
     'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
-const scopes = panel.applicableScopes.call(panel);
-eq('applicable scopes', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+const namespaces = panel.applicableNamespaces.call(panel);
+eq('applicable namespaces', namespaces.map((n) => n.prefix), ['traefik', 'netbird']);
+const scopes = panel.applicableGrants.call(panel);
+eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
-scopes.forEach((s) => (s.grammar ? panel.addGrammar.call(panel, root, s.prefix, s.grammar) : null));
+namespaces.forEach((ns) =>
+    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema) : null,
+);
 
 const spec = root.children.traefik.children.spec.children;
 eq('grammar adds unset rows', Object.keys(spec).sort(), ['host', 'port', 'scheme']);
@@ -427,7 +433,7 @@ eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
-panel.addGrammar.call(panel, root, 'traefik', panel.registrations[0].scopes[0].grammar);
+panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
 // Comment key becomes the sibling's Description, never a row of its own.
@@ -435,7 +441,7 @@ eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['gr
 eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
-console.log('\n--- Access: every registration whose scope covers the row ---');
+console.log('\n--- Access: every grant whose prefix covers the row ---');
 eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
     { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
 ]);
@@ -447,7 +453,7 @@ const overlapping = scopes.concat([
         prefix: 'traefik',
         mode: 'ro',
         selector: { all: true },
-        registration: { name: 'audit', authid: 'svc@pve!audit' },
+        grant: { name: 'audit', authid: 'svc@pve!audit' },
     },
 ]);
 eq(
@@ -466,15 +472,15 @@ console.log('\n--- S6: scope-only principal (no VM.Audit, so no tags) ---');
 const scopedPanel = Object.assign({}, panel);
 scopedPanel.tags = [];
 scopedPanel.access = { read: 0, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const scopedScopes = panel.applicableScopes.call(scopedPanel);
+const scopedScopes = panel.applicableGrants.call(scopedPanel);
 // `netbird` is still applicable regardless of tags (its selector is `all: true`);
 // `traefik` is a `tag` selector that only resolves via GET /meta/access now.
-eq('resolved-scope applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
+eq('resolved-grant applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
     'netbird',
     'traefik',
 ]);
 eq(
-    'access label still comes from the registration',
+    'access label still comes from the grant file',
     panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
     'traefik',
 );
@@ -580,6 +586,58 @@ eq('hover: type, format and description',
 eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
+
+console.log('\n--- nesting: most-specific wins, schemas never merge ---');
+// `homelab` and `homelab.docker` are both namespaces. The child governs its whole
+// subtree; the parent's own `properties.docker` is shadowed, not combined
+// (DESIGN section 3.1). Before revision 6 both walked and their findings unioned.
+const NESTED = L.applicable([
+    {
+        prefix: 'homelab',
+        schema: {
+            type: 'object',
+            properties: {
+                notes: { type: 'string' },
+                // The parent has an opinion about `docker` -- and must not get one.
+                docker: { type: 'string' },
+            },
+        },
+    },
+    {
+        prefix: 'homelab.docker',
+        schema: { type: 'object', properties: { compose: { type: 'string' } } },
+    },
+]);
+eq('applicable sorts longest prefix first', NESTED.map((e) => e[0]), ['homelab.docker', 'homelab']);
+eq('governing picks the child for the child subtree',
+    L.governing('homelab.docker.compose', NESTED)[0], 'homelab.docker');
+eq('governing picks the parent elsewhere', L.governing('homelab.notes', NESTED)[0], 'homelab');
+eq('governing picks the child for the boundary itself',
+    L.governing('homelab.docker', NESTED)[0], 'homelab.docker');
+eq('governing returns null off-namespace', L.governing('unrelated.x', NESTED), null);
+
+// The parent declares `docker: string` and the document has a map there. That is a
+// finding only if the parent is allowed to reach into the child -- it is not.
+const NESTED_DOC = { homelab: { notes: 'ok', docker: { compose: 'services: {}' } } };
+eq('the parent does not lint the child subtree', L.findings(NESTED_DOC, NESTED), []);
+
+// The child does lint its own subtree.
+eq('the child lints its own subtree',
+    L.findings({ homelab: { docker: { compose: 42 } } }, NESTED).map((f) => f.path + ': ' + f.message),
+    ['homelab.docker.compose: expected string']);
+
+// And the parent still lints what it does own.
+eq('the parent lints its own keys',
+    L.findings({ homelab: { notes: 7 } }, NESTED).map((f) => f.path),
+    ['homelab.notes']);
+
+// Hovers resolve to the governing namespace rather than to whichever was collected
+// last -- which used to depend on iteration order.
+const NESTED_IDX = L.schemaIndex(NESTED);
+eq('hover at the boundary comes from the child',
+    NESTED_IDX['homelab.docker'].properties.compose.type, 'string');
+eq('hover below the boundary is the child\'s', NESTED_IDX['homelab.docker.compose'].type, 'string');
+eq('hover elsewhere is the parent\'s', NESTED_IDX['homelab.notes'].type, 'string');
 
 console.log('\n--- round trip: a view toggle must not invent changes ---');
 const U2 = ctx.PVE.meta.Utils;

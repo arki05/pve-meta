@@ -1,6 +1,7 @@
-# pve-meta — design (revision 5)
+# pve-meta — design (revision 6)
 
-Revision 5 supersedes revision 4 (`DESIGN-rev4.md`, kept for the record) and the
+Revision 6 splits revision 5's "operator registration" into a **namespace** and a
+**grant** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 (`DESIGN-rev4.md`, kept for the record) and the
 review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
 deviations recorded in §11. It is the single authority for the code; where code and this
 document disagree, the code is wrong.
@@ -34,56 +35,125 @@ A caller reads or writes a document through a **view**: a key-path prefix (dotte
 depth, through maps only). A view of `traefik` is the subtree under `traefik`, returned
 with the prefix stripped. Views are also the unit of access.
 
-## 3. Registrations, scopes, grants
+## 3. Namespaces and grants
 
-Access-control data lives **outside** the documents, one file per principal, in a drop
-directory: `/etc/pve/meta.d/operators/<name>.yaml` (cluster-wide, pmxcfs) with packaged
-defaults in `/usr/share/pve-meta/operators/<name>.yaml` (a cluster file overrides the
-packaged file of the same name). One format serves scopes and operator registration:
+Two concepts, in two drop directories. They were one — an "operator registration" —
+until revision 6; see §12 for why splitting them was the point.
+
+### 3.1 Namespaces — what a prefix is
+
+`/etc/pve/meta.d/namespaces/<prefix>.yaml`, with packaged defaults in
+`/usr/share/pve-meta/namespaces/<prefix>.yaml` (a cluster file overrides the packaged
+file of the same name).
+
+**The filename is the prefix.** `traefik.yaml` declares `traefik`;
+`homelab.docker.yaml` declares `homelab.docker`. There is no `prefix:` field, so one
+namespace is exactly one prefix and "who declares `traefik`?" is `ls`. A prefix segment
+is `[A-Za-z0-9_@!-]+` and dots are only separators, so a namespace filename can never
+contain a slash, never start with a dot, and never escape its directory — the identity
+is safe by construction rather than by validation.
 
 ```yaml
-authid: svc@pve!traefik
-description: Traefik dynamic-configuration provider
-scopes:
-  - prefix: traefik            # any dotted path, nested allowed
-    mode: rw                   # ro | rw
-    selector: { all: true }    # or { tag: traefik }; room for { pool: name } later
-    grammar:                   # optional, PVE::JSONSchema dialect for the subtree
+# /etc/pve/meta.d/namespaces/traefik.yaml
+description: Traefik dynamic configuration
+selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
+schema:                      # optional, PVE::JSONSchema dialect for the subtree
+  type: object
+  properties:
+    spec:
       type: object
       properties:
-        spec:
-          type: object
-          properties:
-            host: { type: string, description: Public host name }
-            port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+        host: { type: string, description: Public host name }
+        port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
 ```
 
-Rules:
+A namespace names **no principal**. Declaring that a prefix exists and has a shape is
+useful with no operator, no token and no automation anywhere near it — a structured
+notes field with a schema is a complete use of this system.
+
+**Most-specific wins; schemas never merge.** For a document path, the governing
+namespace is the one with the **longest** declared prefix that covers it; no other
+namespace contributes to that path. So with both `homelab` and `homelab.docker`
+declared, `homelab.notes` is governed by `homelab` and `homelab.docker.compose` by
+`homelab.docker` — including `homelab`'s own `properties.docker`, which is shadowed
+rather than merged. Merging two schemas is a rabbit hole (it is what `allOf`/`$ref`
+exist for), and where a parent and child namespace have different owners it would mean
+two owners fighting over one key.
+
+A parent that declares a key a child namespace owns is **not** rejected: files are
+parsed independently, and a cross-file check would trade that for nothing. It is
+shadowed silently, and the UI's Access column names the governing namespace.
+
+The selector decides which guests a namespace reaches, and therefore where its
+declared-but-unset rows appear. Nowhere else.
+
+### 3.2 Grants — who may touch a prefix
+
+`/etc/pve/meta.d/grants/<name>.yaml`. Cluster-only: **there is deliberately no packaged
+grants directory.**
+
+```yaml
+# /etc/pve/meta.d/grants/traefik.yaml
+authid: svc@pve!traefik
+grants:
+  - prefix: traefik
+    mode: rw                 # ro | rw
+    selector: { tag: traefik }
+```
+
+That absence is a mechanism, not an omission. An operator's own `.deb` *should* be able
+to ship a namespace — a schema is a declaration. It must never be able to ship its own
+grant, because that is self-registration, which is privilege escalation. dpkg cannot
+write into pmxcfs, so "an operator declares what it expects; only an administrator
+grants it" is enforced by where the files live rather than by a rule someone has to
+remember. For the same reason **nothing registers itself over the API**: writing either
+directory requires `Sys.Modify` on `/`.
+
+**Grants nest by containment, additively** — the opposite of schemas, deliberately. A
+grant on `homelab` covers `homelab.docker`, because "you may write `homelab`" not
+implying its subtree would be surprising. Schemas shadow because they describe shape and
+shape has one owner; grants accumulate because they describe permission and permission is
+a union. Those two rules cannot both live on one object, which is the concrete reason
+this is two concepts and not one.
+
+### 3.3 Rules common to both
 
 * Files are parsed strictly and independently; a malformed file is skipped with a
-  warning and grants nothing. Prefixes are non-empty. `authid` is a PVE user or token id.
-* A **selector** restricts a scope to guests: `all`, or `tag: <t>` (the guest carries the
-  PVE tag). Tag membership is read from the cluster's cached guest properties. Adding the
-  tag is the deliberate act of granting the operator that guest.
-* Scopes apply to **guest documents only**. The datacenter document is governed by ACLs
+  warning and contributes nothing. It never affects another file.
+* Prefixes are non-empty. `authid` is a PVE user or token id.
+* A **selector** restricts to guests: `all`, or `tag: <t>` (the guest carries the PVE
+  tag), read from the cluster's cached guest properties. Adding the tag is the
+  deliberate act of including that guest. It is *not* enforced by PVE — see §1: this is
+  a selector, not a permission boundary.
+* Grants apply to **guest documents only**. The datacenter document is governed by ACLs
   alone.
-* A scope on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
+* A grant on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
   is the only comment-key rule.
 
-Grants for a caller on a guest document:
+### 3.4 Effective access for one request
 
 * `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`
   (datacenter: `Sys.Audit` / `Sys.Modify` on `/`).
-* `scopes` = the union of scope entries from registrations whose `authid` is the caller
-  and whose selector matches the guest.
+* `scopes` = the union of grant entries whose `authid` is the caller and whose selector
+  matches the guest.
 * Reading view `P` requires full read or a scope covering `P`; writing requires full
   write or a `rw` scope covering every touched path; a write to the root view requires
   full write. A read by a caller with no grant at all is 403. Authorization is decided
   from the request and a plan computed against a copy, never from a diff of stored data.
 
+**PVE ACLs cannot express this**, which is why grants are ours and not
+`pveum acl modify /meta/traefik`. `PVE::AccessControl::check_path` is a hardcoded
+whitelist (`/`, `/access/*`, `/nodes/*`, `/pool/*`, `/sdn/*`, `/storage/*`,
+`/vms/[1-9][0-9]{2,}`, `/mapping/*`); `/meta/*` is not in it and the API refuses it
+(`400 invalid ACL path '/meta/traefik'`, verified live). The whitelist is enforced in
+exactly one place, `PVE::API2::ACL::update_acl`, and the `user.cfg` *parser* only calls
+`normalize_path` — so a hand-written entry would load and evaluate. That is a trap, not
+an opening: unsupported, invisible to the Permissions UI, and one upstream edit from
+breaking silently. Making it legitimate would mean patching a fourth package.
+
 ## 4. Documents on the wire
 
-* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a grammar's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
+* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a namespace schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
 * Reads: `data` (JSON object, unordered) or `text` (YAML, the file's own text for the
   root view, a canonical dump for a sub-view). Key order is preserved in the file and is
   not a wire contract; the UI sorts.
@@ -119,7 +189,8 @@ Grants for a caller on a guest document:
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
 | GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
-| GET | `/meta/operators` | — | `[{ name, authid, description, scopes: [{ prefix, mode, selector, grammar? }] }]` — all registrations, readable by every authenticated user |
+| GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every namespace, readable by every authenticated user |
+| GET | `/meta/grants` | — | `[{ name, authid, grants: [{ prefix, mode, selector }] }]` — every grant, readable by every authenticated user |
 
 PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
 404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
@@ -181,13 +252,13 @@ Both substitute the same placeholders; `requires` gating applies to both.
 ## 8. The UI: one tree of the document
 
 The page shows one tree of the document the caller can see. Rows are the union of the
-keys present and the keys the applicable grammars declare (declared-but-unset rows are
+keys present and the keys the governing namespaces declare (declared-but-unset rows are
 greyed with their default and a "set" action). Rows carry a folder icon for maps and a
 leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays as one text leaf); opened by Edit, double-click or Enter. A grammar's
+  enums, arrays as one text leaf); opened by Edit, double-click or Enter. A schema's
   `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
   format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
   `mac-addr`, `dns-name`, `address`, `email` — the same set in both implementations,
@@ -196,9 +267,9 @@ leaf icon for values, next to the expander. Columns:
   authority — the server's one lint is that (§4), and an operator writing through the
   API is not policed by it. There is deliberately no `pattern`/regex: a format is a
   name PVE already defines and validates, a regex is one more dialect to own.
-* **Description**: the row's comment key (`k__`) if present, else nothing; the grammar
+* **Description**: the row's comment key (`k__`) if present, else nothing; the schema's
   description is the tooltip.
-* **Access**: every registration whose scope covers the row, `rw` ones by name, `ro` ones
+* **Access**: every grant whose prefix covers the row, `rw` ones by name, `ro` ones
   muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
   "access" is about who writes and who subscribes, not ownership.
 
@@ -209,7 +280,7 @@ and at the right end a **Tree | Text** toggle that swaps the panel body in place
 the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
 digest) and Discard; leaving Text while dirty asks first. Text mode validates the buffer **as it is typed**: a
 YAML syntax error is one Error marker on the line the parser reports (Monaco's own JSON
-language service already does this for the JSON view), and every grammar finding is a
+language service already does this for the JSON view), and every schema finding is a
 Warning marker on its key's line, with the key's declared type, format, range, default
 and description on hover. A document's own comment keys need no hover; they are ordinary
 lines in the YAML. Grammar markers are YAML-only — the line index is a YAML scan — so the
@@ -218,7 +289,7 @@ anything**: markers are advisory, and a document that does not match the schema 
 through the same diff dialog as any other, with a warning banner listing what does not fit
 above the diff and Apply gated on an explicit "Save anyway" tick — one decision, taken with
 the diff it is about on screen, rather than an alert to dismiss before a second window. The server's one lint decides
-what is storable (§4); an operator whose grammar has drifted from what a document
+what is storable (§4); an operator whose schema has drifted from what a document
 legitimately holds must not be able to lock the administrator out of editing it.
 
 **Format** re-dumps the buffer canonically in whichever language is showing (two-space
@@ -252,10 +323,10 @@ unit tests, is the thing `ui-extjs/testing/` has to keep earning.
 ## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, scopes+selectors+registrations, lint, api layer, store, gc
+crates/pve-meta-core     document model, views, namespaces+grants+selectors, lint, api layer, store, gc
 crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
 perl/PVE/API2/Ext/Meta.pm
-operators/               packaged example registrations (none required)
+namespaces/              packaged example namespaces (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor tab (plain JS, native ExtJS panel)
@@ -274,6 +345,36 @@ pass); orphan listing/deletion/access rules; the clone and backup hooks and thei
 (destroy came back as a hook in `AbstractConfig`, §6, together with a new create
 hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for grants, guest lists and results
 (`_grants_json`, `_inflate_view`, `parse_grants`, `data_json`); the "View as" selector.
+
+## 12. Why revision 6 splits the registration
+
+Revision 5 had one object doing two jobs, and the type said so: `authid` was
+**mandatory**, so a schema could not be declared without naming a principal. To say
+"a `hass` prefix exists and looks like this" you had to invent an operator to own it.
+
+Three pieces of evidence that it was one concept too few, all of them found in use
+rather than in review:
+
+* **The lab config had already split it by hand.** One file carried the *grammar* with
+  `selector: {all: true}`, another carried the *access* with `selector: {tag: traefik}` —
+  same prefix, two files, because one object could not express both cleanly.
+* **A real bug came out of it.** Declared-but-unset rows were driven by a *grant's*
+  grammar, so a broadly-scoped principal painted one operator's rows onto every guest in
+  the cluster. With the schema on the namespace, the selector that governs rows is the
+  namespace's and that bug is not expressible.
+* **Two files naming the same authid silently unioned their scopes.** Nobody decided
+  that; it is what happens when identity is a field rather than the file.
+
+And the rule that settles it: **schemas shadow, grants accumulate** (§3.1, §3.2). Two
+opposite nesting semantics cannot live on one object. Revision 5's did — which is why
+overlapping grammars unioned their findings and why a path covered by two schemas got
+whichever the iteration reached last.
+
+What the split buys beyond correctness is that the store's vocabulary loses the word
+*operator* entirely. It knows namespaces and grants. An operator is an installer — a
+package that drops a namespace, has an administrator issue a grant, and creates an LXC
+with credentials injected. Nothing at runtime needs the concept, so nothing in the core
+carries it.
 
 ## 11. Deviations from DIRECTION.md, with reasons
 

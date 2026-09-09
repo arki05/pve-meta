@@ -100,13 +100,17 @@ install:
 	# out of band, or a destroy that never ran because its node was down --
 	# and an administrator runs it by hand.
 	install -D -m 0755 libexec/gc $(DESTDIR)$(PREFIX)/libexec/pve-meta/gc
-	# Packaged example operator registrations (docs/DESIGN.md section 3);
-	# none are required for pve-meta to work, so this directory may be
-	# empty in a checkout that hasn't added any yet -- `mkdir -p` plus a
-	# tolerant glob copy, never a hard failure.
-	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/operators
-	if [ -d operators ] && ls operators/*.yaml >/dev/null 2>&1; then \
-		cp operators/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/operators/; \
+	# Packaged example namespaces (docs/DESIGN.md section 3.1); none are
+	# required for pve-meta to work, so this directory may be empty in a
+	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
+	# copy, never a hard failure.
+	#
+	# There is deliberately no packaged *grants* directory: an operator's
+	# package may ship a namespace (a declaration) but must never ship its
+	# own grant, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
+	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/namespaces
+	if [ -d namespaces ] && ls namespaces/*.yaml >/dev/null 2>&1; then \
+		cp namespaces/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/namespaces/; \
 	fi
 	# pve-ext UI-page manifest for the editor (see pages/pve-meta.json,
 	# docs/DESIGN.md section 8) and its static files. The manifest is the

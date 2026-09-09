@@ -32,11 +32,15 @@
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
 //!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
-//! - [`registry`] — the operator registration drop-directories
-//!   (`/usr/share/pve-meta/operators`, `/etc/pve/meta.d/operators`), which
-//!   hold the scopes and their selectors (`docs/DESIGN.md` §3).
+//! - [`registry`] — the two drop-directories: **namespaces**
+//!   (`/usr/share/pve-meta/namespaces`, `/etc/pve/meta.d/namespaces`), which
+//!   say what a prefix is and carry its schema, and **grants**
+//!   (`/etc/pve/meta.d/grants`, cluster-only), which say who may touch one
+//!   (`docs/DESIGN.md` §3). They nest by opposite rules: namespaces shadow
+//!   most-specific-first ([`registry::governing`]), grants accumulate by
+//!   containment ([`registry::scopes_for`]).
 //! - [`scopes`] — [`scopes::Grants`], a principal's effective access to one
-//!   document: the PVE ACL answers plus the registry scopes whose selector
+//!   document: the PVE ACL answers plus the grant scopes whose selector
 //!   matches the guest.
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
 //!   alias) returned throughout this crate.

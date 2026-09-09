@@ -18,7 +18,7 @@ use base qw(PVE::RESTHandler);
 # `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`, implemented in
 # `pve_meta_core::api`). This module does parameters, PVE ACL checks, the
 # vmlist, the guests' tags and the per-document write lock; everything else --
-# resolving the caller's scopes against the operator registrations, view
+# resolving the caller's scopes against the grant files, view
 # extraction, prefix stripping, merge/replace, write authorization, the lint,
 # touched-path computation, YAML/JSON rendering and digesting -- happens in
 # Rust.
@@ -44,7 +44,7 @@ sub ext_path { return 'meta' }
 #
 # `docs/DESIGN.md` §3: `full_read` = `VM.Audit` on `/vms/<vmid>`,
 # `full_write` = `VM.Config.Options` (datacenter: `Sys.Audit` / `Sys.Modify`
-# on `/`). Rust adds the scopes from the operator registrations whose authid
+# on `/`). Rust adds the scopes from the grant files whose authid
 # is the caller and whose selector matches the guest's tags -- which is why
 # the tags travel with the ACL.
 #
@@ -210,7 +210,7 @@ my $TEXT_SCHEMA = {
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
-        . "registrations (docs/DESIGN.md §3), with selectors already resolved.",
+        . "grants (docs/DESIGN.md §3.2), with selectors already resolved.",
     items => {
         type => 'object',
         properties => {
@@ -309,11 +309,11 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests datacenter operators)];
+        return [map { { subdir => $_ } } qw(version access guests datacenter namespaces grants)];
     },
 });
 
-# -- version / access / operators -------------------------------------------
+# -- version / access / namespaces / grants ---------------------------------
 
 __PACKAGE__->register_method({
     name => 'version',
@@ -369,7 +369,7 @@ __PACKAGE__->register_method({
     description => "The caller's effective grants for one document (docs/DESIGN.md §3): "
         . "'read'/'write' are the ACL answers for that document (VM.Audit / "
         . "VM.Config.Options with 'vmid'; Sys.Audit / Sys.Modify with 'dc'), and "
-        . "'scopes' lists the prefix scopes the operator registrations give the caller "
+        . "'scopes' lists the prefix scopes the grant files give the caller "
         . "on it, with selectors already resolved against the guest's tags. Scopes "
         . "apply to guest documents only, never to the datacenter document. "
         . "With neither parameter, 'read'/'write' describe the datacenter document. "
@@ -416,30 +416,62 @@ __PACKAGE__->register_method({
 });
 
 __PACKAGE__->register_method({
-    name => 'operators',
-    path => 'operators',
+    name => 'namespaces',
+    path => 'namespaces',
     method => 'GET',
     permissions => {
-        description => "Readable by every authenticated user: the registry is not "
-            . "sensitive (docs/DESIGN.md §1) and the editor's ownership column needs it.",
+        description => "Readable by every authenticated user: a namespace declares "
+            . "that a prefix exists and what shape it has, which is not sensitive "
+            . "(docs/DESIGN.md §1) and is what the editor needs to render typed rows.",
         user => 'all',
     },
-    description => "Every operator registration (docs/DESIGN.md §3): the files in "
-        . "/usr/share/pve-meta/operators and /etc/pve/meta.d/operators, with a cluster "
-        . "file overriding the packaged one of the same name. A malformed file is "
-        . "skipped with a warning and does not appear here.",
+    description => "Every namespace (docs/DESIGN.md §3.1): the files in "
+        . "/usr/share/pve-meta/namespaces and /etc/pve/meta.d/namespaces, with a cluster "
+        . "file overriding the packaged one of the same name. The file name is the "
+        . "prefix. Sorted most-specific first, which is the order that resolves which "
+        . "namespace governs a path -- longest prefix wins and schemas never merge. A "
+        . "malformed file is skipped with a warning and does not appear here.",
     parameters => {
         additionalProperties => 0,
         properties => {},
     },
     returns => {
         type => 'array',
-        # `{ name, authid, description, scopes: [{ prefix, mode, selector, grammar? }] }`
-        # -- `grammar` is a free-form PVE::JSONSchema-dialect subtree.
+        # `{ prefix, description?, selector, schema? }` -- `schema` is a free-form
+        # PVE::JSONSchema-dialect subtree.
         items => { type => 'object', additionalProperties => 1 },
     },
     code => sub {
-        return _call(\&PVE::RS::Meta::api_operators);
+        return _call(\&PVE::RS::Meta::api_namespaces);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'grants',
+    path => 'grants',
+    method => 'GET',
+    permissions => {
+        description => "Readable by every authenticated user: a grant says who may "
+            . "touch which prefix, which is exactly what the editor's Access column "
+            . "shows for every row, and listings are out of scope (docs/DESIGN.md §1).",
+        user => 'all',
+    },
+    description => "Every grant (docs/DESIGN.md §3.2): the files in "
+        . "/etc/pve/meta.d/grants. Cluster-only on purpose -- there is deliberately no "
+        . "packaged grants directory, because an operator's own package may ship a "
+        . "namespace (a declaration) but must never ship its own grant. A malformed "
+        . "file is skipped with a warning and does not appear here.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => {
+        type => 'array',
+        # `{ name, authid, description?, grants: [{ prefix, mode, selector }] }`
+        items => { type => 'object', additionalProperties => 1 },
+    },
+    code => sub {
+        return _call(\&PVE::RS::Meta::api_grants);
     },
 });
 
@@ -486,7 +518,7 @@ __PACKAGE__->register_method({
         # opens `/etc/pve/.vmlist` or a guest config, so the two can no longer
         # disagree and guest-config parsing is not re-implemented in a second
         # language. `hostname` is the LXC name field, `name` the qemu one;
-        # `tags` resolves the registrations' selectors (docs/DESIGN.md §3).
+        # `tags` resolves the grants' and namespaces' selectors (docs/DESIGN.md §3).
         my $props = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname tags)]) } || {};
         warn "pve-meta: could not read guest properties: $@" if $@;
 
@@ -515,7 +547,7 @@ __PACKAGE__->register_method({
     method => 'GET',
     permissions => {
         description => "The response is filtered to what the caller may read (VM.Audit, "
-            . "or a registered scope whose selector matches this guest). A caller with "
+            . "or a granted scope whose selector matches this guest). A caller with "
             . "neither is refused with 403, as is a 'view' outside the caller's read "
             . "access. A vmid that is not in the vmlist is 404 (docs/DESIGN.md §5).",
         user => 'all',
@@ -549,7 +581,7 @@ __PACKAGE__->register_method({
     method => 'PUT',
     permissions => {
         description => "Anybody may call this; the caller must be able to write the "
-            . "named view (VM.Config.Options, or a registered rw scope covering it) "
+            . "named view (VM.Config.Options, or a granted rw scope covering it) "
             . "and every path the write touches -- otherwise 403. Writing the whole "
             . "document (no 'view') requires VM.Config.Options. Unknown vmids are 404, "
             . "not created.",

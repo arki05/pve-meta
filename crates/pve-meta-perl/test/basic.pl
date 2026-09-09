@@ -22,9 +22,11 @@ use Test::More;
 use PVE::RS::Meta;
 
 my $root = tempdir(CLEANUP => 1);
-my $opdir = tempdir(CLEANUP => 1);
+my $nsdir = tempdir(CLEANUP => 1);
+my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
-$ENV{PVE_META_OPERATOR_DIRS} = $opdir;
+$ENV{PVE_META_NAMESPACE_DIRS} = $nsdir;
+$ENV{PVE_META_GRANT_DIRS} = $grantdir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -42,9 +44,17 @@ sub read_file {
     return $content;
 }
 
-sub write_operator {
+# The file name is the prefix (docs/DESIGN.md §3.1).
+sub write_namespace {
     my ($name, $content) = @_;
-    open(my $fh, '>', "$opdir/$name.yaml") or die "failed to write $opdir/$name.yaml: $!\n";
+    open(my $fh, '>', "$nsdir/$name.yaml") or die "failed to write $nsdir/$name.yaml: $!\n";
+    print {$fh} $content;
+    close($fh);
+}
+
+sub write_grant {
+    my ($name, $content) = @_;
+    open(my $fh, '>', "$grantdir/$name.yaml") or die "failed to write $grantdir/$name.yaml: $!\n";
     print {$fh} $content;
     close($fh);
 }
@@ -113,11 +123,12 @@ $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. `on_destroy`
-# is *not* in this list: it came back with the create/destroy hooks (§6), which is what
-# replaced the GC timer.
+# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. Two names are
+# deliberately *not* in this list: `on_destroy` came back with the create/destroy hooks
+# (§6), and `api_grants` came back in revision 6 meaning something else entirely -- the
+# grant-file listing behind GET /meta/grants, not revision 5's caller-scope lookup.
 for my $gone (qw(on_clone export_for_backup import_from_backup
-                 list_snapshots has_document api_grants)) {
+                 list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
@@ -329,13 +340,43 @@ ok(!defined($res), 'a caller with no grant at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Registrations, selectors and tags (docs/DESIGN.md §3).
+# Namespaces, grants, selectors and tags (docs/DESIGN.md §3).
 # =========================================================================
 
-write_operator('scoped', <<'YAML');
+# The file name is the prefix; there is no `prefix:` field to disagree with it.
+write_namespace('traefik', <<'YAML');
+description: Traefik dynamic configuration
+selector: { tag: traefik }
+schema:
+  type: object
+  properties:
+    spec: { type: object }
+YAML
+write_namespace('homelab.docker', <<'YAML');
+selector: { all: true }
+schema: { type: object }
+YAML
+write_namespace('homelab', <<'YAML');
+selector: { all: true }
+schema: { type: object }
+YAML
+
+my $ns = PVE::RS::Meta::api_namespaces();
+is(scalar(@$ns), 3, 'api_namespaces lists every namespace');
+is($ns->[0]->{prefix}, 'homelab.docker',
+    'sorted most-specific first, which is the order that resolves who governs a path');
+is_deeply([map { $_->{prefix} } @$ns], ['homelab.docker', 'homelab', 'traefik'],
+    '... longest prefix first, then by name');
+my ($traefik_ns) = grep { $_->{prefix} eq 'traefik' } @$ns;
+is($traefik_ns->{description}, 'Traefik dynamic configuration', 'the description survives');
+is_deeply($traefik_ns->{selector}, { tag => 'traefik' }, 'and the selector, as a native hash');
+ok($traefik_ns->{schema}, 'and the schema, passed through verbatim');
+ok(!exists $traefik_ns->{authid}, 'a namespace names no principal');
+
+write_grant('scoped', <<'YAML');
 authid: scoped@pve!t1
 description: The scoped test principal
-scopes:
+grants:
   - prefix: traefik
     mode: rw
     selector: { tag: traefik }
@@ -344,16 +385,17 @@ scopes:
     selector: { all: true }
 YAML
 
-my $ops = PVE::RS::Meta::api_operators();
-is(scalar(@$ops), 1, 'api_operators lists the registration');
-is($ops->[0]->{name}, 'scoped', 'with the file name as its name');
-is($ops->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
-is($ops->[0]->{description}, 'The scoped test principal', 'and the description');
-is_deeply($ops->[0]->{scopes}->[0]->{selector}, { tag => 'traefik' },
+my $gs = PVE::RS::Meta::api_grants();
+is(scalar(@$gs), 1, 'api_grants lists the grant');
+is($gs->[0]->{name}, 'scoped', 'with the file name as its name');
+is($gs->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
+is($gs->[0]->{description}, 'The scoped test principal', 'and the description');
+is_deeply($gs->[0]->{grants}->[0]->{selector}, { tag => 'traefik' },
     'and the selector, as a native hash');
-ok($ops->[0]->{scopes}->[1]->{selector}->{all},
+ok($gs->[0]->{grants}->[1]->{selector}->{all},
     '... and { all: true } is a hash spelled the way the file spells it, not a bare string');
-is($ops->[0]->{scopes}->[1]->{prefix}, 'netbird', 'and every scope entry');
+is($gs->[0]->{grants}->[1]->{prefix}, 'netbird', 'and every grant entry');
+ok(!exists $gs->[0]->{grants}->[0]->{schema}, 'a grant carries no schema');
 
 sub scoped_acl {
     my (@tags) = @_;
@@ -436,15 +478,18 @@ $res = eval { PVE::RS::Meta::api_get('datacenter', 'traefik', 'json', scoped_acl
 ok(!defined($res), 'and a scoped datacenter read is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# A malformed registration file is skipped with a warning and grants nothing;
-# it never takes another operator's grants away.
-write_operator('broken', "authid: nope-not-an-authid\n");
-write_operator('alsobroken', "authid: a\@pve\nscopes:\n  - prefix: x\n    mode: sideways\n");
-is(scalar(@{ PVE::RS::Meta::api_operators() }), 1,
-    'a malformed registration file is skipped');
+# A malformed file is skipped with a warning and contributes nothing; it never
+# takes another file's grants away. Both directories, independently.
+write_grant('broken', "authid: nope-not-an-authid\n");
+write_grant('alsobroken', "authid: a\@pve\ngrants:\n  - prefix: x\n    mode: sideways\n");
+write_namespace('brokenns', "selector: { nonsense: true }\n");
+write_namespace('a b', "selector: { all: true }\n"); # not a valid prefix, so not a namespace
+is(scalar(@{ PVE::RS::Meta::api_grants() }), 1, 'a malformed grant file is skipped');
+is(scalar(@{ PVE::RS::Meta::api_namespaces() }), 3, 'a malformed namespace file is skipped');
 is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
-    '... and the valid one still grants exactly what it did');
-unlink("$opdir/broken.yaml", "$opdir/alsobroken.yaml");
+    '... and the valid ones still grant exactly what they did');
+unlink("$grantdir/broken.yaml", "$grantdir/alsobroken.yaml",
+    "$nsdir/brokenns.yaml", "$nsdir/a b.yaml");
 
 # =========================================================================
 # api_list_guests: native rows in, native rows out.

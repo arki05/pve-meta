@@ -30,7 +30,7 @@
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
 //! `test/basic.pl`); the registration directories likewise with
-//! `PVE_META_OPERATOR_DIRS`.
+//! `PVE_META_NAMESPACE_DIRS`/`PVE_META_GRANT_DIRS`.
 
 use std::path::PathBuf;
 
@@ -62,16 +62,24 @@ mod pve_rs_meta {
     use anyhow::Error;
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
-    use pve_meta_core::registry::{self, Registration};
+    use pve_meta_core::registry::{self, Grant, Namespace};
 
     use super::{open_store, RollbackOutcome};
 
-    /// Every operator registration, packaged then cluster-wide, with a
-    /// cluster file overriding the packaged one of the same name
-    /// (`docs/DESIGN.md` §3). Read per request: the directories are tiny and
-    /// pmxcfs caches them, and a stale registry would be a stale grant.
-    fn open_registry() -> Vec<Registration> {
-        registry::load_default()
+    /// Every grant (`docs/DESIGN.md` §3.2). Cluster-only on purpose: an
+    /// operator's `.deb` may ship a namespace but must never ship its own
+    /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
+    /// a stale grant is a wrong answer about who may write.
+    fn open_grants() -> Vec<Grant> {
+        registry::load_grants_default()
+    }
+
+    /// Every namespace, packaged then cluster-wide, most-specific prefix first
+    /// (`docs/DESIGN.md` §3.1). Read per request, like the grants: the
+    /// directories are tiny, pmxcfs caches them, and a stale namespace would be
+    /// a stale schema.
+    fn open_namespaces() -> Vec<Namespace> {
+        registry::load_namespaces_default()
     }
 
     // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
@@ -221,10 +229,16 @@ mod pve_rs_meta {
         api::version(&open_store(), detail)
     }
 
-    /// `GET /meta/operators` -> every registration, as native hashes.
+    /// `GET /meta/grants` -> every grant, as native hashes.
     #[export]
-    pub fn api_operators() -> Result<Vec<Registration>, Error> {
-        Ok(api::operators(&open_registry()))
+    pub fn api_grants() -> Result<Vec<Grant>, Error> {
+        Ok(api::grants_list(&open_grants()))
+    }
+
+    /// `GET /meta/namespaces` -> every namespace, most-specific first.
+    #[export]
+    pub fn api_namespaces() -> Result<Vec<Namespace>, Error> {
+        Ok(api::namespaces_list(&open_namespaces()))
     }
 
     /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
@@ -233,7 +247,7 @@ mod pve_rs_meta {
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
-        Ok(api::access(&open_registry(), doc_id, &acl))
+        Ok(api::access(&open_grants(), doc_id, &acl))
     }
 
     /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already
@@ -245,7 +259,7 @@ mod pve_rs_meta {
         guests: Vec<GuestInput>,
         has: Option<&str>,
     ) -> Result<Vec<api::GuestListEntry>, Error> {
-        api::list_guests(&open_store(), &open_registry(), authid, &guests, has)
+        api::list_guests(&open_store(), &open_grants(), authid, &guests, has)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
@@ -257,7 +271,7 @@ mod pve_rs_meta {
         format: &str,
         acl: CallerAcl,
     ) -> Result<api::ApiViewDocument, Error> {
-        api::get_document(&open_store(), &open_registry(), id, view, format, &acl)
+        api::get_document(&open_store(), &open_grants(), id, view, format, &acl)
     }
 
     /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
@@ -283,7 +297,7 @@ mod pve_rs_meta {
     ) -> Result<api::ApiPutResult, Error> {
         api::put_document(
             &open_store(),
-            &open_registry(),
+            &open_grants(),
             id,
             view,
             format,
@@ -304,6 +318,6 @@ mod pve_rs_meta {
         digest: Option<&str>,
         acl: CallerAcl,
     ) -> Result<api::ApiPutResult, Error> {
-        api::delete_document(&open_store(), &open_registry(), id, view, digest, &acl)
+        api::delete_document(&open_store(), &open_grants(), id, view, digest, &acl)
     }
 }

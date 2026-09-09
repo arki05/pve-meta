@@ -5,13 +5,14 @@
  *
  *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
  *     document the caller can see. Rows are the union of the keys present in the
- *     document and the keys the applicable grammars declare (`GET /meta/operators`,
- *     matched by scope prefix and selector against this guest); a declared-but-unset key
+ *     document and the keys the governing namespaces declare (`GET /meta/namespaces`,
+ *     matched by prefix and selector against this guest, most-specific first -- schemas
+ *     shadow, they never merge); a declared-but-unset key
  *     renders faded with its default, and "setting" it is just editing it. Map rows
  *     carry a folder icon (open when expanded), value rows a document icon, both at the
  *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
  *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
- *     one text leaf. Access lists every registration whose scope covers the row.
+ *     one text leaf. Access lists every grant whose prefix covers the row.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
  *     toggle), Apply through a diff dialog and Discard.
@@ -182,6 +183,12 @@ PVE.meta.Utils = {
         }
     },
 
+    // Segment count of a dotted prefix -- how "specific" it is. `''` is 0.
+    depth: function (prefix) {
+        let p = String(prefix || '');
+        return p === '' ? 0 : p.split('.').length;
+    },
+
     // A scalar as the string a grammar's `enum` and a hover compare and show.
     scalarText: function (value) {
         return typeof value === 'string' ? value : Ext.encode(value);
@@ -309,17 +316,25 @@ PVE.meta.Yaml = {
 // ---------------------------------------------------------------------------
 
 PVE.meta.Lint = {
-    // [prefix, schema] pairs, from the scopes the panel already resolved
-    // (`applicableScopes()`). A scope with no grammar contributes nothing: an operator
-    // that described no shape has claimed nothing.
-    applicable: function (scopes) {
-        let out = [];
-        (scopes || []).forEach(function (scope) {
-            if (scope.grammar) {
-                out.push([scope.prefix || '', scope.grammar]);
+    // The namespaces that carry a schema, longest prefix first. Shape comes from
+    // namespaces, never from grants (DESIGN section 3.1).
+    applicable: function (namespaces) {
+        return (namespaces || [])
+            .filter((ns) => ns && ns.schema && ns.prefix)
+            .map((ns) => [ns.prefix, ns.schema])
+            .sort((a, b) => PVE.meta.Utils.depth(b[0]) - PVE.meta.Utils.depth(a[0]));
+    },
+
+    // The entry of `applicable` governing `path`: the longest prefix covering it.
+    // `applicable` is sorted longest-first, so this is the first match.
+    governing: function (path, applicable) {
+        let list = applicable || [];
+        for (let i = 0; i < list.length; i++) {
+            if (PVE.meta.Utils.covers(list[i][0], path)) {
+                return list[i];
             }
-        });
-        return out;
+        }
+        return null;
     },
 
     valueAt: function (data, path) {
@@ -339,17 +354,22 @@ PVE.meta.Lint = {
 
     findings: function (data, applicable) {
         let out = [];
-        (applicable || []).forEach(function ([prefix, schema]) {
+        let list = applicable || [];
+        list.forEach(function (entry) {
+            let [prefix, schema] = entry;
             let value = PVE.meta.Lint.valueAt(data, prefix);
             if (value !== undefined) {
-                PVE.meta.Lint.walk(value, schema, prefix, out);
+                PVE.meta.Lint.walk(value, schema, prefix, out, list, entry);
             }
         });
         out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
         return out;
     },
 
-    walk: function (value, schema, path, out) {
+    // `list`/`owner`, when given, enforce most-specific-wins: the walk stops where a
+    // *different* namespace governs, so a parent's schema never reaches into a child
+    // namespace's subtree. Schemas shadow, they do not merge (DESIGN section 3.1).
+    walk: function (value, schema, path, out, list, owner) {
         let message = PVE.meta.Lint.checkValue(schema, value);
         if (message) {
             out.push({ path: path, message: message });
@@ -362,7 +382,10 @@ PVE.meta.Lint = {
         Object.keys(value).forEach(function (key) {
             if (Object.prototype.hasOwnProperty.call(props, key)) {
                 let child = path ? path + '.' + key : key;
-                PVE.meta.Lint.walk(value[key], props[key], child, out);
+                if (owner && PVE.meta.Lint.governing(child, list) !== owner) {
+                    return; // a more specific namespace owns this subtree
+                }
+                PVE.meta.Lint.walk(value[key], props[key], child, out, list, owner);
             }
         });
     },
@@ -496,17 +519,26 @@ PVE.meta.Lint = {
     },
 
     // Every schema node the grammars declare, by document path -- the hover index.
+    // Every schema node by document path -- the hover index. Pruned the same way as
+    // `findings`, so a path covered by two namespaces resolves to the more specific
+    // one rather than to whichever was collected last.
     schemaIndex: function (applicable) {
         let out = Object.create(null);
-        let collect = function (schema, path) {
+        let list = applicable || [];
+        let collect = function (schema, path, owner) {
+            if (owner && PVE.meta.Lint.governing(path, list) !== owner) {
+                return;
+            }
             out[path] = schema;
             let props = schema && schema.properties;
             if (!props) {
                 return;
             }
-            Object.keys(props).forEach((k) => collect(props[k], path ? path + '.' + k : k));
+            Object.keys(props).forEach((k) =>
+                collect(props[k], path ? path + '.' + k : k, owner),
+            );
         };
-        (applicable || []).forEach(([prefix, schema]) => collect(schema, prefix));
+        list.forEach((entry) => collect(entry[1], entry[0], entry));
         return out;
     },
 
@@ -1122,7 +1154,8 @@ Ext.define('PVE.meta.TreePanel', {
         me.baseUrl = me.dc ? '/meta/datacenter' : '/meta/guests/' + me.vmid;
         me.digest = '';
         me.access = { read: 1, write: 0, scopes: [] };
-        me.registrations = [];
+        me.namespaces = [];
+        me.grants = [];
         me.tags = [];
         me.token = null;
         me.editing = false; // a row editor is open
@@ -1459,25 +1492,51 @@ Ext.define('PVE.meta.TreePanel', {
             return;
         }
         Proxmox.Utils.setErrorMask(me, true);
-        me.loadOperators(() =>
-            me.loadTags(() =>
-                me.loadAccess(() => me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false))),
+        me.loadNamespaces(() =>
+            me.loadGrants(() =>
+                me.loadTags(() =>
+                    me.loadAccess(() =>
+                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
+                    ),
+                ),
             ),
         );
     },
 
-    // /meta/operators is revision 5; against an older API it simply fails and the
-    // Access column and the grammar-declared rows stay empty, rather than the page.
-    loadOperators: function (next) {
+    // /meta/namespaces and /meta/grants are revision 6; against an older API they
+    // simply fail and the Access column and the schema-declared rows stay empty,
+    // rather than the page.
+    loadNamespaces: function (next) {
         let me = this;
         me.request({
-            url: '/meta/operators',
+            url: '/meta/namespaces',
             success: function (response) {
-                me.registrations = response.result.data || [];
+                // Served most-specific first (DESIGN section 3.1) -- the order
+                // `governingNamespace` relies on. Sorted again here so the UI does not
+                // depend on the server's ordering for correctness.
+                me.namespaces = (response.result.data || []).slice().sort(function (a, b) {
+                    let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
+                    return d !== 0 ? d : String(a.prefix).localeCompare(String(b.prefix));
+                });
                 next();
             },
             failure: function () {
-                me.registrations = [];
+                me.namespaces = [];
+                next();
+            },
+        });
+    },
+
+    loadGrants: function (next) {
+        let me = this;
+        me.request({
+            url: '/meta/grants',
+            success: function (response) {
+                me.grants = response.result.data || [];
+                next();
+            },
+            failure: function () {
+                me.grants = [];
                 next();
             },
         });
@@ -1487,9 +1546,11 @@ Ext.define('PVE.meta.TreePanel', {
     loadTags: function (next) {
         let me = this;
         me.tags = [];
-        let needed = me.registrations.some((r) =>
-            (r.scopes || []).some((s) => s.selector && s.selector.tag),
-        );
+        let hasTagSelector = (list, key) =>
+            (list || []).some((e) => (e[key] || []).some((x) => x.selector && x.selector.tag));
+        let needed =
+            (me.namespaces || []).some((n) => n.selector && n.selector.tag) ||
+            hasTagSelector(me.grants, 'grants');
         if (me.dc || !needed) {
             next();
             return;
@@ -1595,7 +1656,7 @@ Ext.define('PVE.meta.TreePanel', {
         );
     },
 
-    // The scopes of every registration whose selector matches this guest. Scopes
+    // The grant entries whose selector matches this guest. Grants
     // apply to guest documents only (DESIGN §3), so the datacenter gets none.
     //
     // A `tag` selector is normally resolved against `me.tags` (from
@@ -1604,30 +1665,61 @@ Ext.define('PVE.meta.TreePanel', {
     // a scope `/meta/access` already resolved for us: that endpoint resolves
     // selectors server-side without requiring VM.Audit, so it still surfaces our
     // own declared rows and Access entries even when `me.tags` is empty. The
-    // registration is still the source of the label (name, selector text).
-    applicableScopes: function () {
+    // grant file is still the source of the label (name, selector text).
+    // The namespaces that reach this guest, most-specific first. Namespaces decide
+    // *shape*: which declared-but-unset rows appear and which schema governs a path.
+    applicableNamespaces: function () {
+        let me = this;
+        if (me.dc) {
+            return []; // namespaces apply to guest documents only (DESIGN section 3.3)
+        }
+        return (me.namespaces || []).filter(function (ns) {
+            let sel = ns.selector || {};
+            return sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1);
+        });
+    },
+
+    // The namespace governing `path`: the longest prefix that covers it. Most-specific
+    // wins and schemas never merge (DESIGN section 3.1) -- with both `homelab` and
+    // `homelab.docker` declared, `homelab.docker.compose` is governed by the child
+    // alone. `applicableNamespaces()` is sorted longest-first, so this is the first
+    // match.
+    governingNamespace: function (path, applicable) {
+        let list = applicable || this.applicableNamespaces();
+        for (let i = 0; i < list.length; i++) {
+            if (PVE.meta.Utils.covers(list[i].prefix, path)) {
+                return list[i];
+            }
+        }
+        return null;
+    },
+
+    // The grant entries that reach this guest. Grants decide *access*, and unlike
+    // namespaces they accumulate by containment: a grant on `homelab` covers
+    // `homelab.docker` (DESIGN section 3.2).
+    applicableGrants: function () {
         let me = this;
         let out = [];
         if (me.dc) {
-            return out;
+            return out; // grants apply to guest documents only
         }
-        me.registrations.forEach(function (reg) {
-            (reg.scopes || []).forEach(function (scope) {
-                let sel = scope.selector || {};
+        (me.grants || []).forEach(function (grant) {
+            (grant.grants || []).forEach(function (entry) {
+                let sel = entry.selector || {};
                 let matches =
-                    scope.prefix &&
+                    entry.prefix &&
                     (sel.all ||
                         (sel.tag && me.tags.indexOf(sel.tag) !== -1) ||
-                        me.resolvedScopeApplies(scope));
+                        me.resolvedScopeApplies(entry));
                 if (matches) {
-                    out.push(Ext.apply({ registration: reg }, scope));
+                    out.push(Ext.apply({ grant: grant }, entry));
                 }
             });
         });
         return out;
     },
 
-    // Every registration whose scope covers this row, `rw` first. Several principals
+    // Every grant whose prefix covers this row, `rw` first. Several principals
     // may read a subtree; this is about who writes and who subscribes, not ownership.
     accessFor: function (path, scopes) {
         let U = PVE.meta.Utils;
@@ -1638,7 +1730,7 @@ Ext.define('PVE.meta.TreePanel', {
             if (!U.covers(s.prefix, path)) {
                 return;
             }
-            let name = s.registration.name || s.registration.authid || '';
+            let name = s.grant.name || s.grant.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
             let key = name + '\u0000' + mode;
             if (seen[key]) {
@@ -1776,10 +1868,20 @@ Ext.define('PVE.meta.TreePanel', {
         // Kept for text mode's grammar findings (annotateText): the parsed document the
         // server returned, so nothing has to re-read the YAML to know what is in it.
         me.docData = data;
-        let scopes = me.applicableScopes();
+        // Namespaces decide shape, grants decide access -- two lists, two rules
+        // (DESIGN section 3). Declared rows come from namespaces only, and only from the
+        // one governing each prefix: most-specific wins, schemas never merge.
+        let namespaces = me.applicableNamespaces();
+        let scopes = me.applicableGrants();
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
-        scopes.forEach((s) => (s.grammar ? me.addGrammar(root, s.prefix, s.grammar) : undefined));
+        namespaces.forEach(function (ns) {
+            // A namespace shadowed at its own prefix by a more specific one contributes
+            // nothing there; the child's schema governs that subtree entirely.
+            if (ns.schema && me.governingNamespace(ns.prefix, namespaces) === ns) {
+                me.addGrammar(root, ns.prefix, ns.schema);
+            }
+        });
 
         let toNodes = (entry) =>
             Object.keys(entry.children)
@@ -2233,7 +2335,7 @@ Ext.define('PVE.meta.TreePanel', {
                 });
             }
         } else if (me.textLang === 'yaml') {
-            let applicable = PVE.meta.Lint.applicable(me.applicableScopes());
+            let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
             if (applicable.length) {
                 let index = PVE.meta.Lint.lineIndex(text);
                 markers = PVE.meta.Lint.placed(
@@ -2272,7 +2374,7 @@ Ext.define('PVE.meta.TreePanel', {
         if (!me.textEditor) {
             return [];
         }
-        let applicable = PVE.meta.Lint.applicable(me.applicableScopes());
+        let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
         if (!applicable.length) {
             return [];
         }

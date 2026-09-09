@@ -21,12 +21,12 @@ set -e
 # only exists once the filesystem is actually mounted -- the same guard
 # pattern PVE's own packages use before writing under /etc/pve. Creating
 # this drop directory here (rather than lazily, on first read) means an
-# administrator dropping a registration file into it right after install
+# administrator dropping a namespace or grant file into them right after install
 # never has to first go looking for why the directory doesn't exist yet.
-ensure_operators_dropdir() {
+ensure_dropdirs() {
     if [ -d /etc/pve/local ]; then
-        mkdir -p /etc/pve/meta.d/operators || {
-            echo "pve-meta: warning: could not create /etc/pve/meta.d/operators." >&2
+        mkdir -p /etc/pve/meta.d/namespaces /etc/pve/meta.d/grants || {
+            echo "pve-meta: warning: could not create /etc/pve/meta.d/{namespaces,grants}." >&2
         }
     fi
 }
@@ -61,7 +61,7 @@ restart_pve_services() {
 
 case "$1" in
     configure)
-        ensure_operators_dropdir
+        ensure_dropdirs
         apply_lifecycle_patch
         restart_pve_services
         ;;

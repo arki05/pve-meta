@@ -21,7 +21,7 @@ segmented button at the right end of the toolbar.
 
 * **One tree of the document the caller can see.** Columns **Key | Value | Description |
   Access**, one line per row. Rows are the union of the keys present in the document and
-  the keys the applicable grammars declare. A declared-but-unset key renders faded,
+  the keys the governing namespaces declare. A declared-but-unset key renders faded,
   showing `not set (default: …)`; "setting" it is just editing it.
 * **Row icons.** A folder on a map row (`fa fa-folder`, `fa fa-folder-open` while it is
   expanded — swapped on `itemexpand`/`itemcollapse`, since ExtJS has no per-node
@@ -36,13 +36,13 @@ segmented button at the right end of the toolbar.
   Description column.
 * **Arrays are one text leaf**, shown as JSON. On commit, JSON is parsed if the text
   starts with `[`, otherwise a comma-separated list is split.
-* **Access** lists *every* registration from `GET /meta/operators` whose scope covers the
+* **Access** lists *every* grant from `GET /meta/namespaces` and `GET /meta/grants` whose scope covers the
   row — `rw` ones by name in normal text, `ro` ones muted with `(ro)`, `rw` first. The
   cell tooltip spells each one out with its selector (`example-traefik (rw, all
   guests)`). Several principals may read a subtree; this column is about who writes and
   who subscribes, not ownership. Scopes apply to guest documents only, so the datacenter
   tree has no entries. `selector: { tag: … }` is resolved against the guest's `tags` from
-  `GET /meta/guests`, fetched only when some registration actually uses a tag selector.
+  `GET /meta/guests`, fetched only when some grant actually uses a tag selector.
 * **No per-row action icons.** The toolbar is **Add | Edit | Remove | Edit selection as
   text | Reload**, all targeting the selection: Add goes into the selected map, the
   parent of a selected leaf, or the document root; Edit and Remove need a row; *Edit
@@ -167,8 +167,8 @@ repository copy's header still says otherwise.
   order intact.
 * `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
   Chromium against the real pve-manager SPA:
-  `node headless-tab-check.js <host> <vmid> <light|dark> [--operators] [--readonly]
-  [--scoped] [--ro]`. `--operators` stubs a `GET /meta/operators` payload; `--scoped` and
+  `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
+  [--scoped] [--ro]`. `--stub-registry` stubs a `GET /meta/namespaces` and `GET /meta/grants` payload; `--scoped` and
   `--ro` stub `GET /meta/access` so the restricted toolbar labels and the per-row
   editability can be seen without a second principal's credentials. They need
   `puppeteer-core` and a chromium binary and write their screenshots to
@@ -177,14 +177,14 @@ repository copy's header still says otherwise.
 ## Screenshots
 
 Taken on `pvemeta-node1` (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8)
-inside the real UI, against the live revision-5 API, with two live registrations
+inside the real UI, against the live revision-5 API, with two live grants
 (`example-traefik`, `rw` on `traefik` for all guests, with a grammar; `scoped`, `rw` on
 `traefik` for tag `traefik` and `ro` on `netbird` for all guests).
 
 | File | What it shows |
 |---|---|
 | `extjs-tree-light.png`, `extjs-tree-dark.png` | the Tree card: row icons, the Description column from a comment key, the Access column, a faded declared-but-unset row |
-| `extjs-access-tip-light.png`, `extjs-access-tip-dark.png` | the Access tooltip, one registration per line with its mode and selector |
+| `extjs-access-tip-light.png`, `extjs-access-tip-dark.png` | the Access tooltip, one grant per line with its mode and selector |
 | `extjs-rowedit-light.png`, `extjs-rowedit-dark.png` | the row editor (opened by a double-click), with the comment key as its Description field |
 | `extjs-text-light.png`, `extjs-text-dark.png` | the Text card: the whole document in Monaco, YAML |
 | `extjs-text-json-light.png`, `extjs-text-json-dark.png` | the same after the JSON view toggle |

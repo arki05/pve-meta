@@ -25,56 +25,79 @@ backup:
   retention: 7
 ```
 
-## Views, registrations and scopes
+## Views, namespaces and grants
 
 A caller reads or writes the document through a **view**: a key-path prefix, dotted, any
 depth, through maps only. A view of `backup` is the `backup` subtree, returned with the
 prefix stripped. Views are also the unit of access.
 
-Access control lives outside the documents, one file per principal, in a drop
-directory: `/etc/pve/meta.d/operators/<name>.yaml` (cluster-wide, pmxcfs), with packaged
-defaults under `/usr/share/pve-meta/operators/<name>.yaml` — a cluster file overrides a
-packaged file of the same name. An operator's own package drops its file into the
-packaged location; an administrator overrides or adds one directly under
-`/etc/pve/meta.d/operators/`. One format serves both registration and scopes:
+Two things live outside the documents, in two drop directories.
+
+**A namespace says what a prefix is** — `/etc/pve/meta.d/namespaces/<prefix>.yaml`, with
+packaged defaults under `/usr/share/pve-meta/namespaces/<prefix>.yaml` (a cluster file
+overrides a packaged one of the same name). **The file name is the prefix**, so
+`traefik.yaml` declares `traefik` and `homelab.docker.yaml` declares `homelab.docker`;
+there is no `prefix:` field for the two to disagree about.
 
 ```yaml
-# /usr/share/pve-meta/operators/traefik.yaml
-authid: svc@pve!traefik
-description: Traefik dynamic-configuration provider
-scopes:
-  - prefix: traefik            # any dotted path, nested allowed
-    mode: rw                   # ro | rw
-    selector: { all: true }    # or { tag: traefik }; room for { pool: name } later
-    grammar:                   # optional, PVE::JSONSchema dialect for the subtree
+# /usr/share/pve-meta/namespaces/traefik.yaml
+description: Traefik dynamic configuration
+selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
+schema:                      # optional, PVE::JSONSchema dialect for the subtree
+  type: object
+  properties:
+    spec:
       type: object
       properties:
-        spec:
-          type: object
-          properties:
-            host: { type: string, description: Public host name }
-            port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+        host: { type: string, description: Public host name }
+        port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
 ```
 
-Rules:
+A namespace names **no principal**. Declaring that a prefix exists and has a shape is
+useful with no operator, no token and no automation anywhere near it — a structured
+notes field with a schema is a complete use of this system.
+
+**A grant says who may touch one** — `/etc/pve/meta.d/grants/<name>.yaml`:
+
+```yaml
+authid: svc@pve!traefik
+grants:
+  - prefix: traefik
+    mode: rw                 # ro | rw
+    selector: { tag: traefik }
+```
+
+Grants are **cluster-only: there is deliberately no packaged grants directory.** An
+operator's own package may ship a namespace, because a schema is a declaration; it must
+never ship its own grant, because that is self-registration. dpkg cannot write into
+pmxcfs, so "an operator declares what it expects, only an administrator grants it" is
+enforced by where the files live rather than by a rule someone has to remember.
 
 * Files are parsed strictly and independently; a malformed file is skipped with a
-  warning and grants nothing to anyone else.
-* A **selector** restricts a scope to guests: `all`, or `tag: <t>` — the guest carries
+  warning and costs no other file anything.
+* A **selector** restricts either to guests: `all`, or `tag: <t>` — the guest carries
   that PVE tag. Tag membership comes from the cluster's cached guest properties. Adding
-  the tag is the deliberate, manual act of granting the operator that guest; pve-meta
-  does not enforce anything about the tag itself, it only filters by it.
-* Scopes apply to guest documents only; the datacenter document is governed by ACLs
-  alone.
-* A scope on prefix `p` also covers the sibling comment key `p__` — the only comment-key
-  access rule.
+  the tag is the deliberate, manual act of including that guest; pve-meta does not
+  enforce anything about the tag itself, it only filters by it.
+* Both apply to guest documents only; the datacenter document is governed by ACLs alone.
+* A grant on prefix `p` also covers the sibling comment key `p__` — the only
+  comment-key access rule.
+
+**The two nest by opposite rules, deliberately.** Namespaces: *most-specific wins, and
+schemas never merge* — with both `homelab` and `homelab.docker` declared,
+`homelab.docker.compose` is governed by the child alone and the parent's own
+`properties.docker` is shadowed, not combined. Grants: *containment, additive* — a grant
+on `homelab` covers `homelab.docker`, because "you may write `homelab`" not implying its
+subtree would be surprising. Shape has one owner, so it shadows; permission is a union,
+so it adds. Those two rules cannot live on one object, which is why this is two
+concepts and not one (`docs/DESIGN.md` §12).
 
 Grants for a caller on a guest document:
 
 * Full read = `VM.Audit` on `/vms/<vmid>`; full write = `VM.Config.Options` (datacenter:
   `Sys.Audit` / `Sys.Modify` on `/`).
-* Scopes = the union of scope entries from every registration whose `authid` is the
-  caller and whose selector matches the guest.
+* Scopes = the union of grant entries whose `authid` is the caller and whose selector
+  matches the guest.
 * Reading view `P` needs full read or a scope covering `P`; writing needs full write or
   a `rw` scope covering every path the write touches; a write to the root view needs
   full write. A caller with no grant at all gets 403 on read.
@@ -96,7 +119,7 @@ are `protected` and run in pvedaemon.
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
 | GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
-| GET | `/meta/operators` | — | `[{ name, authid, description, scopes }]` — every registration, readable by any authenticated user (it drives the UI's ownership column) |
+| GET | `/meta/namespaces`, `/meta/grants` | — | `[{ name, authid, description, scopes }]` — every registration, readable by any authenticated user (it drives the UI's ownership column) |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
 `data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust
@@ -112,7 +135,7 @@ Datacenter panel: one tree of the document the caller can see. Rows are the unio
 the keys present and the keys any applicable grammar declares (an unset declared key
 renders greyed out, with its default, description and a "set" action). Columns: key,
 value (an inline editor by type), owner (which registration's scope covers the row, from
-`/meta/operators`). A row edit is a minimal `PUT ?view=<path>&mode=replace`; add is the
+`/meta/namespaces` and `/meta/grants`). A row edit is a minimal `PUT ?view=<path>&mode=replace`; add is the
 same at a new path; delete is `DELETE ?view=<path>`. Editability is per row, from
 `/meta/access`. Monaco is the escape hatch: edit a subtree as YAML/JSON text, with a
 diff-confirmed apply.
@@ -176,7 +199,7 @@ dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
 
 Installing/configuring `pve-meta` runs its `postinst`: `pve-ext-patch apply
 pve-meta-lifecycle` (dpkg-diverts `PVE/AbstractConfig.pm`, applies the diff, gates on
-`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/operators` when `/etc/pve`
+`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/{namespaces,grants}` when `/etc/pve`
 is mounted, and restarts `pvedaemon`/`pveproxy`. The API module and the UI tabs need no
 action — pve-ext discovers
 the API module at process startup and re-reads page manifests on every `/ext/pages`
@@ -202,7 +225,7 @@ account system of its own:
 | A guest's document | `VM.Audit` on `/vms/<vmid>` | `VM.Config.Options` on `/vms/<vmid>` |
 | Datacenter document | `Sys.Audit` on `/` | `Sys.Modify` on `/` |
 
-A registration (above) additionally grants a prefix, read-only or read-write, on the
+A grant (above) additionally grants a prefix, read-only or read-write, on the
 guests its selector matches, to a principal that may hold no VM privilege at all.
 
 ## Building
@@ -221,10 +244,10 @@ live node.
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, views, registrations/scopes/selectors, lint, api layer, store, gc — pure Rust |
+| `crates/pve-meta-core` | Document model, views, namespaces/grants/selectors, lint, api layer, store, gc — pure Rust |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
-| `operators/` | Packaged example registrations (none required) |
+| `namespaces/` | Packaged example namespaces (none required) |
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/lifecycle/` | The one guest-lifecycle diff (snapshot/rollback/delete-snapshot) + `lifecycle.toml` manifest |

@@ -52,7 +52,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Registration};
+use crate::registry::{self, Grant, Namespace};
 use crate::scopes::{Grants, Scope};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
 use crate::view;
@@ -139,7 +139,7 @@ pub struct CallerAcl {
 /// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
 /// datacenter document is governed by ACLs alone, which is what keeps the
 /// registry from being able to grant access to it.
-pub fn grants(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> Grants {
+pub fn grants(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
     let scopes = match doc_id {
         DocId::Guest(_) => registry::scopes_for(regs, &acl.authid, &acl.tags),
         DocId::Datacenter => Vec::new(),
@@ -432,7 +432,7 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
 }
 
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
-pub fn access(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
+pub fn access(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
     let g = grants(regs, doc_id, acl);
     ApiAccess {
         read: g.full_read,
@@ -441,11 +441,19 @@ pub fn access(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> ApiAcces
     }
 }
 
-/// `GET /meta/operators`: every registration, readable by every
-/// authenticated user (`docs/DESIGN.md` §5). The registry is not sensitive
-/// under the threat model (§1) and the UI's ownership column needs it.
-pub fn operators(regs: &[Registration]) -> Vec<Registration> {
+/// `GET /meta/grants`: every grant, readable by every authenticated user.
+///
+/// Not filtered per caller: a grant says who may touch which prefix, which is
+/// exactly what the UI's Access column shows for every row, and the threat
+/// model puts listings out of scope (`docs/DESIGN.md` §1).
+pub fn grants_list(regs: &[Grant]) -> Vec<Grant> {
     regs.to_vec()
+}
+
+/// `GET /meta/namespaces`: every namespace, most-specific first, readable by
+/// every authenticated user.
+pub fn namespaces_list(namespaces: &[Namespace]) -> Vec<Namespace> {
+    namespaces.to_vec()
 }
 
 /// `GET /meta/guests`: for every guest Perl passed in, the metadata the
@@ -459,7 +467,7 @@ pub fn operators(regs: &[Registration]) -> Vec<Registration> {
 /// `400:` if `has` is not a valid path.
 pub fn list_guests(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     authid: &str,
     guests: &[GuestInput],
     has: Option<&str>,
@@ -524,7 +532,7 @@ pub fn list_guests(
 /// not readable. `422:` the stored document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -686,7 +694,7 @@ fn plan_write(
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
 pub fn put_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -780,7 +788,7 @@ pub fn put_document(
 /// writable, or a planned touched path is outside the caller's write grants.
 pub fn delete_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     digest: Option<&str>,
@@ -929,7 +937,7 @@ pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Registration;
+    use crate::registry::Grant;
     use serde_json::json;
 
     /// A store over a fresh tempdir. No global state: every test owns its
@@ -940,13 +948,13 @@ mod tests {
         (dir, store)
     }
 
-    /// The registrations used throughout: `scoped@pve!t1` holds `traefik` rw
-    /// on guests tagged `traefik`, and `netbird` ro on every guest.
-    fn regs() -> Vec<Registration> {
-        vec![registry::parse(
+    /// The grants used throughout: `scoped@pve!t1` holds `traefik` rw on
+    /// guests tagged `traefik`, and `netbird` ro on every guest.
+    fn regs() -> Vec<Grant> {
+        vec![registry::parse_grant(
             "scoped",
             "authid: scoped@pve!t1\n\
-             scopes:\n\
+             grants:\n\
              \x20 - prefix: traefik\n    mode: rw\n    selector: {tag: traefik}\n\
              \x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
         )
@@ -1614,11 +1622,11 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
-    fn operators_lists_every_registration() {
-        let ops = operators(&regs());
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].authid, "scoped@pve!t1");
-        assert_eq!(ops[0].scopes.len(), 2);
+    fn grants_list_returns_every_grant() {
+        let gs = grants_list(&regs());
+        assert_eq!(gs.len(), 1);
+        assert_eq!(gs[0].authid, "scoped@pve!t1");
+        assert_eq!(gs[0].grants.len(), 2);
     }
 
     #[test]
