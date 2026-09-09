@@ -629,18 +629,72 @@ PVE.meta.Monaco = {
     // cfg: { title, original, modified, lang, apply }
     confirmDiff: function (cfg) {
         let state = {};
+        // `cfg.warnings` (grammar findings) turns this into the warned form: a banner
+        // above the diff and an Apply gated on an explicit tick.
+        let warnings = cfg.warnings || [];
         let win = Ext.create('Ext.window.Window', {
             title: gettext('Confirm') + ': ' + Ext.htmlEncode(cfg.title),
             itemId: 'pveMetaDiffWindow',
             modal: true,
             width: 1000,
             height: 620,
-            layout: 'fit',
+            layout: 'border',
             referenceHolder: true,
-            items: [{ xtype: 'component', reference: 'diff', style: 'height:100%;width:100%' }],
+            items: [
+                // The schema warning lives *in* the confirm step rather than in a
+                // dialog before it: one decision, with the diff that decision is
+                // about visible underneath it, instead of an alert to dismiss and
+                // then a second window to read.
+                {
+                    xtype: 'panel',
+                    region: 'north',
+                    hidden: !warnings.length,
+                    bodyPadding: 8,
+                    border: false,
+                    cls: 'pve-meta-diff-warning',
+                    style: 'border-bottom:1px solid var(--pwt-color-outline,#c0c0c0)',
+                    html:
+                        '<div style="display:flex;gap:8px;align-items:flex-start">' +
+                        '<i class="fa fa-exclamation-triangle" style="color:#e6a23c;margin-top:2px"></i>' +
+                        '<div><b>' +
+                        Ext.htmlEncode(gettext('This does not match the schema the operators declare')) +
+                        '</b><ul style="margin:4px 0 0 0;padding-left:18px">' +
+                        warnings.slice(0, 8).map((w) => '<li>' + Ext.htmlEncode(w) + '</li>').join('') +
+                        '</ul>' +
+                        (warnings.length > 8
+                            ? '<div>' +
+                              Ext.htmlEncode(
+                                  Ext.String.format(gettext('... and {0} more.'), warnings.length - 8),
+                              ) +
+                              '</div>'
+                            : '') +
+                        '</div></div>',
+                },
+                {
+                    xtype: 'component',
+                    region: 'center',
+                    reference: 'diff',
+                    style: 'height:100%;width:100%',
+                },
+            ],
             buttons: [
                 {
+                    xtype: 'proxmoxcheckbox',
+                    itemId: 'diffAckBox',
+                    hidden: !warnings.length,
+                    boxLabel: gettext('Save anyway'),
+                    // Advisory, not a gate: the server's lint decides what is storable
+                    // (DESIGN section 4). The tick is here so a mismatch is a deliberate
+                    // act rather than a dialog reflex -- never to make it impossible.
+                    listeners: {
+                        change: (box, value) => win.down('#diffApplyBtn').setDisabled(!value),
+                    },
+                },
+                '->',
+                {
                     text: gettext('Apply'),
+                    itemId: 'diffApplyBtn',
+                    disabled: !!warnings.length,
                     handler: function () {
                         win.close();
                         cfg.apply();
@@ -2088,49 +2142,23 @@ Ext.define('PVE.meta.TreePanel', {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
-        let proceed = function () {
-            PVE.meta.Monaco.confirmDiff({
+        PVE.meta.Monaco.confirmDiff({
             title: gettext('(whole document)'),
             original: original,
             modified: edited,
             lang: lang,
+            // Advisory: the banner and the tick make a schema mismatch a deliberate
+            // act, they do not forbid it. The server's lint decides what is storable
+            // (DESIGN section 4), and an operator whose grammar has drifted from what
+            // a document legitimately holds must not be able to lock the administrator
+            // out of editing it.
+            warnings: me.textFindings(),
             apply: function () {
                 // The whole document, at the root view. JSON is a subset of YAML, but
                 // `data` is the parameter that says "this is the JSON data model".
                 let params = { view: '', mode: 'replace', digest: me.digest };
                 params[me.textLang === 'json' ? 'data' : 'text'] = edited;
                 me.submit({ url: me.baseUrl, method: 'PUT', params: params }, () => me.refreshText());
-            },
-            });
-        };
-
-        // Advisory, exactly like the squiggles: a grammar is an operator's statement of
-        // what it expects, not a gate. The server's lint decides what is storable
-        // (DESIGN section 4), so this warns and still lets the write through -- an
-        // operator whose grammar has drifted from what the document legitimately holds
-        // must not be able to lock the administrator out of editing it.
-        let findings = me.textFindings();
-        if (!findings.length) {
-            proceed();
-            return;
-        }
-        Ext.Msg.show({
-            title: gettext('Does not match the schema'),
-            message:
-                gettext('This document does not match the schema the operators declare:') +
-                '<ul><li>' +
-                findings.slice(0, 8).map(Ext.htmlEncode).join('</li><li>') +
-                '</li></ul>' +
-                (findings.length > 8
-                    ? Ext.String.format(gettext('... and {0} more.'), findings.length - 8) + '<br>'
-                    : '') +
-                gettext('Save it anyway?'),
-            icon: Ext.Msg.WARNING,
-            buttons: Ext.Msg.YESNO,
-            fn: function (btn) {
-                if (btn === 'yes') {
-                    proceed();
-                }
             },
         });
     },

@@ -214,8 +214,10 @@ Warning marker on its key's line, with the key's declared type, format, range, d
 and description on hover. A document's own comment keys need no hover; they are ordinary
 lines in the YAML. Grammar markers are YAML-only — the line index is a YAML scan — so the
 JSON view keeps syntax validation and loses the schema squiggles. **Nothing here blocks
-anything**: markers are advisory, and Apply on a document that does not match the schema
-warns, lists what does not fit, and proceeds if confirmed. The server's one lint decides
+anything**: markers are advisory, and a document that does not match the schema is applied
+through the same diff dialog as any other, with a warning banner listing what does not fit
+above the diff and Apply gated on an explicit "Save anyway" tick — one decision, taken with
+the diff it is about on screen, rather than an alert to dismiss before a second window. The server's one lint decides
 what is storable (§4); an operator whose grammar has drifted from what a document
 legitimately holds must not be able to lock the administrator out of editing it.
 
