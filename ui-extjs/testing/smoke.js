@@ -843,13 +843,71 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
         docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
         schemas: { prefix: META },
     });
-    ['grammarFor', 'docKind', 'documentEntries', 'addData', 'addGrammar', 'entry', 'schemaKind', 'dataOf', 'applicablePrefixes'].forEach(
+    ['grammarFor', 'docKind', 'documentEntries', 'addData', 'addGrammar', 'entry', 'schemaKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
         (m) => (panelR[m] = P[m]),
     );
-    const entries = panelR.documentEntries('prefixes/x');
+    panelR.pending = [];
+    panelR.docId = 'prefixes/x';
+    const entries = panelR.documentEntries();
     eq('a prefix document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
     eq('what it holds is present', entries.children.selector.children.tag.present, true);
     eq('what it does not hold is a declared-but-unset row', entries.children.description.present, false);
+}
+
+console.log('\n--- staged edits: the change that had no legal single step ---');
+{
+    // The case that forced this: a prefix definition's selector is exactly one of
+    // `all` or `tag`, so `{all: true}` -> `{tag: web}` has NO valid intermediate.
+    // Dropping `all` first is refused by the server; adding `tag` first is refused;
+    // the row editor could only ever do one at a time. Reproduced on the lab.
+    const stored = { description: 'Home', selector: { all: true } };
+    const pending = [
+        { path: 'selector.all', op: 'delete' },
+        { path: 'selector.tag', op: 'set', value: 'web' },
+    ];
+    eq('both edits land in one planned document', U.applyPending(stored, pending), {
+        description: 'Home',
+        selector: { tag: 'web' },
+    });
+    // ... and go out as ONE write, at the narrowest view covering both.
+    eq('written as one view', U.writeView(pending), 'selector');
+    eq('the stored document is untouched until then', stored, {
+        description: 'Home',
+        selector: { all: true },
+    });
+
+    // A single row edit is still exactly the one-key write it always was.
+    eq('one set writes that key', U.writeView([{ path: 'a.b.c', op: 'set', value: 1 }]), 'a.b.c');
+    // A delete cannot be expressed by replacing the thing being deleted, so the
+    // write moves one level up and replaces the parent without the key.
+    eq('one delete writes its parent', U.writeView([{ path: 'a.b.c', op: 'delete' }]), 'a.b');
+    eq('a top-level delete writes the document', U.writeView([{ path: 'a', op: 'delete' }]), '');
+    eq('unrelated subtrees write the document', U.writeView([
+        { path: 'traefik.spec.host', op: 'set', value: 'x' },
+        { path: 'netbird.groups', op: 'set', value: [] },
+    ]), '');
+    eq('nothing staged, nothing to write', U.writeView([]), null);
+
+    // Deletes and sets applied in the order they were made.
+    eq('order is what was done', U.applyPending({ a: 1 }, [
+        { path: 'a', op: 'delete' },
+        { path: 'a', op: 'set', value: 2 },
+    ]), { a: 2 });
+    eq('a set then a delete leaves nothing', U.applyPending({}, [
+        { path: 'x.y', op: 'set', value: 1 },
+        { path: 'x.y', op: 'delete' },
+    ]), { x: {} });
+    // Intermediate maps are created for a new nested key.
+    eq('a new nested key builds its parents', U.applyPending({}, [
+        { path: 'schema.properties.port.type', op: 'set', value: 'integer' },
+    ]), { schema: { properties: { port: { type: 'integer' } } } });
+
+    // Keys are document data and no key is reserved: staging one named `__proto__`
+    // must set a key, not the prototype. (`entry()` guards the same way.)
+    const planned = U.applyPending({}, [{ path: '__proto__', op: 'set', value: 'oops' }]);
+    eq('a proto-named key is a key', Object.prototype.hasOwnProperty.call(planned, '__proto__'), true);
+    eq('and the prototype is untouched', {}.oops, undefined);
+    eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
 }
 
 console.log('\n--- the registry lists ---');
@@ -956,10 +1014,12 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
         tags: [],
     });
-    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'applicablePrefixes'].forEach(
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
         (m) => (panelF[m] = P[m]),
     );
-    const found = panelF.findingsFor('201');
+    panelF.pending = [];
+    panelF.docId = '201';
+    const found = panelF.findingsFor();
     eq('the out-of-range row is marked', found['docker.port'], 'must be at most 65535');
     eq('a row that fits is not', found['docker.host'], undefined);
 
@@ -969,17 +1029,20 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
         schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
     });
-    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'applicablePrefixes'].forEach(
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
         (m) => (panelR[m] = P[m]),
     );
+    panelR.pending = [];
+    panelR.docId = 'prefixes/x';
     eq(
         'a prefix file is marked against the meta-schema',
-        panelR.findingsFor('prefixes/x').description,
+        panelR.findingsFor().description,
         'expected string',
     );
     // The datacenter document has no schema at all, so it can never be marked.
     panelR.docState.datacenter = { digest: 'd', data: { anything: 5 } };
-    eq('the datacenter document is never marked', panelR.findingsFor('datacenter'), {});
+    panelR.docId = 'datacenter';
+    eq('the datacenter document is never marked', panelR.findingsFor(), {});
 }
 
 console.log('\n--- declaring one key of a prefix schema ---');

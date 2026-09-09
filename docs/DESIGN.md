@@ -348,6 +348,12 @@ leaf icon for values, next to the expander. Columns:
   name PVE already defines and validates, a regex is one more dialect to own.
 * **Description**: the row's comment key (`k__`) if present, else nothing; the schema's
   description is the tooltip.
+A button that varies per *document* may hide — Declare Key is a missing concept on a
+guest, not a missing permission, and the toolbar is stable for as long as you are in that
+document. One that varies per *row* is disabled instead, never hidden: otherwise the
+buttons beside it shift under the pointer on every selection change, which is how you
+aim for Remove and hit something else.
+
 **Every key is optional, and a default is an offer.** Nothing in pve-meta ever requires
 a key to be present: no write is refused for a missing one and no read invents one. So
 `optional` says nothing about a guest document — it is not in the Declare Key form and
@@ -358,6 +364,41 @@ A declared `default` is shown on the greyed row and written **only** by the expl
 your back, and never by merely looking at the document. (`optional` survives in the
 meta-schema (§3.6), because those files really do have required fields: a grant with no
 `authid` is refused on the way in.)
+
+**Edits are staged, and one Apply writes them.** A row edit used to be a write of
+that one key. That works until a document has a rule spanning two keys, and then it
+does not work at all: a prefix definition's selector is *exactly one of* `all` or `tag`
+(§3.1), so turning `{all: true}` into `{tag: web}` has **no legal single-key step** —
+dropping `all` is refused, adding `tag` is refused, and the row editor could only ever
+do one at a time. The field was uneditable from the tree, with nothing on screen saying
+why. (Reproduced on the lab: both routes 400, only the combined write at `selector`
+succeeds.)
+
+So the tree works the way the text editor always has. Edits accumulate, the tree renders
+the document as it *would* be, and **Apply** sends them as one write: a `replace` at the
+narrowest view covering every staged path, carrying the planned subtree. For a single
+row that is exactly the one-key write it used to send immediately; for the selector
+change it is one `replace` at `selector`, which is the only thing the server will take.
+A staged delete moves the write one level up, since a key cannot be removed by replacing
+it. Narrow on purpose: a root write needs full write access, while a scoped principal
+may hold only its own prefix (§3.4).
+
+A staged row is rendered the way proxmoxlib's own `PendingObjectGrid` renders a config
+change that has not taken effect yet — the stored value, then the pending one beneath it
+in `darkorange`, a pending removal struck through — because that is exactly what this is
+and PVE already has a vocabulary for it. **Revert** drops the lot; a reload or a poll
+never silently discards them (the poll simply holds off while anything is staged); and
+the text editors, which write immediately, are unavailable until the staged set is
+settled, since they would be showing the stored document while the tree shows the
+planned one.
+
+Apply asks the server **twice**: once with `dry_run=1`, whose refusal becomes the diff
+dialog's warning banner, and then for real. That is how a rule the client cannot know
+gets said before the write rather than after: "exactly one of `all`/`tag`" is not
+expressible in the schema dialect (§3.6), so the client never learns it — it asks. The
+banner and the diff are the same warned-apply dialog the text editor uses, with the same
+explicit tick, because a schema mismatch must stay possible: the server's lint decides
+what is storable (§4), not a schema that may have drifted.
 
 A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
 colour, a triangle, and the message in the tooltip ahead of the schema's description.
@@ -372,8 +413,8 @@ still stored — the server's lint decides what is storable (§4).
   "access" is about who writes and who subscribes, not ownership.
 
 Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
-parent of a selected leaf, or the root), **Declare Key** (only on a prefix document,
-see below), **Edit selection as text** (enabled with a
+parent of a selected leaf, or the root), **Set to default**, **Declare Key** (only on a
+prefix document, see below), **Edit selection as text** (enabled with a
 selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
 and at the right end a **Tree | Text** toggle that swaps the panel body in place between
 the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the

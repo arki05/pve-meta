@@ -142,9 +142,15 @@ renders greyed with its default and a **Set to default** button, which is the on
 that ever writes one. Columns: key, value (an editor chosen by the value's shape — inline
 for a scalar, a text box for a string with newlines, Monaco for a map or an array of
 maps), description (the row's own `k__` comment key) and access (every grant whose prefix
-covers the row). A row whose value does not match its schema is marked amber in place. A
-row edit is a minimal `PUT ?view=<path>&mode=replace`; add is the same at a new path;
-delete is `DELETE ?view=<path>`. Editability is per row, from `/meta/access`.
+covers the row). A row whose value does not match its schema is marked amber in place.
+
+Edits are **staged**, not written one key at a time: the tree shows the document as it
+would be, a staged row renders like a pending PVE config change (the stored value, then
+the pending one beneath it in `darkorange`), and **Apply** sends the lot as one
+`PUT ?view=<narrowest covering path>&mode=replace`, diff-confirmed. That is what makes a
+change like "this prefix applies to a tag rather than to every guest" possible at all —
+dropping `all` and adding `tag` are each refused on their own, because a definition's
+selector is exactly one of the two. Editability is per row, from `/meta/access`.
 
 On the Datacenter panel it is three sub-tabs: **Document** (the same editor, on the
 datacenter document), **Prefixes** and **Grants** — two grids over `/meta/prefixes` and
