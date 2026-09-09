@@ -205,7 +205,7 @@ struct RawSelector {
 }
 
 fn bad(msg: impl std::fmt::Display) -> Error {
-    Error::Registration(msg.to_string())
+    Error::Registry(msg.to_string())
 }
 
 /// `true` if `s` is a PVE realm (or token sub-id):
@@ -269,7 +269,7 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
 /// prefix.
 ///
 /// # Errors
-/// [`Error::Registration`] describing the first problem; [`Error::Parse`] if
+/// [`Error::Registry`] describing the first problem; [`Error::Parse`] if
 /// the text is not YAML at all.
 pub fn parse_namespace(name: &str, text: &str) -> Result<Namespace> {
     // Dotted form only. `Path::parse` also accepts `a/b`, which must never be a

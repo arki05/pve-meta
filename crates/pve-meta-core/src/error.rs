@@ -60,9 +60,9 @@ pub enum Error {
     InvalidName(String),
 
     /// An operator registration file (`docs/DESIGN.md` §3) is malformed; see
-    /// [`crate::registry::parse`].
-    #[error("invalid registration: {0}")]
-    Registration(String),
+    /// [`crate::registry::parse_namespace`] / [`crate::registry::parse_grant`].
+    #[error("invalid registry file: {0}")]
+    Registry(String),
 
     /// An underlying I/O operation failed.
     #[error(transparent)]

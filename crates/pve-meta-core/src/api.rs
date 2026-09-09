@@ -73,7 +73,7 @@ pub fn api_err(err: CoreError) -> anyhow::Error {
         | CoreError::Parse { .. }
         | CoreError::InvalidPath(_)
         | CoreError::InvalidName(_)
-        | CoreError::Registration(_)
+        | CoreError::Registry(_)
         | CoreError::TooLarge { .. } => 400,
         CoreError::Io(_) | CoreError::Other(_) => 500,
     };
@@ -139,9 +139,9 @@ pub struct CallerAcl {
 /// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
 /// datacenter document is governed by ACLs alone, which is what keeps the
 /// registry from being able to grant access to it.
-pub fn grants(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
+pub fn grants(grant_files: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
     let scopes = match doc_id {
-        DocId::Guest(_) => registry::scopes_for(regs, &acl.authid, &acl.tags),
+        DocId::Guest(_) => registry::scopes_for(grant_files, &acl.authid, &acl.tags),
         DocId::Datacenter => Vec::new(),
     };
     Grants {
@@ -432,8 +432,8 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
 }
 
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
-pub fn access(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
-    let g = grants(regs, doc_id, acl);
+pub fn access(grant_files: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
+    let g = grants(grant_files, doc_id, acl);
     ApiAccess {
         read: g.full_read,
         write: g.full_write,
@@ -446,8 +446,8 @@ pub fn access(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
 /// Not filtered per caller: a grant says who may touch which prefix, which is
 /// exactly what the UI's Access column shows for every row, and the threat
 /// model puts listings out of scope (`docs/DESIGN.md` §1).
-pub fn grants_list(regs: &[Grant]) -> Vec<Grant> {
-    regs.to_vec()
+pub fn grants_list(grant_files: &[Grant]) -> Vec<Grant> {
+    grant_files.to_vec()
 }
 
 /// `GET /meta/namespaces`: every namespace, most-specific first, readable by
@@ -467,7 +467,7 @@ pub fn namespaces_list(namespaces: &[Namespace]) -> Vec<Namespace> {
 /// `400:` if `has` is not a valid path.
 pub fn list_guests(
     store: &MetaStore,
-    regs: &[Grant],
+    grant_files: &[Grant],
     authid: &str,
     guests: &[GuestInput],
     has: Option<&str>,
@@ -482,7 +482,7 @@ pub fn list_guests(
             write: guest.write,
             tags: guest.tags.clone(),
         };
-        let g = grants(regs, DocId::Guest(guest.vmid), &acl);
+        let g = grants(grant_files, DocId::Guest(guest.vmid), &acl);
         let readable = g.readable_prefixes();
         if readable.is_empty() {
             continue;
@@ -532,14 +532,14 @@ pub fn list_guests(
 /// not readable. `422:` the stored document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
-    regs: &[Grant],
+    grant_files: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(regs, doc_id, acl);
+    let grants = grants(grant_files, doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
@@ -694,7 +694,7 @@ fn plan_write(
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
 pub fn put_document(
     store: &MetaStore,
-    regs: &[Grant],
+    grant_files: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -705,7 +705,7 @@ pub fn put_document(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(regs, doc_id, acl);
+    let grants = grants(grant_files, doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
@@ -788,14 +788,14 @@ pub fn put_document(
 /// writable, or a planned touched path is outside the caller's write grants.
 pub fn delete_document(
     store: &MetaStore,
-    regs: &[Grant],
+    grant_files: &[Grant],
     id: &str,
     view: Option<&str>,
     digest: Option<&str>,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, anyhow::Error> {
     let doc_id = parse_id(id)?;
-    let grants = grants(regs, doc_id, acl);
+    let grants = grants(grant_files, doc_id, acl);
     let view_path = parse_view(view)?;
 
     authorize_view_write(&grants, &view_path)?;
@@ -1057,13 +1057,13 @@ fn version_detail_names_the_documents_that_changed() {
         fn a_selector_resolves_against_the_guests_tags() {
         // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
         // granting the operator that guest.
-        let regs = regs();
-        let untagged = grants(&regs, DocId::Guest(100), &scoped(&[]));
+        let grant_files = regs();
+        let untagged = grants(&grant_files, DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
         assert_eq!(untagged.scopes[0].prefix.to_string(), "netbird");
         assert!(!untagged.can_write(&DocPath::parse("traefik").unwrap()));
 
-        let tagged = grants(&regs, DocId::Guest(100), &scoped(&["traefik"]));
+        let tagged = grants(&grant_files, DocId::Guest(100), &scoped(&["traefik"]));
         assert!(tagged.can_write(&DocPath::parse("traefik.spec").unwrap()));
         assert!(tagged.can_read(&DocPath::parse("netbird").unwrap()));
         assert!(!tagged.can_write(&DocPath::parse("netbird").unwrap()));
@@ -1075,13 +1075,13 @@ fn version_detail_names_the_documents_that_changed() {
         // alone, so no registration can ever reach it.
         let g = grants(&regs(), DocId::Datacenter, &scoped(&["traefik"]));
         assert!(g.scopes.is_empty());
-        assert!(g.is_empty());
+        assert!(g.readable_prefixes().is_empty());
     }
 
     #[test]
     fn a_registration_for_another_authid_grants_nothing() {
         let g = grants(&regs(), DocId::Guest(100), &none());
-        assert!(g.is_empty());
+        assert!(g.readable_prefixes().is_empty());
     }
 
     // -- write authorization ------------------------------------------------
@@ -1608,16 +1608,16 @@ fn version_detail_names_the_documents_that_changed() {
 
     #[test]
     fn access_reports_resolved_scopes() {
-        let regs = regs();
-        let tagged = access(&regs, DocId::Guest(100), &scoped(&["traefik"]));
+        let grant_files = regs();
+        let tagged = access(&grant_files, DocId::Guest(100), &scoped(&["traefik"]));
         assert!(!tagged.read && !tagged.write);
         assert_eq!(
             tagged.scopes.iter().map(|s| s.prefix.to_string()).collect::<Vec<_>>(),
             vec!["traefik", "netbird"]
         );
-        let untagged = access(&regs, DocId::Guest(100), &scoped(&[]));
+        let untagged = access(&grant_files, DocId::Guest(100), &scoped(&[]));
         assert_eq!(untagged.scopes.len(), 1);
-        let dc = access(&regs, DocId::Datacenter, &full());
+        let dc = access(&grant_files, DocId::Datacenter, &full());
         assert!(dc.read && dc.write && dc.scopes.is_empty());
     }
 

@@ -108,11 +108,6 @@ impl Grants {
                 .any(|s| s.mode == Mode::Rw && covers(&s.prefix, path))
     }
 
-    /// `true` if the principal can read nothing at all in this document.
-    pub fn is_empty(&self) -> bool {
-        !self.full_read && !self.full_write && self.scopes.is_empty()
-    }
-
     /// The prefixes to union for a "no view" read (see
     /// [`crate::view::filter`]): the whole document (`[Path::root()]`) for
     /// full read access, else every scope's prefix (of either mode).
@@ -195,7 +190,7 @@ mod tests {
         assert!(g.can_read(&p("anything.at.all")));
         assert!(g.can_write(&p("anything")));
         assert_eq!(g.readable_prefixes(), vec![Path::root()]);
-        assert!(!g.is_empty());
+        assert!(!g.readable_prefixes().is_empty());
     }
 
     #[test]
@@ -204,7 +199,7 @@ mod tests {
         assert!(!g.can_read(&p("a")));
         assert!(!g.can_write(&p("a")));
         assert!(g.readable_prefixes().is_empty());
-        assert!(g.is_empty());
+        assert!(g.readable_prefixes().is_empty());
     }
 
     #[test]
