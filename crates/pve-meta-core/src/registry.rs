@@ -460,6 +460,14 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 ///
 /// `namespaces` must be sorted most-specific first ([`load_namespaces`]), so
 /// this is the first match.
+///
+/// **Nothing in this crate calls it**, and that is deliberate rather than an
+/// oversight: schema resolution happens in the editor, which is the only
+/// consumer that needs it today. It stays because this crate owns the data
+/// model, so this is where the rule and its tests belong — and because the
+/// moment a second consumer appears (a client library, a hook script, a second
+/// UI) the alternative is each of them re-deriving it. If that never happens,
+/// delete it rather than letting it drift from the implementation that runs.
 pub fn governing<'a>(
     namespaces: &'a [Namespace],
     path: &Path,
@@ -468,14 +476,6 @@ pub fn governing<'a>(
     namespaces
         .iter()
         .find(|ns| ns.selector.matches(tags) && ns.prefix.is_prefix_of(path))
-}
-
-/// The namespaces that apply to a guest carrying `tags`, most-specific first.
-pub fn applicable<'a>(namespaces: &'a [Namespace], tags: &[String]) -> Vec<&'a Namespace> {
-    namespaces
-        .iter()
-        .filter(|ns| ns.selector.matches(tags))
-        .collect()
 }
 
 /// The scopes `authid` holds on a guest carrying `tags`: the union of every

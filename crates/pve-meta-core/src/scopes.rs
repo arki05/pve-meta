@@ -142,6 +142,40 @@ mod tests {
     use crate::patch::Op;
     use pretty_assertions::assert_eq;
 
+    /// The prefix-coverage rule against the fixture the JavaScript editor's suite
+    /// reads too (`testdata/covers-cases.json`).
+    ///
+    /// `covers` is mirrored in `ui-extjs`'s `PVE.meta.Utils.covers` on purpose: the
+    /// server enforces the rule, the editor predicts it, and an editor that predicts
+    /// it differently shows rows a write then rejects. Testing each side against its
+    /// own hand-written cases is how those two drift, so both read one table. Add a
+    /// case to the file, never to one suite.
+    #[test]
+    fn covers_matches_the_shared_cases() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/covers-cases.json"
+        ))
+        .expect("the shared fixture is part of the repository");
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 15, "the fixture should not have been emptied");
+
+        for case in cases {
+            let prefix = Path::parse(case["prefix"].as_str().unwrap()).unwrap();
+            let path = Path::parse(case["path"].as_str().unwrap()).unwrap();
+            let want = case["covered"].as_bool().unwrap();
+            assert_eq!(
+                covers(&prefix, &path),
+                want,
+                "covers({:?}, {:?}) should be {want}: {}",
+                case["prefix"].as_str().unwrap(),
+                case["path"].as_str().unwrap(),
+                case["why"].as_str().unwrap(),
+            );
+        }
+    }
+
     fn p(s: &str) -> Path {
         Path::parse(s).unwrap()
     }

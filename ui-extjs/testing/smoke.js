@@ -93,11 +93,19 @@ eq('defined', ctx.__defined, [
     'PVE.meta.TreePanel',
 ]);
 
-console.log('\n--- covers / paths ---');
-eq('covers exact', U.covers('traefik', 'traefik'), true);
-eq('covers child', U.covers('traefik', 'traefik.spec.host'), true);
-eq('covers sibling comment', U.covers('traefik', 'traefik__'), true);
-eq('covers not prefix-of-name', U.covers('traefik', 'traefikx'), false);
+console.log('\n--- covers / paths (shared fixture, mirrored in Rust) ---');
+// `covers` is mirrored in crates/pve-meta-core/src/scopes.rs on purpose: the server
+// enforces the rule, this editor predicts it, and an editor that predicts it
+// differently shows rows a write then rejects. Both suites read the same table, so a
+// case added on one side cannot be missing on the other. Add cases to the file.
+const coversCases = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'covers-cases.json'), 'utf8'),
+).cases;
+eq('the shared covers fixture is present', coversCases.length >= 15, true);
+coversCases.forEach((c) => {
+    eq(`covers(${JSON.stringify(c.prefix)}, ${JSON.stringify(c.path)}) -- ${c.why}`,
+        U.covers(c.prefix, c.path), c.covered);
+});
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
 eq('isComment', [U.isComment('k__'), U.isComment('__'), U.isComment('k')], [true, true, false]);
