@@ -854,6 +854,37 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
     eq('what it does not hold is a declared-but-unset row', entries.children.description.present, false);
 }
 
+console.log('\n--- a marker has to survive collapsing the branch it is in ---');
+{
+    // The whole point: collapse `homelab` and the amber `port` goes with it, along
+    // with any sign that something is wrong. Every ancestor carries the count.
+    const rolled = U.rollUp({
+        'homelab.docker.port': 'must be at most 65535',
+        'homelab.owner': 'expected string',
+    });
+    eq('every ancestor answers for what is under it', Object.keys(rolled).sort(), [
+        'homelab',
+        'homelab.docker',
+    ]);
+    eq('the top of the branch counts both', rolled.homelab.count, 2);
+    eq('a nearer branch counts only its own', rolled['homelab.docker'].count, 1);
+    eq('and the tooltip names them', rolled['homelab.docker'].messages, [
+        'homelab.docker.port: must be at most 65535',
+    ]);
+    // A top-level finding has no ancestor to bubble to -- and must not invent one.
+    eq('a top-level finding bubbles nowhere', U.rollUp({ owner: 'expected string' }), {});
+    eq('nothing wrong, nothing to say', U.rollUp({}), {});
+
+    // The tooltip shows the first few, not a wall of text.
+    const many = {};
+    for (let i = 0; i < 7; i++) {
+        many['a.b.k' + i] = 'expected string';
+    }
+    const deep = U.rollUp(many);
+    eq('all of them are counted', deep.a.count, 7);
+    eq('but only the first few are quoted', deep.a.messages.length, 3);
+}
+
 console.log('\n--- staged edits: the change that had no legal single step ---');
 {
     // The case that forced this: a prefix definition's selector is exactly one of

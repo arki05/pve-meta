@@ -216,6 +216,29 @@ PVE.meta.Utils = {
         return out;
     },
 
+    // Rolls a set of `path -> message` facts up to every ancestor path.
+    //
+    // A collapsed branch hides everything under it, so a marker that only ever sits
+    // on the offending row is a marker you cannot see: collapse `homelab` and the
+    // amber `port` disappears along with the fact that something is wrong. Ancestors
+    // therefore carry a count of what is beneath them, and the first few messages,
+    // which is what their tooltip says.
+    rollUp: function (byPath) {
+        let out = Object.create(null);
+        Object.keys(byPath || {}).forEach(function (path) {
+            let segs = path.split('.');
+            for (let i = 1; i < segs.length; i++) {
+                let ancestor = segs.slice(0, i).join('.');
+                let at = out[ancestor] || (out[ancestor] = { count: 0, messages: [] });
+                at.count++;
+                if (at.messages.length < 3) {
+                    at.messages.push(path + ': ' + byPath[path]);
+                }
+            }
+        });
+        return out;
+    },
+
     // The narrowest view that covers every staged path -- the write Apply sends.
     //
     // One write, because the whole point is that the intermediate states are the
@@ -1030,6 +1053,9 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'docId', type: 'string' }, // which document this row belongs to
         { name: 'path', type: 'string' }, // dotted; this is the `view` of a write
         { name: 'finding', type: 'string' }, // this row does not match its schema
+        { name: 'belowCount', type: 'int' }, // findings somewhere beneath this row
+        { name: 'belowText', type: 'string' }, // the first few of them, for the tooltip
+        { name: 'stagedBelow', type: 'int' }, // staged edits somewhere beneath this row
         { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
         { name: 'valueText', type: 'string' },
         { name: 'description', type: 'string' }, // the comment key `k__`, if present
@@ -1869,6 +1895,33 @@ Ext.define('PVE.meta.TreePanel', {
             if (d.finding) {
                 parts.push(Ext.htmlEncode(d.finding));
             }
+            if (d.belowCount) {
+                parts.push(
+                    Ext.htmlEncode(
+                        Ext.String.format(
+                            d.belowCount === 1
+                                ? gettext('{0} problem below:')
+                                : gettext('{0} problems below:'),
+                            d.belowCount,
+                        ),
+                    ) +
+                        '<br>' +
+                        Ext.htmlEncode(d.belowText).replace(/\n/g, '<br>') +
+                        (d.belowCount > 3 ? '<br>...' : ''),
+                );
+            }
+            if (d.stagedBelow) {
+                parts.push(
+                    Ext.htmlEncode(
+                        Ext.String.format(
+                            d.stagedBelow === 1
+                                ? gettext('{0} unapplied change below')
+                                : gettext('{0} unapplied changes below'),
+                            d.stagedBelow,
+                        ),
+                    ),
+                );
+            }
             if (d.grammarDescription) {
                 parts.push(Ext.htmlEncode(d.grammarDescription));
             }
@@ -1891,7 +1944,20 @@ Ext.define('PVE.meta.TreePanel', {
                 flex: 2,
                 renderer: function (value, meta, rec) {
                     rowTip(rec, meta);
-                    return fade(rec, Ext.htmlEncode(value));
+                    let d = rec.data;
+                    let out = fade(rec, Ext.htmlEncode(value));
+                    // Collapsing a branch must not hide what is inside it. These are
+                    // the *branch's* markers -- something beneath this row -- so they
+                    // sit in the Key column, next to the thing you would collapse,
+                    // rather than in the Value column, which is empty for a map. The
+                    // row's own trouble is still shown on its own value.
+                    if (d.stagedBelow) {
+                        out += ' <i class="fa fa-circle" style="color:darkorange"></i>';
+                    }
+                    if (d.belowCount) {
+                        out += ' <i class="fa fa-exclamation-triangle warning"></i>';
+                    }
+                    return out;
                 },
             },
             {
@@ -2737,12 +2803,22 @@ Ext.define('PVE.meta.TreePanel', {
         // column is empty on the datacenter tab by construction (DESIGN §3.3).
         let scopes = me.applicableGrants();
 
+        let findings = me.findingsFor();
         // What is staged, by path, so a changed row can show `stored -> pending`.
         let staged = Object.create(null);
         me.pending.forEach((e) => (staged[e.path] = e.op));
         let storedDoc = me.dataOf(me.docId);
+        // What each branch has to answer for: schema findings beneath it, and staged
+        // edits beneath it. Both are invisible once the branch is collapsed.
+        let below = PVE.meta.Utils.rollUp(findings);
+        let stagedBelow = PVE.meta.Utils.rollUp(
+            me.pending.reduce(function (acc, e) {
+                acc[e.path] = e.op === 'delete' ? gettext('removed') : gettext('changed');
+                return acc;
+            }, Object.create(null)),
+        );
 
-        let toNodes = function (entry, docId, findings) {
+        let toNodes = function (entry, docId) {
             return Object.keys(entry.children)
                 .sort()
                 .map(function (key) {
@@ -2770,6 +2846,9 @@ Ext.define('PVE.meta.TreePanel', {
                         accessText: me.accessSummary(access),
                         finding: findings[c.path] || '',
                         pending: staged[c.path] || '',
+                        belowCount: (below[c.path] || {}).count || 0,
+                        belowText: ((below[c.path] || {}).messages || []).join('\n'),
+                        stagedBelow: (stagedBelow[c.path] || {}).count || 0,
                         // Rendered with the row's own kind, not one inferred from the
                         // raw value: the API returns booleans as 1/0 (DESIGN §4), so
                         // inferring would print a struck-through "1" under a row whose
@@ -2782,7 +2861,7 @@ Ext.define('PVE.meta.TreePanel', {
                         leaf: kind !== 'map',
                     };
                     if (kind === 'map') {
-                        node.children = toNodes(c, docId, findings);
+                        node.children = toNodes(c, docId);
                         node.expanded = true;
                         node.iconCls = I.mapExpanded;
                         node.expandedCls = I.mapExpanded;
@@ -2793,7 +2872,7 @@ Ext.define('PVE.meta.TreePanel', {
                 });
         };
 
-        let children = toNodes(me.documentEntries(), me.docId, me.findingsFor());
+        let children = toNodes(me.documentEntries(), me.docId);
 
         // Reloading (including from the version poll) must not fold the tree up.
         // Keyed by document *and* path, even though one panel shows one document: a

@@ -402,6 +402,13 @@ what is storable (§4), not a schema that may have drifted.
 
 A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
 colour, a triangle, and the message in the tooltip ahead of the schema's description.
+**The mark bubbles up.** A marker that sits only on the offending row is one you cannot
+see: collapse `homelab` and the amber `port` goes with it, along with any sign that
+something is wrong. So every ancestor carries a triangle in its **Key** column — next to
+the thing you would collapse, and where a map's empty Value column has nothing to say —
+with a count and the first few messages in its tooltip. Staged edits bubble the same way
+and for the same reason, as a `darkorange` dot: the toolbar counter says *how many* are
+unapplied, and this says *where*.
 The text editor has squiggled these since revision 6, but the tree is the view people
 open, and a value the schema refuses looked exactly like one it liked. Both callers ask
 one function (`grammarSplit`) what describes the document, so they cannot disagree.
