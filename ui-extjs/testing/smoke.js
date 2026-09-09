@@ -93,11 +93,19 @@ eq('defined', ctx.__defined, [
     'PVE.meta.TreePanel',
 ]);
 
-console.log('\n--- covers / paths ---');
-eq('covers exact', U.covers('traefik', 'traefik'), true);
-eq('covers child', U.covers('traefik', 'traefik.spec.host'), true);
-eq('covers sibling comment', U.covers('traefik', 'traefik__'), true);
-eq('covers not prefix-of-name', U.covers('traefik', 'traefikx'), false);
+console.log('\n--- covers / paths (shared fixture, mirrored in Rust) ---');
+// `covers` is mirrored in crates/pve-meta-core/src/scopes.rs on purpose: the server
+// enforces the rule, this editor predicts it, and an editor that predicts it
+// differently shows rows a write then rejects. Both suites read the same table, so a
+// case added on one side cannot be missing on the other. Add cases to the file.
+const coversCases = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'covers-cases.json'), 'utf8'),
+).cases;
+eq('the shared covers fixture is present', coversCases.length >= 15, true);
+coversCases.forEach((c) => {
+    eq(`covers(${JSON.stringify(c.prefix)}, ${JSON.stringify(c.path)}) -- ${c.why}`,
+        U.covers(c.prefix, c.path), c.covered);
+});
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
 eq('isComment', [U.isComment('k__'), U.isComment('__'), U.isComment('k')], [true, true, false]);
@@ -415,7 +423,9 @@ eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
 namespaces.forEach((ns) =>
-    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema) : null,
+    // The 5-argument form buildTree actually uses -- the 3-argument one silently
+    // disables pruning, so a test using it is not testing what the panel does.
+    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema, namespaces, ns) : null,
 );
 
 const spec = root.children.traefik.children.spec.children;
@@ -432,7 +442,7 @@ eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
-panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA);
+panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA, namespaces, namespaces[0]);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
 // Comment key becomes the sibling's Description, never a row of its own.
@@ -484,7 +494,7 @@ eq(
     'traefik',
 );
 
-console.log('\n--- grammar findings for the text editor (mirrors ui/src/lint.rs) ---');
+console.log('\n--- schema findings for the text editor ---');
 const L = ctx.PVE.meta.Lint;
 // Namespace objects, the same shape GET /meta/namespaces returns.
 const GRAMMAR = L.applicable([
@@ -676,6 +686,62 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
     eq('the parent does not describe the child row', dockerRow.grammarDescription, undefined);
     eq('the child declares its own keys', Object.keys(dockerRow.children).sort(), ['compose']);
     eq('the parent still declares its own', r.children.homelab.children.notes.kind, 'string');
+}
+
+console.log('\n--- the client model must agree with the server model ---');
+// js-yaml's DEFAULT_SCHEMA resolves implicit timestamps; the store does not. Under the
+// default, a *presentation-only* YAML/JSON toggle or the Format button rewrote
+// `2020-01-01` to "2020-01-01T00:00:00.000Z" and Apply wrote that back.
+eq('a bare date stays the string the server stores',
+    U.yamlLoad('date: 2020-01-01\n'), { date: '2020-01-01' });
+eq('... and survives a dump/load round trip unchanged',
+    U.yamlLoad(U.yamlDump({ date: '2020-01-01' })), { date: '2020-01-01' });
+eq('a quoted numeric string is still a string', U.yamlLoad('v: "1"\n'), { v: '1' });
+eq('an unquoted integer is still a number', U.yamlLoad('v: 1\n'), { v: 1 });
+eq('booleans still parse', U.yamlLoad('v: true\n'), { v: true });
+eq('an empty document is the empty map, not null', U.yamlLoad(''), {});
+
+console.log('\n--- governing uses containment, not the grant predicate ---');
+// `covers` aliases the sibling comment key `p__` -- that is a GRANT rule. Using it to
+// pick a governing namespace made `a` govern the whole `a__` namespace, where Rust's
+// registry::governing (plain containment) says `a__`.
+eq('covers aliases the comment key (grant rule)', U.covers('a', 'a__'), true);
+eq('containsPath does not (namespace rule)', U.containsPath('a', 'a__'), false);
+eq('containsPath: the prefix itself', U.containsPath('a', 'a'), true);
+eq('containsPath: a child', U.containsPath('a', 'a.b'), true);
+eq('containsPath: not a name prefix', U.containsPath('a', 'ab'), false);
+{
+    const two = U.bySpecificity([{ prefix: 'a' }, { prefix: 'a__' }]);
+    eq('a comment-key namespace governs itself, not its subject',
+        U.governing('a__', two).prefix, 'a__');
+}
+
+console.log('\n--- nesting: a schema-less namespace still shadows ---');
+{
+    // A namespace may declare a selector and no schema (the lab's `netbird` does).
+    // It still governs its subtree -- so a parent's schema must not reach into it.
+    const all = [
+        { prefix: 'homelab.docker', selector: { all: true } },   // no schema
+        {
+            prefix: 'homelab',
+            selector: { all: true },
+            schema: {
+                type: 'object',
+                properties: {
+                    notes: { type: 'string' },
+                    docker: { type: 'string' },
+                },
+            },
+        },
+    ];
+    const doc = { homelab: { notes: 'ok', docker: { compose: 'x' } } };
+    eq('a schema-less child still shadows its parent',
+        L.findings(doc, L.applicable(all), all).map((f) => f.path), []);
+    eq('the parent still lints what it owns',
+        L.findings({ homelab: { notes: 7 } }, L.applicable(all), all).map((f) => f.path),
+        ['homelab.notes']);
+    eq('and the hover index does not cross the boundary either',
+        L.schemaIndex(L.applicable(all), all)['homelab.docker'], undefined);
 }
 
 console.log('\n--- round trip: a view toggle must not invent changes ---');

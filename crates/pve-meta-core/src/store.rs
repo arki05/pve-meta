@@ -275,11 +275,6 @@ impl MetaStore {
         MetaStore { root: root.into() }
     }
 
-    /// The store's root directory.
-    pub fn root(&self) -> &std::path::Path {
-        &self.root
-    }
-
     fn path_for(&self, id: DocId) -> PathBuf {
         self.root.join(format!("{}.{}", id.base_name(), DISK_FORMAT.ext()))
     }

@@ -81,8 +81,7 @@ exist for), and where a parent and child namespace have different owners it woul
 two owners fighting over one key.
 
 A parent that declares a key a child namespace owns is **not** rejected: files are
-parsed independently, and a cross-file check would trade that for nothing. It is
-shadowed silently, and the UI's Access column names the governing namespace.
+parsed independently, and a cross-file check would trade that for nothing. It is shadowed silently: the UI shows the child's schema and never the parent's.
 
 The selector decides which guests a namespace reaches, and therefore where its
 declared-but-unset rows appear. Nowhere else.

@@ -533,6 +533,9 @@ __PACKAGE__->register_method({
                 name => $p->{name} // $p->{hostname},
                 tags => _parse_tags($p->{tags}),
                 read => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1) ? 1 : 0,
+                # Constant, not the real ACL answer: a listing never consults full_write
+                # (api.rs's `list_guests` gates only on read), so asking PVE for it would be
+                # one $rpcenv->check() per guest for a value nothing reads.
                 write => 0,
             };
         }

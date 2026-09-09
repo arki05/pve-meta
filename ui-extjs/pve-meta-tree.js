@@ -100,8 +100,11 @@ PVE.meta.Utils = {
     // wired to PVE's own checker, with PVE's own (translated) error message, rather
     // than to a regex of ours. A format with no vtype (or one we do not know) simply
     // does not constrain the field: an unknown constraint must never block an edit.
-    // This is exactly the set ui/src/grammar.rs's check_format() implements, so the two
-    // UIs accept and reject the same strings; adding a format means adding it in both.
+    // This is the ONLY implementation of the format set anywhere: the server passes a
+    // namespace's `schema` through verbatim and never validates `format` (DESIGN §4 --
+    // the lint is the authority, a schema is an affordance). It used to be mirrored in
+    // a second UI that no longer exists (git tag pwt-ui-removed), so there is nothing
+    // to keep in sync; adding a format is a change here and in DESIGN §8's list.
     FORMAT_VTYPES: {
         'ip': 'IP64Address',
         'ipv4': 'IPAddress',
@@ -195,18 +198,29 @@ PVE.meta.Utils = {
     governing: function (path, namespaces) {
         let list = namespaces || [];
         for (let i = 0; i < list.length; i++) {
-            if (PVE.meta.Utils.covers(list[i].prefix, path)) {
+            if (PVE.meta.Utils.containsPath(list[i].prefix, path)) {
                 return list[i];
             }
         }
         return null;
     },
 
+    // Plain containment: `p` itself, or anything under `p.`. Deliberately NOT
+    // `covers`, which additionally aliases the sibling comment key `p__` -- that is a
+    // *grant* rule (a scope on `p` may write the note about `p`), and it does not
+    // belong here. With namespaces `a` and `a__` both declared, `covers` would have
+    // said `a` governs the whole `a__` namespace; Rust's `registry::governing` uses
+    // plain containment and would have said `a__`. Two predicates, two jobs.
+    containsPath: (p, path) => path === p || path.indexOf(p + '.') === 0,
+
     // Longest prefix first, then by name: the order `governing` relies on.
     bySpecificity: function (namespaces) {
         return (namespaces || []).slice().sort(function (a, b) {
             let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
-            return d !== 0 ? d : String(a.prefix).localeCompare(String(b.prefix));
+            // Byte order, matching Rust's `String::cmp` -- `localeCompare` orders
+            // `@`, `!`, `_` and mixed case differently, and a mirror that sorts
+            // differently is a mirror that will eventually decide differently.
+            return d !== 0 ? d : (a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0);
         });
     },
 
@@ -266,13 +280,27 @@ PVE.meta.Utils = {
     },
 
     yamlLoad: function (text) {
-        let doc = PVE.meta.Utils.yamlLib().load(String(text));
+        // JSON_SCHEMA, not js-yaml's DEFAULT_SCHEMA. The default resolves implicit
+        // timestamps, so `2020-01-01` parses to a JS Date and re-serialises as
+        // "2020-01-01T00:00:00.000Z" -- a *presentation-only* view toggle, or the
+        // Format button, would silently rewrite the stored value. The server keeps it
+        // a string (`serde_yaml_ng`, verified), and this must agree with the server
+        // about what a document *is*.
+        //
+        // js-yaml still accepts anchors, aliases and explicit tags, which the store
+        // refuses (format.rs's YAML safety scan). That divergence is one the server
+        // catches -- an Apply carrying them is a 400 -- so it is left alone rather
+        // than reimplementing that scan here.
+        let doc = PVE.meta.Utils.yamlLib().load(String(text), {
+            schema: PVE.meta.Utils.yamlLib().JSON_SCHEMA,
+        });
         // An empty document is the empty map, not a null: the model has no nulls.
         return doc === undefined || doc === null ? {} : doc;
     },
 
     yamlDump: function (value) {
         return PVE.meta.Utils.yamlLib().dump(value, {
+            schema: PVE.meta.Utils.yamlLib().JSON_SCHEMA, // as yamlLoad, for the same reason
             indent: 2,
             lineWidth: -1, // never fold: a folded line is a changed line in the diff
             noRefs: true, // anchors/aliases are not part of the document model
@@ -332,9 +360,12 @@ PVE.meta.Yaml = {
 // ---------------------------------------------------------------------------
 // Grammar findings for the text editor: what is wrong, and which line to underline.
 //
-// Mirrors ui/src/lint.rs exactly -- same rules, same messages, same line scan -- so
-// the two implementations say the same thing about the same document. Changing one
-// means changing the other.
+// The only implementation of these rules: the second UI this used to mirror is gone
+// (git tag pwt-ui-removed). What it must still agree with is the *server* -- the value
+// model (PVE.meta.Utils.yamlLoad uses JSON_SCHEMA so a bare date stays a string, as
+// the store keeps it) and the coverage rule (testdata/covers-cases.json, read by this
+// suite and by scopes.rs). Findings themselves are advisory: DESIGN §4 makes the
+// server's single lint the authority on what is storable.
 //
 // Two halves, kept apart on purpose. `findings()` answers *what is wrong*, from the
 // parsed document the panel already holds; `lineIndex()` answers *where to draw it*,
@@ -366,13 +397,20 @@ PVE.meta.Lint = {
         return cur;
     },
 
-    findings: function (data, applicable) {
+    // `withSchema` is what to walk; `all` is what *shadows*, which is every applicable
+    // namespace whether or not it carries a schema. Two jobs, two lists: a namespace
+    // with a selector and no schema (the lab's `netbird`) still governs its subtree, so
+    // reusing the filtered list for pruning let a parent's schema reach into a
+    // schema-less child. Defaults to `withSchema` only for callers that have no
+    // schema-less namespaces to worry about.
+    findings: function (data, withSchema, all) {
         let out = [];
-        let list = applicable || [];
+        let list = withSchema || [];
+        let shadow = all && all.length ? PVE.meta.Utils.bySpecificity(all) : list;
         list.forEach(function (ns) {
             let value = PVE.meta.Lint.valueAt(data, ns.prefix);
             if (value !== undefined) {
-                PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, list, ns);
+                PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, shadow, ns);
             }
         });
         out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -531,15 +569,15 @@ PVE.meta.Lint = {
         return out;
     },
 
-    // Every schema node the grammars declare, by document path -- the hover index.
     // Every schema node by document path -- the hover index. Pruned the same way as
     // `findings`, so a path covered by two namespaces resolves to the more specific
     // one rather than to whichever was collected last.
-    schemaIndex: function (applicable) {
+    schemaIndex: function (withSchema, all) {
         let out = Object.create(null);
-        let list = applicable || [];
+        let list = withSchema || [];
+        let shadow = all && all.length ? PVE.meta.Utils.bySpecificity(all) : list;
         let collect = function (schema, path, owner) {
-            if (owner && PVE.meta.Utils.governing(path, list) !== owner) {
+            if (owner && PVE.meta.Utils.governing(path, shadow) !== owner) {
                 return;
             }
             out[path] = schema;
@@ -1599,6 +1637,14 @@ Ext.define('PVE.meta.TreePanel', {
             // principal may not read that at all (DESIGN §3): do not offer it.
             modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
+        // A Text-mode Apply is a root replace, which needs full write and nothing else
+        // (DESIGN §3.4, `authorize_view_write`). Without this a read-only caller could
+        // compose a whole document, open the diff, tick through the schema warning and
+        // collect a 403 at the very end -- the server was right, the button was a lie.
+        let applyBtn = me.down('#textApplyBtn');
+        if (applyBtn) {
+            applyBtn.setDisabled(!me.access.write);
+        }
         let label = me.down('#accessText');
         if (!label) {
             return;
@@ -1839,19 +1885,23 @@ Ext.define('PVE.meta.TreePanel', {
                 // it is the operator's statement of what the key means, and the API's
                 // JSON view cannot tell a boolean from the integer 1 anyway.
                 child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
-                if (ps.default !== undefined) {
+                // First writer wins, like `grammarDescription` above: namespaces are
+                // walked most-specific first, so the closest one should win. The
+                // governing prune makes this unobservable today -- it is here so the
+                // six fields cannot disagree if that prune is ever loosened.
+                if (ps.default !== undefined && child.defaultValue === undefined) {
                     child.defaultValue = ps.default;
                 }
-                if (ps.enum) {
+                if (ps.enum && child.enumValues === undefined) {
                     child.enumValues = ps.enum;
                 }
-                if (ps.minimum !== undefined) {
+                if (ps.minimum !== undefined && child.minimum === undefined) {
                     child.minimum = ps.minimum;
                 }
-                if (ps.maximum !== undefined) {
+                if (ps.maximum !== undefined && child.maximum === undefined) {
                     child.maximum = ps.maximum;
                 }
-                if (ps.format !== undefined) {
+                if (ps.format !== undefined && child.format === undefined) {
                     child.format = ps.format;
                 }
             });
@@ -2338,11 +2388,12 @@ Ext.define('PVE.meta.TreePanel', {
                 });
             }
         } else if (me.textLang === 'yaml') {
-            let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
+            let all = me.applicableNamespaces();
+            let applicable = PVE.meta.Lint.applicable(all);
             if (applicable.length) {
                 let index = PVE.meta.Lint.lineIndex(text);
                 markers = PVE.meta.Lint.placed(
-                    PVE.meta.Lint.findings(parsed, applicable),
+                    PVE.meta.Lint.findings(parsed, applicable, all),
                     index,
                 ).map(function (f) {
                     return {
@@ -2354,7 +2405,7 @@ Ext.define('PVE.meta.TreePanel', {
                         severity: monaco.MarkerSeverity.Warning,
                     };
                 });
-                let schemas = PVE.meta.Lint.schemaIndex(applicable);
+                let schemas = PVE.meta.Lint.schemaIndex(applicable, all);
                 Object.keys(schemas).forEach(function (path) {
                     let hover = PVE.meta.Lint.hoverText(schemas[path]);
                     if (hover && index[path] !== undefined) {
@@ -2377,7 +2428,8 @@ Ext.define('PVE.meta.TreePanel', {
         if (!me.textEditor) {
             return [];
         }
-        let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
+        let all = me.applicableNamespaces();
+        let applicable = PVE.meta.Lint.applicable(all);
         if (!applicable.length) {
             return [];
         }
@@ -2386,7 +2438,7 @@ Ext.define('PVE.meta.TreePanel', {
                 me.textLang === 'json'
                     ? Ext.decode(me.textEditor.getValue())
                     : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
-            return PVE.meta.Lint.findings(value, applicable).map((f) => f.path + ': ' + f.message);
+            return PVE.meta.Lint.findings(value, applicable, all).map((f) => f.path + ': ' + f.message);
         } catch (_err) {
             return [];
         }

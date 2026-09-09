@@ -75,11 +75,6 @@ impl Path {
         self.0.last().map(String::as_str)
     }
 
-    /// Appends a segment in place.
-    pub fn push(&mut self, segment: impl Into<String>) {
-        self.0.push(segment.into());
-    }
-
     /// The parent path (all but the last segment), or `None` for the root.
     pub fn parent(&self) -> Option<Path> {
         if self.0.is_empty() {
@@ -223,10 +218,8 @@ mod tests {
     }
 
     #[test]
-    fn push_join_parent_last() {
-        let mut p = Path::root();
-        p.push("a");
-        p.push("b");
+    fn join_parent_last() {
+        let p = Path::root().join("a").join("b");
         assert_eq!(p.to_string(), "a.b");
         assert_eq!(p.last(), Some("b"));
         let joined = p.join("c");

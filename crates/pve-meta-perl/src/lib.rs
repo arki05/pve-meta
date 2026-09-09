@@ -8,7 +8,8 @@
 //!   lifecycle hooks that exist: destroy is a GC, clone and backup are not
 //!   carried;
 //! * the **GC** (`gc_candidates`/`gc_purge`, and the unvalidated whole-sweep
-//!   `gc`), run by a systemd timer on every node under the cluster lock,
+//!   `gc`), run by hand from `/usr/libexec/pve-meta/gc` under the cluster lock
+//!   -- nothing runs it on a timer (`docs/DESIGN.md` §6),
 //!   which removes documents and snapshot copies whose vmid has left the
 //!   vmlist; and
 //! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`

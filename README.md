@@ -112,14 +112,15 @@ are `protected` and run in pvedaemon.
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | — | `{ token, changed }` — content hash over the store; poll it |
+| GET | `/meta/version` | `detail` | `{ token, changed }` — content hash over the store; poll it |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags, digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's grants, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
 | GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
-| GET | `/meta/namespaces`, `/meta/grants` | — | `[{ name, authid, description, scopes }]` — every registration, readable by any authenticated user (it drives the UI's ownership column) |
+| GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
+| GET | `/meta/grants` | — | `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
 `data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust
@@ -134,7 +135,8 @@ A **Metadata** tab appears on every LXC/QEMU guest's config panel and on the
 Datacenter panel: one tree of the document the caller can see. Rows are the union of
 the keys present and the keys any applicable grammar declares (an unset declared key
 renders greyed out, with its default, description and a "set" action). Columns: key,
-value (an inline editor by type), owner (which registration's scope covers the row, from
+value (an inline editor by type), description (the row's own `k__` comment key) and
+access (every grant whose prefix covers the row, from `/meta/grants`)
 `/meta/namespaces` and `/meta/grants`). A row edit is a minimal `PUT ?view=<path>&mode=replace`; add is the
 same at a new path; delete is `DELETE ?view=<path>`. Editability is per row, from
 `/meta/access`. Monaco is the escape hatch: edit a subtree as YAML/JSON text, with a
