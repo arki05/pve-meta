@@ -191,6 +191,28 @@ Four things are specific to them:
   document of its own: over-notifying a poll costs a reload, under-notifying it leaves a
   stale UI.
 
+### 3.6 The meta-schema
+
+The two registry formats are themselves described as schemas, in the same
+`PVE::JSONSchema` dialect a namespace uses for a guest's subtree, and served by
+`GET /meta/schemas` as `{ namespace, grant }`. The editor renders a namespace or grant
+document with these exactly the way it renders a guest document with the namespaces
+that reach it: declared rows, hovers, markers, the same code.
+
+It is **not** the validator. `parse_namespace`/`parse_grant` decide what is storable,
+on the way in, in one place (§3.5); this is the affordance that says what to type
+*before* you try. What keeps the two honest is a test rather than a convention: every
+property the meta-schema marks required is dropped from a valid file, and the parser
+has to refuse exactly the ones the schema said it would. That test already earned its
+place — it caught `grants:` being documented as required when the parser is happy
+without it (a grant file with no entries grants nothing, which is legal, if pointless).
+
+A namespace's own `schema:` is described as a **free-form object**: `type: object` with
+no `properties`. It is a schema in an open-ended dialect, and the honest offer for it is
+the text editor — a map row opens Monaco on its own subtree (§8) — rather than a form
+covering only the keywords we happened to think of. The small form that *does* exist
+(§8, "Declare Key") writes one property of it, which is the part with a fixed shape.
+
 ## 4. Documents on the wire
 
 * Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a namespace schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
@@ -233,6 +255,7 @@ Four things are specific to them:
 | GET | `/meta/grants` | — | `[{ name, authid, grants: [{ prefix, mode, selector }] }]` — every grant, readable by every authenticated user |
 | GET/PUT/DELETE | `/meta/namespaces/{name}` | same as a document | the namespace **file** as a document, with `id: "namespaces/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a namespace is a 400, never a 200 (§3.5) |
 | GET/PUT/DELETE | `/meta/grants/{name}` | same | the grant file, `id: "grants/<name>"`, same rules |
+| GET | `/meta/schemas` | — | `{ namespace, grant }` — the two registry file formats as schemas (§3.6), so the editor can show one as a typed tree. An affordance, not the validator |
 
 PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
 404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
@@ -300,7 +323,17 @@ leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays as one text leaf); opened by Edit, double-click or Enter. A schema's
+  enums, arrays of scalars as one text leaf); opened by Edit, double-click or Enter.
+  **The editor follows the value's shape**: a value with structure inside it — a map,
+  or an array of maps — is edited as *text*, in Monaco on that subtree, by the same
+  three gestures. A string with newlines in it gets a text box rather than a one-line
+  field, and the Value column shows its first line and how many more there are (the
+  row keeps the whole string; only the cell is a summary). There is deliberately no
+  "nested YAML" *type*: a map already is nested YAML, and a type that said so would be
+  the string blob wearing a hat — it costs the per-key rows, diffs and writes that
+  nesting is for. The one thing a declaration can say that the value cannot is
+  `multiline`, for a string that has no value yet; it is the only extension to the
+  dialect, an editor hint, and the server neither reads nor validates it (§4). A schema's
   `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
   format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
   `mac-addr`, `dns-name`, `address`, `email` — the same set in both implementations,
@@ -311,12 +344,21 @@ leaf icon for values, next to the expander. Columns:
   name PVE already defines and validates, a regex is one more dialect to own.
 * **Description**: the row's comment key (`k__`) if present, else nothing; the schema's
   description is the tooltip.
+A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
+colour, a triangle, and the message in the tooltip ahead of the schema's description.
+The text editor has squiggled these since revision 6, but the tree is the view people
+open, and a value the schema refuses looked exactly like one it liked. Both callers ask
+one function (`grammarSplit`) what describes the document, so they cannot disagree.
+Advisory like every other schema signal: the row is still editable and the value is
+still stored — the server's lint decides what is storable (§4).
+
 * **Access**: every grant whose prefix covers the row, `rw` ones by name, `ro` ones
   muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
   "access" is about who writes and who subscribes, not ownership.
 
 Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
-parent of a selected leaf, or the root), **Edit selection as text** (enabled with a
+parent of a selected leaf, or the root), **Declare Key** (only on a namespace document,
+see below), **Edit selection as text** (enabled with a
 selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
 and at the right end a **Tree | Text** toggle that swaps the panel body in place between
 the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
@@ -347,6 +389,28 @@ per-row action icons. Editability is per row from `/meta/access`; a row edit is
 `PUT ?view=<path>&mode=replace` with the scalar, delete is `DELETE ?view=<path>`, the
 digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
 never while an editor is open.
+
+**The datacenter tab shows more than one document.** A guest tab is one document and
+looks exactly as it always did. The datacenter tab is the datacenter document *and*
+`meta.d/` beside it: a **Datacenter** row, a **Namespaces** folder and a **Grants**
+folder, one row per file, each file's keys under it. Every row therefore carries the id
+of the document it belongs to as well as its path — a path stopped being an address the
+moment there was more than one document — and each document keeps its own digest, since
+a compare-and-swap is per document. The file list comes from `GET /meta/version?detail=1`
+rather than from `/meta/namespaces` and `/meta/grants`, on purpose: those two list what
+the loader *parsed*, so a file with a typo in it — exactly the file an administrator
+needs to open — would be missing from the one screen that could repair it. The
+Tree | Text toggle edits the document the selection is in.
+
+**Declare Key** appears only on a namespace document: a small form for the seven things
+the editor actually consumes (type, description, optional, default, enum,
+minimum/maximum, format) plus `multiline`, writing one `schema.properties.<key>` with an
+ordinary view `PUT`. Anything with no field on that form — a nested `properties`, a
+keyword we did not anticipate — is what editing the schema as text is for. The key
+itself is not validated in the browser: `schema.properties.<key>` is a document path
+like any other, so the server's one lint decides what a key may be and says so. A
+*dotted* key is refused, because it would silently declare a nested property rather than
+the one the form is asking about.
 
 **Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
 datacenter), and that is the whole audience: PVE's own resource tree lists a guest only

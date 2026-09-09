@@ -88,6 +88,7 @@ console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
+    'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
@@ -769,6 +770,218 @@ eq('sameDocument says no when only the key order changed (order is data)',
     U.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
 eq('sameDocument on unparseable text is not a match',
     U.sameDocument({}, 'a:\n  - [\n'), false);
+
+console.log('\n--- many documents in one panel ---');
+const D = ctx.PVE.meta.DeclareKeyWindow;
+// An id is an address: the path it is served at, for every kind of document.
+eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
+eq('the datacenter id', P.urlFor.call(P, 'datacenter'), '/meta/datacenter');
+eq('a namespace id', P.urlFor.call(P, 'namespaces/homelab.docker'), '/meta/namespaces/homelab.docker');
+eq('a grant id', P.urlFor.call(P, 'grants/scoped'), '/meta/grants/scoped');
+eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
+eq('kind of the datacenter', P.docKind.call(P, 'datacenter'), 'datacenter');
+eq('kind of a namespace', P.docKind.call(P, 'namespaces/traefik'), 'namespace');
+eq('kind of a grant', P.docKind.call(P, 'grants/scoped'), 'grant');
+eq('the title is the file name', P.docTitle.call(P, 'namespaces/homelab.docker'), 'homelab.docker');
+
+// Per-document digests. One shared field would have sent a namespace's digest with a
+// write to the datacenter, which is a 409 at best and the wrong document at worst.
+{
+    const panelM = Object.assign({}, panel, {
+        docState: { datacenter: { digest: 'aaa', data: { a: 1 } }, 'namespaces/x': { digest: 'bbb', data: {} } },
+    });
+    ['digestOf', 'dataOf', 'docOf'].forEach((m) => (panelM[m] = P[m]));
+    panelM.docId = 'datacenter';
+    eq('each document keeps its own digest', panelM.digestOf('namespaces/x'), 'bbb');
+    eq('and its own data', panelM.dataOf('datacenter'), { a: 1 });
+    eq('an unknown document has no digest', panelM.digestOf('grants/nope'), '');
+    eq('a row names its document', panelM.docOf({ data: { docId: 'namespaces/x' } }), 'namespaces/x');
+    eq('no row means the default one', panelM.docOf(null), 'datacenter');
+}
+
+// What describes each kind of document. The datacenter document gets nothing:
+// namespaces reach guest documents only (DESIGN §3.3).
+{
+    const META = { type: 'object', properties: { selector: { type: 'object' } } };
+    const panelG = Object.assign({}, panel, { dc: true, schemas: { namespace: META, grant: {} } });
+    ['grammarFor', 'docKind', 'applicableNamespaces'].forEach((m) => (panelG[m] = P[m]));
+    eq('a namespace document is described by the meta-schema',
+        panelG.grammarFor('namespaces/x').map((g) => g.prefix), ['']);
+    eq('... which is the schema served for its kind',
+        panelG.grammarFor('namespaces/x')[0].schema, META);
+    eq('the datacenter document is described by nothing', panelG.grammarFor('datacenter'), []);
+}
+
+// A root-prefix schema governs the whole document. It must not be pruned away: the
+// prune asks `governing`, which answers about prefixes, and '' is not one.
+{
+    const META = {
+        type: 'object',
+        properties: {
+            selector: { type: 'object', properties: { tag: { type: 'string' } } },
+            description: { type: 'string' },
+        },
+    };
+    const rooted = [{ prefix: '', schema: META }];
+    eq(
+        'the meta-schema lints the document it is rooted at',
+        L.findings({ description: 5, selector: { tag: 7 } }, rooted, rooted).map((f) => f.path + ': ' + f.message),
+        ['description: expected string', 'selector.tag: expected string'],
+    );
+    eq(
+        'and indexes it for hovers',
+        Object.keys(L.schemaIndex(rooted, rooted)).sort(),
+        ['', 'description', 'selector', 'selector.tag'],
+    );
+    // The same rows the tree would show, including a declared-but-unset one.
+    const panelR = Object.assign({}, panel, {
+        dc: true,
+        docState: { 'namespaces/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
+        schemas: { namespace: META },
+    });
+    ['grammarFor', 'docKind', 'documentEntries', 'addData', 'addGrammar', 'entry', 'schemaKind', 'dataOf', 'applicableNamespaces'].forEach(
+        (m) => (panelR[m] = P[m]),
+    );
+    const entries = panelR.documentEntries('namespaces/x');
+    eq('a namespace document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
+    eq('what it holds is present', entries.children.selector.children.tag.present, true);
+    eq('what it does not hold is a declared-but-unset row', entries.children.description.present, false);
+}
+
+console.log('\n--- reloading must not fold the tree up ---');
+{
+    // The key that survives a reload. A document row and a group row both live at the
+    // empty path, and the two group rows have no document at all, so keying on
+    // (docId, path) collided: collapsing `Namespaces` came back expanded on the next
+    // reload because `Grants` had won the shared key.
+    const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
+    const namespaces = { data: { docId: null, path: '', key: 'Namespaces' } };
+    const grants = { data: { docId: null, path: '', key: 'Grants' } };
+    const dcRoot = { data: { docId: 'datacenter', path: '', key: 'datacenter' } };
+    const nsRoot = { data: { docId: 'namespaces/homelab', path: '', key: 'namespaces/homelab' } };
+    const same = { data: { docId: 'namespaces/homelab', path: 'selector', key: 'selector' } };
+    const other = { data: { docId: 'grants/scoped', path: 'selector', key: 'selector' } };
+    const keys = [namespaces, grants, dcRoot, nsRoot, same, other].map(key);
+    eq('every row has a key of its own', new Set(keys).size, keys.length);
+}
+
+console.log('\n--- the tree marks a row its schema refuses ---');
+{
+    // The text editor has squiggled these since revision 6; the tree, which is what
+    // people open, said nothing. Same rule, same function -- `grammarSplit` is shared
+    // by both callers so they cannot answer differently.
+    const SCHEMA = {
+        type: 'object',
+        properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
+    };
+    const panelF = Object.assign({}, panel, {
+        dc: false,
+        docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
+        namespaces: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
+        tags: [],
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'applicableNamespaces'].forEach(
+        (m) => (panelF[m] = P[m]),
+    );
+    const found = panelF.findingsFor('201');
+    eq('the out-of-range row is marked', found['docker.port'], 'must be at most 65535');
+    eq('a row that fits is not', found['docker.host'], undefined);
+
+    // A registry document is linted by its meta-schema through the same call.
+    const panelR = Object.assign({}, panel, {
+        dc: true,
+        docState: { 'namespaces/x': { digest: 'd', data: { description: 5 } } },
+        schemas: { namespace: { type: 'object', properties: { description: { type: 'string' } } } },
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'applicableNamespaces'].forEach(
+        (m) => (panelR[m] = P[m]),
+    );
+    eq(
+        'a namespace file is marked against the meta-schema',
+        panelR.findingsFor('namespaces/x').description,
+        'expected string',
+    );
+    // The datacenter document has no schema at all, so it can never be marked.
+    panelR.docState.datacenter = { digest: 'd', data: { anything: 5 } };
+    eq('the datacenter document is never marked', panelR.findingsFor('datacenter'), {});
+}
+
+console.log('\n--- declaring one key of a namespace schema ---');
+eq('the type is always written', D.schemaFrom({ type: 'string' }), { type: 'string' });
+eq(
+    'every field the editor consumes',
+    D.schemaFrom({
+        type: 'integer',
+        description: 'How many',
+        optional: true,
+        default: '3',
+        minimum: '1',
+        maximum: '9',
+    }),
+    { type: 'integer', description: 'How many', optional: 1, default: 3, minimum: 1, maximum: 9 },
+);
+eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'always, no ,unless-stopped' }),
+    { type: 'string', enum: ['always', 'no', 'unless-stopped'] });
+// A range on a string, or a format on a number, would be a declaration nothing reads.
+eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
+eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
+eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });
+// An empty field is left out entirely: a schema full of nulls describes nothing, and
+// the server's lint refuses null values anyway.
+eq('empty fields are omitted', D.schemaFrom({ type: 'string', description: '', default: '', enum: '' }), { type: 'string' });
+// A boolean default comes from a list, not a text box: `parseValue` reads truth the
+// way the row editor's checkbox writes it, so "True" or "yes" typed into a field would
+// have been stored as `false` -- the opposite of what was meant, in a cluster-wide file.
+eq('a boolean default comes from the list', D.schemaFrom({ type: 'boolean', defaultBool: 'true' }), { type: 'boolean', default: true });
+eq('... and "false" means false', D.schemaFrom({ type: 'boolean', defaultBool: 'false' }), { type: 'boolean', default: false });
+eq('... an unset one is left out', D.schemaFrom({ type: 'boolean', defaultBool: '' }), { type: 'boolean' });
+eq(
+    'a boolean never reads the text field',
+    D.schemaFrom({ type: 'boolean', default: 'yes', defaultBool: '' }),
+    { type: 'boolean' },
+);
+// A map has no default the editor would ever read: `addGrammar` stops at an object and
+// walks into it. Writing one would be a declaration nothing consumes -- and a string.
+eq('a map takes no default', D.schemaFrom({ type: 'object', default: '{}' }), { type: 'object' });
+eq('an array default still parses as a list', D.schemaFrom({ type: 'array', default: 'a,b' }), { type: 'array', default: ['a', 'b'] });
+
+console.log('\n--- the editor follows the value\'s shape, not a declaration ---');
+// A map is nested YAML: Monaco, not a one-line field. This is the case that had no
+// editor at all -- Edit was disabled, and double-click and Enter both bailed out.
+eq('a map is edited as text', U.editorKind({ kind: 'map' }), 'text');
+// An array of scalars reads and edits fine on one line; an array of maps does not.
+eq('an array of scalars stays inline', U.editorKind({ kind: 'array', rawValue: ['lan', 'wan'] }), 'inline');
+eq('an array of maps is text', U.editorKind({ kind: 'array', rawValue: [{ a: 1 }] }), 'text');
+eq('a scalar is inline', U.editorKind({ kind: 'string', rawValue: 'ct200.example' }), 'inline');
+eq('a number is inline', U.editorKind({ kind: 'number', rawValue: 8080 }), 'inline');
+// A block string is a real leaf (an ssh key, a note) and needs a real editor.
+eq(
+    'a string with newlines gets a textarea',
+    U.editorKind({ kind: 'string', rawValue: 'services:\n  web:\n    image: nginx\n' }),
+    'multiline',
+);
+// ... and a declared-but-unset one has no newline to detect, which is the only thing
+// the `multiline` schema extension exists for.
+eq('a declared multiline row, still unset', U.editorKind({ kind: 'string', multiline: 1 }), 'multiline');
+eq('no row, no editor', U.editorKind(null), 'none');
+
+// The Value column summarises; the row's own valueText must stay exact, because that
+// is what the editor opens on.
+eq('one line is shown as it is', U.previewText('nginx'), 'nginx');
+eq('a block shows its first line and the rest', U.previewText('a\nb\nc\n'), 'a (+2 lines)');
+eq('a trailing newline is not a line', U.previewText('a\n'), 'a');
+eq('an empty value is empty', U.previewText(undefined), '');
+
+// A declared `multiline` reaches the row through the same path as `format`.
+{
+    const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    const ns = [{ prefix: 'notes', selector: { all: true }, schema: {
+        type: 'object',
+        properties: { body: { type: 'string', multiline: 1, description: 'Free text' } },
+    } }];
+    panel.addGrammar.call(panel, root, 'notes', ns[0].schema, ns, ns[0]);
+    eq('multiline reaches the row', root.children.notes.children.body.multiline, true);
+}
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document

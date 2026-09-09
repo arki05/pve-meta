@@ -142,6 +142,64 @@ PVE.meta.Utils = {
         return String(text);
     },
 
+    // A schema `type` as the kind `parseValue` speaks: both integers and numbers are
+    // parsed as numbers, and a map or a list of one is not a scalar to parse at all.
+    schemaValueKind: function (type) {
+        if (type === 'integer' || type === 'number') {
+            return 'number';
+        }
+        return type === 'boolean' || type === 'array' ? type : 'string';
+    },
+
+    // Which editor a row's *shape* calls for: 'inline' (the one-line row editor),
+    // 'multiline' (a textarea) or 'text' (Monaco on that subtree).
+    //
+    // One function, because four places have to agree on it -- the Edit button's
+    // enabled state, the double-click, the Enter key and the window that opens -- and
+    // when they did not, a map row was simply not editable by any of the three
+    // gestures while the toolbar's "Edit selection as text" quietly did the job.
+    //
+    // The rule is the value's shape, not a declaration: **a value with structure
+    // inside it is edited as text**. A map is nested YAML and belongs in Monaco; so is
+    // an array of maps. An array of scalars stays a one-line leaf (`[lan, wan]` reads
+    // and edits fine). A string is one line unless it has newlines in it -- or the
+    // schema said so with `multiline`, which is the only way to know before the
+    // first value exists. Adding a `nested yaml` *type* instead would be the string
+    // blob wearing a hat: it costs the per-key rows, diffs and writes that nesting is
+    // for (docs/DESIGN.md §8).
+    editorKind: function (d) {
+        if (!d) {
+            return 'none';
+        }
+        if (d.kind === 'map') {
+            return 'text';
+        }
+        if (d.kind === 'array') {
+            let list = Array.isArray(d.rawValue) ? d.rawValue : [];
+            return list.some((v) => v !== null && typeof v === 'object') ? 'text' : 'inline';
+        }
+        if (d.kind === 'string') {
+            let raw = typeof d.rawValue === 'string' ? d.rawValue : '';
+            return d.multiline || raw.indexOf('\n') !== -1 ? 'multiline' : 'inline';
+        }
+        return 'inline';
+    },
+
+    // What the Value column shows for a value that does not fit on a line. The row
+    // keeps its exact `valueText` -- the editor opens on that, so truncating it here
+    // and nowhere else is the difference between a summary and data loss.
+    previewText: function (text) {
+        let s = String(text === undefined || text === null ? '' : text);
+        let nl = s.indexOf('\n');
+        if (nl === -1) {
+            return s;
+        }
+        let rest = s.slice(nl + 1).replace(/\n+$/, '');
+        let more = rest === '' ? 0 : rest.split('\n').length;
+        let first = s.slice(0, nl);
+        return more ? first + ' ' + Ext.String.format(gettext('(+{0} lines)'), more) : first;
+    },
+
     // The field a row's value is edited with. The grammar's declared type wins over the
     // type inferred from the stored value: it is the operator's statement of what the
     // key means, and the API's JSON view cannot tell a boolean from the integer 1.
@@ -165,6 +223,11 @@ PVE.meta.Utils = {
                 f.maxValue = d.maximum;
             }
             return f;
+        }
+        if (PVE.meta.Utils.editorKind(d) === 'multiline') {
+            // No `format` here: a PVE format validates one line (an address, a name),
+            // and none of them describe a block of text.
+            return { xtype: 'textarea', height: 260, grow: false };
         }
         let f = { xtype: 'textfield', selectOnFocus: true };
         let vtype = PVE.meta.Utils.vtypeFor(d.format);
@@ -409,8 +472,18 @@ PVE.meta.Lint = {
         let shadow = all && all.length ? PVE.meta.Utils.bySpecificity(all) : list;
         list.forEach(function (ns) {
             let value = PVE.meta.Lint.valueAt(data, ns.prefix);
-            if (value !== undefined) {
+            if (value === undefined) {
+                return;
+            }
+            if (ns.prefix) {
                 PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, shadow, ns);
+            } else {
+                // The empty prefix is the document itself -- a registry document's
+                // meta-schema (DESIGN §3.6). It governs everything and shadows
+                // nothing, so it is walked with no owner: `governing` answers about
+                // prefixes, the empty prefix is not one, and passing an owner here
+                // would prune every path in the document.
+                PVE.meta.Lint.walk(value, ns.schema, '', out, [], null);
             }
         });
         out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
@@ -589,7 +662,8 @@ PVE.meta.Lint = {
                 collect(props[k], path ? path + '.' + k : k, owner),
             );
         };
-        list.forEach((ns) => collect(ns.schema, ns.prefix, ns));
+        // `ns.prefix || null` as the owner: the same root-schema case as `findings`.
+        list.forEach((ns) => collect(ns.schema, ns.prefix, ns.prefix ? ns : null));
         return out;
     },
 
@@ -822,7 +896,11 @@ Ext.define('PVE.meta.TreeModel', {
     extend: 'Ext.data.TreeModel',
     fields: [
         { name: 'key', type: 'string' },
+        { name: 'docId', type: 'string' }, // which document this row belongs to
+        { name: 'group', type: 'boolean' }, // a folder that is not a document
         { name: 'path', type: 'string' }, // dotted; this is the `view` of a write
+        { name: 'finding', type: 'string' }, // this row does not match its schema
+        { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
         { name: 'valueText', type: 'string' },
         { name: 'description', type: 'string' }, // the comment key `k__`, if present
         { name: 'grammarDescription', type: 'string' }, // the grammar's, shown as tooltip
@@ -928,6 +1006,206 @@ Ext.define('PVE.meta.AddKeyWindow', {
 });
 
 // ---------------------------------------------------------------------------
+// "Declare Key" — the small form behind a namespace's `schema.properties.<key>`.
+//
+// A namespace's schema is a document like any other now, so this window writes one
+// property of it with an ordinary view PUT; there is no second write path. It covers
+// the seven things the editor actually consumes (type, description, optional,
+// default, enum, minimum/maximum, format) plus `multiline`. Anything beyond that --
+// nested `properties`, a shape this form has no field for -- is what "Edit as text"
+// is for, and the schema row opens Monaco on itself.
+//
+// The key is not validated here on purpose: `schema.properties.<key>` is a document
+// path like any other, so the server's one lint decides what a key may be and says
+// so (DESIGN §4). A *dotted* key is refused, because that would silently declare a
+// nested property rather than the one the form is asking about.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.DeclareKeyWindow', {
+    extend: 'Ext.window.Window',
+    xtype: 'pveMetaDeclareKeyWindow',
+
+    title: gettext('Declare Key'),
+    modal: true,
+    width: 520,
+    layout: 'fit',
+    prefix: '', // the namespace's prefix, for the header line
+
+    initComponent: function () {
+        let me = this;
+        let numeric = () => ['integer', 'number'].indexOf(me.down('[name=type]').getValue()) !== -1;
+        let isString = () => me.down('[name=type]').getValue() === 'string';
+        let sync = function () {
+            let type = me.down('[name=type]').getValue();
+            ['minimum', 'maximum'].forEach((n) => me.down('[name=' + n + ']').setDisabled(!numeric()));
+            me.down('[name=format]').setDisabled(!isString());
+            me.down('[name=multiline]').setDisabled(!isString());
+            // A boolean picks its default from a list; a map has no default the
+            // editor would ever read (`addGrammar` stops at an object and walks into
+            // it), so offering one would be a field that does nothing.
+            me.down('[name=defaultBool]').setHidden(type !== 'boolean');
+            let plain = me.down('[name=default]');
+            plain.setHidden(type === 'boolean');
+            plain.setDisabled(type === 'object');
+        };
+        Ext.apply(me, {
+            items: [
+                {
+                    xtype: 'form',
+                    reference: 'form',
+                    bodyPadding: 10,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 120 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            fieldLabel: gettext('Namespace'),
+                            value: Ext.htmlEncode(me.prefix),
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'key',
+                            allowBlank: false,
+                            fieldLabel: gettext('Key'),
+                            emptyText: gettext('the key this declares'),
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'type',
+                            fieldLabel: gettext('Type'),
+                            value: 'string',
+                            comboItems: [
+                                ['string', gettext('String')],
+                                ['integer', gettext('Integer')],
+                                ['number', gettext('Number')],
+                                ['boolean', gettext('Boolean')],
+                                ['object', gettext('Map')],
+                                ['array', gettext('Array')],
+                            ],
+                            listeners: { change: sync },
+                        },
+                        { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
+                        {
+                            xtype: 'proxmoxcheckbox',
+                            name: 'optional',
+                            fieldLabel: gettext('Optional'),
+                            boxLabel: gettext('a guest need not carry this key'),
+                        },
+                        // Two fields, one label: a boolean default typed into a text
+                        // box is a trap. `parseValue` reads truth the way the row
+                        // editor's checkbox produces it -- `true`/`1` -- so "True" or
+                        // "yes" would have been accepted and stored as `false`, the
+                        // opposite of what was typed, into a cluster-wide file.
+                        { xtype: 'textfield', name: 'default', fieldLabel: gettext('Default') },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'defaultBool',
+                            fieldLabel: gettext('Default'),
+                            hidden: true,
+                            value: '',
+                            comboItems: [
+                                ['', gettext('none')],
+                                ['true', gettext('Yes')],
+                                ['false', gettext('No')],
+                            ],
+                        },
+                        {
+                            xtype: 'textfield',
+                            name: 'enum',
+                            fieldLabel: gettext('Values'),
+                            emptyText: gettext('comma-separated; leave empty for any'),
+                        },
+                        { xtype: 'numberfield', name: 'minimum', fieldLabel: gettext('Minimum'), hideTrigger: true },
+                        { xtype: 'numberfield', name: 'maximum', fieldLabel: gettext('Maximum'), hideTrigger: true },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'format',
+                            fieldLabel: gettext('Format'),
+                            value: '',
+                            comboItems: [['', gettext('none')]].concat(
+                                Object.keys(PVE.meta.Utils.FORMAT_VTYPES).map((f) => [f, f]),
+                            ),
+                        },
+                        {
+                            xtype: 'proxmoxcheckbox',
+                            name: 'multiline',
+                            fieldLabel: gettext('Multi-line'),
+                            boxLabel: gettext('edit this string in a text box'),
+                        },
+                    ],
+                },
+            ],
+            buttons: [
+                { text: gettext('Declare'), handler: () => me.submit() },
+                { text: gettext('Cancel'), handler: () => me.close() },
+            ],
+        });
+        me.callParent();
+        me.on('show', function () {
+            sync();
+            me.down('[name=key]').focus(true, 50);
+        });
+    },
+
+    // The declaration, in the order a reader wants it, with every empty field left
+    // out entirely: a schema full of nulls describes nothing and would not pass the
+    // document lint anyway.
+    schemaFrom: function (v) {
+        let U = PVE.meta.Utils;
+        let out = { type: v.type };
+        if (v.description) {
+            out.description = v.description;
+        }
+        if (v.optional) {
+            out.optional = 1;
+        }
+        let dflt = v.type === 'boolean' ? v.defaultBool : v.type === 'object' ? '' : v.default;
+        if (dflt !== undefined && dflt !== '') {
+            out.default = U.parseValue(dflt, U.schemaValueKind(v.type));
+        }
+        if (v.enum) {
+            out.enum = String(v.enum)
+                .split(',')
+                .map((x) => x.trim())
+                .filter((x) => x !== '');
+        }
+        ['minimum', 'maximum'].forEach(function (n) {
+            if (['integer', 'number'].indexOf(v.type) !== -1 && v[n] !== undefined && v[n] !== '') {
+                out[n] = Number(v[n]);
+            }
+        });
+        if (v.type === 'string' && v.format) {
+            out.format = v.format;
+        }
+        if (v.type === 'string' && v.multiline) {
+            out.multiline = 1;
+        }
+        return out;
+    },
+
+    submit: function () {
+        let me = this;
+        let form = me.down('form').getForm();
+        if (!form.isValid()) {
+            return;
+        }
+        let v = form.getValues();
+        let key = String(v.key).trim();
+        try {
+            if (key.indexOf('.') !== -1) {
+                throw new Error(
+                    gettext('A key is one name; edit the schema as text to nest one inside another'),
+                );
+            }
+            me.fireEvent('declarekey', key, me.schemaFrom(v));
+            me.close();
+        } catch (err) {
+            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+        }
+    },
+});
+
+// ---------------------------------------------------------------------------
 // The row editor — opened by Edit, double-click or Enter (DESIGN §8).
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1223,9 @@ Ext.define('PVE.meta.EditValueWindow', {
         let me = this;
         let U = PVE.meta.Utils;
         let d = me.rec.data;
+        if (U.editorKind(d) === 'multiline') {
+            me.width = 640;
+        }
         me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(d.path));
 
         let value;
@@ -1175,9 +1456,13 @@ Ext.define('PVE.meta.TextWindow', {
         let me = this;
         // JSON is a subset of YAML, but `data` is the parameter that says "this is the
         // JSON data model", so use it when the user is editing JSON.
-        let params = { view: me.view, mode: 'replace', digest: me.tree.digest };
+        let params = {
+            view: me.view || undefined,
+            mode: 'replace',
+            digest: me.tree.digestOf(me.docId),
+        };
         params[lang === 'json' ? 'data' : 'text'] = text;
-        me.tree.write(params, () => me.close());
+        me.tree.write(me.docId, params, () => me.close());
     },
 });
 
@@ -1202,8 +1487,16 @@ Ext.define('PVE.meta.TreePanel', {
 
         me.vmid = me.vmid || sel.vmid;
         me.dc = !me.vmid;
-        me.baseUrl = me.dc ? '/meta/datacenter' : '/meta/guests/' + me.vmid;
-        me.digest = '';
+        // One panel, one or many documents. A guest tab shows exactly one and looks
+        // as it always did; the datacenter tab shows the datacenter document *and*
+        // every namespace and grant file beside it, because those are documents now
+        // (DESIGN §3.5) and `meta.d/` is the other half of what an administrator
+        // edits. Every row therefore carries the id of the document it belongs to:
+        // a path alone stopped being an address the moment there was more than one.
+        me.docs = [];
+        me.docState = Object.create(null); // id -> { digest, data }
+        me.docId = me.dc ? 'datacenter' : String(me.vmid); // the default target
+        me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0, scopes: [] };
         me.namespaces = [];
         me.grants = [];
@@ -1261,7 +1554,7 @@ Ext.define('PVE.meta.TreePanel', {
                 selectionchange: () => me.syncButtons(),
                 itemdblclick: (view, rec) => me.editRow(rec),
                 itemkeydown: function (view, rec, item, index, e) {
-                    if (e.getKey() === e.ENTER && rec && rec.data.kind !== 'map') {
+                    if (e.getKey() === e.ENTER && rec) {
                         e.stopEvent();
                         me.editRow(rec);
                         return false;
@@ -1333,7 +1626,12 @@ Ext.define('PVE.meta.TreePanel', {
                 text: gettext('Add'),
                 itemId: 'addBtn',
                 iconCls: 'fa fa-plus',
-                handler: () => me.addKey(me.addTarget()),
+                handler: function () {
+                    let t = me.addTarget();
+                    if (t) {
+                        me.addKey(t.docId, t.path);
+                    }
+                },
             },
             {
                 text: gettext('Edit'),
@@ -1341,6 +1639,16 @@ Ext.define('PVE.meta.TreePanel', {
                 iconCls: 'fa fa-pencil',
                 disabled: true,
                 handler: () => me.editRow(me.getSelection()[0]),
+            },
+            {
+                // Only ever shown on a namespace document, where declaring a key is a
+                // thing you can do; hidden everywhere else rather than disabled, since
+                // on a guest tab it is not a missing permission but a missing concept.
+                text: gettext('Declare Key'),
+                itemId: 'declareBtn',
+                iconCls: 'fa fa-tag',
+                hidden: true,
+                handler: () => me.declareKey(me.getSelection()[0]),
             },
             {
                 text: gettext('Remove'),
@@ -1384,8 +1692,20 @@ Ext.define('PVE.meta.TreePanel', {
                 meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(html) + '"';
             }
         };
-        // The grammar's description is the tooltip of every cell in the row (DESIGN §8).
-        let rowTip = (rec, meta) => tip(meta, Ext.htmlEncode(rec.data.grammarDescription || ''));
+        // The grammar's description is the tooltip of every cell in the row (DESIGN §8)
+        // -- unless the row does not match its schema, in which case that is the more
+        // urgent thing to say and goes first.
+        let rowTip = function (rec, meta) {
+            let d = rec.data;
+            let parts = [];
+            if (d.finding) {
+                parts.push(Ext.htmlEncode(d.finding));
+            }
+            if (d.grammarDescription) {
+                parts.push(Ext.htmlEncode(d.grammarDescription));
+            }
+            tip(meta, parts.join('<br>'));
+        };
         let unsetText = function (rec) {
             let d = rec.data.defaultValue;
             return d === undefined
@@ -1415,9 +1735,23 @@ Ext.define('PVE.meta.TreePanel', {
                     if (rec.data.kind === 'map') {
                         return '';
                     }
-                    return rec.data.present
-                        ? Ext.htmlEncode(value)
-                        : '<span class="faded">' + unsetText(rec) + '</span>';
+                    if (!rec.data.present) {
+                        return '<span class="faded">' + unsetText(rec) + '</span>';
+                    }
+                    // A block of text collapses into one unreadable line in a grid
+                    // cell. Show its first line and how much more there is; the row's
+                    // `valueText` is untouched, so the editor still opens on all of it.
+                    let shown = Ext.htmlEncode(PVE.meta.Utils.previewText(value));
+                    if (!rec.data.finding) {
+                        return shown;
+                    }
+                    // Advisory, like every other schema signal: the row is still
+                    // editable, the value is still stored, and the message is in the
+                    // tooltip. `warning` is proxmoxlib's own class (DESIGN §8).
+                    return (
+                        '<i class="fa fa-exclamation-triangle warning"></i> ' +
+                        '<span class="warning">' + shown + '</span>'
+                    );
                 },
             },
             {
@@ -1465,6 +1799,115 @@ Ext.define('PVE.meta.TreePanel', {
         ];
     },
 
+    // --- documents -----------------------------------------------------------
+
+    // The API path of a document, from its id. Total by construction: a registry id
+    // is `namespaces/<name>` -- the path it is served at -- and everything else is a
+    // vmid or the literal `datacenter` (`api::parse_id`).
+    urlFor: function (id) {
+        if (id === 'datacenter') {
+            return '/meta/datacenter';
+        }
+        return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
+    },
+
+    // What kind of document an id names -- which decides what governs its rows.
+    docKind: function (id) {
+        if (id === 'datacenter') {
+            return 'datacenter';
+        }
+        if (id.indexOf('namespaces/') === 0) {
+            return 'namespace';
+        }
+        if (id.indexOf('grants/') === 0) {
+            return 'grant';
+        }
+        return 'guest';
+    },
+
+    docTitle: function (id) {
+        let cut = id.indexOf('/');
+        return cut === -1 ? id : id.slice(cut + 1);
+    },
+
+    // What describes one document, in the two lists `Lint.findings` wants: what to
+    // walk, and what shadows. A guest document has namespaces (which shadow each
+    // other); a registry document has one schema at its root (which shadows nothing,
+    // so it is its own list); the datacenter document has neither.
+    //
+    // One function, two callers -- the tree's row markers and the text editor's --
+    // because they are the same question asked twice, and the last four wrong-result
+    // bugs in this file were all a rule with two implementations.
+    grammarSplit: function (docId) {
+        let all = this.grammarFor(docId);
+        let rooted = all.filter((ns) => ns.schema && !ns.prefix);
+        if (rooted.length) {
+            return { all: rooted, withSchema: rooted };
+        }
+        return { all: all, withSchema: PVE.meta.Lint.applicable(all) };
+    },
+
+    // Every path in `docId` whose value does not match its schema, by path. The tree
+    // shows these on the rows themselves: the text editor has squiggled them since
+    // revision 6, but the tree is the view people actually open, and a value the
+    // schema refuses looked exactly like one it liked.
+    findingsFor: function (docId) {
+        let out = Object.create(null);
+        let g = this.grammarSplit(docId);
+        if (!g.withSchema.length) {
+            return out;
+        }
+        PVE.meta.Lint.findings(this.dataOf(docId), g.withSchema, g.all).forEach(function (f) {
+            out[f.path] = f.message;
+        });
+        return out;
+    },
+
+    // The digest to send with a write, and the parsed document to build rows from.
+    // Per document, because a compare-and-swap is per document: one shared `digest`
+    // field would have sent a namespace's digest with a write to the datacenter.
+    digestOf: function (id) {
+        return (this.docState[id] || {}).digest || '';
+    },
+
+    dataOf: function (id) {
+        return (this.docState[id] || {}).data || {};
+    },
+
+    setDigest: function (id, digest) {
+        if (digest) {
+            this.docState[id] = this.docState[id] || { data: {} };
+            this.docState[id].digest = digest;
+        }
+    },
+
+    // The document a row belongs to; the panel's default for anything with no row.
+    docOf: function (rec) {
+        return (rec && rec.data && rec.data.docId) || this.docId;
+    },
+
+    // What describes this document's shape. A guest document is described by the
+    // namespaces that reach it, most-specific first (they shadow); a namespace or
+    // grant file by the one meta-schema for its kind, rooted at the document itself;
+    // the datacenter document by nothing at all -- namespaces are guest-only
+    // (DESIGN §3.3), which is what keeps a namespace from painting rows onto it.
+    grammarFor: function (id) {
+        let me = this;
+        let kind = me.docKind(id);
+        if (kind === 'guest') {
+            return me.applicableNamespaces();
+        }
+        if (kind !== 'namespace' && kind !== 'grant') {
+            return []; // the datacenter document: nothing describes its shape
+        }
+        let schema = kind === 'namespace' ? me.schemas.namespace : me.schemas.grant;
+        // A pseudo-namespace at the root. Its prefix is empty, so it governs the
+        // whole document and there is nothing for it to shadow -- which is why it is
+        // never passed as the shadowing list: `governing` answers about prefixes, and
+        // the empty prefix is not one.
+        return schema ? [{ prefix: '', schema: schema }] : [];
+    },
+
     // --- selection and buttons ----------------------------------------------
 
     getRootNode: function () {
@@ -1484,9 +1927,23 @@ Ext.define('PVE.meta.TreePanel', {
     parentPath: (rec) => (rec.parentNode && rec.parentNode.data.path) || '',
 
     // Add goes into the selected map, the parent of a selected leaf, or the root.
+    // Where a new key goes: into the selected map, or beside the selected leaf, or --
+    // with nothing selected -- at the root of the panel's default document. On the
+    // datacenter tab a group row (`Namespaces`) is not a document, so it has nowhere
+    // to add a key and the button is disabled for it.
     addTarget: function () {
-        let rec = this.getSelection()[0];
-        return rec ? (rec.data.kind === 'map' ? rec.data.path : this.parentPath(rec)) : '';
+        let me = this;
+        let rec = me.getSelection()[0];
+        if (!rec) {
+            return me.dc ? null : { docId: me.docId, path: '' };
+        }
+        if (!rec.data.docId) {
+            return null;
+        }
+        return {
+            docId: rec.data.docId,
+            path: rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec),
+        };
     },
 
     syncButtons: function () {
@@ -1500,11 +1957,20 @@ Ext.define('PVE.meta.TreePanel', {
                 btn.setDisabled(disabled);
             }
         };
-        set('addBtn', text || !me.editableFor(me.addTarget()));
-        set('editBtn', text || !d || d.kind === 'map' || !d.editable);
-        set('removeBtn', text || !d || !d.present || !d.editable);
-        set('textSelBtn', text || !d);
+        let target = me.addTarget();
+        set('addBtn', text || !target || !me.editableFor(target.path));
+        // A group row (`Namespaces`) is not a document and has no keys of its own.
+        let row = d && d.docId ? d : null;
+        set('editBtn', text || !row || !row.editable);
+        set('removeBtn', text || !row || !row.present || !row.editable);
+        set('textSelBtn', text || !row);
         set('reloadBtn', text);
+        let declare = me.down('#declareBtn');
+        if (declare) {
+            let isNamespace = !!row && me.docKind(row.docId) === 'namespace';
+            declare.setHidden(!isNamespace);
+            declare.setDisabled(text || !isNamespace || !row.editable);
+        }
     },
 
     setModeButton: function (value) {
@@ -1547,7 +2013,11 @@ Ext.define('PVE.meta.TreePanel', {
             me.loadGrants(() =>
                 me.loadTags(() =>
                     me.loadAccess(() =>
-                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
+                        me.loadSchemas(() =>
+                            me.listDocuments(() =>
+                                me.loadDocuments(() => Proxmox.Utils.setErrorMask(me, false)),
+                            ),
+                        ),
                     ),
                 ),
             ),
@@ -1658,18 +2128,99 @@ Ext.define('PVE.meta.TreePanel', {
         label.setVisible(true);
     },
 
-    loadDocument: function (next) {
+    // The meta-schema, once per load and only where it is used: it describes a
+    // registry document, and a guest tab never shows one.
+    loadSchemas: function (next) {
         let me = this;
+        if (!me.dc) {
+            next();
+            return;
+        }
         me.request({
-            url: me.baseUrl,
+            url: '/meta/schemas',
             success: function (response) {
-                let d = response.result.data || {};
-                me.digest = d.digest || '';
-                me.buildTree(d.data || {});
-                me.syncButtons();
+                me.schemas = response.result.data || {};
                 next();
             },
+            // An older API has no /meta/schemas: the registry documents still show
+            // as trees, just without declared rows or hovers.
+            failure: () => next(),
         });
+    },
+
+    // Which documents this panel shows. A guest tab: its own, and nothing else.
+    //
+    // The datacenter tab enumerates the registry from `GET /meta/version?detail=1`
+    // rather than from `/meta/namespaces` and `/meta/grants`, on purpose: those two
+    // list what the loader *parsed*, so a file with a typo in it -- exactly the file
+    // an administrator needs to open -- would be missing from the one screen that
+    // could repair it. The version detail is the store's own walk, so it lists the
+    // file whether or not it parses.
+    listDocuments: function (next) {
+        let me = this;
+        if (!me.dc) {
+            me.docs = [{ id: String(me.vmid), kind: 'guest' }];
+            next();
+            return;
+        }
+        let finish = function (ids) {
+            let docs = [];
+            // The datacenter document is listed even when no file exists yet (it is
+            // then the empty document), so there is somewhere to add the first key.
+            if (me.access.read) {
+                docs.push({ id: 'datacenter', kind: 'datacenter' });
+            }
+            ids.filter((id) => me.docKind(id) === 'namespace')
+                .sort()
+                .forEach((id) => docs.push({ id: id, kind: 'namespace' }));
+            ids.filter((id) => me.docKind(id) === 'grant')
+                .sort()
+                .forEach((id) => docs.push({ id: id, kind: 'grant' }));
+            me.docs = docs;
+            next();
+        };
+        me.request({
+            url: '/meta/version',
+            params: { detail: 1 },
+            success: function (response) {
+                let d = response.result.data || {};
+                finish((d.documents || []).map((row) => row.id));
+            },
+            failure: () => finish([]),
+        });
+    },
+
+    // Every document's content, one request each. Serial rather than parallel: the
+    // list is short (one guest, or the datacenter plus a handful of registry files),
+    // and a chain has one obvious completion point where a fan-out needs a counter
+    // that has to be right when a request fails.
+    loadDocuments: function (next) {
+        let me = this;
+        let queue = me.docs.slice();
+        let step = function () {
+            let doc = queue.shift();
+            if (!doc) {
+                me.buildTree();
+                me.syncButtons();
+                next();
+                return;
+            }
+            me.request({
+                url: me.urlFor(doc.id),
+                success: function (response) {
+                    let d = response.result.data || {};
+                    me.docState[doc.id] = { digest: d.digest || '', data: d.data || {} };
+                    step();
+                },
+                // One unreadable document must not take the whole page down: it
+                // shows as empty, and the others are still there.
+                failure: function () {
+                    me.docState[doc.id] = { digest: '', data: {} };
+                    step();
+                },
+            });
+        };
+        step();
     },
 
     poll: function () {
@@ -1841,11 +2392,16 @@ Ext.define('PVE.meta.TreePanel', {
         let U = PVE.meta.Utils;
         let entry = root;
         let path = '';
-        prefix.split('.').forEach(function (seg) {
-            path = U.joinPath(path, seg);
-            entry = me.entry(entry, seg, path);
-            entry.kind = entry.kind || 'map';
-        });
+        // The empty prefix is the document root itself -- how a registry document's
+        // meta-schema is rooted (DESIGN §3.6). `''.split('.')` is `['']`, which would
+        // otherwise create a child with an empty key.
+        if (prefix) {
+            prefix.split('.').forEach(function (seg) {
+                path = U.joinPath(path, seg);
+                entry = me.entry(entry, seg, path);
+                entry.kind = entry.kind || 'map';
+            });
+        }
         let walk = function (node, sch) {
             if (!sch || sch.type !== 'object' || !sch.properties) {
                 return;
@@ -1889,6 +2445,14 @@ Ext.define('PVE.meta.TreePanel', {
                 if (ps.format !== undefined && child.format === undefined) {
                     child.format = ps.format;
                 }
+                // The one extension to the PVE::JSONSchema dialect: "this string is
+                // a block of text". Only a declaration can say so before the key has
+                // a value, which is exactly what `Utils.editorKind` cannot see for
+                // itself. It is an editor hint and nothing else -- the server neither
+                // reads it nor validates against it, like `format` (DESIGN §4).
+                if (ps.multiline !== undefined && child.multiline === undefined) {
+                    child.multiline = !!ps.multiline;
+                }
             });
         };
         walk(entry, schema);
@@ -1902,27 +2466,39 @@ Ext.define('PVE.meta.TreePanel', {
         return t === 'boolean' || t === 'array' ? t : 'string';
     },
 
-    buildTree: function (data) {
+    // The merged rows of ONE document: what is present in it, plus what its grammar
+    // declares (DESIGN §8). Two sources, one set of entries.
+    documentEntries: function (id) {
         let me = this;
-        let I = PVE.meta.Icons;
-        // Kept for text mode's grammar findings (annotateText): the parsed document the
-        // server returned, so nothing has to re-read the YAML to know what is in it.
-        me.docData = data;
-        // Namespaces decide shape, grants decide access -- two lists, two rules
-        // (DESIGN section 3). Declared rows come from namespaces only, and only from the
-        // one governing each prefix: most-specific wins, schemas never merge.
-        let namespaces = me.applicableNamespaces();
-        let scopes = me.applicableGrants();
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
-        me.addData(root, data);
-        namespaces.forEach(function (ns) {
-            if (ns.schema) {
-                me.addGrammar(root, ns.prefix, ns.schema, namespaces, ns);
+        me.addData(root, me.dataOf(id));
+        let grammar = me.grammarFor(id);
+        grammar.forEach(function (ns) {
+            if (!ns.schema) {
+                return;
+            }
+            // `namespaces`/`owner` are the most-specific-wins prune, and only guest
+            // documents have more than one namespace to shadow between. A registry
+            // document has exactly one schema, rooted at the document, so it is
+            // walked with no owner and nothing is pruned.
+            if (ns.prefix) {
+                me.addGrammar(root, ns.prefix, ns.schema, grammar, ns);
+            } else {
+                me.addGrammar(root, '', ns.schema, [], null);
             }
         });
+        return root;
+    },
 
-        let toNodes = (entry) =>
-            Object.keys(entry.children)
+    buildTree: function () {
+        let me = this;
+        let I = PVE.meta.Icons;
+        // Grants decide access, and they reach guest documents only, so the Access
+        // column is empty on the datacenter tab by construction (DESIGN §3.3).
+        let scopes = me.applicableGrants();
+
+        let toNodes = function (entry, docId, findings) {
+            return Object.keys(entry.children)
                 .sort()
                 .map(function (key) {
                     let c = entry.children[key];
@@ -1931,6 +2507,7 @@ Ext.define('PVE.meta.TreePanel', {
                     let node = {
                         key: key,
                         text: key,
+                        docId: docId,
                         path: c.path,
                         kind: kind,
                         present: !!c.present,
@@ -1941,15 +2518,17 @@ Ext.define('PVE.meta.TreePanel', {
                         minimum: c.minimum,
                         maximum: c.maximum,
                         format: c.format,
+                        multiline: c.multiline,
                         rawValue: c.value,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         accessList: access,
                         accessText: me.accessSummary(access),
+                        finding: findings[c.path] || '',
                         editable: me.editableFor(c.path),
                         leaf: kind !== 'map',
                     };
                     if (kind === 'map') {
-                        node.children = toNodes(c);
+                        node.children = toNodes(c, docId, findings);
                         node.expanded = true;
                         node.iconCls = I.mapExpanded;
                         node.expandedCls = I.mapExpanded;
@@ -1958,23 +2537,99 @@ Ext.define('PVE.meta.TreePanel', {
                     }
                     return node;
                 });
+        };
+
+        // One document's own root row, on a tab that shows several. Its path is the
+        // empty path -- the document root -- so Edit on it opens the whole file, and
+        // Add puts a key at the top level.
+        let docNode = function (doc, text) {
+            return {
+                key: doc.id,
+                text: text,
+                docId: doc.id,
+                path: '',
+                kind: 'map',
+                present: true,
+                description: '',
+                accessList: [],
+                accessText: '',
+                editable: me.editableFor(''),
+                leaf: false,
+                expanded: doc.kind !== 'namespace' && doc.kind !== 'grant',
+                iconCls: I.mapExpanded,
+                expandedCls: I.mapExpanded,
+                children: toNodes(me.documentEntries(doc.id), doc.id, me.findingsFor(doc.id)),
+            };
+        };
+
+        // A folder that is not a document: `Namespaces` and `Grants` group the files
+        // under them. `docId: null` is what makes every button ignore it -- there is
+        // no document to write to, and nothing here is a key.
+        let groupNode = function (text, docs) {
+            return {
+                key: text,
+                text: text,
+                docId: null,
+                group: true,
+                path: '',
+                kind: 'map',
+                present: true,
+                accessList: [],
+                accessText: '',
+                editable: false,
+                leaf: false,
+                expanded: true,
+                iconCls: I.mapExpanded,
+                expandedCls: I.mapExpanded,
+                children: docs.map((doc) => docNode(doc, me.docTitle(doc.id))),
+            };
+        };
+
+        let children;
+        if (!me.dc) {
+            // A guest tab is one document, and shows exactly the tree it always did:
+            // no root row, no groups, the document's own keys at the top level.
+            children = toNodes(
+                me.documentEntries(me.docId),
+                me.docId,
+                me.findingsFor(me.docId),
+            );
+        } else {
+            children = [];
+            let byKind = (k) => me.docs.filter((d) => d.kind === k);
+            byKind('datacenter').forEach((doc) => children.push(docNode(doc, gettext('Datacenter'))));
+            let namespaces = byKind('namespace');
+            if (namespaces.length) {
+                children.push(groupNode(gettext('Namespaces'), namespaces));
+            }
+            let grants = byKind('grant');
+            if (grants.length) {
+                children.push(groupNode(gettext('Grants'), grants));
+            }
+        }
 
         // Reloading (including from the version poll) must not fold the tree up.
-        // Keyed by document path, so it gets the same treatment as `children`.
+        // Keyed by document *and* path: two documents can hold the same path, and on
+        // the datacenter tab they routinely do (`selector`, `description`).
+        // A document row and a group row both have the empty path, and the two group
+        // rows have no document at all -- so the id alone collided and collapsing
+        // `Namespaces` re-expanded it on the next reload, because `Grants` won the
+        // shared key. The row's own key is what tells those apart.
+        let key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
         let expanded = Object.create(null);
         let seen = false;
         me.store.getRoot().cascadeBy(function (n) {
-            if (n.data.path && !n.isLeaf()) {
+            if (n.data.text && !n.isLeaf()) {
                 seen = true;
                 if (n.isExpanded()) {
-                    expanded[n.data.path] = true;
+                    expanded[key(n)] = true;
                 }
             }
         });
-        me.store.setRoot({ expanded: true, children: toNodes(root) });
+        me.store.setRoot({ expanded: true, children: children });
         if (seen) {
             me.store.getRoot().cascadeBy(function (n) {
-                if (n.data.path && !n.isLeaf() && !expanded[n.data.path]) {
+                if (n.data.text && !n.isLeaf() && !expanded[key(n)]) {
                     n.collapse();
                     n.set('iconCls', PVE.meta.Icons.map);
                 }
@@ -1986,13 +2641,26 @@ Ext.define('PVE.meta.TreePanel', {
 
     editRow: function (rec) {
         let me = this;
-        if (!rec || rec.data.kind === 'map' || !rec.data.editable) {
+        if (!rec || !rec.data.editable) {
+            return;
+        }
+        // A value with structure inside it is edited as text, wherever the request came
+        // from (button, double-click, Enter). Before this, all three simply did nothing
+        // on a map row.
+        if (PVE.meta.Utils.editorKind(rec.data) === 'text') {
+            me.editAsText(rec);
             return;
         }
         me.editing = true;
         let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
+        let docId = me.docOf(rec);
         win.on('setvalue', (value) =>
-            me.write({ view: rec.data.path, mode: 'replace', data: Ext.encode(value), digest: me.digest }),
+            me.write(docId, {
+                view: rec.data.path,
+                mode: 'replace',
+                data: Ext.encode(value),
+                digest: me.digestOf(docId),
+            }),
         );
         win.on('destroy', function () {
             me.editing = false;
@@ -2000,12 +2668,42 @@ Ext.define('PVE.meta.TreePanel', {
         win.show();
     },
 
-    addKey: function (parentPath) {
+    addKey: function (docId, parentPath) {
         let me = this;
         me.editing = true;
         let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: parentPath || '' });
         win.on('addkey', (path, value) =>
-            me.write({ view: path, mode: 'replace', data: Ext.encode(value), digest: me.digest }),
+            me.write(docId, {
+                view: path,
+                mode: 'replace',
+                data: Ext.encode(value),
+                digest: me.digestOf(docId),
+            }),
+        );
+        win.on('destroy', function () {
+            me.editing = false;
+        });
+        win.show();
+    },
+
+    // Declare one key of the selected namespace's schema: a view PUT into
+    // `schema.properties.<key>` of that namespace document, with its digest. The
+    // window builds the declaration; this only decides where it goes.
+    declareKey: function (rec) {
+        let me = this;
+        if (!rec || !rec.data.docId || me.docKind(rec.data.docId) !== 'namespace') {
+            return;
+        }
+        let docId = rec.data.docId;
+        me.editing = true;
+        let win = Ext.create('PVE.meta.DeclareKeyWindow', { prefix: me.docTitle(docId) });
+        win.on('declarekey', (key, schema) =>
+            me.write(docId, {
+                view: 'schema.properties.' + key,
+                mode: 'replace',
+                data: Ext.encode(schema),
+                digest: me.digestOf(docId),
+            }),
         );
         win.on('destroy', function () {
             me.editing = false;
@@ -2023,8 +2721,12 @@ Ext.define('PVE.meta.TreePanel', {
             Ext.String.format(gettext('Remove "{0}"?'), Ext.htmlEncode(rec.data.path)),
             function (btn) {
                 if (btn === 'yes') {
-                    let q = Ext.Object.toQueryString({ view: rec.data.path, digest: me.digest });
-                    me.submit({ url: me.baseUrl + '?' + q, method: 'DELETE' });
+                    let docId = me.docOf(rec);
+                    let q = Ext.Object.toQueryString({
+                        view: rec.data.path,
+                        digest: me.digestOf(docId),
+                    });
+                    me.submit({ url: me.urlFor(docId) + '?' + q, method: 'DELETE' });
                 }
             },
         );
@@ -2033,19 +2735,32 @@ Ext.define('PVE.meta.TreePanel', {
     // "Edit selection as text": Monaco on the selected subtree, in its own window.
     editSelectionAsText: function () {
         let me = this;
-        let rec = me.getSelection()[0];
+        me.editAsText(me.getSelection()[0]);
+    },
+
+    // Monaco on one subtree. Which subtree depends on the row: a value that *has* a
+    // subtree (a map, an array of maps) is edited as itself, and a scalar is edited
+    // through the map that contains it -- selecting `port` and asking for text is a
+    // request to see it in context, not to edit `8080` in an editor with a gutter.
+    editAsText: function (rec) {
+        let me = this;
         if (!rec) {
             return;
         }
-        let view = rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec);
+        let view =
+            PVE.meta.Utils.editorKind(rec.data) === 'text' ? rec.data.path : me.parentPath(rec);
+        let docId = me.docOf(rec);
         me.request({
-            url: me.baseUrl,
-            params: { view: view, format: 'yaml' },
+            url: me.urlFor(docId),
+            // The document root is addressed by *omitting* `view`, not by sending an
+            // empty one -- which is what a document row on the datacenter tab is.
+            params: { view: view || undefined, format: 'yaml' },
             success: function (response) {
                 let d = response.result.data || {};
-                me.digest = d.digest || me.digest;
+                me.setDigest(docId, d.digest);
                 me.textWindow = Ext.create('PVE.meta.TextWindow', {
                     view: view,
+                    docId: docId,
                     text: d.text || '',
                     tree: me,
                 });
@@ -2097,15 +2812,21 @@ Ext.define('PVE.meta.TreePanel', {
     enterTextMode: function () {
         let me = this;
         me.mode = 'text';
+        // Which document the Text card shows. On a guest tab there is only one; on
+        // the datacenter tab it is the one the selection is in, so switching to Text
+        // with a namespace row selected edits that namespace -- the alternative was
+        // a full-document editor that could only ever mean one of several documents.
+        let rec = me.getSelection()[0];
+        me.textDocId = (rec && rec.data.docId) || me.docId;
         me.syncButtons();
         me.getLayout().setActiveItem(me.down('#metaText'));
         Proxmox.Utils.setErrorMask(me, true);
         me.request({
-            url: me.baseUrl,
-            params: { view: '', format: 'yaml' },
+            url: me.urlFor(me.textDocId),
+            params: { format: 'yaml' },
             success: function (response) {
                 let d = response.result.data || {};
-                me.digest = d.digest || me.digest;
+                me.setDigest(me.textDocId, d.digest);
                 me.textOriginal = d.text || '';
                 me.showTextEditor();
             },
@@ -2296,9 +3017,12 @@ Ext.define('PVE.meta.TreePanel', {
             apply: function () {
                 // The whole document, at the root view. JSON is a subset of YAML, but
                 // `data` is the parameter that says "this is the JSON data model".
-                let params = { view: '', mode: 'replace', digest: me.digest };
+                let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
                 params[me.textLang === 'json' ? 'data' : 'text'] = edited;
-                me.submit({ url: me.baseUrl, method: 'PUT', params: params }, () => me.refreshText());
+                me.submit(
+                    { url: me.urlFor(me.textDocId), method: 'PUT', params: params },
+                    () => me.refreshText(),
+                );
             },
         });
     },
@@ -2373,8 +3097,9 @@ Ext.define('PVE.meta.TreePanel', {
                 });
             }
         } else if (me.textLang === 'yaml') {
-            let all = me.applicableNamespaces();
-            let applicable = PVE.meta.Lint.applicable(all);
+            let g = me.textGrammar();
+            let all = g.all;
+            let applicable = g.withSchema;
             if (applicable.length) {
                 let index = PVE.meta.Lint.lineIndex(text);
                 markers = PVE.meta.Lint.placed(
@@ -2408,13 +3133,18 @@ Ext.define('PVE.meta.TreePanel', {
     // The grammar findings for the current buffer, as plain messages -- what Apply
     // warns about before it writes. Empty when the buffer does not parse (the write
     // will fail on its own) or when no grammar applies.
+    textGrammar: function () {
+        return this.grammarSplit(this.textDocId || this.docId);
+    },
+
     textFindings: function () {
         let me = this;
         if (!me.textEditor) {
             return [];
         }
-        let all = me.applicableNamespaces();
-        let applicable = PVE.meta.Lint.applicable(all);
+        let g = me.textGrammar();
+        let all = g.all;
+        let applicable = g.withSchema;
         if (!applicable.length) {
             return [];
         }
@@ -2460,11 +3190,11 @@ Ext.define('PVE.meta.TreePanel', {
     refreshText: function () {
         let me = this;
         me.request({
-            url: me.baseUrl,
-            params: { view: '', format: 'yaml' },
+            url: me.urlFor(me.textDocId),
+            params: { format: 'yaml' },
             success: function (response) {
                 let d = response.result.data || {};
-                me.digest = d.digest || me.digest;
+                me.setDigest(me.textDocId, d.digest);
                 me.textOriginal = d.text || '';
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
@@ -2476,8 +3206,8 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- writes -------------------------------------------------------------
 
-    write: function (params, onSuccess) {
-        this.submit({ url: this.baseUrl, method: 'PUT', params: params }, onSuccess);
+    write: function (docId, params, onSuccess) {
+        this.submit({ url: this.urlFor(docId), method: 'PUT', params: params }, onSuccess);
     },
 
     submit: function (opts, onSuccess) {

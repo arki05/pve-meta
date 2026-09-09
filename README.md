@@ -122,6 +122,7 @@ are `protected` and run in pvedaemon.
 | GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
 | GET | `/meta/grants` | — | `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
 | GET/PUT/DELETE | `/meta/namespaces/{name}`<br>`/meta/grants/{name}` | same as a document | the file itself as a document (`id: "namespaces/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a namespace/grant. `Sys.Modify` on `/` to write |
+| GET | `/meta/schemas` | — | `{ namespace, grant }` — the two registry file formats described as schemas, which is what lets the editor show a namespace file as a typed tree |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
 `data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust

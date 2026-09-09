@@ -462,6 +462,13 @@ pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Er
     })
 }
 
+/// `GET /meta/schemas`: the two registry file formats as schemas
+/// (`crate::metaschema`), so the editor can show a namespace or grant file as a
+/// typed tree the way a namespace's own schema does for a guest document.
+pub fn schemas() -> Value {
+    crate::metaschema::schemas()
+}
+
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
 pub fn access(grant_files: &[Grant], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
     let g = grants(grant_files, doc_id, acl);

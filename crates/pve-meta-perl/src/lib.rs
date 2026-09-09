@@ -242,6 +242,14 @@ mod pve_rs_meta {
         Ok(api::namespaces_list(&open_namespaces()))
     }
 
+    /// `GET /meta/schemas` -> `{ namespace, grant }`, the two registry file
+    /// formats described in the same dialect a namespace uses, so the editor
+    /// can show one as a typed tree.
+    #[export]
+    pub fn api_schemas() -> Result<pve_meta_core::model::Value, Error> {
+        Ok(api::schemas())
+    }
+
     /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
     /// with the registrations' selectors already resolved against `$acl`'s
     /// tags. `$id` is a vmid or `"datacenter"`.

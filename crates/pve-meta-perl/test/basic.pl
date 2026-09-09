@@ -717,6 +717,29 @@ my $wipe = PVE::RS::Meta::api_delete('9400', undef,
 is($wipe->{digest}, '', 'api_delete without a view leaves digest "" (the file is gone)');
 ok(!file_exists('9400.yaml'), 'api_delete without a view actually removes the file');
 
+# -- the meta-schema ---------------------------------------------------------
+
+my $schemas = PVE::RS::Meta::api_schemas();
+is(ref($schemas), 'HASH', 'api_schemas returns a native hash');
+is_deeply([sort keys %$schemas], ['grant', 'namespace'], '... one schema per registry kind');
+is($schemas->{namespace}->{properties}->{selector}->{type}, 'object',
+    'the namespace schema describes its selector');
+ok(!defined($schemas->{namespace}->{properties}->{selector}->{optional}),
+    '... as required, which is what the parser enforces');
+ok($schemas->{namespace}->{properties}->{schema}->{optional},
+    'a namespace schema is optional');
+ok(!defined($schemas->{namespace}->{properties}->{schema}->{properties}),
+    '... and free-form: no properties, so the editor offers text rather than a form');
+my $sel = $schemas->{namespace}->{properties}->{selector}->{properties};
+is_deeply([sort keys %$sel], ['all', 'tag'], 'the selector describes both alternatives');
+ok($sel->{all}->{optional} && $sel->{tag}->{optional},
+    '... each individually optional: "exactly one of" is a rule the dialect cannot hold');
+# ... so the parser is the only thing that enforces it, on the way in.
+$res = eval { PVE::RS::Meta::api_put('namespaces/bothsel', undef, 'yaml',
+    "selector: {all: true, tag: web}\n", 'replace', '', 0, $FULL) };
+ok(!defined($res), 'a selector with both alternatives is refused');
+like($@, api_error_status(400), '... with a 400');
+
 # -- registry documents: namespaces and grants are documents too --------------
 #
 # Same three functions, a third kind of id (`namespaces/<name>`), and one rule

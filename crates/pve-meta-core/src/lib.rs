@@ -32,6 +32,9 @@
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
 //!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
+//! - [`metaschema`] — the two registry file formats, written as schemas in the
+//!   same dialect a namespace uses, so the editor can show a namespace or grant
+//!   file as a typed tree (`docs/DESIGN.md` §3.6).
 //! - [`registry`] — the two drop-directories: **namespaces**
 //!   (`/usr/share/pve-meta/namespaces`, `/etc/pve/meta.d/namespaces`), which
 //!   say what a prefix is and carry its schema, and **grants**
@@ -69,6 +72,7 @@ pub mod api;
 pub mod digest;
 pub mod error;
 pub mod format;
+pub mod metaschema;
 pub mod model;
 pub mod patch;
 pub mod path;

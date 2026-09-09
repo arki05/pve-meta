@@ -332,7 +332,7 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests datacenter namespaces grants)];
+        return [map { { subdir => $_ } } qw(version access guests datacenter namespaces grants schemas)];
     },
 });
 
@@ -495,6 +495,34 @@ __PACKAGE__->register_method({
     },
     code => sub {
         return _call(\&PVE::RS::Meta::api_grants);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'schemas',
+    path => 'schemas',
+    method => 'GET',
+    permissions => {
+        description => "Readable by every authenticated user: it is a description of a "
+            . "file format, the same one this package's own documentation carries.",
+        user => 'all',
+    },
+    description => "The two registry file formats as schemas (docs/DESIGN.md §3.6), "
+        . "keyed 'namespace' and 'grant', in the same PVE::JSONSchema dialect a "
+        . "namespace uses to describe a guest's subtree. The editor renders a "
+        . "namespace or grant document with these the way it renders a guest document "
+        . "with the namespaces that reach it. This is an affordance, not the "
+        . "validator: what is storable is decided by the parser on the way in.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => {
+        type => 'object',
+        additionalProperties => 1,
+    },
+    code => sub {
+        return _call(\&PVE::RS::Meta::api_schemas);
     },
 });
 
