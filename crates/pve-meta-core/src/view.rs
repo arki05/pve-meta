@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn replace_empty_object_round_trips_an_empty_namespace() {
+    fn replace_empty_object_round_trips_an_empty_prefix() {
         // Opening a view whose value is legitimately `{}` and applying it
         // unchanged must not delete the key.
         let mut doc = json!({"traefik": {}, "other": 1});

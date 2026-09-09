@@ -1,4 +1,4 @@
-//! The two drop directories: **namespaces** (what a prefix is) and **grants**
+//! The two drop directories: **prefixes** (what a prefix is) and **grants**
 //! (who may touch one) — `docs/DESIGN.md` §3.
 //!
 //! Both live outside the documents, one file each, parsed strictly and
@@ -6,36 +6,39 @@
 //! nothing, and never affects another file. That isolation is the whole
 //! reason this data left `datacenter.yaml`.
 //!
-//! # Namespaces
+//! # Prefixes
 //!
-//! * `/usr/share/pve-meta/namespaces/<prefix>.yaml` — packaged defaults, dropped
+//! * `/usr/share/pve-meta/prefixes/<prefix>.yaml` — packaged defaults, dropped
 //!   in by an operator's own `.deb`;
-//! * `/etc/pve/meta.d/namespaces/<prefix>.yaml` — cluster overrides, by file name.
+//! * `/etc/pve/meta.d/prefixes/<prefix>.yaml` — cluster overrides, by file name.
 //!
-//! **The file name is the prefix**, so one namespace is exactly one prefix and
-//! there is no `prefix:` field to disagree with it. A prefix segment is
+//! **The file name is the prefix.** `homelab.docker.yaml` declares the prefix
+//! `homelab.docker`, so a definition and its prefix are one thing and there is
+//! no `prefix:` field for the two to disagree about. A prefix segment is
 //! `[A-Za-z0-9_@!-]+` and dots are only separators
-//! ([`crate::path::is_valid_segment`]), so a namespace file name can never
+//! ([`crate::path::is_valid_segment`]), so a prefix file name can never
 //! contain a slash, never start with a dot and never escape its directory.
 //!
 //! ```yaml
-//! # namespaces/traefik.yaml
+//! # prefixes/traefik.yaml
 //! description: Traefik dynamic configuration
 //! selector: { tag: traefik }
 //! schema:                      # optional, PVE::JSONSchema dialect
 //!   type: object
 //! ```
 //!
-//! A namespace names no principal: declaring that a prefix exists and has a
-//! shape is useful with no operator, no token and no automation anywhere near
-//! it.
+//! A definition names no principal: saying that a prefix exists and has a shape
+//! is useful with no operator, no token and no automation anywhere near it. It
+//! is also **entirely optional** -- a document may hold any key at all; a
+//! definition is only the "give this one a bit more structure" piece, for the
+//! operators and hook scripts that want it.
 //!
 //! # Grants
 //!
 //! * `/etc/pve/meta.d/grants/<name>.yaml` — cluster only. **There is
 //!   deliberately no packaged grants directory**: an operator's `.deb` may ship
-//!   a namespace (a declaration) but must never ship its own grant, which would
-//!   be self-registration. dpkg cannot write into pmxcfs, so "an operator
+//!   a prefix definition (what it expects) but must never ship its own grant,
+//!   which would be self-registration. dpkg cannot write into pmxcfs, so "an operator
 //!   declares what it expects; only an administrator grants it" is enforced by
 //!   where files live rather than by a rule.
 //!
@@ -50,8 +53,8 @@
 //!
 //! # The two nesting rules are opposites, deliberately
 //!
-//! [`governing`]: **most-specific wins, schemas never merge.** The namespace
-//! with the longest prefix covering a path governs it; no other contributes.
+//! [`governing`]: **most-specific wins, schemas never merge.** The longest
+//! declared prefix covering a path governs it; no other contributes.
 //!
 //! [`scopes_for`]: **grants accumulate by containment.** A grant on `homelab`
 //! covers `homelab.docker`, because "you may write `homelab`" not implying its
@@ -72,17 +75,17 @@ use crate::model::Value;
 use crate::path::Path;
 use crate::scopes::{Mode, Scope};
 
-/// The packaged namespace directory.
-pub const NAMESPACE_PACKAGED_DIR: &str = "/usr/share/pve-meta/namespaces";
-/// The cluster-wide namespace directory (pmxcfs); overrides
-/// [`NAMESPACE_PACKAGED_DIR`] by file name.
-pub const NAMESPACE_CLUSTER_DIR: &str = "/etc/pve/meta.d/namespaces";
+/// The packaged prefix directory.
+pub const PREFIX_PACKAGED_DIR: &str = "/usr/share/pve-meta/prefixes";
+/// The cluster-wide prefix directory (pmxcfs); overrides
+/// [`PREFIX_PACKAGED_DIR`] by file name.
+pub const PREFIX_CLUSTER_DIR: &str = "/etc/pve/meta.d/prefixes";
 /// The grants directory. Cluster only, on purpose — see the module docs.
 pub const GRANT_CLUSTER_DIR: &str = "/etc/pve/meta.d/grants";
 
-/// Environment variable overriding the namespace directories with a
+/// Environment variable overriding the prefix directories with a
 /// colon-separated list, lowest precedence first. Tests and `test/basic.pl`.
-pub const NAMESPACE_DIRS_ENV: &str = "PVE_META_NAMESPACE_DIRS";
+pub const PREFIX_DIRS_ENV: &str = "PVE_META_PREFIX_DIRS";
 /// Environment variable overriding the grants directories, likewise.
 pub const GRANT_DIRS_ENV: &str = "PVE_META_GRANT_DIRS";
 
@@ -121,9 +124,9 @@ impl Selector {
     }
 }
 
-/// One namespace: a prefix, what it is, and where it applies.
+/// One prefix: a prefix, what it is, and where it applies.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Namespace {
+pub struct PrefixDef {
     /// The prefix, taken from the file name. Non-empty.
     pub prefix: Path,
     /// A human description, for the UI.
@@ -136,6 +139,32 @@ pub struct Namespace {
     /// through verbatim for the UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<Value>,
+    /// Which directory this one was read from. Not part of the file.
+    pub origin: Origin,
+    /// `true` when a lower-precedence directory holds a file of the same name that
+    /// this one displaced. With the two configured directories that is exactly "a
+    /// cluster file written over a packaged one"; with three or more (only reachable
+    /// through `PVE_META_PREFIX_DIRS`) a packaged file can displace another packaged
+    /// file and this is true of it too. Nothing keys off the combination -- the UI
+    /// and the write path both ask [`Origin`] -- so it stays the plain fact it says.
+    pub overrides: bool,
+}
+
+/// Where a loaded file came from, and what it displaced.
+///
+/// The loader has always known this -- it walks the directories in precedence
+/// order -- and always thrown it away. A list is where it matters: a packaged
+/// prefix definition and a cluster override of the same name are the same row
+/// in every other respect, and "who owns this file, and is a package's copy
+/// underneath it?" is the first question an administrator asks about one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// From a package's directory (`/usr/share/pve-meta/prefixes`): read-only,
+    /// and replaced rather than edited -- a write creates the cluster file.
+    Packaged,
+    /// From the cluster directory (`/etc/pve/meta.d/...`).
+    Cluster,
 }
 
 /// One `grants:` entry.
@@ -161,13 +190,19 @@ pub struct Grant {
     pub description: Option<String>,
     /// What it grants.
     pub grants: Vec<GrantEntry>,
+    /// Which directory this one was read from. Always `Cluster` today: there is
+    /// no packaged grants directory, deliberately (see the module docs).
+    pub origin: Origin,
+    /// `true` when it displaced a same-named file from a lower-precedence
+    /// directory. Always `false` while there is only one grants directory.
+    pub overrides: bool,
 }
 
 // -- strict parsing ------------------------------------------------------
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawNamespace {
+struct RawPrefixDef {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -265,15 +300,30 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
     }
 }
 
-/// Parses one namespace file. `name` is the file's base name, which **is** the
+/// Parses one prefix file. `name` is the file's base name, which **is** the
 /// prefix.
 ///
 /// # Errors
 /// [`Error::Registry`] describing the first problem; [`Error::Parse`] if
 /// the text is not YAML at all.
-pub fn parse_namespace(name: &str, text: &str) -> Result<Namespace> {
+/// Whether `name` is a usable registry **file** name (the part before `.yaml`).
+///
+/// One rule, because three places need it and they must agree: `parse_id`
+/// turns an API id into a file name, `MetaStore::version` turns a file name
+/// back into a document id, and the loader decides which files it reads at all.
+///
+/// A name is one or more [`crate::path::is_valid_segment`] segments joined by
+/// dots -- which is exactly a prefix, since **the file name is the
+/// prefix**: `homelab.docker.yaml` declares `homelab.docker`. That admits the
+/// dots a prefix needs while still refusing everything that could address
+/// another directory (`/`, `..`, a leading dot) or another file type.
+pub fn is_valid_file_name(name: &str) -> bool {
+    !name.is_empty() && name.split('.').all(crate::path::is_valid_segment)
+}
+
+pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
     // Dotted form only. `Path::parse` also accepts `a/b`, which must never be a
-    // namespace name: the name is used as a file name, so accepting a separator
+    // prefix name: the name is used as a file name, so accepting a separator
     // that is also the filesystem's would be the one way this identity could
     // reach outside its directory.
     if name.contains('/') {
@@ -287,10 +337,15 @@ pub fn parse_namespace(name: &str, text: &str) -> Result<Namespace> {
     // `parse_raw` also applies the store's YAML safety rules (no anchors,
     // aliases, explicit tags or complex keys).
     let value = format::parse_raw(Format::Yaml, text)?;
-    let raw: RawNamespace =
+    let raw: RawPrefixDef =
         serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
     let selector = parse_selector(name, raw.selector)?;
-    Ok(Namespace {
+    Ok(PrefixDef {
+        // A parse knows the text, not the directory: `load_dirs` stamps the real
+        // origin over these. The defaults are what a hand-parsed file is -- the
+        // cluster's, displacing nothing.
+        origin: Origin::Cluster,
+        overrides: false,
         prefix,
         description: raw.description,
         selector,
@@ -301,7 +356,7 @@ pub fn parse_namespace(name: &str, text: &str) -> Result<Namespace> {
 /// Parses one grants file. `name` is the file's base name (the override key).
 ///
 /// # Errors
-/// As [`parse_namespace`].
+/// As [`parse_prefix`].
 pub fn parse_grant(name: &str, text: &str) -> Result<Grant> {
     let value = format::parse_raw(Format::Yaml, text)?;
     let raw: RawGrant = serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -338,6 +393,8 @@ pub fn parse_grant(name: &str, text: &str) -> Result<Grant> {
     }
 
     Ok(Grant {
+        origin: Origin::Cluster,
+        overrides: false,
         name: name.to_string(),
         authid: raw.authid,
         description: raw.description,
@@ -354,9 +411,9 @@ fn dirs_from(env: &str, defaults: &[&str]) -> Vec<PathBuf> {
     }
 }
 
-/// The namespace directories, lowest precedence first.
-pub fn namespace_dirs() -> Vec<PathBuf> {
-    dirs_from(NAMESPACE_DIRS_ENV, &[NAMESPACE_PACKAGED_DIR, NAMESPACE_CLUSTER_DIR])
+/// The prefix directories, lowest precedence first.
+pub fn prefix_dirs() -> Vec<PathBuf> {
+    dirs_from(PREFIX_DIRS_ENV, &[PREFIX_PACKAGED_DIR, PREFIX_CLUSTER_DIR])
 }
 
 /// The grants directories. One, and cluster-only — see the module docs.
@@ -364,9 +421,22 @@ pub fn grant_dirs() -> Vec<PathBuf> {
     dirs_from(GRANT_DIRS_ENV, &[GRANT_CLUSTER_DIR])
 }
 
-fn load_dirs<T>(dirs: &[PathBuf], kind: &str, parse: impl Fn(&str, &str) -> Result<T>) -> Vec<(String, T)> {
+/// Loads one drop-directory list, later directories overriding earlier by file
+/// name, and stamps each survivor with where it came from.
+///
+/// **The last directory is the writable one** -- the same rule
+/// `store::MetaStore::registry_write_dir` applies -- so everything below it is a
+/// package's, read-only, and displaced rather than edited.
+fn load_dirs<T>(
+    dirs: &[PathBuf],
+    kind: &str,
+    parse: impl Fn(&str, &str) -> Result<T>,
+    stamp: impl Fn(&mut T, Origin, bool),
+) -> Vec<(String, T)> {
     let mut by_name: BTreeMap<String, T> = BTreeMap::new();
-    for dir in dirs {
+    let last = dirs.len().saturating_sub(1);
+    for (index, dir) in dirs.iter().enumerate() {
+        let origin = if index == last { Origin::Cluster } else { Origin::Packaged };
         for (name, path) in yaml_files(dir) {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
@@ -376,7 +446,11 @@ fn load_dirs<T>(dirs: &[PathBuf], kind: &str, parse: impl Fn(&str, &str) -> Resu
                 }
             };
             match parse(&name, &text) {
-                Ok(parsed) => {
+                Ok(mut parsed) => {
+                    // File names are unique within a directory, so anything this
+                    // displaces necessarily came from a lower-precedence one.
+                    let displaced = by_name.contains_key(&name);
+                    stamp(&mut parsed, origin, displaced);
                     by_name.insert(name, parsed);
                 }
                 Err(e) => {
@@ -388,11 +462,14 @@ fn load_dirs<T>(dirs: &[PathBuf], kind: &str, parse: impl Fn(&str, &str) -> Resu
     by_name.into_iter().collect()
 }
 
-/// Every namespace in `dirs` (lowest precedence first, later directories
+/// Every prefix in `dirs` (lowest precedence first, later directories
 /// overriding earlier **by file name**), **sorted most-specific first** — the
 /// order [`governing`] relies on.
-pub fn load_namespaces(dirs: &[PathBuf]) -> Vec<Namespace> {
-    let mut out: Vec<Namespace> = load_dirs(dirs, "namespace", parse_namespace)
+pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
+    let mut out: Vec<PrefixDef> = load_dirs(dirs, "prefix", parse_prefix, |p, origin, over| {
+        p.origin = origin;
+        p.overrides = over;
+    })
         .into_iter()
         .map(|(_, ns)| ns)
         .collect();
@@ -410,15 +487,18 @@ pub fn load_namespaces(dirs: &[PathBuf]) -> Vec<Namespace> {
 
 /// Every grant in `dirs`, sorted by file name.
 pub fn load_grants(dirs: &[PathBuf]) -> Vec<Grant> {
-    load_dirs(dirs, "grant", parse_grant)
+    load_dirs(dirs, "grant", parse_grant, |g, origin, over| {
+        g.origin = origin;
+        g.overrides = over;
+    })
         .into_iter()
         .map(|(_, g)| g)
         .collect()
 }
 
-/// [`load_namespaces`] over [`namespace_dirs`].
-pub fn load_namespaces_default() -> Vec<Namespace> {
-    load_namespaces(&namespace_dirs())
+/// [`load_prefixes`] over [`prefix_dirs`].
+pub fn load_prefixes_default() -> Vec<PrefixDef> {
+    load_prefixes(&prefix_dirs())
 }
 
 /// [`load_grants`] over [`grant_dirs`].
@@ -448,7 +528,7 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// The namespace governing `path`: the one whose prefix is the **longest** that
+/// The prefix governing `path`: the one whose prefix is the **longest** that
 /// covers it, among those whose selector matches `tags`.
 ///
 /// Most-specific wins and schemas never merge (`docs/DESIGN.md` §3.1). With
@@ -458,7 +538,7 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 /// for, and where parent and child have different owners it would mean two
 /// owners fighting over one key.
 ///
-/// `namespaces` must be sorted most-specific first ([`load_namespaces`]), so
+/// `prefixes` must be sorted most-specific first ([`load_prefixes`]), so
 /// this is the first match.
 ///
 /// **Nothing in this crate calls it**, and that is deliberate rather than an
@@ -469,11 +549,11 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 /// UI) the alternative is each of them re-deriving it. If that never happens,
 /// delete it rather than letting it drift from the implementation that runs.
 pub fn governing<'a>(
-    namespaces: &'a [Namespace],
+    prefixes: &'a [PrefixDef],
     path: &Path,
     tags: &[String],
-) -> Option<&'a Namespace> {
-    namespaces
+) -> Option<&'a PrefixDef> {
+    prefixes
         .iter()
         .find(|ns| ns.selector.matches(tags) && ns.prefix.is_prefix_of(path))
 }
@@ -483,7 +563,7 @@ pub fn governing<'a>(
 ///
 /// Grants **accumulate**: a grant on `homelab` covers `homelab.docker`, because
 /// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
-/// namespaces nest, and deliberately so — permission is a union, shape is not.
+/// prefixes nest, and deliberately so — permission is a union, shape is not.
 ///
 /// Grants apply to **guest documents only**; the datacenter document is
 /// governed by ACLs alone, so this is never called for it.
@@ -539,25 +619,87 @@ grants:
     }
 
     #[test]
-    fn a_namespaces_prefix_is_its_file_name() {
-        let ns = parse_namespace("traefik", NS).unwrap();
+    fn a_loaded_file_says_which_directory_it_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let packaged = dir.path().join("packaged");
+        let cluster = dir.path().join("cluster");
+        std::fs::create_dir_all(&packaged).unwrap();
+        std::fs::create_dir_all(&cluster).unwrap();
+        std::fs::write(packaged.join("traefik.yaml"), "selector: {all: true}\n").unwrap();
+        std::fs::write(packaged.join("onlypkg.yaml"), "selector: {all: true}\n").unwrap();
+        std::fs::write(
+            cluster.join("traefik.yaml"),
+            "description: overridden\nselector: {tag: traefik}\n",
+        )
+        .unwrap();
+        std::fs::write(cluster.join("mine.yaml"), "selector: {all: true}\n").unwrap();
+
+        let loaded = load_prefixes(&[packaged, cluster]);
+        let by = |name: &str| {
+            loaded
+                .iter()
+                .find(|p| p.prefix.to_string() == name)
+                .unwrap_or_else(|| panic!("{name} was not loaded"))
+        };
+
+        // The one an administrator wrote over a package's copy: theirs, and it
+        // displaced something -- the two facts a list has to show separately,
+        // since "cluster" alone cannot tell you a delete would not remove it.
+        assert_eq!(by("traefik").origin, Origin::Cluster);
+        assert!(by("traefik").overrides);
+        assert_eq!(by("traefik").description.as_deref(), Some("overridden"));
+
+        assert_eq!(by("onlypkg").origin, Origin::Packaged);
+        assert!(!by("onlypkg").overrides);
+        assert_eq!(by("mine").origin, Origin::Cluster);
+        assert!(!by("mine").overrides);
+
+        // The last directory is the writable one, and that is the only thing
+        // that decides this -- with a single directory nothing is packaged.
+        let only = load_prefixes(&[dir.path().join("cluster")]);
+        assert!(only.iter().all(|p| p.origin == Origin::Cluster));
+    }
+
+    #[test]
+    fn a_registry_file_name_is_a_dotted_prefix_and_never_a_path() {
+        for good in ["traefik", "homelab.docker", "a-b_c", "svc@pve!t1"] {
+            assert!(is_valid_file_name(good), "{good} was refused");
+        }
+        for bad in ["", ".", "..", ".hidden", "a/b", "a b", "a..b", "a.", ".a"] {
+            assert!(!is_valid_file_name(bad), "{bad} was accepted");
+        }
+        // The two halves of "the file name is the prefix" have to agree: a name
+        // this accepts must parse as a prefix, and one it refuses must not.
+        assert_eq!(
+            parse_prefix("homelab.docker", "selector: {all: true}\n")
+                .unwrap()
+                .prefix
+                .to_string(),
+            "homelab.docker",
+        );
+        assert!(parse_prefix("a b", "selector: {all: true}\n").is_err());
+    }
+
+    #[test]
+    fn a_definitions_prefix_is_its_file_name() {
+        let ns = parse_prefix("traefik", NS).unwrap();
         assert_eq!(ns.prefix.to_string(), "traefik");
         assert_eq!(ns.selector, Selector::Tag("traefik".into()));
         assert!(ns.schema.is_some());
         // Dotted, any depth -- `homelab.docker.yaml` declares `homelab.docker`.
-        let nested = parse_namespace("homelab.docker", "selector: {all: true}\n").unwrap();
+        let nested = parse_prefix("homelab.docker", "selector: {all: true}\n").unwrap();
         assert_eq!(nested.prefix.to_string(), "homelab.docker");
         assert_eq!(nested.prefix.segments().len(), 2);
     }
 
     #[test]
     fn a_file_name_that_is_not_a_prefix_is_refused() {
-        // A segment is `[A-Za-z0-9_@!-]+`, so none of these can name a namespace --
+        // A segment is `[A-Za-z0-9_@!-]+`, so none of these can name a prefix --
         // which is also what stops a file name escaping the directory.
         for bad in ["", "a/b", "a b", ".hidden", "a..b", "a."] {
             assert!(
-                parse_namespace(bad, "selector: {all: true}\n").is_err(),
-                "{bad:?} should not be a valid namespace name",
+                parse_prefix(bad, "selector: {all: true}\n").is_err(),
+                "{bad:?} should not be a valid prefix name",
             );
         }
     }
@@ -565,9 +707,9 @@ grants:
     #[test]
     fn parsing_is_strict_on_both_kinds() {
         // Unknown fields, a missing selector, a bad authid, an empty prefix.
-        assert!(parse_namespace("x", "selector: {all: true}\nnope: 1\n").is_err());
-        assert!(parse_namespace("x", "description: no selector\n").is_err());
-        assert!(parse_namespace("x", "selector: {all: true, tag: t}\n").is_err());
+        assert!(parse_prefix("x", "selector: {all: true}\nnope: 1\n").is_err());
+        assert!(parse_prefix("x", "description: no selector\n").is_err());
+        assert!(parse_prefix("x", "selector: {all: true, tag: t}\n").is_err());
         assert!(parse_grant("g", "authid: not-an-authid\ngrants: []\n").is_err());
         assert!(parse_grant("g", "authid: a@pve\ngrants: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
         assert!(parse_grant("g", "authid: a@pve\ngrants: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
@@ -575,14 +717,14 @@ grants:
     }
 
     #[test]
-    fn a_grant_has_no_schema_and_a_namespace_has_no_authid() {
+    fn a_grant_has_no_schema_and_a_prefix_has_no_authid() {
         // The split, asserted: neither file can express the other's job.
         assert!(parse_grant(
             "g",
             "authid: a@pve\ngrants: [{prefix: p, mode: rw, selector: {all: true}, schema: {}}]\n"
         )
         .is_err());
-        assert!(parse_namespace("x", "selector: {all: true}\nauthid: a@pve\n").is_err());
+        assert!(parse_prefix("x", "selector: {all: true}\nauthid: a@pve\n").is_err());
     }
 
     #[test]
@@ -593,7 +735,7 @@ grants:
         write(packaged.path(), "netbird.yaml", "selector: {all: true}\n");
         write(cluster.path(), "traefik.yaml", "selector: {all: true}\n");
 
-        let all = load_namespaces(&[packaged.path().into(), cluster.path().into()]);
+        let all = load_prefixes(&[packaged.path().into(), cluster.path().into()]);
         assert_eq!(all.len(), 2);
         let traefik = all.iter().find(|n| n.prefix.to_string() == "traefik").unwrap();
         assert_eq!(traefik.selector, Selector::All, "the cluster file wins");
@@ -606,17 +748,17 @@ grants:
         write(dir.path(), "traefik.yaml", NS);
         write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
         write(dir.path(), "notyaml.txt", "ignored");
-        let all = load_namespaces(&[dir.path().into()]);
+        let all = load_prefixes(&[dir.path().into()]);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].prefix.to_string(), "traefik");
     }
 
     #[test]
-    fn namespaces_load_most_specific_first_and_governing_takes_the_first_match() {
+    fn prefixes_load_most_specific_first_and_governing_takes_the_first_match() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "homelab.yaml", "selector: {all: true}\nschema: {type: object}\n");
         write(dir.path(), "homelab.docker.yaml", "selector: {all: true}\nschema: {type: object, properties: {compose: {type: string}}}\n");
-        let all = load_namespaces(&[dir.path().into()]);
+        let all = load_prefixes(&[dir.path().into()]);
         assert_eq!(
             all.iter().map(|n| n.prefix.to_string()).collect::<Vec<_>>(),
             vec!["homelab.docker", "homelab"],
@@ -646,9 +788,9 @@ grants:
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "a.b.yaml", "selector: {tag: deep}\n");
         write(dir.path(), "a.yaml", "selector: {all: true}\n");
-        let all = load_namespaces(&[dir.path().into()]);
+        let all = load_prefixes(&[dir.path().into()]);
         let p = Path::parse("a.b.c").unwrap();
-        // Without the tag the specific namespace does not apply, so the broad one governs.
+        // Without the tag the specific prefix does not apply, so the broad one governs.
         assert_eq!(governing(&all, &p, &[]).unwrap().prefix.to_string(), "a");
         assert_eq!(
             governing(&all, &p, &["deep".to_string()]).unwrap().prefix.to_string(),
@@ -657,7 +799,7 @@ grants:
     }
 
     #[test]
-    fn grants_accumulate_by_containment_which_is_the_opposite_of_namespaces() {
+    fn grants_accumulate_by_containment_which_is_the_opposite_of_prefixes() {
         let g = parse_grant("traefik", GRANT).unwrap();
         let scopes = scopes_for(std::slice::from_ref(&g), "svc@pve!traefik", &["traefik".to_string()]);
         assert_eq!(scopes.len(), 2, "both entries, the tag one having matched");
@@ -686,7 +828,7 @@ grants:
 
     #[test]
     fn a_missing_directory_is_not_an_error() {
-        assert!(load_namespaces(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
+        assert!(load_prefixes(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
         assert!(load_grants(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
     }
 

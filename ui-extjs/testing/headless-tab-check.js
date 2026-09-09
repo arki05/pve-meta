@@ -3,7 +3,7 @@
 //
 // Usage: node headless-tab-check.js <host> <vmid> <theme: light|dark>
 //            [--stub-registry] [--readonly] [--scoped]
-// --stub-registry stubs GET /meta/namespaces and GET /meta/grants, for a lab
+// --stub-registry stubs GET /meta/prefixes and GET /meta/grants, for a lab
 //   whose real files do not exercise every schema shape.
 // --readonly skips everything that writes.
 // --scoped / --ro stub GET /meta/access with a restricted answer (an rw scope on
@@ -25,7 +25,7 @@ const ACCESS_STUB = scoped
     : { read: 1, write: 0, scopes: [] };
 const out = '/root/headless/shots';
 
-const NAMESPACES = [
+const PREFIXES = [
     {
         prefix: 'traefik',
         description: 'Traefik dynamic configuration',
@@ -165,8 +165,8 @@ async function main() {
                             contentType: 'application/json',
                             body: JSON.stringify({ success: 1, data }),
                         });
-                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/namespaces/.test(req.url())) {
-                        reply(NAMESPACES);
+                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/prefixes/.test(req.url())) {
+                        reply(PREFIXES);
                         return;
                     }
                     if (stubRegistry && /\/api2\/(extjs|json)\/meta\/grants/.test(req.url())) {
@@ -288,7 +288,7 @@ async function main() {
                 mode: p.mode,
                 digest: p.digest,
                 access: p.access,
-                namespaces: (p.namespaces || []).length,
+                prefixes: (p.prefixes || []).length,
                 grants: (p.grants || []).length,
                 columns: p.tree.getColumns().map((c) => c.text),
                 rows,

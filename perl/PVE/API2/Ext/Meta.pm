@@ -88,6 +88,29 @@ sub _datacenter_acl {
     };
 }
 
+# A registry document -- one prefix or grant file (docs/DESIGN.md §3) --
+# is an administrator's to edit and nobody else's.
+#
+# Read is open to every authenticated user, because it has to agree with the
+# two list endpoints below: they already return the same files' content to
+# everyone, and a document read that was stricter than the list of the same
+# thing would be a rule with two answers. Write is Sys.Modify on '/', the same
+# as the datacenter document.
+#
+# There is deliberately no scope path here at all: `api::grants` gives a
+# registry document no scopes, so an operator holding `rw` on some prefix
+# cannot edit the grant file that gave it that prefix, nor the prefix that
+# declares it. Self-registration is refused by there being no way to express it.
+sub _registry_acl {
+    my ($rpcenv, $authuser) = @_;
+    return {
+        authid => $authuser,
+        read => 1,
+        write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
+        tags => [],
+    };
+}
+
 # -- helpers ------------------------------------------------------------
 
 # Calls a `PVE::RS::Meta::api_*` function, catching its "NNN: message" die
@@ -309,11 +332,11 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests datacenter namespaces grants)];
+        return [map { { subdir => $_ } } qw(version access guests datacenter prefixes grants schemas)];
     },
 });
 
-# -- version / access / namespaces / grants ---------------------------------
+# -- version / access / prefixes / grants ---------------------------------
 
 __PACKAGE__->register_method({
     name => 'version',
@@ -372,11 +395,19 @@ __PACKAGE__->register_method({
         . "'scopes' lists the prefix scopes the grant files give the caller "
         . "on it, with selectors already resolved against the guest's tags. Scopes "
         . "apply to guest documents only, never to the datacenter document. "
-        . "With neither parameter, 'read'/'write' describe the datacenter document. "
+        . "With no parameter at all, 'read'/'write' describe the datacenter document. "
         . "Used by the editor UI to decide what to offer and whether to enable Apply.",
     parameters => {
         additionalProperties => 0,
         properties => {
+            id => {
+                type => 'string',
+                optional => 1,
+                description => "The document to ask about, as an id: a vmid, "
+                    . "'datacenter', 'prefixes/<name>' or 'grants/<name>'. Prefer this "
+                    . "over 'vmid'/'dc', which predate registry documents and cannot "
+                    . "name one.",
+            },
             vmid => get_standard_option('pve-vmid', { optional => 1 }),
             dc => {
                 type => 'boolean',
@@ -399,37 +430,52 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        raise_param_exc({ vmid => "'vmid' and 'dc' are mutually exclusive" })
-            if defined($param->{vmid}) && $param->{dc};
+        my $given = grep { $_ } (defined($param->{id}), defined($param->{vmid}), $param->{dc});
+        raise_param_exc({ id => "'id', 'vmid' and 'dc' are mutually exclusive" }) if $given > 1;
 
-        if (defined(my $vmid = $param->{vmid})) {
-            _assert_guest_exists($vmid);
-            return _call(
-                \&PVE::RS::Meta::api_access, "$vmid", _guest_acl($rpcenv, $authuser, $vmid),
-            );
+        # One place that maps a document id to the ACL answers for that *kind* of
+        # document. The three endpoint families each knew their own mapping; this
+        # endpoint used to infer it from which parameter was set, which could not
+        # name a registry document at all -- so the editor asked about the
+        # datacenter document instead and got Sys.Audit for a file every
+        # authenticated user may read (docs/DESIGN.md §3.5).
+        my $id = $param->{id};
+        if (!defined($id)) {
+            $id = defined($param->{vmid}) ? "$param->{vmid}" : 'datacenter';
         }
 
+        if ($id =~ m{^(prefixes|grants)/}) {
+            return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
+        }
+        if ($id =~ m{^\d+$}) {
+            _assert_guest_exists($id);
+            return _call(
+                \&PVE::RS::Meta::api_access, $id, _guest_acl($rpcenv, $authuser, $id),
+            );
+        }
+        # 'datacenter' -- or anything else, which the id parser refuses with a 400
+        # rather than this endpoint growing a second opinion about what an id is.
         return _call(
-            \&PVE::RS::Meta::api_access, 'datacenter', _datacenter_acl($rpcenv, $authuser),
+            \&PVE::RS::Meta::api_access, $id, _datacenter_acl($rpcenv, $authuser),
         );
     },
 });
 
 __PACKAGE__->register_method({
-    name => 'namespaces',
-    path => 'namespaces',
+    name => 'prefixes',
+    path => 'prefixes',
     method => 'GET',
     permissions => {
-        description => "Readable by every authenticated user: a namespace declares "
+        description => "Readable by every authenticated user: a prefix declares "
             . "that a prefix exists and what shape it has, which is not sensitive "
             . "(docs/DESIGN.md §1) and is what the editor needs to render typed rows.",
         user => 'all',
     },
-    description => "Every namespace (docs/DESIGN.md §3.1): the files in "
-        . "/usr/share/pve-meta/namespaces and /etc/pve/meta.d/namespaces, with a cluster "
+    description => "Every prefix (docs/DESIGN.md §3.1): the files in "
+        . "/usr/share/pve-meta/prefixes and /etc/pve/meta.d/prefixes, with a cluster "
         . "file overriding the packaged one of the same name. The file name is the "
         . "prefix. Sorted most-specific first, which is the order that resolves which "
-        . "namespace governs a path -- longest prefix wins and schemas never merge. A "
+        . "prefix governs a path -- longest prefix wins and schemas never merge. A "
         . "malformed file is skipped with a warning and does not appear here.",
     parameters => {
         additionalProperties => 0,
@@ -442,7 +488,7 @@ __PACKAGE__->register_method({
         items => { type => 'object', additionalProperties => 1 },
     },
     code => sub {
-        return _call(\&PVE::RS::Meta::api_namespaces);
+        return _call(\&PVE::RS::Meta::api_prefixes);
     },
 });
 
@@ -459,7 +505,7 @@ __PACKAGE__->register_method({
     description => "Every grant (docs/DESIGN.md §3.2): the files in "
         . "/etc/pve/meta.d/grants. Cluster-only on purpose -- there is deliberately no "
         . "packaged grants directory, because an operator's own package may ship a "
-        . "namespace (a declaration) but must never ship its own grant. A malformed "
+        . "prefix (a declaration) but must never ship its own grant. A malformed "
         . "file is skipped with a warning and does not appear here.",
     parameters => {
         additionalProperties => 0,
@@ -474,6 +520,179 @@ __PACKAGE__->register_method({
         return _call(\&PVE::RS::Meta::api_grants);
     },
 });
+
+__PACKAGE__->register_method({
+    name => 'schemas',
+    path => 'schemas',
+    method => 'GET',
+    permissions => {
+        description => "Readable by every authenticated user: it is a description of a "
+            . "file format, the same one this package's own documentation carries.",
+        user => 'all',
+    },
+    description => "The two registry file formats as schemas (docs/DESIGN.md §3.6), "
+        . "keyed 'prefix' and 'grant', in the same PVE::JSONSchema dialect a "
+        . "prefix uses to describe a guest's subtree. The editor renders a "
+        . "prefix or grant document with these the way it renders a guest document "
+        . "with the prefixes that reach it. This is an affordance, not the "
+        . "validator: what is storable is decided by the parser on the way in.",
+    parameters => {
+        additionalProperties => 0,
+        properties => {},
+    },
+    returns => {
+        type => 'object',
+        additionalProperties => 1,
+    },
+    code => sub {
+        return _call(\&PVE::RS::Meta::api_schemas);
+    },
+});
+
+# -- registry documents ------------------------------------------------------
+
+# The file name, which for a prefix *is* its prefix -- so it is dotted when
+# the prefix is nested. The same shape `pve_meta_core::registry::is_valid_file_name`
+# accepts, which is what the Rust layer re-checks when it parses the id: this
+# pattern is the friendly 400, that check is the real one.
+my $REGISTRY_NAME_SCHEMA = {
+    type => 'string',
+    pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',
+    maxLength => 128,
+    description => "The file's name, without the '.yaml' suffix. For a prefix "
+        . "definition that name *is* the prefix (docs/DESIGN.md §3.1): the file "
+        . "'homelab.docker.yaml' declares 'homelab.docker'.",
+};
+
+# The six endpoints below are generated rather than written twice: a prefix
+# and a grant are the same document to everything but the parser that validates
+# what is written (`api::check_registry_shape`), and two copies of a read/write
+# pair is how this project has produced every wrong-result bug it has had.
+for my $kind (['prefixes', 'prefix'], ['grants', 'grant']) {
+    my ($dir, $one) = @$kind;
+    my $where = $one eq 'prefix'
+        ? "/etc/pve/meta.d/prefixes, overriding the packaged file of the same name in "
+          . "/usr/share/pve-meta/prefixes if there is one"
+        : "/etc/pve/meta.d/grants";
+
+    __PACKAGE__->register_method({
+        name => "get_$one",
+        path => "$dir/{name}",
+        method => 'GET',
+        permissions => {
+            description => "Readable by every authenticated user, exactly as the "
+                . "GET /meta/$dir listing is (docs/DESIGN.md §1).",
+            user => 'all',
+        },
+        description => "Gets one $one file as a document (or a view/prefix of it). "
+            . "Unlike the GET /meta/$dir listing, which returns what the loader "
+            . "parsed, this returns the file itself -- including a file the loader "
+            . "would skip, so a malformed one can be seen and repaired.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                format => $FORMAT_SCHEMA,
+            },
+        },
+        returns => $VIEW_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return $get_view->(
+                "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+            );
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "put_$one",
+        protected => 1,
+        path => "$dir/{name}",
+        method => 'PUT',
+        permissions => {
+            description => "Requires Sys.Modify on / (docs/DESIGN.md §3).",
+            user => 'all',
+        },
+        description => "Writes one $one file (or a view/prefix of it), in $where. "
+            . "The result must parse as a $one: a file the loader would skip is "
+            . "refused with a 400 rather than written, because a write that made the "
+            . "$one silently disappear would otherwise answer 200.",
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                data => $DATA_SCHEMA,
+                text => $TEXT_SCHEMA,
+                mode => $MODE_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+                dry_run => {
+                    type => 'boolean',
+                    optional => 1,
+                    default => 0,
+                    description => "Validate and diff without writing.",
+                },
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return _locked("$one-$param->{name}", sub {
+                return $put_view->(
+                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+                );
+            });
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "delete_$one",
+        protected => 1,
+        path => "$dir/{name}",
+        method => 'DELETE',
+        permissions => {
+            description => "Requires Sys.Modify on / for the view and every touched "
+                . "path, same as PUT.",
+            user => 'all',
+        },
+        description => "Removes one $one file, or the subtree at 'view'. "
+            . ($one eq 'prefix'
+                ? "A packaged prefix is never removed: deleting the cluster file "
+                  . "that overrode it reverts to the packaged one, which is then what "
+                  . "a following GET returns."
+                : "Grants are cluster-only, so this removes the file."),
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                name => $REGISTRY_NAME_SCHEMA,
+                view => $VIEW_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+
+            my $rpcenv = PVE::RPCEnvironment::get();
+            my $authuser = $rpcenv->get_user();
+
+            return _locked("$one-$param->{name}", sub {
+                return $delete_view->(
+                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
+                );
+            });
+        },
+    });
+}
 
 # -- guests -------------------------------------------------------------
 
@@ -518,7 +737,7 @@ __PACKAGE__->register_method({
         # opens `/etc/pve/.vmlist` or a guest config, so the two can no longer
         # disagree and guest-config parsing is not re-implemented in a second
         # language. `hostname` is the LXC name field, `name` the qemu one;
-        # `tags` resolves the grants' and namespaces' selectors (docs/DESIGN.md §3).
+        # `tags` resolves the grants' and prefixes' selectors (docs/DESIGN.md §3).
         my $props = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname tags)]) } || {};
         warn "pve-meta: could not read guest properties: $@" if $@;
 

@@ -92,7 +92,7 @@ accepts `yml`), `Display`, `FromStr`, `ALL`.
     strings (tested).
   * JSON: `serde_json::from_str`; comments and trailing commas not allowed.
 * `parse_raw(format, text)` is the same without the lint (crate-internal): the store's
-  tolerant read, the view payload parsers and the namespace/grant parsers all use it.
+  tolerant read, the view payload parsers and the prefix/grant parsers all use it.
 * `pub fn dump(format, doc: &Value) -> String` — canonical dump, always ends with a single
   `\n`, preserves key order:
   * YAML: block style, 2-space indent, no document markers (serde_yaml_ng defaults).
@@ -150,33 +150,33 @@ once the report names that subtree's path rather than every leaf under it, which
 makes the write check stricter (every reported path is an ancestor of what it stands
 for).
 
-## 7. Namespaces and grants (`registry.rs`)
+## 7. Prefixes and grants (`registry.rs`)
 
 Two concepts in two drop directories, both **outside** the documents, one file each,
 parsed strictly and independently (`docs/DESIGN.md` §3). Revision 6 split revision 5's
 single "operator registration" in two; nothing here carries the *operator* concept any
-more — this crate knows namespaces and grants (`docs/DESIGN.md` §12).
+more — this crate knows prefixes and grants (`docs/DESIGN.md` §12).
 
-`Namespace { prefix, description?, selector, schema? }`,
+`PrefixDef { prefix, description?, selector, schema? }`,
 `Grant { name, authid, description?, grants: Vec<GrantEntry> }`,
 `GrantEntry { prefix, mode, selector }`.
 
-**Namespaces — what a prefix is** (`docs/DESIGN.md` §3.1):
+**Prefixes — what a prefix is** (`docs/DESIGN.md` §3.1):
 
-* `NAMESPACE_PACKAGED_DIR = "/usr/share/pve-meta/namespaces"` — packaged defaults,
+* `PREFIX_PACKAGED_DIR = "/usr/share/pve-meta/prefixes"` — packaged defaults,
   dropped in by an operator's own `.deb`;
-* `NAMESPACE_CLUSTER_DIR = "/etc/pve/meta.d/namespaces"` — cluster-wide (pmxcfs),
+* `PREFIX_CLUSTER_DIR = "/etc/pve/meta.d/prefixes"` — cluster-wide (pmxcfs),
   **overriding the packaged file of the same name**;
-* `NAMESPACE_DIRS_ENV = "PVE_META_NAMESPACE_DIRS"` — a colon-separated override, lowest
+* `PREFIX_DIRS_ENV = "PVE_META_PREFIX_DIRS"` — a colon-separated override, lowest
   precedence first, for the tests and `test/basic.pl`.
 
 **The file name is the prefix** — there is no `prefix:` field to disagree with it. A
-prefix segment is `[A-Za-z0-9_@!-]+` and dots are only separators, so a namespace file
+prefix segment is `[A-Za-z0-9_@!-]+` and dots are only separators, so a prefix file
 name can never contain a slash, never start with a dot and never escape its directory.
-A namespace names **no principal**.
+A prefix names **no principal**.
 
 ```yaml
-# namespaces/traefik.yaml — declares the prefix `traefik`
+# prefixes/traefik.yaml — declares the prefix `traefik`
 description: Traefik dynamic configuration
 selector: { tag: traefik }   # or { all: true }
 schema:                      # optional, PVE::JSONSchema dialect, passed through
@@ -186,7 +186,7 @@ schema:                      # optional, PVE::JSONSchema dialect, passed through
 **Grants — who may touch a prefix** (`docs/DESIGN.md` §3.2):
 
 * `GRANT_CLUSTER_DIR = "/etc/pve/meta.d/grants"` — cluster only. **There is deliberately
-  no packaged grants directory**: an operator's `.deb` may ship a namespace (a
+  no packaged grants directory**: an operator's `.deb` may ship a prefix (a
   declaration) but must never ship its own grant, which would be self-registration, and
   dpkg cannot write into pmxcfs;
 * `GRANT_DIRS_ENV = "PVE_META_GRANT_DIRS"` — the same colon-separated override.
@@ -201,32 +201,32 @@ grants:
     selector: { all: true }    # or { tag: traefik }
 ```
 
-* `parse_namespace(name, text) -> Result<Namespace>` and
+* `parse_prefix(name, text) -> Result<PrefixDef>` and
   `parse_grant(name, text) -> Result<Grant>` — **strict**: `deny_unknown_fields`
   throughout, so neither file can express the other's job (a grant entry with a `schema`
-  and a namespace with an `authid` are both errors). A namespace's `name` must be a valid
+  and a prefix with an `authid` are both errors). A prefix's `name` must be a valid
   **non-root** prefix and must not contain a slash; a grant's `authid` must satisfy
   `is_authid` (`PVE::AccessControl`'s `$userid_or_token_regex` transliterated), each
   grant prefix must parse and be **non-empty** (whole-document access comes from PVE
   ACLs, never from a grant), `mode` is `ro`/`rw`, and `selector` is exactly one of
   `{all: true}` / `{tag: <name>}`. Room is left in the format for `{pool: <name>}`; it is
   deliberately not implemented, so it is currently an unknown field.
-* `load_namespaces(dirs) -> Vec<Namespace>` and `load_grants(dirs) -> Vec<Grant>` — read
+* `load_prefixes(dirs) -> Vec<PrefixDef>` and `load_grants(dirs) -> Vec<Grant>` — read
   `*.yaml` from each directory in order, later directories overriding earlier ones **by
   file name**. A missing directory is not an error. **A malformed file is skipped with a
   `warn!` and contributes nothing** — files are independent, so one operator's typo can
   never take another's grants or another's schema away. That independence is the whole
   reason this data left `datacenter.yaml`.
-* `load_namespaces` returns them **sorted longest-prefix-first** (ties by name), which is
+* `load_prefixes` returns them **sorted longest-prefix-first** (ties by name), which is
   the order `governing` relies on; `load_grants` returns them sorted by file name.
-* `namespace_dirs()` / `grant_dirs()` — the constants above, or the env override.
-  `load_namespaces_default()` / `load_grants_default()` are those composed with the
+* `prefix_dirs()` / `grant_dirs()` — the constants above, or the env override.
+  `load_prefixes_default()` / `load_grants_default()` are those composed with the
   matching loader.
-* `governing(namespaces, path, tags) -> Option<&Namespace>` — **most-specific wins;
-  schemas never merge** (`docs/DESIGN.md` §3.1). The governing namespace is the one with
+* `governing(prefixes, path, tags) -> Option<&PrefixDef>` — **most-specific wins;
+  schemas never merge** (`docs/DESIGN.md` §3.1). The governing prefix is the one with
   the longest prefix covering `path` among those whose selector matches; no other
   contributes to that path. Given the load order it is the first match.
-* `applicable(namespaces, tags) -> Vec<&Namespace>` — the namespaces reaching a guest
+* `applicable(prefixes, tags) -> Vec<&Prefix>` — the prefixes reaching a guest
   carrying `tags`, most-specific first.
 * `scopes_for(grants, authid, tags) -> Vec<Scope>` — the union of the entries of every
   grant file for that authid whose selector matches the guest's tags. **Grants accumulate
@@ -235,7 +235,7 @@ grants:
   `governing` — shape has one owner so it shadows, permission is a union so it adds, and
   the two rules cannot live on one object.
 * `Selector` serializes as it is written (`{all: true}` / `{tag: <name>}`), so
-  `GET /meta/namespaces` and `GET /meta/grants` hand the UI the same shape an
+  `GET /meta/prefixes` and `GET /meta/grants` hand the UI the same shape an
   administrator edits.
 
 Tag membership is a **selector pve-meta implements itself** — PVE has no tag ACL. Adding
@@ -352,7 +352,7 @@ boundary and must be unit-testable without `libperl-dev` and without a cluster.
 * `grants(grants, doc_id, acl) -> Grants` — the ACL answers plus, for a guest,
   `registry::scopes_for(grants, acl.authid, acl.tags)`. Empty scopes for the datacenter.
 * `version(store, detail)`, `access(grants, doc_id, acl)`, `grants_list(grants)`,
-  `namespaces_list(namespaces)`,
+  `prefixes_list(prefixes)`,
   `list_guests(store, grants, authid, guests, has)`,
   `get_document(store, grants, id, view, format, acl)`,
   `put_document(store, grants, id, view, format, payload, mode, digest, dry_run, acl)`,
@@ -469,14 +469,14 @@ scenarios:
   never emits one the same grant's `can_read` refuses; a list- or scalar-rooted document
   filters to nothing; `parse` does not lint the payload, and `parse_patch` requires an
   object and nothing else;
-* **registry**: a namespace's prefix is its file name, dotted and any depth; a file name
+* **registry**: a prefix definition's prefix is its file name, dotted and any depth; a file name
   that is not a valid prefix is refused; strict parsing on both kinds rejects an unknown
   field, a missing/ambiguous selector, a bad authid, an empty prefix and a bad mode; a
-  grant has no schema and a namespace has no authid; a cluster file overrides the
+  grant has no schema and a prefix has no authid; a cluster file overrides the
   packaged one of the same name wholesale while unrelated files survive; a malformed file
-  is skipped and costs no other file anything; namespaces load most-specific first and
+  is skipped and costs no other file anything; prefixes load most-specific first and
   `governing` takes the first match, respecting the selector; grants accumulate by
-  containment, which is the opposite of namespaces, with the selector still gating;
+  containment, which is the opposite of prefixes, with the selector still gating;
   `Selector` serializes as it is written; a missing directory is not an error for either
   kind; `is_authid` matches `PVE::AccessControl`'s shape;
 * **scopes**: a scope covers its own `p__` and nothing else's; `readable_prefixes`;

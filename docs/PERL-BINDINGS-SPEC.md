@@ -24,10 +24,10 @@ pve-meta-rs` (or an explicit `--workspace`) still targets it.
 
 The bindings crate is deliberately **thin**: it owns the `#[perlmod::package]` glue,
 `open_store()` (the `$PVE_META_ROOT` lookup, default `/etc/pve/meta`),
-`open_namespaces()` (`registry::load_namespaces_default()`) and `open_grants()`
+`open_prefixes()` (`registry::load_prefixes_default()`) and `open_grants()`
 (`registry::load_grants_default()`), and nothing else. Both drop directories are read per
 request — they are tiny, pmxcfs caches them, and a stale grant is a wrong answer about
-who may write. Every decision — the document model, the views, the namespace and grant
+who may write. Every decision — the document model, the views, the prefix and grant
 rules, and in particular the write authorization — lives in `pve-meta-core`, where it can
 be unit-tested on any machine.
 
@@ -57,7 +57,7 @@ The caller crosses as one hash:
 `read`/`write` are the PVE ACL answers for the document being addressed (`VM.Audit` /
 `VM.Config.Options` on `/vms/<vmid>`; `Sys.Audit` / `Sys.Modify` on `/` for the
 datacenter document) and `tags` are that guest's PVE tags, which resolve the grants' and
-namespaces' selectors (`DESIGN.md` §3). Rust computes the caller's scopes from it; Perl
+prefixes' selectors (`DESIGN.md` §3). Rust computes the caller's scopes from it; Perl
 never builds a grant list.
 
 ## Perl API (`#[perlmod::package(name = "PVE::RS::Meta", lib = "pve_meta_rs")]`)
@@ -177,10 +177,10 @@ authorization rules and `DESIGN.md` §5 for the endpoints). They die with
 
 * `api_version($detail)` → `{ token, changed }`, plus `documents` (`[{ id, digest }]`,
   sorted) when `$detail` is true.
-* `api_namespaces()` → every namespace, as native hashes, **sorted most-specific first**
+* `api_prefixes()` → every prefix, as native hashes, **sorted most-specific first**
   — the order that resolves which one governs a path (`DESIGN.md` §3.1):
   `[{ prefix, description?, selector, schema? }]`. The prefix is the file's name; a
-  namespace names no principal, so there is no `authid` on it.
+  prefix names no principal, so there is no `authid` on it.
 * `api_grants()` → every grant, as native hashes:
   `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]`. Read from
   `/etc/pve/meta.d/grants` only — there is deliberately no packaged grants directory
@@ -222,7 +222,7 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   `$(DESTDIR)$(PERL_INSTALLVENDORLIB)/…` (paths from `perl -MConfig`).
 * Perl-side test: `crates/pve-meta-perl/test/basic.pl`, run by `make check`. It uses the
   sed-patched loader trick so it loads `target/{debug,release}/libpve_meta_rs.so`
-  directly, sets `PVE_META_ROOT`, `PVE_META_NAMESPACE_DIRS` and `PVE_META_GRANT_DIRS` to
+  directly, sets `PVE_META_ROOT`, `PVE_META_PREFIX_DIRS` and `PVE_META_GRANT_DIRS` to
   temp dirs, and exercises every export: the three snapshot hooks and their `die`
   behaviour; that the removed exports really are gone; `gc` (a stale document plus both
   its snapshot copies,
@@ -232,13 +232,13 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   the perlmod truthiness conversion in all
   six shapes; the `api_*` contract with native hash arguments and native results
   (including that integers, floats, booleans and lists survive the boundary);
-  `api_namespaces` listing every namespace sorted longest-prefix-first (the file name
+  `api_prefixes` listing every prefix sorted longest-prefix-first (the file name
   being the prefix, and no `authid` on any of them) and `api_grants` listing a grant by
   its file name with every entry's prefix, mode and native-hash selector, and no schema;
   tag selectors on and off, on `access`, on reads and on writes; a read-only scope; the root
   view needing full write; an empty merge creating nothing; the one comment-key rule;
   scopes never reaching the datacenter document; a malformed file in *either* drop
-  directory being skipped without disturbing a valid one, including a namespace file
+  directory being skipped without disturbing a valid one, including a prefix file
   whose name is not a valid prefix; `api_list_guests` gating node/name/tags on
   `VM.Audit` and `has` filtering on visible data; the one lint for both a full and a
   scoped caller with no redaction; unrecoverable documents in all three of their causes

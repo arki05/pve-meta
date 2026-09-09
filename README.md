@@ -25,7 +25,7 @@ backup:
   retention: 7
 ```
 
-## Views, namespaces and grants
+## Views, prefixes and grants
 
 A caller reads or writes the document through a **view**: a key-path prefix, dotted, any
 depth, through maps only. A view of `backup` is the `backup` subtree, returned with the
@@ -33,14 +33,14 @@ prefix stripped. Views are also the unit of access.
 
 Two things live outside the documents, in two drop directories.
 
-**A namespace says what a prefix is** — `/etc/pve/meta.d/namespaces/<prefix>.yaml`, with
-packaged defaults under `/usr/share/pve-meta/namespaces/<prefix>.yaml` (a cluster file
+**A prefix says what a prefix is** — `/etc/pve/meta.d/prefixes/<prefix>.yaml`, with
+packaged defaults under `/usr/share/pve-meta/prefixes/<prefix>.yaml` (a cluster file
 overrides a packaged one of the same name). **The file name is the prefix**, so
 `traefik.yaml` declares `traefik` and `homelab.docker.yaml` declares `homelab.docker`;
 there is no `prefix:` field for the two to disagree about.
 
 ```yaml
-# /usr/share/pve-meta/namespaces/traefik.yaml
+# /usr/share/pve-meta/prefixes/traefik.yaml
 description: Traefik dynamic configuration
 selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
 schema:                      # optional, PVE::JSONSchema dialect for the subtree
@@ -50,10 +50,10 @@ schema:                      # optional, PVE::JSONSchema dialect for the subtree
       type: object
       properties:
         host: { type: string, description: Public host name }
-        port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+        port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A namespace names **no principal**. Declaring that a prefix exists and has a shape is
+A prefix names **no principal**. Declaring that a prefix exists and has a shape is
 useful with no operator, no token and no automation anywhere near it — a structured
 notes field with a schema is a complete use of this system.
 
@@ -68,7 +68,7 @@ grants:
 ```
 
 Grants are **cluster-only: there is deliberately no packaged grants directory.** An
-operator's own package may ship a namespace, because a schema is a declaration; it must
+operator's own package may ship a prefix, because a schema is a declaration; it must
 never ship its own grant, because that is self-registration. dpkg cannot write into
 pmxcfs, so "an operator declares what it expects, only an administrator grants it" is
 enforced by where the files live rather than by a rule someone has to remember.
@@ -83,7 +83,7 @@ enforced by where the files live rather than by a rule someone has to remember.
 * A grant on prefix `p` also covers the sibling comment key `p__` — the only
   comment-key access rule.
 
-**The two nest by opposite rules, deliberately.** Namespaces: *most-specific wins, and
+**The two nest by opposite rules, deliberately.** Prefixes: *most-specific wins, and
 schemas never merge* — with both `homelab` and `homelab.docker` declared,
 `homelab.docker.compose` is governed by the child alone and the parent's own
 `properties.docker` is shadowed, not combined. Grants: *containment, additive* — a grant
@@ -118,9 +118,11 @@ are `protected` and run in pvedaemon.
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's grants, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
-| GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
+| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
 | GET | `/meta/grants` | — | `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
+| GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/grants/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix/grant. `Sys.Modify` on `/` to write |
+| GET | `/meta/schemas` | — | `{ prefix, grant }` — the two registry file formats described as schemas, which is what lets the editor show a prefix file as a typed tree |
 
 PUT and DELETE 404 for a vmid absent from the vmlist; GET of such a vmid is 404 too.
 `data` is a JSON-encoded string parameter; grants and guest lists cross the Perl/Rust
@@ -132,15 +134,30 @@ boundary as native hashes/arrays, not JSON strings.
 ## The editor
 
 A **Metadata** tab appears on every LXC/QEMU guest's config panel and on the
-Datacenter panel: one tree of the document the caller can see. Rows are the union of
-the keys present and the keys any applicable grammar declares (an unset declared key
-renders greyed out, with its default, description and a "set" action). Columns: key,
-value (an inline editor by type), description (the row's own `k__` comment key) and
-access (every grant whose prefix covers the row, from `/meta/grants`)
-`/meta/namespaces` and `/meta/grants`). A row edit is a minimal `PUT ?view=<path>&mode=replace`; add is the
-same at a new path; delete is `DELETE ?view=<path>`. Editability is per row, from
-`/meta/access`. Monaco is the escape hatch: edit a subtree as YAML/JSON text, with a
-diff-confirmed apply.
+Datacenter panel.
+
+On a guest it is one tree of the document the caller can see. Rows are the union of the
+keys present and the keys the governing prefix definition declares; an unset declared key
+renders greyed with its default and a **Set to default** button, which is the only thing
+that ever writes one. Columns: key, value (an editor chosen by the value's shape — inline
+for a scalar, a text box for a string with newlines, Monaco for a map or an array of
+maps), description (the row's own `k__` comment key) and access (every grant whose prefix
+covers the row). A row whose value does not match its schema is marked amber in place.
+
+Edits are **staged**, not written one key at a time: the tree shows the document as it
+would be, a staged row renders like a pending PVE config change (the stored value, then
+the pending one beneath it in `darkorange`), and **Apply** sends the lot as one
+`PUT ?view=<narrowest covering path>&mode=replace`, diff-confirmed. That is what makes a
+change like "this prefix applies to a tag rather than to every guest" possible at all —
+dropping `all` and adding `tag` are each refused on their own, because a definition's
+selector is exactly one of the two. Editability is per row, from `/meta/access`.
+
+On the Datacenter panel it is three sub-tabs: **Document** (the same editor, on the
+datacenter document), **Prefixes** and **Grants** — two grids over `/meta/prefixes` and
+`/meta/grants`, with columns a tree could not show (which guests a prefix reaches,
+whether it carries a schema, and whether the file is a package's or yours on top of one).
+Editing a row opens that file in the same document editor, because a prefix definition is
+a document like any other.
 
 The tab is `ui-extjs/`: plain JavaScript, a native `Ext.tree.Panel` mounted through
 pve-ext's `script`+`xtype` manifest form, so session, CSRF, theme and i18n all come from
@@ -201,7 +218,7 @@ dpkg -i pve-meta_*.deb libpve-meta-rs-perl_*.deb
 
 Installing/configuring `pve-meta` runs its `postinst`: `pve-ext-patch apply
 pve-meta-lifecycle` (dpkg-diverts `PVE/AbstractConfig.pm`, applies the diff, gates on
-`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/{namespaces,grants}` when `/etc/pve`
+`perl -c` reporting `syntax OK`), creates `/etc/pve/meta.d/{prefixes,grants}` when `/etc/pve`
 is mounted, and restarts `pvedaemon`/`pveproxy`. The API module and the UI tabs need no
 action — pve-ext discovers
 the API module at process startup and re-reads page manifests on every `/ext/pages`
@@ -246,10 +263,10 @@ live node.
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, views, namespaces/grants/selectors, lint, api layer, store, gc — pure Rust |
+| `crates/pve-meta-core` | Document model, views, prefixes/grants/selectors, lint, api layer, store, gc — pure Rust |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
-| `namespaces/` | Packaged example namespaces (none required) |
+| `prefixes/` | Packaged example prefixes (none required) |
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/lifecycle/` | The one guest-lifecycle diff (snapshot/rollback/delete-snapshot) + `lifecycle.toml` manifest |

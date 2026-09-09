@@ -88,9 +88,14 @@ console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
+    'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
+    'PVE.meta.DocumentWindow',
+    'PVE.meta.NewRegistryWindow',
+    'PVE.meta.RegistryGrid',
+    'PVE.meta.DatacenterPanel',
 ]);
 
 console.log('\n--- covers / paths (shared fixture, mirrored in Rust) ---');
@@ -383,9 +388,9 @@ const panel = {
     dc: false,
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    // Two lists now, two rules (DESIGN section 3): namespaces decide shape, grants
+    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, grants
     // decide access.
-    namespaces: [
+    prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
     ],
@@ -407,25 +412,24 @@ const panel = {
     'addData',
     'addGrammar',
     'schemaKind',
-    'applicableNamespaces',
+    'applicablePrefixes',
     'applicableGrants',
-    'resolvedScopeApplies',
     'accessFor',
     'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
-const namespaces = panel.applicableNamespaces.call(panel);
-eq('applicable namespaces', namespaces.map((n) => n.prefix), ['traefik', 'netbird']);
+const prefixes = panel.applicablePrefixes.call(panel);
+eq('applicable prefixes', prefixes.map((n) => n.prefix), ['traefik', 'netbird']);
 const scopes = panel.applicableGrants.call(panel);
 eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
-namespaces.forEach((ns) =>
+prefixes.forEach((ns) =>
     // The 5-argument form buildTree actually uses -- the 3-argument one silently
     // disables pruning, so a test using it is not testing what the panel does.
-    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema, namespaces, ns) : null,
+    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema, prefixes, ns) : null,
 );
 
 const spec = root.children.traefik.children.spec.children;
@@ -442,7 +446,7 @@ eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
-panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA, namespaces, namespaces[0]);
+panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA, prefixes, prefixes[0]);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
 // Comment key becomes the sibling's Description, never a row of its own.
@@ -475,28 +479,31 @@ panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] 
 eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
 eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), false);
 
-console.log('\n--- S6: scope-only principal (no VM.Audit, so no tags) ---');
-// No `me.tags` (as a caller without VM.Audit gets from GET /meta/guests), but
-// GET /meta/access already resolved this caller's own tag-selector scope.
-const scopedPanel = Object.assign({}, panel);
-scopedPanel.tags = [];
-scopedPanel.access = { read: 0, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const scopedScopes = panel.applicableGrants.call(scopedPanel);
-// `netbird` is still applicable regardless of tags (its selector is `all: true`);
-// `traefik` is a `tag` selector that only resolves via GET /meta/access now.
-eq('resolved-grant applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
-    'netbird',
-    'traefik',
-]);
+console.log('\n--- S6: a guest that does not carry the tag ---');
+// A tag selector resolves against this guest's tags and nothing else. Holding a
+// `traefik` rw scope of our own must not drag another principal's tag-selected
+// grant onto a guest that is not tagged `traefik` -- the Access column would
+// then name a writer who cannot in fact write here.
+const untagged = Object.assign({}, panel);
+untagged.tags = [];
+untagged.access = { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
+const untaggedScopes = panel.applicableGrants.call(untagged);
+eq('a tag grant needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
 eq(
-    'access label still comes from the grant file',
-    panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
-    'traefik',
+    'no Access row for the prefix whose selector missed',
+    panel.accessFor.call(untagged, 'traefik.spec.host', untaggedScopes),
+    [],
+);
+// Same rule on the shape side: no tag, no declared rows from that prefix.
+eq(
+    'prefix applicability follows the same tags',
+    panel.applicablePrefixes.call(untagged).map((n) => n.prefix),
+    ['netbird'],
 );
 
 console.log('\n--- schema findings for the text editor ---');
 const L = ctx.PVE.meta.Lint;
-// Namespace objects, the same shape GET /meta/namespaces returns.
+// Prefix objects, the same shape GET /meta/prefixes returns.
 const GRAMMAR = L.applicable([
     {
         prefix: 'traefik',
@@ -538,7 +545,7 @@ eq('but 2 is', L.findings({ traefik: { spec: { enabled: 2 } } }, GRAMMAR).length
 eq('keys no grammar describes are left alone',
     L.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }, GRAMMAR), []);
 eq('a prefix with nothing under it contributes nothing', L.findings({}, GRAMMAR), []);
-eq('a namespace with no schema contributes nothing',
+eq('a prefix with no schema contributes nothing',
     L.applicable([{ prefix: 'netbird' }]), []);
 
 const YAML = [
@@ -598,7 +605,7 @@ eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
 eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
 
 console.log('\n--- nesting: most-specific wins, schemas never merge ---');
-// `homelab` and `homelab.docker` are both namespaces. The child governs its whole
+// `homelab` and `homelab.docker` are both prefixes. The child governs its whole
 // subtree; the parent's own `properties.docker` is shadowed, not combined
 // (DESIGN section 3.1). Before revision 6 both walked and their findings unioned.
 const NESTED = L.applicable([
@@ -626,7 +633,7 @@ eq('governing picks the child for the child subtree',
 eq('governing picks the parent elsewhere', U.governing('homelab.notes', NESTED).prefix, 'homelab');
 eq('governing picks the child for the boundary itself',
     U.governing('homelab.docker', NESTED).prefix, 'homelab.docker');
-eq('governing returns null off-namespace', U.governing('unrelated.x', NESTED), null);
+eq('governing returns null off-prefix', U.governing('unrelated.x', NESTED), null);
 
 // The parent declares `docker: string` and the document has a map there. That is a
 // finding only if the parent is allowed to reach into the child -- it is not.
@@ -643,7 +650,7 @@ eq('the parent lints its own keys',
     L.findings({ homelab: { notes: 7 } }, NESTED).map((f) => f.path),
     ['homelab.notes']);
 
-// Hovers resolve to the governing namespace rather than to whichever was collected
+// Hovers resolve to the governing prefix rather than to whichever was collected
 // last -- which used to depend on iteration order.
 const NESTED_IDX = L.schemaIndex(NESTED);
 eq('hover at the boundary comes from the child',
@@ -654,7 +661,7 @@ eq('hover elsewhere is the parent\'s', NESTED_IDX['homelab.notes'].type, 'string
 console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
 {
     const nsPanel = Object.assign({}, panel);
-    nsPanel.namespaces = [
+    nsPanel.prefixes = [
         {
             prefix: 'homelab.docker',
             selector: { all: true },
@@ -664,7 +671,7 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
             prefix: 'homelab',
             selector: { all: true },
             // The parent has an opinion about `docker` and must not get one: the child
-            // namespace governs that subtree entirely (DESIGN section 3.1).
+            // prefix governs that subtree entirely (DESIGN section 3.1).
             schema: {
                 type: 'object',
                 properties: {
@@ -674,7 +681,7 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
             },
         },
     ];
-    const nsList = nsPanel.applicableNamespaces.call(nsPanel);
+    const nsList = nsPanel.applicablePrefixes.call(nsPanel);
     const r = { key: '', path: '', children: {}, present: true, kind: 'map' };
     nsPanel.addData.call(nsPanel, r, { homelab: { docker: { compose: 'x' } } });
     // Exactly what buildTree does: no call-site guard any more, the walk prunes itself.
@@ -703,22 +710,22 @@ eq('an empty document is the empty map, not null', U.yamlLoad(''), {});
 
 console.log('\n--- governing uses containment, not the grant predicate ---');
 // `covers` aliases the sibling comment key `p__` -- that is a GRANT rule. Using it to
-// pick a governing namespace made `a` govern the whole `a__` namespace, where Rust's
+// pick a governing prefix made `a` govern the whole `a__` prefix, where Rust's
 // registry::governing (plain containment) says `a__`.
 eq('covers aliases the comment key (grant rule)', U.covers('a', 'a__'), true);
-eq('containsPath does not (namespace rule)', U.containsPath('a', 'a__'), false);
+eq('containsPath does not (prefix rule)', U.containsPath('a', 'a__'), false);
 eq('containsPath: the prefix itself', U.containsPath('a', 'a'), true);
 eq('containsPath: a child', U.containsPath('a', 'a.b'), true);
 eq('containsPath: not a name prefix', U.containsPath('a', 'ab'), false);
 {
     const two = U.bySpecificity([{ prefix: 'a' }, { prefix: 'a__' }]);
-    eq('a comment-key namespace governs itself, not its subject',
+    eq('a comment-key prefix governs itself, not its subject',
         U.governing('a__', two).prefix, 'a__');
 }
 
-console.log('\n--- nesting: a schema-less namespace still shadows ---');
+console.log('\n--- nesting: a schema-less prefix still shadows ---');
 {
-    // A namespace may declare a selector and no schema (the lab's `netbird` does).
+    // A prefix may declare a selector and no schema (the lab's `netbird` does).
     // It still governs its subtree -- so a parent's schema must not reach into it.
     const all = [
         { prefix: 'homelab.docker', selector: { all: true } },   // no schema
@@ -767,6 +774,386 @@ eq('sameDocument says no when only the key order changed (order is data)',
     U.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
 eq('sameDocument on unparseable text is not a match',
     U.sameDocument({}, 'a:\n  - [\n'), false);
+
+console.log('\n--- many documents in one panel ---');
+const D = ctx.PVE.meta.DeclareKeyWindow;
+// An id is an address: the path it is served at, for every kind of document.
+eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
+eq('the datacenter id', P.urlFor.call(P, 'datacenter'), '/meta/datacenter');
+eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
+eq('a grant id', P.urlFor.call(P, 'grants/scoped'), '/meta/grants/scoped');
+eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
+eq('kind of the datacenter', P.docKind.call(P, 'datacenter'), 'datacenter');
+eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
+eq('kind of a grant', P.docKind.call(P, 'grants/scoped'), 'grant');
+eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
+
+// Per-document digests. One shared field would have sent a prefix's digest with a
+// write to the datacenter, which is a 409 at best and the wrong document at worst.
+{
+    const panelM = Object.assign({}, panel, {
+        docState: { datacenter: { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
+    });
+    ['digestOf', 'dataOf', 'docOf'].forEach((m) => (panelM[m] = P[m]));
+    panelM.docId = 'datacenter';
+    eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
+    eq('and its own data', panelM.dataOf('datacenter'), { a: 1 });
+    eq('an unknown document has no digest', panelM.digestOf('grants/nope'), '');
+    eq('a row names its document', panelM.docOf({ data: { docId: 'prefixes/x' } }), 'prefixes/x');
+    eq('no row means the default one', panelM.docOf(null), 'datacenter');
+}
+
+// What describes each kind of document. The datacenter document gets nothing:
+// prefixes reach guest documents only (DESIGN §3.3).
+{
+    const META = { type: 'object', properties: { selector: { type: 'object' } } };
+    const panelG = Object.assign({}, panel, { dc: true, schemas: { prefix: META, grant: {} } });
+    ['grammarFor', 'docKind', 'applicablePrefixes'].forEach((m) => (panelG[m] = P[m]));
+    eq('a prefix document is described by the meta-schema',
+        panelG.grammarFor('prefixes/x').map((g) => g.prefix), ['']);
+    eq('... which is the schema served for its kind',
+        panelG.grammarFor('prefixes/x')[0].schema, META);
+    eq('the datacenter document is described by nothing', panelG.grammarFor('datacenter'), []);
+}
+
+// A root-prefix schema governs the whole document. It must not be pruned away: the
+// prune asks `governing`, which answers about prefixes, and '' is not one.
+{
+    const META = {
+        type: 'object',
+        properties: {
+            selector: { type: 'object', properties: { tag: { type: 'string' } } },
+            description: { type: 'string' },
+        },
+    };
+    const rooted = [{ prefix: '', schema: META }];
+    eq(
+        'the meta-schema lints the document it is rooted at',
+        L.findings({ description: 5, selector: { tag: 7 } }, rooted, rooted).map((f) => f.path + ': ' + f.message),
+        ['description: expected string', 'selector.tag: expected string'],
+    );
+    eq(
+        'and indexes it for hovers',
+        Object.keys(L.schemaIndex(rooted, rooted)).sort(),
+        ['', 'description', 'selector', 'selector.tag'],
+    );
+    // The same rows the tree would show, including a declared-but-unset one.
+    const panelR = Object.assign({}, panel, {
+        dc: true,
+        docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
+        schemas: { prefix: META },
+    });
+    ['grammarFor', 'docKind', 'documentEntries', 'addData', 'addGrammar', 'entry', 'schemaKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+        (m) => (panelR[m] = P[m]),
+    );
+    panelR.pending = [];
+    panelR.docId = 'prefixes/x';
+    const entries = panelR.documentEntries();
+    eq('a prefix document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
+    eq('what it holds is present', entries.children.selector.children.tag.present, true);
+    eq('what it does not hold is a declared-but-unset row', entries.children.description.present, false);
+}
+
+console.log('\n--- a marker has to survive collapsing the branch it is in ---');
+{
+    // The whole point: collapse `homelab` and the amber `port` goes with it, along
+    // with any sign that something is wrong. Every ancestor carries the count.
+    const rolled = U.rollUp({
+        'homelab.docker.port': 'must be at most 65535',
+        'homelab.owner': 'expected string',
+    });
+    eq('every ancestor answers for what is under it', Object.keys(rolled).sort(), [
+        'homelab',
+        'homelab.docker',
+    ]);
+    eq('the top of the branch counts both', rolled.homelab.count, 2);
+    eq('a nearer branch counts only its own', rolled['homelab.docker'].count, 1);
+    eq('and the tooltip names them', rolled['homelab.docker'].messages, [
+        'homelab.docker.port: must be at most 65535',
+    ]);
+    // A top-level finding has no ancestor to bubble to -- and must not invent one.
+    eq('a top-level finding bubbles nowhere', U.rollUp({ owner: 'expected string' }), {});
+    eq('nothing wrong, nothing to say', U.rollUp({}), {});
+
+    // The tooltip shows the first few, not a wall of text.
+    const many = {};
+    for (let i = 0; i < 7; i++) {
+        many['a.b.k' + i] = 'expected string';
+    }
+    const deep = U.rollUp(many);
+    eq('all of them are counted', deep.a.count, 7);
+    eq('but only the first few are quoted', deep.a.messages.length, 3);
+}
+
+console.log('\n--- staged edits: the change that had no legal single step ---');
+{
+    // The case that forced this: a prefix definition's selector is exactly one of
+    // `all` or `tag`, so `{all: true}` -> `{tag: web}` has NO valid intermediate.
+    // Dropping `all` first is refused by the server; adding `tag` first is refused;
+    // the row editor could only ever do one at a time. Reproduced on the lab.
+    const stored = { description: 'Home', selector: { all: true } };
+    const pending = [
+        { path: 'selector.all', op: 'delete' },
+        { path: 'selector.tag', op: 'set', value: 'web' },
+    ];
+    eq('both edits land in one planned document', U.applyPending(stored, pending), {
+        description: 'Home',
+        selector: { tag: 'web' },
+    });
+    // ... and go out as ONE write, at the narrowest view covering both.
+    eq('written as one view', U.writeView(pending), 'selector');
+    eq('the stored document is untouched until then', stored, {
+        description: 'Home',
+        selector: { all: true },
+    });
+
+    // A single row edit is still exactly the one-key write it always was.
+    eq('one set writes that key', U.writeView([{ path: 'a.b.c', op: 'set', value: 1 }]), 'a.b.c');
+    // A delete cannot be expressed by replacing the thing being deleted, so the
+    // write moves one level up and replaces the parent without the key.
+    eq('one delete writes its parent', U.writeView([{ path: 'a.b.c', op: 'delete' }]), 'a.b');
+    eq('a top-level delete writes the document', U.writeView([{ path: 'a', op: 'delete' }]), '');
+    eq('unrelated subtrees write the document', U.writeView([
+        { path: 'traefik.spec.host', op: 'set', value: 'x' },
+        { path: 'netbird.groups', op: 'set', value: [] },
+    ]), '');
+    eq('nothing staged, nothing to write', U.writeView([]), null);
+
+    // Deletes and sets applied in the order they were made.
+    eq('order is what was done', U.applyPending({ a: 1 }, [
+        { path: 'a', op: 'delete' },
+        { path: 'a', op: 'set', value: 2 },
+    ]), { a: 2 });
+    eq('a set then a delete leaves nothing', U.applyPending({}, [
+        { path: 'x.y', op: 'set', value: 1 },
+        { path: 'x.y', op: 'delete' },
+    ]), { x: {} });
+    // Intermediate maps are created for a new nested key.
+    eq('a new nested key builds its parents', U.applyPending({}, [
+        { path: 'schema.properties.port.type', op: 'set', value: 'integer' },
+    ]), { schema: { properties: { port: { type: 'integer' } } } });
+
+    // Keys are document data and no key is reserved: staging one named `__proto__`
+    // must set a key, not the prototype. (`entry()` guards the same way.)
+    const planned = U.applyPending({}, [{ path: '__proto__', op: 'set', value: 'oops' }]);
+    eq('a proto-named key is a key', Object.prototype.hasOwnProperty.call(planned, '__proto__'), true);
+    eq('and the prototype is untouched', {}.oops, undefined);
+    eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
+}
+
+console.log('\n--- the registry lists ---');
+{
+    // `statics:` in the shim is a plain object; Ext hoists it onto the class.
+    const G = ctx.PVE.meta.RegistryGrid.statics;
+    const rows = G.rowsFrom('prefixes', [
+        {
+            prefix: 'traefik',
+            description: 'Traefik dynamic configuration',
+            selector: { tag: 'traefik' },
+            schema: { type: 'object' },
+            origin: 'packaged',
+            overrides: false,
+        },
+        { prefix: 'netbird', selector: { all: true }, origin: 'cluster', overrides: false },
+        { prefix: 'homelab', selector: { all: true }, schema: {}, origin: 'cluster', overrides: true },
+    ]);
+    eq('a row is addressed by the document id it opens', rows.map((r) => r.id), [
+        'prefixes/traefik',
+        'prefixes/netbird',
+        'prefixes/homelab',
+    ]);
+    eq('the selector is the "applies to" column', rows.map((r) => r.selector), [
+        'tag: traefik',
+        'all guests',
+        'all guests',
+    ]);
+    // A column a tree could not show: a schema-less definition is a real thing
+    // (the lab's netbird), and looked identical to one with a schema.
+    eq('carrying a schema is a column', rows.map((r) => r.schema), ['yes', '', 'yes']);
+
+    // Three origin states, not two. The middle one is where Remove does not remove.
+    eq('a package\'s file', G.originText(rows[0]), 'packaged');
+    eq('an administrator\'s own', G.originText(rows[1]), 'cluster');
+    eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
+
+    const grants = G.rowsFrom('grants', [
+        {
+            name: 'scoped',
+            authid: 'svc@pve!t1',
+            grants: [
+                { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
+                { prefix: 'netbird', mode: 'ro', selector: { all: true } },
+            ],
+            origin: 'cluster',
+        },
+    ]);
+    eq('a grant row is addressed the same way', grants[0].id, 'grants/scoped');
+    eq(
+        'and says what it actually grants',
+        grants[0].summary,
+        'traefik (rw, tag: traefik), netbird (ro, all guests)',
+    );
+    // An older API returns neither field; the list must still render.
+    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('grants', [{ name: 'x' }])[0]), 'cluster');
+}
+
+console.log('\n--- creating a registry file: the least that parses ---');
+{
+    const N = ctx.PVE.meta.NewRegistryWindow;
+    const make = (kind, v) => N.contentFrom.call({ kind: kind }, v);
+    eq('a prefix with an "all" selector', make('prefixes', { selector: 'all' }), { selector: { all: true } });
+    eq('a prefix with a tag selector', make('prefixes', { selector: 'tag', tag: 'web' }), { selector: { tag: 'web' } });
+    eq(
+        'a description when there is one',
+        make('prefixes', { selector: 'all', description: 'Home' }),
+        { description: 'Home', selector: { all: true } },
+    );
+    // A grant is created granting nothing: it names a principal, and an
+    // administrator says what it may touch afterwards.
+    eq('a grant starts empty', make('grants', { authid: 'a@pve!t1' }), { authid: 'a@pve!t1', grants: [] });
+}
+
+console.log('\n--- reloading must not fold the tree up ---');
+{
+    // The key that survives a reload. A document row and a group row both live at the
+    // empty path, and the two group rows have no document at all, so keying on
+    // (docId, path) collided: collapsing `Prefixes` came back expanded on the next
+    // reload because `Grants` had won the shared key.
+    const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
+    const prefixes = { data: { docId: null, path: '', key: 'Prefixes' } };
+    const grants = { data: { docId: null, path: '', key: 'Grants' } };
+    const dcRoot = { data: { docId: 'datacenter', path: '', key: 'datacenter' } };
+    const nsRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
+    const same = { data: { docId: 'prefixes/homelab', path: 'selector', key: 'selector' } };
+    const other = { data: { docId: 'grants/scoped', path: 'selector', key: 'selector' } };
+    const keys = [prefixes, grants, dcRoot, nsRoot, same, other].map(key);
+    eq('every row has a key of its own', new Set(keys).size, keys.length);
+}
+
+console.log('\n--- the tree marks a row its schema refuses ---');
+{
+    // The text editor has squiggled these since revision 6; the tree, which is what
+    // people open, said nothing. Same rule, same function -- `grammarSplit` is shared
+    // by both callers so they cannot answer differently.
+    const SCHEMA = {
+        type: 'object',
+        properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
+    };
+    const panelF = Object.assign({}, panel, {
+        dc: false,
+        docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
+        prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
+        tags: [],
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+        (m) => (panelF[m] = P[m]),
+    );
+    panelF.pending = [];
+    panelF.docId = '201';
+    const found = panelF.findingsFor();
+    eq('the out-of-range row is marked', found['docker.port'], 'must be at most 65535');
+    eq('a row that fits is not', found['docker.host'], undefined);
+
+    // A registry document is linted by its meta-schema through the same call.
+    const panelR = Object.assign({}, panel, {
+        dc: true,
+        docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
+        schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+        (m) => (panelR[m] = P[m]),
+    );
+    panelR.pending = [];
+    panelR.docId = 'prefixes/x';
+    eq(
+        'a prefix file is marked against the meta-schema',
+        panelR.findingsFor().description,
+        'expected string',
+    );
+    // The datacenter document has no schema at all, so it can never be marked.
+    panelR.docState.datacenter = { digest: 'd', data: { anything: 5 } };
+    panelR.docId = 'datacenter';
+    eq('the datacenter document is never marked', panelR.findingsFor(), {});
+}
+
+console.log('\n--- declaring one key of a prefix schema ---');
+eq('the type is always written', D.schemaFrom({ type: 'string' }), { type: 'string' });
+eq(
+    'every field the editor consumes',
+    D.schemaFrom({
+        type: 'integer',
+        description: 'How many',
+        default: '3',
+        minimum: '1',
+        maximum: '9',
+    }),
+    { type: 'integer', description: 'How many', default: 3, minimum: 1, maximum: 9 },
+);
+// There is no Optional field, and a stray one is not written: every key of a guest
+// document is optional, so `optional` would be a claim nothing reads or enforces.
+eq('optional is never declared', D.schemaFrom({ type: 'string', optional: true }), { type: 'string' });
+eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'always, no ,unless-stopped' }),
+    { type: 'string', enum: ['always', 'no', 'unless-stopped'] });
+// A range on a string, or a format on a number, would be a declaration nothing reads.
+eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
+eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
+eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });
+// An empty field is left out entirely: a schema full of nulls describes nothing, and
+// the server's lint refuses null values anyway.
+eq('empty fields are omitted', D.schemaFrom({ type: 'string', description: '', default: '', enum: '' }), { type: 'string' });
+// A boolean default comes from a list, not a text box: `parseValue` reads truth the
+// way the row editor's checkbox writes it, so "True" or "yes" typed into a field would
+// have been stored as `false` -- the opposite of what was meant, in a cluster-wide file.
+eq('a boolean default comes from the list', D.schemaFrom({ type: 'boolean', defaultBool: 'true' }), { type: 'boolean', default: true });
+eq('... and "false" means false', D.schemaFrom({ type: 'boolean', defaultBool: 'false' }), { type: 'boolean', default: false });
+eq('... an unset one is left out', D.schemaFrom({ type: 'boolean', defaultBool: '' }), { type: 'boolean' });
+eq(
+    'a boolean never reads the text field',
+    D.schemaFrom({ type: 'boolean', default: 'yes', defaultBool: '' }),
+    { type: 'boolean' },
+);
+// A map has no default the editor would ever read: `addGrammar` stops at an object and
+// walks into it. Writing one would be a declaration nothing consumes -- and a string.
+eq('a map takes no default', D.schemaFrom({ type: 'object', default: '{}' }), { type: 'object' });
+eq('an array default still parses as a list', D.schemaFrom({ type: 'array', default: 'a,b' }), { type: 'array', default: ['a', 'b'] });
+
+console.log('\n--- the editor follows the value\'s shape, not a declaration ---');
+// A map is nested YAML: Monaco, not a one-line field. This is the case that had no
+// editor at all -- Edit was disabled, and double-click and Enter both bailed out.
+eq('a map is edited as text', U.editorKind({ kind: 'map' }), 'text');
+// An array of scalars reads and edits fine on one line; an array of maps does not.
+eq('an array of scalars stays inline', U.editorKind({ kind: 'array', rawValue: ['lan', 'wan'] }), 'inline');
+eq('an array of maps is text', U.editorKind({ kind: 'array', rawValue: [{ a: 1 }] }), 'text');
+eq('a scalar is inline', U.editorKind({ kind: 'string', rawValue: 'ct200.example' }), 'inline');
+eq('a number is inline', U.editorKind({ kind: 'number', rawValue: 8080 }), 'inline');
+// A block string is a real leaf (an ssh key, a note) and needs a real editor.
+eq(
+    'a string with newlines gets a textarea',
+    U.editorKind({ kind: 'string', rawValue: 'services:\n  web:\n    image: nginx\n' }),
+    'multiline',
+);
+// ... and a declared-but-unset one has no newline to detect, which is the only thing
+// the `multiline` schema extension exists for.
+eq('a declared multiline row, still unset', U.editorKind({ kind: 'string', multiline: 1 }), 'multiline');
+eq('no row, no editor', U.editorKind(null), 'none');
+
+// The Value column summarises; the row's own valueText must stay exact, because that
+// is what the editor opens on.
+eq('one line is shown as it is', U.previewText('nginx'), 'nginx');
+eq('a block shows its first line and the rest', U.previewText('a\nb\nc\n'), 'a (+2 lines)');
+eq('a trailing newline is not a line', U.previewText('a\n'), 'a');
+eq('an empty value is empty', U.previewText(undefined), '');
+
+// A declared `multiline` reaches the row through the same path as `format`.
+{
+    const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    const ns = [{ prefix: 'notes', selector: { all: true }, schema: {
+        type: 'object',
+        properties: { body: { type: 'string', multiline: 1, description: 'Free text' } },
+    } }];
+    panel.addGrammar.call(panel, root, 'notes', ns[0].schema, ns, ns[0]);
+    eq('multiline reaches the row', root.children.notes.children.body.multiline, true);
+}
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document

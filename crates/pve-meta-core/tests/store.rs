@@ -3,34 +3,63 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
-use pve_meta_core::store::{DocId, MetaStore, RollbackOutcome, MAX_READ_BYTES};
+use pve_meta_core::store::{DocId, MetaStore, RegistryKind, RollbackOutcome, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+/// A store rooted in a fresh temp directory, with its **own** registry
+/// directories under `<root>/registry/` rather than the real
+/// `/usr/share/pve-meta` and `/etc/pve/meta.d` that `MetaStore::new` would
+/// resolve. Without that a run of this suite on an actual PVE node would read
+/// the live cluster's prefixes (and, worse, write to them).
+///
+/// They are plain subdirectories of the root on purpose: the root walks skip
+/// anything that is not a file, so their presence changes nothing the other
+/// tests observe.
 fn store() -> (tempfile::TempDir, MetaStore) {
     let dir = tempdir().unwrap();
-    let store = MetaStore::new(dir.path());
+    let store = MetaStore::with_registry_dirs(
+        dir.path(),
+        vec![packaged_prefix_dir(dir.path()), cluster_prefix_dir(dir.path())],
+        vec![cluster_grant_dir(dir.path())],
+    );
     (dir, store)
+}
+
+fn packaged_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("registry/prefixes-packaged")
+}
+
+fn cluster_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("registry/prefixes-cluster")
+}
+
+fn cluster_grant_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("registry/grants")
+}
+
+fn prefix(name: &str) -> DocId {
+    DocId::Registry(RegistryKind::PrefixDef, name.to_string())
 }
 
 #[test]
 fn read_missing_is_not_found() {
     let (_dir, store) = store();
-    let err = store.read(DocId::Guest(100)).unwrap_err();
+    let err = store.read(&DocId::Guest(100)).unwrap_err();
     assert!(matches!(err, Error::NotFound(DocId::Guest(100))));
 }
 
 #[test]
 fn put_raw_creates_and_replaces_and_diffs() {
     let (_dir, store) = store();
-    let result = store.put_raw(DocId::Guest(100), "a: 1\nb: 2\n", None).unwrap();
+    let result = store.put_raw(&DocId::Guest(100), "a: 1\nb: 2\n", None).unwrap();
     assert_eq!(result.document.value, json!({"a": 1, "b": 2}));
     assert!(result.document.path.ends_with("100.yaml"));
     // diff against an empty starting document
     assert_eq!(result.touched.len(), 2);
 
     let result2 = store
-        .put_raw(DocId::Guest(100), "a: 10\nc: 3\n", Some(&result.document.digest))
+        .put_raw(&DocId::Guest(100), "a: 10\nc: 3\n", Some(&result.document.digest))
         .unwrap();
     assert_eq!(result2.document.value, json!({"a": 10, "c": 3}));
     let mut touched: Vec<String> = result2.touched.iter().map(|t| t.path.to_string()).collect();
@@ -41,9 +70,9 @@ fn put_raw_creates_and_replaces_and_diffs() {
 #[test]
 fn put_raw_digest_mismatch() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let err = store
-        .put_raw(DocId::Guest(100), "a: 2\n", Some("nope"))
+        .put_raw(&DocId::Guest(100), "a: 2\n", Some("nope"))
         .unwrap_err();
     assert!(matches!(err, Error::DigestMismatch { .. }));
 }
@@ -53,12 +82,12 @@ fn put_raw_empty_digest_matches_a_missing_document() {
     // `GET` reports digest "" for a non-existent document, so
     // the documented GET-then-PUT-with-digest create flow must work.
     let (_dir, store) = store();
-    let result = store.put_raw(DocId::Guest(100), "a: 1\n", Some("")).unwrap();
+    let result = store.put_raw(&DocId::Guest(100), "a: 1\n", Some("")).unwrap();
     assert_eq!(result.document.value, json!({"a": 1}));
 
     // Once it exists, "" no longer matches.
     let err = store
-        .put_raw(DocId::Guest(100), "a: 2\n", Some(""))
+        .put_raw(&DocId::Guest(100), "a: 2\n", Some(""))
         .unwrap_err();
     match err {
         Error::DigestMismatch { expected, actual } => {
@@ -73,7 +102,7 @@ fn put_raw_empty_digest_matches_a_missing_document() {
 fn put_raw_non_empty_digest_against_a_missing_document_is_a_mismatch() {
     let (_dir, store) = store();
     let err = store
-        .put_raw(DocId::Guest(100), "a: 1\n", Some("deadbeef"))
+        .put_raw(&DocId::Guest(100), "a: 1\n", Some("deadbeef"))
         .unwrap_err();
     match err {
         Error::DigestMismatch { expected, actual } => {
@@ -88,25 +117,25 @@ fn put_raw_non_empty_digest_against_a_missing_document_is_a_mismatch() {
 fn put_raw_rejects_invalid_yaml_and_invalid_documents() {
     let (_dir, store) = store();
     assert!(matches!(
-        store.put_raw(DocId::Guest(100), "a: [\n", None),
+        store.put_raw(&DocId::Guest(100), "a: [\n", None),
         Err(Error::Parse { .. })
     ));
     assert!(matches!(
-        store.put_raw(DocId::Guest(100), "a: ~\n", None),
+        store.put_raw(&DocId::Guest(100), "a: ~\n", None),
         Err(Error::Lint(_))
     ));
     assert!(matches!(
-        store.put_raw(DocId::Guest(100), "- 1\n- 2\n", None),
+        store.put_raw(&DocId::Guest(100), "- 1\n- 2\n", None),
         Err(Error::Lint(_))
     ));
     // Nothing was written.
-    assert!(store.locate(DocId::Guest(100)).unwrap().is_none());
+    assert!(store.locate(&DocId::Guest(100)).unwrap().is_none());
 }
 
 #[test]
 fn put_raw_normalizes_the_trailing_newline_and_digest_matches_the_file() {
     let (_dir, store) = store();
-    let r = store.put_raw(DocId::Guest(100), "a: 1", None).unwrap();
+    let r = store.put_raw(&DocId::Guest(100), "a: 1", None).unwrap();
     assert_eq!(r.document.raw, "a: 1\n");
     let on_disk = std::fs::read(&r.document.path).unwrap();
     assert_eq!(digest(&on_disk), r.document.digest);
@@ -115,9 +144,9 @@ fn put_raw_normalizes_the_trailing_newline_and_digest_matches_the_file() {
 #[test]
 fn delete_removes_document() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.delete(DocId::Guest(100)).unwrap();
-    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.delete(&DocId::Guest(100)).unwrap();
+    assert!(matches!(store.read(&DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
 }
 
 #[test]
@@ -127,10 +156,10 @@ fn delete_is_idempotent_and_says_whether_it_removed_anything() {
     // request satisfied. The old `locate`-then-remove pair turned the loser
     // of that race into an `Error::Io`, which the API layer maps to 500.
     let (_dir, store) = store();
-    assert!(!store.delete(DocId::Guest(100)).unwrap());
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    assert!(store.delete(DocId::Guest(100)).unwrap());
-    assert!(!store.delete(DocId::Guest(100)).unwrap());
+    assert!(!store.delete(&DocId::Guest(100)).unwrap());
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    assert!(store.delete(&DocId::Guest(100)).unwrap());
+    assert!(!store.delete(&DocId::Guest(100)).unwrap());
     assert!(!store.delete_snapshot(100, "nope").unwrap());
 }
 
@@ -143,12 +172,12 @@ fn a_file_that_vanishes_between_syscalls_is_not_found_not_an_io_error() {
     // NotFound rather than propagating `io::ErrorKind::NotFound` as
     // `Error::Io`.
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     std::fs::remove_file(dir.path().join("100.yaml")).unwrap();
 
-    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
-    assert_eq!(store.digest_of(DocId::Guest(100)).unwrap(), None);
-    assert!(store.check_precondition(DocId::Guest(100), Some("")).is_ok());
+    assert!(matches!(store.read(&DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    assert_eq!(store.digest_of(&DocId::Guest(100)).unwrap(), None);
+    assert!(store.check_precondition(&DocId::Guest(100), Some("")).is_ok());
     assert!(!store.snapshot(100, "s").unwrap());
     assert_eq!(store.purge(100).unwrap(), 0);
     assert!(store.version().is_ok());
@@ -160,7 +189,7 @@ fn version_skips_a_file_that_disappears_under_the_walk() {
     // it before the walk gets to its `stat`. A 5 s poll must not 500 for it.
     let (dir, store) = store();
     for vmid in 100..140u32 {
-        store.put_raw(DocId::Guest(vmid), "a: 1\n", None).unwrap();
+        store.put_raw(&DocId::Guest(vmid), "a: 1\n", None).unwrap();
     }
     let deleter = {
         let root = dir.path().to_path_buf();
@@ -184,7 +213,7 @@ fn version_does_not_read_a_file_above_the_read_cap() {
     // by every open UI, forever. Its identity becomes a surrogate over
     // (len, mtime) -- which still moves when the file does.
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let path = dir.path().join("999500.yaml");
     std::fs::write(&path, format!("a: \"{}\"\n", "x".repeat(MAX_READ_BYTES as usize))).unwrap();
 
@@ -193,11 +222,11 @@ fn version_does_not_read_a_file_above_the_read_cap() {
 
     // `digest_of` answers for it without reading it, and it is the same
     // string the compare-and-swap precondition compares against.
-    let dig = store.digest_of(DocId::Guest(999500)).unwrap().unwrap();
+    let dig = store.digest_of(&DocId::Guest(999500)).unwrap().unwrap();
     assert_eq!(dig.len(), 64);
-    assert!(store.check_precondition(DocId::Guest(999500), Some(&dig)).is_ok());
+    assert!(store.check_precondition(&DocId::Guest(999500), Some(&dig)).is_ok());
     assert!(matches!(
-        store.check_precondition(DocId::Guest(999500), Some("deadbeef")),
+        store.check_precondition(&DocId::Guest(999500), Some("deadbeef")),
         Err(Error::DigestMismatch { .. })
     ));
 
@@ -211,9 +240,9 @@ fn delete_leaves_snapshots_alone() {
     // `DELETE /meta/guests/{vmid}` has no concept of snapshots, so `delete`
     // must never cascade into them. Only `purge` (the GC) does.
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
-    store.delete(DocId::Guest(100)).unwrap();
+    store.delete(&DocId::Guest(100)).unwrap();
     assert_eq!(store.list_snapshots(100).unwrap(), vec!["snapA".to_string()]);
     assert!(dir.path().join("100.snapA.yaml").exists());
 }
@@ -221,11 +250,11 @@ fn delete_leaves_snapshots_alone() {
 #[test]
 fn purge_removes_the_document_and_every_snapshot() {
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
     store.snapshot(100, "snapB").unwrap();
     assert_eq!(store.purge(100).unwrap(), 3);
-    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    assert!(matches!(store.read(&DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
     assert!(store.list_snapshots(100).unwrap().is_empty());
     assert!(!dir.path().join("100.snapA.yaml").exists());
     assert!(!dir.path().join("100.snapB.yaml").exists());
@@ -234,9 +263,9 @@ fn purge_removes_the_document_and_every_snapshot() {
 #[test]
 fn purge_is_idempotent_and_cleans_left_behind_snapshots() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "leftover").unwrap();
-    store.delete(DocId::Guest(100)).unwrap();
+    store.delete(&DocId::Guest(100)).unwrap();
     // No live document, but a snapshot survives the API delete.
     assert_eq!(store.purge(100).unwrap(), 1);
     assert!(store.list_snapshots(100).unwrap().is_empty());
@@ -249,17 +278,17 @@ fn api_delete_then_rollback_does_not_lose_snapshot_metadata() {
     // snapshot copies, after which `on_rollback` read "no snapshot" as
     // "there was no metadata" and deleted the freshly rewritten document.
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "traefik:\n  host: a\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "traefik:\n  host: a\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
 
     // A user empties the document through the API...
-    store.delete(DocId::Guest(100)).unwrap();
+    store.delete(&DocId::Guest(100)).unwrap();
     // ... then writes new metadata ...
-    store.put_raw(DocId::Guest(100), "traefik:\n  host: b\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "traefik:\n  host: b\n", None).unwrap();
     // ... then rolls the guest back to snapA.
     assert_eq!(store.rollback(100, "snapA").unwrap(), RollbackOutcome::Restored);
     assert_eq!(
-        store.read(DocId::Guest(100)).unwrap().value,
+        store.read(&DocId::Guest(100)).unwrap().value,
         json!({"traefik": {"host": "a"}})
     );
 }
@@ -270,12 +299,12 @@ fn snapshot_rollback_delete_and_list() {
     // snapshot with no document is a no-op
     assert!(!store.snapshot(100, "none").unwrap());
 
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     assert!(store.snapshot(100, "v1").unwrap());
     assert_eq!(store.list_snapshots(100).unwrap(), vec!["v1".to_string()]);
 
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     assert!(store.snapshot(100, "v2").unwrap());
     assert_eq!(
         store.list_snapshots(100).unwrap(),
@@ -285,7 +314,7 @@ fn snapshot_rollback_delete_and_list() {
     // rollback restores content
     let outcome = store.rollback(100, "v1").unwrap();
     assert_eq!(outcome, RollbackOutcome::Restored);
-    assert_eq!(store.read(DocId::Guest(100)).unwrap().value, json!({"a": 1}));
+    assert_eq!(store.read(&DocId::Guest(100)).unwrap().value, json!({"a": 1}));
 
     store.delete_snapshot(100, "v2").unwrap();
     assert_eq!(store.list_snapshots(100).unwrap(), vec!["v1".to_string()]);
@@ -297,22 +326,22 @@ fn snapshot_rollback_delete_and_list() {
 #[test]
 fn snapshot_re_snapshot_overwrites() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.snapshot(100, "v1").unwrap();
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     store.snapshot(100, "v1").unwrap();
     store.rollback(100, "v1").unwrap();
-    assert_eq!(store.read(DocId::Guest(100)).unwrap().value, json!({"a": 2}));
+    assert_eq!(store.read(&DocId::Guest(100)).unwrap().value, json!({"a": 2}));
 }
 
 #[test]
 fn rollback_without_snapshot_but_with_live_doc_removes_it() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let outcome = store.rollback(100, "never-existed").unwrap();
     assert_eq!(outcome, RollbackOutcome::RemovedNoSnapshot);
-    assert!(matches!(store.read(DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
+    assert!(matches!(store.read(&DocId::Guest(100)).unwrap_err(), Error::NotFound(_)));
 }
 
 #[test]
@@ -332,9 +361,9 @@ fn rollback_rejects_invalid_snapshot_name() {
 #[test]
 fn list_snapshots_ignores_documents_temp_files_and_other_guests() {
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(DocId::Guest(1000), "a: 1\n", None).unwrap();
-    store.put_raw(DocId::Datacenter, "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(1000), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Datacenter, "a: 1\n", None).unwrap();
     store.snapshot(100, "before").unwrap();
     std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
     std::fs::write(dir.path().join("100.bad name.yaml"), "a: 1\n").unwrap();
@@ -346,9 +375,9 @@ fn list_snapshots_ignores_documents_temp_files_and_other_guests() {
 #[test]
 fn write_atomic_leaves_no_temp_files_behind() {
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     let leftovers: Vec<String> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -362,19 +391,19 @@ fn version_lists_documents_with_their_digests_and_never_snapshots() {
     let (_dir, store) = store();
     assert!(store.version().unwrap().documents.is_empty());
 
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(DocId::Datacenter, "b: 2\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Datacenter, "b: 2\n", None).unwrap();
     // A snapshot copy moves the token but is not a document: nothing addresses
     // it through the API, so a caller diffing the list has nothing to do about it.
     store.snapshot(100, "before").unwrap();
 
     let v = store.version().unwrap();
-    let ids: Vec<DocId> = v.documents.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<DocId> = v.documents.iter().map(|(id, _)| id.clone()).collect();
     assert_eq!(ids, vec![DocId::Guest(100), DocId::Datacenter]);
 
     // Each digest is that document's own, matching what a read reports.
     for (id, digest) in &v.documents {
-        assert_eq!(*digest, store.read(*id).unwrap().digest);
+        assert_eq!(*digest, store.read(id).unwrap().digest);
     }
 
     let before = v.token.clone();
@@ -389,18 +418,18 @@ fn version_token_changes_on_write_not_on_read() {
     let (_dir, store) = store();
     let v0 = store.version().unwrap();
 
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
     assert_ne!(v0.token, v1.token);
 
     // reading doesn't change the version
-    let _ = store.read(DocId::Guest(100)).unwrap();
+    let _ = store.read(&DocId::Guest(100)).unwrap();
     let v1_again = store.version().unwrap();
     assert_eq!(v1.token, v1_again.token);
 
     // another write changes it again
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     let v2 = store.version().unwrap();
     assert_ne!(v1.token, v2.token);
 }
@@ -411,10 +440,10 @@ fn version_distinguishes_same_length_same_second_writes() {
     // one pmxcfs mtime tick apart, so the token is always computed from the
     // files' actual content.
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
     let v2 = store.version().unwrap();
     assert_ne!(v1.token, v2.token, "equal-length same-second writes must differ");
 }
@@ -424,7 +453,7 @@ fn version_reflects_a_change_made_behind_the_stores_back() {
     // No cache means a second `MetaStore` over the same root, or an
     // out-of-band write, is always seen.
     let (dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
     std::fs::write(dir.path().join("100.yaml"), "a: 2\n").unwrap();
     assert_ne!(v1.token, store.version().unwrap().token);
@@ -436,12 +465,12 @@ fn version_reflects_a_change_made_behind_the_stores_back() {
 #[test]
 fn version_token_returns_to_an_earlier_value_when_content_does() {
     let (_dir, store) = store();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let v1 = store.version().unwrap();
-    let d = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
-    let d2 = store.read(DocId::Guest(100)).unwrap().digest;
-    store.put_raw(DocId::Guest(100), "a: 1\n", Some(&d2)).unwrap();
+    let d = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 2\n", Some(&d)).unwrap();
+    let d2 = store.read(&DocId::Guest(100)).unwrap().digest;
+    store.put_raw(&DocId::Guest(100), "a: 1\n", Some(&d2)).unwrap();
     assert_eq!(v1.token, store.version().unwrap().token);
 }
 
@@ -455,7 +484,7 @@ fn reads_never_lint_but_writes_still_do() {
     let broken = "bad key: 1\nempty:\nlist:\n- ~\n";
     std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
 
-    let doc = store.read(DocId::Datacenter).unwrap();
+    let doc = store.read(&DocId::Datacenter).unwrap();
     assert_eq!(doc.raw, broken);
     assert_eq!(doc.value["bad key"], json!(1));
     assert_eq!(doc.value["empty"], Value::Null);
@@ -463,21 +492,21 @@ fn reads_never_lint_but_writes_still_do() {
     // The repair goes through, even though the *old* content would never
     // pass lint (it used to be re-parsed strictly, just to compute a diff).
     let good = "ok: 1\n";
-    let result = store.put_raw(DocId::Datacenter, good, Some(&doc.digest)).unwrap();
+    let result = store.put_raw(&DocId::Datacenter, good, Some(&doc.digest)).unwrap();
     assert_eq!(result.document.raw, good);
-    assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+    assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
 
     // ... and the write-time gate is untouched.
     assert!(matches!(
-        store.put_raw(DocId::Datacenter, "bad key: 1\n", None),
+        store.put_raw(&DocId::Datacenter, "bad key: 1\n", None),
         Err(Error::Lint(_))
     ));
-    assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+    assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
 
     // A syntax error is reported *per document*, not raised: see
     // `a_syntax_error_is_reported_per_document_and_never_blocks_a_repair`.
     std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
-    let unparseable = store.read(DocId::Guest(100)).unwrap();
+    let unparseable = store.read(&DocId::Guest(100)).unwrap();
     assert!(unparseable.parse_error.is_some());
     assert_eq!(unparseable.value, json!({}));
 }
@@ -500,7 +529,7 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
         let (dir, store) = store();
         std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
 
-        let doc = store.read(DocId::Datacenter).unwrap();
+        let doc = store.read(&DocId::Datacenter).unwrap();
         assert!(doc.parse_error.is_some(), "{broken:?} parsed after all");
         // The empty document, the real bytes, the real digest.
         assert_eq!(doc.value, json!({}));
@@ -512,14 +541,14 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
         // thing standing between the file and its own fix.
         let good = "ok: 1\n";
         store
-            .put_raw(DocId::Datacenter, good, Some(&doc.digest))
+            .put_raw(&DocId::Datacenter, good, Some(&doc.digest))
             .unwrap_or_else(|e| panic!("{broken:?}: repair refused: {e}"));
-        assert_eq!(store.read(DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+        assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
 
         // A stale digest is still a 409-shaped refusal, not a free pass.
         std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
         assert!(matches!(
-            store.put_raw(DocId::Datacenter, good, Some("deadbeef")),
+            store.put_raw(&DocId::Datacenter, good, Some("deadbeef")),
             Err(Error::DigestMismatch { .. })
         ));
     }
@@ -535,7 +564,7 @@ fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
     let big = format!("a: \"{}\"\n", "x".repeat(MAX_READ_BYTES as usize));
     std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
 
-    match store.read(DocId::Guest(100)).unwrap_err() {
+    match store.read(&DocId::Guest(100)).unwrap_err() {
         Error::TooLarge { size, max } => {
             assert_eq!(max, MAX_READ_BYTES);
             assert!(size > MAX_READ_BYTES);
@@ -546,13 +575,13 @@ fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
     // A document that was legally written is always readable back: the read
     // cap is eight times the write cap on purpose.
     let legal = format!("a: \"{}\"\n", "x".repeat(400 * 1024));
-    store.put_raw(DocId::Guest(101), &legal, None).unwrap();
-    assert!(store.read(DocId::Guest(101)).is_ok());
+    store.put_raw(&DocId::Guest(101), &legal, None).unwrap();
+    assert!(store.read(&DocId::Guest(101)).is_ok());
 
     // ... and the oversized one can still be replaced with something sane
     // (the repair path does not depend on reading the old content).
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    assert_eq!(store.read(DocId::Guest(100)).unwrap().value, json!({"a": 1}));
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    assert_eq!(store.read(&DocId::Guest(100)).unwrap().value, json!({"a": 1}));
 }
 
 #[test]
@@ -567,11 +596,11 @@ fn there_is_one_write_gate_and_it_is_the_document_lint() {
         ("- 1\n- 2\n", true),
         ("traefik:\n  host: b\n", false),
     ] {
-        let result = store.put_raw(DocId::Guest(100), text, None);
+        let result = store.put_raw(&DocId::Guest(100), text, None);
         assert_eq!(matches!(result, Err(Error::Lint(_))), expect_lint, "{text:?}");
     }
     assert!(matches!(
-        store.put_raw(DocId::Guest(100), "a: [\n", None),
+        store.put_raw(&DocId::Guest(100), "a: [\n", None),
         Err(Error::Parse { .. })
     ));
 }
@@ -584,14 +613,14 @@ fn stored_vmids_covers_documents_and_snapshot_copies() {
     let (dir, store) = store();
     assert!(store.stored_vmids().unwrap().is_empty());
 
-    store.put_raw(DocId::Guest(999500), "a: 1\n", None).unwrap();
-    store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(DocId::Datacenter, "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(999500), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Datacenter, "a: 1\n", None).unwrap();
     store.snapshot(100, "before").unwrap();
     // A guest whose document was deleted but whose snapshot copy survives.
-    store.put_raw(DocId::Guest(777), "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(777), "a: 1\n", None).unwrap();
     store.snapshot(777, "only").unwrap();
-    store.delete(DocId::Guest(777)).unwrap();
+    store.delete(&DocId::Guest(777)).unwrap();
     std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
     std::fs::write(dir.path().join("notes.txt"), "junk").unwrap();
 
@@ -603,6 +632,150 @@ fn too_large_document_is_rejected() {
     let (_dir, store) = store();
     let big = "x".repeat(600 * 1024);
     let text = format!("a: \"{big}\"\n");
-    let err = store.put_raw(DocId::Guest(100), &text, None).unwrap_err();
+    let err = store.put_raw(&DocId::Guest(100), &text, None).unwrap_err();
     assert!(matches!(err, Error::TooLarge { .. }));
+}
+
+// --- registry documents (DocId::Registry) -----------------------------------
+
+#[test]
+fn a_registry_document_is_written_to_its_own_directory_not_the_root() {
+    let (dir, store) = store();
+    store
+        .put_raw(&prefix("homelab"), "description: Home\n", None)
+        .unwrap();
+
+    assert!(cluster_prefix_dir(dir.path()).join("homelab.yaml").is_file());
+    assert!(!dir.path().join("homelab.yaml").exists());
+    assert_eq!(store.read(&prefix("homelab")).unwrap().raw, "description: Home\n");
+}
+
+#[test]
+fn a_registry_write_creates_the_override_and_leaves_the_packaged_file_alone() {
+    let (dir, store) = store();
+    let packaged = packaged_prefix_dir(dir.path());
+    std::fs::create_dir_all(&packaged).unwrap();
+    std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
+
+    // A read sees the packaged file, and its digest is what a write must carry.
+    let read = store.read(&prefix("traefik")).unwrap();
+    assert_eq!(read.raw, "description: packaged\n");
+    assert_eq!(read.path, packaged.join("traefik.yaml"));
+
+    // The compare-and-swap is against what was read, so overriding a packaged
+    // file is an ordinary write and not a spurious conflict.
+    store
+        .put_raw(&prefix("traefik"), "description: cluster\n", Some(&read.digest))
+        .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(packaged.join("traefik.yaml")).unwrap(),
+        "description: packaged\n",
+        "the packaged file belongs to its .deb and must not be touched",
+    );
+    let after = store.read(&prefix("traefik")).unwrap();
+    assert_eq!(after.raw, "description: cluster\n");
+    assert_eq!(after.path, cluster_prefix_dir(dir.path()).join("traefik.yaml"));
+}
+
+#[test]
+fn deleting_a_registry_override_falls_back_to_the_packaged_file() {
+    let (dir, store) = store();
+    let packaged = packaged_prefix_dir(dir.path());
+    std::fs::create_dir_all(&packaged).unwrap();
+    std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
+    store
+        .put_raw(&prefix("traefik"), "description: cluster\n", None)
+        .unwrap();
+
+    assert!(store.delete(&prefix("traefik")).unwrap());
+    assert_eq!(
+        store.read(&prefix("traefik")).unwrap().raw,
+        "description: packaged\n",
+        "deleting the override reverts to the packaged prefix",
+    );
+
+    // And there is nothing left of ours to delete: the packaged file stays.
+    assert!(!store.delete(&prefix("traefik")).unwrap());
+    assert!(packaged.join("traefik.yaml").is_file());
+}
+
+#[test]
+fn a_missing_registry_document_is_not_found() {
+    let (_dir, store) = store();
+    let err = store.read(&prefix("nope")).unwrap_err();
+    assert!(matches!(err, Error::NotFound(DocId::Registry(RegistryKind::PrefixDef, ref n)) if n == "nope"));
+    assert_eq!(store.digest_of(&prefix("nope")).unwrap(), None);
+}
+
+#[test]
+fn version_lists_a_shadowed_registry_document_once_and_still_notices_it() {
+    let (dir, store) = store();
+    let packaged = packaged_prefix_dir(dir.path());
+    std::fs::create_dir_all(&packaged).unwrap();
+    std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    let cluster = store
+        .put_raw(&prefix("traefik"), "description: cluster\n", None)
+        .unwrap()
+        .document
+        .digest;
+
+    let v = store.version().unwrap();
+    let registry: Vec<_> = v
+        .documents
+        .iter()
+        .filter(|(id, _)| matches!(id, DocId::Registry(..)))
+        .collect();
+    assert_eq!(
+        registry,
+        vec![&(prefix("traefik"), cluster)],
+        "one document, with the digest of the file the loader would read",
+    );
+
+    // The shadowed file still moves the token: it is part of what the loaders
+    // see, and a poll that misses a change is worse than one that reloads.
+    let before = v.token;
+    std::fs::write(packaged.join("traefik.yaml"), "description: edited\n").unwrap();
+    assert_ne!(store.version().unwrap().token, before);
+}
+
+#[test]
+fn a_registry_write_leaves_no_temp_files_behind_in_its_own_directory() {
+    let (dir, store) = store();
+    store.put_raw(&prefix("homelab"), "description: a\n", None).unwrap();
+    let d = store.read(&prefix("homelab")).unwrap().digest;
+    store
+        .put_raw(&prefix("homelab"), "description: b\n", Some(&d))
+        .unwrap();
+
+    let leftovers: Vec<String> = std::fs::read_dir(cluster_prefix_dir(dir.path()))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+}
+
+#[test]
+fn a_nested_prefix_is_a_dotted_file_name_and_still_one_document() {
+    let (dir, store) = store();
+    // `homelab.docker.yaml` declares the prefix `homelab.docker` -- the file
+    // name *is* the prefix, so dots in it are ordinary.
+    let nested = DocId::Registry(RegistryKind::PrefixDef, "homelab.docker".to_string());
+    let written = store.put_raw(&nested, "selector: {all: true}\n", None).unwrap();
+    assert_eq!(
+        written.document.path,
+        cluster_prefix_dir(dir.path()).join("homelab.docker.yaml"),
+    );
+
+    // And the version walk maps that file name back to the same id, which is
+    // the half of the rule a guest document's `<vmid>.<snap>.yaml` makes easy
+    // to get wrong.
+    let v = store.version().unwrap();
+    assert!(
+        v.documents.iter().any(|(id, _)| *id == nested),
+        "the nested prefix is missing from {:?}",
+        v.documents,
+    );
 }

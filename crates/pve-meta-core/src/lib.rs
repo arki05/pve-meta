@@ -32,11 +32,14 @@
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
 //!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
-//! - [`registry`] — the two drop-directories: **namespaces**
-//!   (`/usr/share/pve-meta/namespaces`, `/etc/pve/meta.d/namespaces`), which
+//! - [`metaschema`] — the two registry file formats, written as schemas in the
+//!   same dialect a prefix uses, so the editor can show a prefix or grant
+//!   file as a typed tree (`docs/DESIGN.md` §3.6).
+//! - [`registry`] — the two drop-directories: **prefixes**
+//!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which
 //!   say what a prefix is and carry its schema, and **grants**
 //!   (`/etc/pve/meta.d/grants`, cluster-only), which say who may touch one
-//!   (`docs/DESIGN.md` §3). They nest by opposite rules: namespaces shadow
+//!   (`docs/DESIGN.md` §3). They nest by opposite rules: prefixes shadow
 //!   most-specific-first ([`registry::governing`]), grants accumulate by
 //!   containment ([`registry::scopes_for`]).
 //! - [`scopes`] — [`scopes::Grants`], a principal's effective access to one
@@ -55,10 +58,21 @@
 //! assert!(model::lint(&doc).is_empty());
 //! ```
 
+// Doc comments here reference internal helpers by intra-doc link on purpose:
+// `covers` (the coverage rule), `identify`, `is_valid_segment` and
+// `Stored::unrecoverable` are what the prose is *about*, and a plain code span
+// would drop the navigation under `cargo doc --document-private-items` -- the
+// only way anyone reads this crate, since its sole consumer is the perlmod
+// crate next door. Rustdoc renders such a link as plain text in the public
+// docs, so nothing is broken there either; the lint only warns that it did.
+// `make doc` still fails on a link that resolves to nothing at all.
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub mod api;
 pub mod digest;
 pub mod error;
 pub mod format;
+pub mod metaschema;
 pub mod model;
 pub mod patch;
 pub mod path;

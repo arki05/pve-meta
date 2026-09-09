@@ -25,7 +25,7 @@ my $root = tempdir(CLEANUP => 1);
 my $nsdir = tempdir(CLEANUP => 1);
 my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
-$ENV{PVE_META_NAMESPACE_DIRS} = $nsdir;
+$ENV{PVE_META_PREFIX_DIRS} = $nsdir;
 $ENV{PVE_META_GRANT_DIRS} = $grantdir;
 
 sub write_file {
@@ -45,7 +45,7 @@ sub read_file {
 }
 
 # The file name is the prefix (docs/DESIGN.md §3.1).
-sub write_namespace {
+sub write_prefix {
     my ($name, $content) = @_;
     open(my $fh, '>', "$nsdir/$name.yaml") or die "failed to write $nsdir/$name.yaml: $!\n";
     print {$fh} $content;
@@ -230,6 +230,14 @@ for my $case (
 # api_* : reads and writes
 # =========================================================================
 
+# The GC section above emptied the store, and a `documents` assertion against an
+# empty list passes for the wrong reason -- `grep` over nothing found nothing.
+# So seed one of each thing the walk has to tell apart: a guest document, the
+# datacenter document, and a snapshot copy, which is *not* a document.
+write_file('datacenter.yaml', "note: keep me\n");
+write_file('9100.yaml', "a: 1\n");
+write_file('9100.keep.yaml', "a: 1\n");
+
 my $v = PVE::RS::Meta::api_version(0);
 like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
 ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
@@ -238,10 +246,10 @@ ok(!defined($v->{documents}), 'no `documents` without detail');
 my $vd = PVE::RS::Meta::api_version(1);
 is($vd->{token}, $v->{token}, 'detail does not change the token');
 ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
-ok((grep { $_->{id} eq 'datacenter' } @{ $vd->{documents} }),
-    'the datacenter document is listed by id');
-ok((!grep { $_->{id} =~ /\./ } @{ $vd->{documents} }),
-    'snapshot copies are not listed as documents');
+is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200', 'datacenter'],
+    'every guest and the datacenter document are listed by id, and the snapshot copy is not');
+
+unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
 # A missing document is the empty document with digest "".
 my $missing = PVE::RS::Meta::api_get('9101', undef, 'json', $FULL);
@@ -340,11 +348,11 @@ ok(!defined($res), 'a caller with no grant at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Namespaces, grants, selectors and tags (docs/DESIGN.md §3).
+# Prefixes, grants, selectors and tags (docs/DESIGN.md §3).
 # =========================================================================
 
 # The file name is the prefix; there is no `prefix:` field to disagree with it.
-write_namespace('traefik', <<'YAML');
+write_prefix('traefik', <<'YAML');
 description: Traefik dynamic configuration
 selector: { tag: traefik }
 schema:
@@ -352,17 +360,17 @@ schema:
   properties:
     spec: { type: object }
 YAML
-write_namespace('homelab.docker', <<'YAML');
+write_prefix('homelab.docker', <<'YAML');
 selector: { all: true }
 schema: { type: object }
 YAML
-write_namespace('homelab', <<'YAML');
+write_prefix('homelab', <<'YAML');
 selector: { all: true }
 schema: { type: object }
 YAML
 
-my $ns = PVE::RS::Meta::api_namespaces();
-is(scalar(@$ns), 3, 'api_namespaces lists every namespace');
+my $ns = PVE::RS::Meta::api_prefixes();
+is(scalar(@$ns), 3, 'api_prefixes lists every prefix');
 is($ns->[0]->{prefix}, 'homelab.docker',
     'sorted most-specific first, which is the order that resolves who governs a path');
 is_deeply([map { $_->{prefix} } @$ns], ['homelab.docker', 'homelab', 'traefik'],
@@ -371,7 +379,7 @@ my ($traefik_ns) = grep { $_->{prefix} eq 'traefik' } @$ns;
 is($traefik_ns->{description}, 'Traefik dynamic configuration', 'the description survives');
 is_deeply($traefik_ns->{selector}, { tag => 'traefik' }, 'and the selector, as a native hash');
 ok($traefik_ns->{schema}, 'and the schema, passed through verbatim');
-ok(!exists $traefik_ns->{authid}, 'a namespace names no principal');
+ok(!exists $traefik_ns->{authid}, 'a prefix names no principal');
 
 write_grant('scoped', <<'YAML');
 authid: scoped@pve!t1
@@ -482,10 +490,10 @@ like($@, api_error_status(403), 'that read is refused with 403:');
 # takes another file's grants away. Both directories, independently.
 write_grant('broken', "authid: nope-not-an-authid\n");
 write_grant('alsobroken', "authid: a\@pve\ngrants:\n  - prefix: x\n    mode: sideways\n");
-write_namespace('brokenns', "selector: { nonsense: true }\n");
-write_namespace('a b', "selector: { all: true }\n"); # not a valid prefix, so not a namespace
+write_prefix('brokenns', "selector: { nonsense: true }\n");
+write_prefix('a b', "selector: { all: true }\n"); # not a valid prefix, so not a definition
 is(scalar(@{ PVE::RS::Meta::api_grants() }), 1, 'a malformed grant file is skipped');
-is(scalar(@{ PVE::RS::Meta::api_namespaces() }), 3, 'a malformed namespace file is skipped');
+is(scalar(@{ PVE::RS::Meta::api_prefixes() }), 3, 'a malformed prefix file is skipped');
 is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
     '... and the valid ones still grant exactly what they did');
 unlink("$grantdir/broken.yaml", "$grantdir/alsobroken.yaml",
@@ -708,5 +716,107 @@ my $wipe = PVE::RS::Meta::api_delete('9400', undef,
     PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{digest}, $FULL);
 is($wipe->{digest}, '', 'api_delete without a view leaves digest "" (the file is gone)');
 ok(!file_exists('9400.yaml'), 'api_delete without a view actually removes the file');
+
+# -- the meta-schema ---------------------------------------------------------
+
+my $schemas = PVE::RS::Meta::api_schemas();
+is(ref($schemas), 'HASH', 'api_schemas returns a native hash');
+is_deeply([sort keys %$schemas], ['grant', 'prefix'], '... one schema per registry kind');
+is($schemas->{prefix}->{properties}->{selector}->{type}, 'object',
+    'the prefix schema describes its selector');
+ok(!defined($schemas->{prefix}->{properties}->{selector}->{optional}),
+    '... as required, which is what the parser enforces');
+ok($schemas->{prefix}->{properties}->{schema}->{optional},
+    'a prefix schema is optional');
+ok(!defined($schemas->{prefix}->{properties}->{schema}->{properties}),
+    '... and free-form: no properties, so the editor offers text rather than a form');
+my $sel = $schemas->{prefix}->{properties}->{selector}->{properties};
+is_deeply([sort keys %$sel], ['all', 'tag'], 'the selector describes both alternatives');
+ok($sel->{all}->{optional} && $sel->{tag}->{optional},
+    '... each individually optional: "exactly one of" is a rule the dialect cannot hold');
+# ... so the parser is the only thing that enforces it, on the way in.
+$res = eval { PVE::RS::Meta::api_put('prefixes/bothsel', undef, 'yaml',
+    "selector: {all: true, tag: web}\n", 'replace', '', 0, $FULL) };
+ok(!defined($res), 'a selector with both alternatives is refused');
+like($@, api_error_status(400), '... with a 400');
+
+# -- registry documents: prefixes and grants are documents too --------------
+#
+# Same three functions, a third kind of id (`prefixes/<name>`), and one rule
+# they do not share with the other two: what is written has to parse as the kind
+# it claims to be, because the loader *skips* a file it cannot parse. A 200 on a
+# write that made the prefix disappear from api_prefixes() would be the
+# worst possible answer, so it is a 400 instead.
+
+my $ADMIN = { authid => 'root@pam', read => 1, write => 1, tags => [] };
+
+my $ns_put = PVE::RS::Meta::api_put(
+    'prefixes/labtest', undef, 'yaml',
+    "selector:\n  all: true\ndescription: Home lab\n",
+    'replace', '', 0, $ADMIN,
+);
+is($ns_put->{id}, 'prefixes/labtest', 'api_put creates a prefix document');
+ok(-f "$nsdir/labtest.yaml", 'the file lands in the prefix directory, not the store root');
+ok(!file_exists('labtest.yaml'), '... and nothing appeared beside the guest documents');
+
+my ($labtest) = grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_prefixes() };
+ok($labtest, 'the loader picks up what the write produced');
+is($labtest->{description}, 'Home lab', '... with the description it was given');
+
+my $ns_doc = PVE::RS::Meta::api_get('prefixes/labtest', undef, 'json', $ADMIN);
+is($ns_doc->{digest}, $ns_put->{digest}, 'api_get of a prefix agrees with the write');
+is(ref($ns_doc->{data}->{selector}), 'HASH',
+    'api_get returns it as a native hash like any other document');
+# A YAML boolean crosses the boundary as a plain Perl truth value, not as a
+# JSON::PP object -- the same convention the `types` round trip above checks.
+ok($ns_doc->{data}->{selector}->{all} && !ref($ns_doc->{data}->{selector}->{all}),
+    'and `selector: { all: true }` arrives as a plain true scalar');
+
+# A view write reaches into it, with the same digest compare-and-swap.
+PVE::RS::Meta::api_put('prefixes/labtest', 'schema.type', 'json', '"object"',
+    'replace', $ns_doc->{digest}, 0, $ADMIN);
+($labtest) = grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_prefixes() };
+is($labtest->{schema}->{type}, 'object', 'a view write reached into the prefix file');
+
+# The gate: a prefix with no selector is one the loader would skip.
+$res = eval { PVE::RS::Meta::api_put('prefixes/broken', undef, 'yaml',
+    "description: nothing else\n", 'replace', '', 0, $ADMIN) };
+ok(!defined($res), 'api_put refuses a prefix the loader could not read back');
+like($@, api_error_status(400), '... with a 400');
+ok(!-e "$nsdir/broken.yaml", '... and wrote nothing');
+
+my $g_put = PVE::RS::Meta::api_put(
+    'grants/ops', undef, 'yaml',
+    "authid: ops\@pve!t1\ngrants:\n  - prefix: labtest\n    mode: rw\n    selector: {all: true}\n",
+    'replace', '', 0, $ADMIN,
+);
+is($g_put->{id}, 'grants/ops', 'api_put creates a grant document');
+my ($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
+is($ops->{authid}, 'ops@pve!t1', 'the grant loader picks it up too');
+
+# A partial delete is a write, and the same rule holds on that path.
+$res = eval { PVE::RS::Meta::api_delete('grants/ops', 'authid', undef, $ADMIN) };
+ok(!defined($res), 'api_delete refuses to strip a grant of its authid');
+like($@, api_error_status(400), '... with a 400');
+($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_grants() };
+ok($ops, 'the grant still loads');
+
+is(PVE::RS::Meta::api_delete('grants/ops', undef, undef, $ADMIN)->{digest}, '',
+    'removing the whole file is an ordinary delete');
+ok(!-e "$grantdir/ops.yaml", '... and the file is gone');
+
+# A nested prefix is a dotted file name, and has to be addressable: the
+# file name *is* the prefix, and `homelab.docker` was declared above.
+my $nested = PVE::RS::Meta::api_get('prefixes/homelab.docker', undef, 'json', $ADMIN);
+is($nested->{id}, 'prefixes/homelab.docker', 'a nested prefix is addressable by its file name');
+is_deeply($nested->{data}->{schema}, { type => 'object' },
+    '... and reads back the file the loader reads');
+
+# An id that could address a file outside the directory is not an id.
+for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'operators/traefik') {
+    $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
+    ok(!defined($res), "api_get refuses the id '$bad'");
+    like($@, api_error_status(400), "... with a 400");
+}
 
 done_testing();

@@ -1,6 +1,6 @@
 # pve-meta — design (revision 6)
 
-Revision 6 splits revision 5's "operator registration" into a **namespace** and a
+Revision 6 splits revision 5's "operator registration" into a **prefix** and a
 **grant** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 (`DESIGN-rev4.md`, kept for the record) and the
 review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
 deviations recorded in §11. It is the single authority for the code; where code and this
@@ -35,26 +35,26 @@ A caller reads or writes a document through a **view**: a key-path prefix (dotte
 depth, through maps only). A view of `traefik` is the subtree under `traefik`, returned
 with the prefix stripped. Views are also the unit of access.
 
-## 3. Namespaces and grants
+## 3. Prefixes and grants
 
 Two concepts, in two drop directories. They were one — an "operator registration" —
 until revision 6; see §12 for why splitting them was the point.
 
-### 3.1 Namespaces — what a prefix is
+### 3.1 Prefixes — what a prefix is
 
-`/etc/pve/meta.d/namespaces/<prefix>.yaml`, with packaged defaults in
-`/usr/share/pve-meta/namespaces/<prefix>.yaml` (a cluster file overrides the packaged
+`/etc/pve/meta.d/prefixes/<prefix>.yaml`, with packaged defaults in
+`/usr/share/pve-meta/prefixes/<prefix>.yaml` (a cluster file overrides the packaged
 file of the same name).
 
 **The filename is the prefix.** `traefik.yaml` declares `traefik`;
 `homelab.docker.yaml` declares `homelab.docker`. There is no `prefix:` field, so one
-namespace is exactly one prefix and "who declares `traefik`?" is `ls`. A prefix segment
-is `[A-Za-z0-9_@!-]+` and dots are only separators, so a namespace filename can never
+prefix is exactly one prefix and "who declares `traefik`?" is `ls`. A prefix segment
+is `[A-Za-z0-9_@!-]+` and dots are only separators, so a prefix filename can never
 contain a slash, never start with a dot, and never escape its directory — the identity
 is safe by construction rather than by validation.
 
 ```yaml
-# /etc/pve/meta.d/namespaces/traefik.yaml
+# /etc/pve/meta.d/prefixes/traefik.yaml
 description: Traefik dynamic configuration
 selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
 schema:                      # optional, PVE::JSONSchema dialect for the subtree
@@ -64,26 +64,26 @@ schema:                      # optional, PVE::JSONSchema dialect for the subtree
       type: object
       properties:
         host: { type: string, description: Public host name }
-        port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+        port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A namespace names **no principal**. Declaring that a prefix exists and has a shape is
+A prefix names **no principal**. Declaring that a prefix exists and has a shape is
 useful with no operator, no token and no automation anywhere near it — a structured
 notes field with a schema is a complete use of this system.
 
 **Most-specific wins; schemas never merge.** For a document path, the governing
-namespace is the one with the **longest** declared prefix that covers it; no other
-namespace contributes to that path. So with both `homelab` and `homelab.docker`
+prefix is the one with the **longest** declared prefix that covers it; no other
+prefix contributes to that path. So with both `homelab` and `homelab.docker`
 declared, `homelab.notes` is governed by `homelab` and `homelab.docker.compose` by
 `homelab.docker` — including `homelab`'s own `properties.docker`, which is shadowed
 rather than merged. Merging two schemas is a rabbit hole (it is what `allOf`/`$ref`
-exist for), and where a parent and child namespace have different owners it would mean
+exist for), and where a parent and child prefix have different owners it would mean
 two owners fighting over one key.
 
-A parent that declares a key a child namespace owns is **not** rejected: files are
+A parent that declares a key a child prefix owns is **not** rejected: files are
 parsed independently, and a cross-file check would trade that for nothing. It is shadowed silently: the UI shows the child's schema and never the parent's.
 
-The selector decides which guests a namespace reaches, and therefore where its
+The selector decides which guests a prefix reaches, and therefore where its
 declared-but-unset rows appear. Nowhere else.
 
 ### 3.2 Grants — who may touch a prefix
@@ -101,7 +101,7 @@ grants:
 ```
 
 That absence is a mechanism, not an omission. An operator's own `.deb` *should* be able
-to ship a namespace — a schema is a declaration. It must never be able to ship its own
+to ship a prefix — a schema is a declaration. It must never be able to ship its own
 grant, because that is self-registration, which is privilege escalation. dpkg cannot
 write into pmxcfs, so "an operator declares what it expects; only an administrator
 grants it" is enforced by where the files live rather than by a rule someone has to
@@ -150,9 +150,72 @@ exactly one place, `PVE::API2::ACL::update_acl`, and the `user.cfg` *parser* onl
 an opening: unsupported, invisible to the Permissions UI, and one upstream edit from
 breaking silently. Making it legitimate would mean patching a fourth package.
 
+### 3.5 The registry files are documents too
+
+A prefix or grant file is addressed as a document: `prefixes/<name>` and
+`grants/<name>` are ids like `100` and `datacenter`, reachable at
+`/meta/prefixes/{name}` and `/meta/grants/{name}` with the same `view`, `format`,
+`mode`, `digest` and `dry_run` the other two take. That is not an aesthetic choice: the
+editor's tree, its markers, its diff, the digest compare-and-swap and the version poll
+are all written against *a document*, and the alternative was a second read/write path
+beside the first — the shape of every wrong-result bug this project has had.
+
+Four things are specific to them:
+
+* **Writes land in the cluster directory**, always. Editing a prefix that a package
+  shipped creates `/etc/pve/meta.d/prefixes/<name>.yaml` and leaves the packaged file
+  alone; a `DELETE` removes only the cluster file, so it is a *revert* to the packaged
+  prefix rather than a removal, and a following `GET` returns the packaged one again.
+  The compare-and-swap is checked against the file the caller actually read, so
+  overriding a packaged file is an ordinary write and not a spurious 409.
+* **The result must parse as what it claims to be.** The loader deliberately skips a
+  malformed file (§3.3), which is exactly why a write that produced one must not answer
+  200: the prefix would silently disappear. `parse_prefix`/`parse_grant` — the
+  loader's own parsers, not a copy — gate every write, including a `dry_run` and a
+  narrow `DELETE ?view=authid`. The ordinary document lint (§4) applies on top, to the
+  `schema:` subtree as much as anywhere else — a property name the lint refuses is a
+  property no document could ever hold — so a registry file that already contains
+  something it rejects is repaired the same way any document is: one whole-document
+  replace. (That is not hypothetical. The lab's `homelab.docker` prefix held
+  `compose: { type: string, description: The compose file, as text }`, where the unquoted
+  comma inside a flow mapping had silently made a second key `as text: null`. The loader
+  never looked inside `schema`, so nothing had complained for weeks.)
+* **No grant ever reaches them.** These documents get no scopes at all, so an operator
+  holding `rw` on a prefix cannot edit the grant that gave it that prefix, nor the
+  prefix that declares it. Self-registration is refused by there being no way to
+  express it. Read is open to every authenticated user, matching the two list endpoints,
+  which return the same content; writing is `Sys.Modify` on `/`.
+* **They move the version token.** The poll walks the registry directories as well as
+  the store, so an editor open on a guest notices a prefix change within one tick.
+  A file shadowed by a higher-precedence one still moves the token while contributing no
+  document of its own: over-notifying a poll costs a reload, under-notifying it leaves a
+  stale UI.
+
+### 3.6 The meta-schema
+
+The two registry formats are themselves described as schemas, in the same
+`PVE::JSONSchema` dialect a prefix uses for a guest's subtree, and served by
+`GET /meta/schemas` as `{ prefix, grant }`. The editor renders a prefix or grant
+document with these exactly the way it renders a guest document with the prefixes
+that reach it: declared rows, hovers, markers, the same code.
+
+It is **not** the validator. `parse_prefix`/`parse_grant` decide what is storable,
+on the way in, in one place (§3.5); this is the affordance that says what to type
+*before* you try. What keeps the two honest is a test rather than a convention: every
+property the meta-schema marks required is dropped from a valid file, and the parser
+has to refuse exactly the ones the schema said it would. That test already earned its
+place — it caught `grants:` being documented as required when the parser is happy
+without it (a grant file with no entries grants nothing, which is legal, if pointless).
+
+A prefix's own `schema:` is described as a **free-form object**: `type: object` with
+no `properties`. It is a schema in an open-ended dialect, and the honest offer for it is
+the text editor — a map row opens Monaco on its own subtree (§8) — rather than a form
+covering only the keywords we happened to think of. The small form that *does* exist
+(§8, "Declare Key") writes one property of it, which is the part with a fixed shape.
+
 ## 4. Documents on the wire
 
-* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a namespace schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
+* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a prefix schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
 * Reads: `data` (JSON object, unordered) or `text` (YAML, the file's own text for the
   root view, a canonical dump for a sub-view). Key order is preserved in the file and is
   not a wire contract; the UI sorts.
@@ -187,9 +250,12 @@ breaking silently. Making it legitimate would mean patching a fourth package.
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
-| GET | `/meta/access` | `vmid` or `dc=1` | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
-| GET | `/meta/namespaces` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every namespace, readable by every authenticated user |
+| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
 | GET | `/meta/grants` | — | `[{ name, authid, grants: [{ prefix, mode, selector }] }]` — every grant, readable by every authenticated user |
+| GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
+| GET/PUT/DELETE | `/meta/grants/{name}` | same | the grant file, `id: "grants/<name>"`, same rules |
+| GET | `/meta/schemas` | — | `{ prefix, grant }` — the two registry file formats as schemas (§3.6), so the editor can show one as a typed tree. An affordance, not the validator |
 
 PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
 404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
@@ -246,18 +312,32 @@ two lines at the end of `PVE/API2.pm` calling `PVE::API2::Ext->register_all`, th
 manifest-driven `pve-ext-patch`, and page manifests in `/usr/share/pve-ext/pages/`.
 **New:** a page manifest may declare either `url` (a same-origin iframe) or `script` +
 `xtype` (a native ExtJS panel class defined by that script and instantiated as the tab).
-Both substitute the same placeholders; `requires` gating applies to both.
+Both substitute the same placeholders; `requires` gating applies to both. pve-meta ships
+**two** manifests over one script — a manifest carries a single `xtype`, and a guest tab
+(one document's editor) and the datacenter tab (that plus the two registry lists) are
+different panels. The loader fetches a `script` once per URL, so the second manifest
+costs one file and no second download.
 
 ## 8. The UI: one tree of the document
 
 The page shows one tree of the document the caller can see. Rows are the union of the
-keys present and the keys the governing namespaces declare (declared-but-unset rows are
+keys present and the keys the governing prefixes declare (declared-but-unset rows are
 greyed with their default and a "set" action). Rows carry a folder icon for maps and a
 leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays as one text leaf); opened by Edit, double-click or Enter. A schema's
+  enums, arrays of scalars as one text leaf); opened by Edit, double-click or Enter.
+  **The editor follows the value's shape**: a value with structure inside it — a map,
+  or an array of maps — is edited as *text*, in Monaco on that subtree, by the same
+  three gestures. A string with newlines in it gets a text box rather than a one-line
+  field, and the Value column shows its first line and how many more there are (the
+  row keeps the whole string; only the cell is a summary). There is deliberately no
+  "nested YAML" *type*: a map already is nested YAML, and a type that said so would be
+  the string blob wearing a hat — it costs the per-key rows, diffs and writes that
+  nesting is for. The one thing a declaration can say that the value cannot is
+  `multiline`, for a string that has no value yet; it is the only extension to the
+  dialect, an editor hint, and the server neither reads nor validates it (§4). A schema's
   `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
   format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
   `mac-addr`, `dns-name`, `address`, `email` — the same set in both implementations,
@@ -268,12 +348,80 @@ leaf icon for values, next to the expander. Columns:
   name PVE already defines and validates, a regex is one more dialect to own.
 * **Description**: the row's comment key (`k__`) if present, else nothing; the schema's
   description is the tooltip.
+A button that varies per *document* may hide — Declare Key is a missing concept on a
+guest, not a missing permission, and the toolbar is stable for as long as you are in that
+document. One that varies per *row* is disabled instead, never hidden: otherwise the
+buttons beside it shift under the pointer on every selection change, which is how you
+aim for Remove and hit something else.
+
+**Every key is optional, and a default is an offer.** Nothing in pve-meta ever requires
+a key to be present: no write is refused for a missing one and no read invents one. So
+`optional` says nothing about a guest document — it is not in the Declare Key form and
+not in the packaged example, because it would be a claim no code reads. A missing value
+is a legitimate state: an operator fills it in, or there is a reason it is not there.
+A declared `default` is shown on the greyed row and written **only** by the explicit
+**Set to default** button (or by opening the editor, which pre-fills it) — never behind
+your back, and never by merely looking at the document. (`optional` survives in the
+meta-schema (§3.6), because those files really do have required fields: a grant with no
+`authid` is refused on the way in.)
+
+**Edits are staged, and one Apply writes them.** A row edit used to be a write of
+that one key. That works until a document has a rule spanning two keys, and then it
+does not work at all: a prefix definition's selector is *exactly one of* `all` or `tag`
+(§3.1), so turning `{all: true}` into `{tag: web}` has **no legal single-key step** —
+dropping `all` is refused, adding `tag` is refused, and the row editor could only ever
+do one at a time. The field was uneditable from the tree, with nothing on screen saying
+why. (Reproduced on the lab: both routes 400, only the combined write at `selector`
+succeeds.)
+
+So the tree works the way the text editor always has. Edits accumulate, the tree renders
+the document as it *would* be, and **Apply** sends them as one write: a `replace` at the
+narrowest view covering every staged path, carrying the planned subtree. For a single
+row that is exactly the one-key write it used to send immediately; for the selector
+change it is one `replace` at `selector`, which is the only thing the server will take.
+A staged delete moves the write one level up, since a key cannot be removed by replacing
+it. Narrow on purpose: a root write needs full write access, while a scoped principal
+may hold only its own prefix (§3.4).
+
+A staged row is rendered the way proxmoxlib's own `PendingObjectGrid` renders a config
+change that has not taken effect yet — the stored value, then the pending one beneath it
+in `darkorange`, a pending removal struck through — because that is exactly what this is
+and PVE already has a vocabulary for it. **Revert** drops the lot; a reload or a poll
+never silently discards them (the poll simply holds off while anything is staged); and
+the text editors, which write immediately, are unavailable until the staged set is
+settled, since they would be showing the stored document while the tree shows the
+planned one.
+
+Apply asks the server **twice**: once with `dry_run=1`, whose refusal becomes the diff
+dialog's warning banner, and then for real. That is how a rule the client cannot know
+gets said before the write rather than after: "exactly one of `all`/`tag`" is not
+expressible in the schema dialect (§3.6), so the client never learns it — it asks. The
+banner and the diff are the same warned-apply dialog the text editor uses, with the same
+explicit tick, because a schema mismatch must stay possible: the server's lint decides
+what is storable (§4), not a schema that may have drifted.
+
+A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
+colour, a triangle, and the message in the tooltip ahead of the schema's description.
+**The mark bubbles up.** A marker that sits only on the offending row is one you cannot
+see: collapse `homelab` and the amber `port` goes with it, along with any sign that
+something is wrong. So every ancestor carries a triangle in its **Key** column — next to
+the thing you would collapse, and where a map's empty Value column has nothing to say —
+with a count and the first few messages in its tooltip. Staged edits bubble the same way
+and for the same reason, as a `darkorange` dot: the toolbar counter says *how many* are
+unapplied, and this says *where*.
+The text editor has squiggled these since revision 6, but the tree is the view people
+open, and a value the schema refuses looked exactly like one it liked. Both callers ask
+one function (`grammarSplit`) what describes the document, so they cannot disagree.
+Advisory like every other schema signal: the row is still editable and the value is
+still stored — the server's lint decides what is storable (§4).
+
 * **Access**: every grant whose prefix covers the row, `rw` ones by name, `ro` ones
   muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
   "access" is about who writes and who subscribes, not ownership.
 
 Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
-parent of a selected leaf, or the root), **Edit selection as text** (enabled with a
+parent of a selected leaf, or the root), **Set to default**, **Declare Key** (only on a
+prefix document, see below), **Edit selection as text** (enabled with a
 selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
 and at the right end a **Tree | Text** toggle that swaps the panel body in place between
 the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
@@ -305,6 +453,61 @@ per-row action icons. Editability is per row from `/meta/access`; a row edit is
 digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
 never while an editor is open.
 
+**Which ACL answers apply is a property of the document, not of the tab.** `GET
+/meta/access` takes the document's `id`, because the three kinds answer differently and
+only one of the differences is obvious: a guest's read is `VM.Audit`, the datacenter
+document's is `Sys.Audit`, and a registry file's is **open to every authenticated user**
+while its write is `Sys.Modify` (§3.5). The write bits of the last two coincide, which is
+exactly why asking the wrong question was invisible until someone held `Sys.Modify`
+without `Sys.Audit`: the editor then greyed out Text mode on a file that caller could
+certainly read. Verified on the lab with a token holding only `Sys.Modify`.
+
+**The datacenter tab has three sub-tabs.** A guest tab is one document's editor, and
+looks as it always did. The datacenter tab is a tab panel: **Document** (the datacenter
+document, the same editor), **Prefixes** and **Grants** (two grids). They are three
+different kinds of thing — one document, a list of definitions, a list of grants — and
+an earlier revision drew them as branches of a single tree, which claimed a relationship
+they do not have and hid the only columns worth reading. A grid shows what a tree could
+not: which guests a prefix reaches, whether it carries a schema, and **where the file
+came from** — `packaged`, `cluster`, or `cluster (overrides packaged)`, the last being
+the one where Remove does not remove the prefix but reverts to the package's copy. That
+third state is why `origin` and `overrides` are two fields and not one.
+
+Double-click or Edit on a grid row opens that file **in the ordinary document editor**,
+in a window: tree, row editors, markers, Tree | Text, the diff. A prefix definition is a
+document (§3.5), so "edit one" needed no editor of its own — which is the whole return on
+making them documents. Add creates the smallest file the loader will read back (a prefix:
+its name and a selector; a grant: an authid and no entries at all, so it grants nothing
+until an administrator says what) with `digest: ''` as the precondition, so two
+administrators creating the same name is a 409 rather than a silent overwrite, and then
+opens the editor on it. Editing a packaged definition is allowed and creates the cluster
+override; removing one is not, because there is nothing of ours to remove.
+
+The panel is one document's editor throughout, named by `docId`. Rows carry it even
+though there is only ever one: it is what every write threads through, and a panel that
+had to remember which document it was on top of which row was selected is how one
+document's digest ends up on a write to another.
+
+**Declare Key** appears only on a prefix document: a small form for the seven things
+the editor actually consumes (type, description, default, enum, minimum/maximum,
+format) plus `multiline`, writing one `schema.properties.<key>` with an ordinary view
+`PUT`. Anything with no field on that form — a nested `properties`, a
+keyword we did not anticipate — is what editing the schema as text is for. The key
+itself is not validated in the browser: `schema.properties.<key>` is a document path
+like any other, so the server's one lint decides what a key may be and says so. A
+*dotted* key is refused, because it would silently declare a nested property rather than
+the one the form is asking about.
+
+**Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
+datacenter), and that is the whole audience: PVE's own resource tree lists a guest only
+to a caller holding `VM.Audit` on it (`PVE::API2::Cluster::resources`), so a principal
+holding nothing but grants has no guest to open the tab on, whatever the manifest says.
+Tag selectors are therefore resolved against `GET /meta/guests`' `tags` (§5) and nothing
+else, and no server-resolved fallback is needed for a caller this page can have. Grants
+lose nothing by that: they bind server-side, on the API a scope-only principal actually
+uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
+exactly the rows its `rw` grants cover -- that is the "Scoped write access" label.
+
 `ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
 mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
 theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe,
@@ -322,10 +525,10 @@ unit tests, is the thing `ui-extjs/testing/` has to keep earning.
 ## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, namespaces+grants+selectors, lint, api layer, store, gc
+crates/pve-meta-core     document model, views, prefixes+grants+selectors, lint, api layer, store, gc
 crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
 perl/PVE/API2/Ext/Meta.pm
-namespaces/              packaged example namespaces (none required)
+prefixes/              packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor tab (plain JS, native ExtJS panel)
@@ -359,8 +562,8 @@ rather than in review:
   same prefix, two files, because one object could not express both cleanly.
 * **A real bug came out of it.** Declared-but-unset rows were driven by a *grant's*
   grammar, so a broadly-scoped principal painted one operator's rows onto every guest in
-  the cluster. With the schema on the namespace, the selector that governs rows is the
-  namespace's and that bug is not expressible.
+  the cluster. With the schema on the prefix, the selector that governs rows is the
+  prefix's and that bug is not expressible.
 * **Two files naming the same authid silently unioned their scopes.** Nobody decided
   that; it is what happens when identity is a field rather than the file.
 
@@ -370,8 +573,8 @@ overlapping grammars unioned their findings and why a path covered by two schema
 whichever the iteration reached last.
 
 What the split buys beyond correctness is that the store's vocabulary loses the word
-*operator* entirely. It knows namespaces and grants. An operator is an installer — a
-package that drops a namespace, has an administrator issue a grant, and creates an LXC
+*operator* entirely. It knows prefixes and grants. An operator is an installer — a
+package that drops a prefix, has an administrator issue a grant, and creates an LXC
 with credentials injected. Nothing at runtime needs the concept, so nothing in the core
 carries it.
 

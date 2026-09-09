@@ -1,14 +1,14 @@
-# An example namespace (docs/DESIGN.md §3.1).
+# An example prefix definition (docs/DESIGN.md §3.1).
 #
-# Packaged namespaces live in /usr/share/pve-meta/namespaces/<prefix>.yaml and
+# Packaged definitions live in /usr/share/pve-meta/prefixes/<prefix>.yaml and
 # are dropped in by an operator's own .deb; a cluster-wide file of the same
-# name in /etc/pve/meta.d/namespaces/<prefix>.yaml overrides it.
+# name in /etc/pve/meta.d/prefixes/<prefix>.yaml overrides it.
 #
 # **The file name is the prefix.** This file declares `traefik`; a file named
 # `homelab.docker.yaml` would declare `homelab.docker`. There is no `prefix:`
 # field, so the two can never disagree.
 #
-# A namespace names no principal. Declaring that a prefix exists and has a
+# A definition names no principal. Declaring that a prefix exists and has a
 # shape is useful with no operator, no token and no automation anywhere near
 # it -- a structured notes field with a schema is a complete use of this
 # system. Who may *write* it is a separate file (docs/DESIGN.md §3.2).
@@ -18,7 +18,7 @@
 description: Traefik dynamic configuration
 
 # `{ tag: traefik }` rather than `{ all: true }` on purpose. The selector
-# decides which guests this namespace reaches, and a schema's declared-but-unset
+# decides which guests this prefix definition reaches, and a schema's declared-but-unset
 # keys show as greyed rows on exactly those guests -- so an `all` example puts
 # traefik's rows on every guest in the cluster, and teaches the wrong default
 # for the one feature it exists to demonstrate. Tag a guest `traefik` to see
@@ -33,4 +33,4 @@ schema:
       type: object
       properties:
         host: { type: string, description: Public host name }
-        port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
+        port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
