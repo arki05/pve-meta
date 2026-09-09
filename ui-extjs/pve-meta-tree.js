@@ -1702,26 +1702,14 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- rows ---------------------------------------------------------------
 
-    // `true` if `/meta/access` (server-resolved, not gated on VM.Audit) already
-    // told us this scope applies to us: same prefix and mode as one of our own
-    // resolved scopes.
-    resolvedScopeApplies: function (scope) {
-        let me = this;
-        return (me.access.scopes || []).some(
-            (s) => s.prefix === scope.prefix && s.mode === scope.mode,
-        );
-    },
+    // Both lists below resolve `selector: { tag: t }` against `me.tags`, which
+    // `GET /meta/guests` fills in only for a caller with VM.Audit (DESIGN §5).
+    // That is not a gap here: this is a guest tab, and a caller without VM.Audit
+    // on `/vms/<vmid>` never sees the guest in the resource tree at all
+    // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
+    // panel has tags we cannot read. A scope-only principal is still bound by
+    // its grants -- they are enforced server-side, on the API it actually uses.
 
-    // The grant entries whose selector matches this guest. Grants
-    // apply to guest documents only (DESIGN §3), so the datacenter gets none.
-    //
-    // A `tag` selector is normally resolved against `me.tags` (from
-    // `GET /meta/guests`), but that field is only populated for a caller with
-    // VM.Audit (DESIGN §5). A scope-only principal never has it, so also accept
-    // a scope `/meta/access` already resolved for us: that endpoint resolves
-    // selectors server-side without requiring VM.Audit, so it still surfaces our
-    // own declared rows and Access entries even when `me.tags` is empty. The
-    // grant file is still the source of the label (name, selector text).
     // The namespaces that reach this guest, most-specific first. Namespaces decide
     // *shape*: which declared-but-unset rows appear and which schema governs a path.
     applicableNamespaces: function () {
@@ -1748,10 +1736,7 @@ Ext.define('PVE.meta.TreePanel', {
             (grant.grants || []).forEach(function (entry) {
                 let sel = entry.selector || {};
                 let matches =
-                    entry.prefix &&
-                    (sel.all ||
-                        (sel.tag && me.tags.indexOf(sel.tag) !== -1) ||
-                        me.resolvedScopeApplies(entry));
+                    entry.prefix && (sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1));
                 if (matches) {
                     out.push(Ext.apply({ grant: grant }, entry));
                 }

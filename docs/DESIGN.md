@@ -305,6 +305,16 @@ per-row action icons. Editability is per row from `/meta/access`; a row edit is
 digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
 never while an editor is open.
 
+**Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
+datacenter), and that is the whole audience: PVE's own resource tree lists a guest only
+to a caller holding `VM.Audit` on it (`PVE::API2::Cluster::resources`), so a principal
+holding nothing but grants has no guest to open the tab on, whatever the manifest says.
+Tag selectors are therefore resolved against `GET /meta/guests`' `tags` (§5) and nothing
+else, and no server-resolved fallback is needed for a caller this page can have. Grants
+lose nothing by that: they bind server-side, on the API a scope-only principal actually
+uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
+exactly the rows its `rw` grants cover -- that is the "Scoped write access" label.
+
 `ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
 mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
 theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe,

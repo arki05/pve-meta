@@ -120,8 +120,10 @@ pub struct Document {
     /// The raw file text.
     pub raw: String,
     /// The parsed value, or the **empty document** when [`Document::parse_error`]
-    /// is set. **Unstripped**: comment keys are still present; stripping them
-    /// is the caller's (API layer's) job via [`crate::model::strip_comments`].
+    /// is set. Comment keys (`foo__`) are ordinary data and stay in it: nothing
+    /// strips them, and what a caller may see of one is decided further up by
+    /// [`crate::view::filter`], where [`crate::scopes::covers`] makes a scope on
+    /// `foo` cover `foo__` as well.
     pub value: Value,
     /// `Some(message)` when the file's text is not valid YAML at all, in
     /// which case [`Document::value`] is the empty document

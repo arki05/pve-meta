@@ -409,7 +409,6 @@ const panel = {
     'schemaKind',
     'applicableNamespaces',
     'applicableGrants',
-    'resolvedScopeApplies',
     'accessFor',
     'accessSummary',
     'editableFor',
@@ -475,23 +474,26 @@ panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] 
 eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
 eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), false);
 
-console.log('\n--- S6: scope-only principal (no VM.Audit, so no tags) ---');
-// No `me.tags` (as a caller without VM.Audit gets from GET /meta/guests), but
-// GET /meta/access already resolved this caller's own tag-selector scope.
-const scopedPanel = Object.assign({}, panel);
-scopedPanel.tags = [];
-scopedPanel.access = { read: 0, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const scopedScopes = panel.applicableGrants.call(scopedPanel);
-// `netbird` is still applicable regardless of tags (its selector is `all: true`);
-// `traefik` is a `tag` selector that only resolves via GET /meta/access now.
-eq('resolved-grant applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
-    'netbird',
-    'traefik',
-]);
+console.log('\n--- S6: a guest that does not carry the tag ---');
+// A tag selector resolves against this guest's tags and nothing else. Holding a
+// `traefik` rw scope of our own must not drag another principal's tag-selected
+// grant onto a guest that is not tagged `traefik` -- the Access column would
+// then name a writer who cannot in fact write here.
+const untagged = Object.assign({}, panel);
+untagged.tags = [];
+untagged.access = { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
+const untaggedScopes = panel.applicableGrants.call(untagged);
+eq('a tag grant needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
 eq(
-    'access label still comes from the grant file',
-    panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
-    'traefik',
+    'no Access row for the prefix whose selector missed',
+    panel.accessFor.call(untagged, 'traefik.spec.host', untaggedScopes),
+    [],
+);
+// Same rule on the shape side: no tag, no declared rows from that namespace.
+eq(
+    'namespace applicability follows the same tags',
+    panel.applicableNamespaces.call(untagged).map((n) => n.prefix),
+    ['netbird'],
 );
 
 console.log('\n--- schema findings for the text editor ---');

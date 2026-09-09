@@ -55,6 +55,16 @@
 //! assert!(model::lint(&doc).is_empty());
 //! ```
 
+// Doc comments here reference internal helpers by intra-doc link on purpose:
+// `covers` (the coverage rule), `identify`, `is_valid_segment` and
+// `Stored::unrecoverable` are what the prose is *about*, and a plain code span
+// would drop the navigation under `cargo doc --document-private-items` -- the
+// only way anyone reads this crate, since its sole consumer is the perlmod
+// crate next door. Rustdoc renders such a link as plain text in the public
+// docs, so nothing is broken there either; the lint only warns that it did.
+// `make doc` still fails on a link that resolves to nothing at all.
+#![allow(rustdoc::private_intra_doc_links)]
+
 pub mod api;
 pub mod digest;
 pub mod error;
