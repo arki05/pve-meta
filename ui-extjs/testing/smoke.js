@@ -581,6 +581,31 @@ eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
 
+console.log('\n--- round trip: a view toggle must not invent changes ---');
+const U2 = ctx.PVE.meta.Utils;
+// serde_yaml and js-yaml lay the same document out differently, so re-dumping on the
+// way back from JSON made a *presentation* toggle report unsaved changes.
+const SERVER_YAML = [
+    'traefik:',
+    '  spec:',
+    '    host: a.example',
+    '    port: 80',
+    '  routers:',
+    '  - rule: Host(`a`)',
+    '',
+].join('\n');
+const parsed = U2.yamlLoad(SERVER_YAML);
+eq('a js-yaml redump differs from the server text (the bug\'s premise)',
+    U2.yamlDump(parsed) !== SERVER_YAML, true);
+eq('sameDocument sees through the layout difference',
+    U2.sameDocument(parsed, SERVER_YAML), true);
+eq('sameDocument says no when a value really changed',
+    U2.sameDocument({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
+eq('sameDocument says no when only the key order changed (order is data)',
+    U2.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
+eq('sameDocument on unparseable text is not a match',
+    U2.sameDocument({}, 'a:\n  - [\n'), false);
+
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
 // keys (DESIGN §4) that must become ordinary rows, not resolve through the

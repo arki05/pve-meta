@@ -170,6 +170,18 @@ PVE.meta.Utils = {
         return f;
     },
 
+    // True if `value` is the same document as `yamlText` parses to, key order
+    // included. JSON.stringify preserves insertion order, and the document model is
+    // ordered maps (DESIGN section 2), so comparing the two encodings is the right
+    // test: same keys, same order, same values.
+    sameDocument: function (value, yamlText) {
+        try {
+            return JSON.stringify(value) === JSON.stringify(PVE.meta.Utils.yamlLoad(yamlText));
+        } catch (_err) {
+            return false;
+        }
+    },
+
     // A scalar as the string a grammar's `enum` and a hover compare and show.
     scalarText: function (value) {
         return typeof value === 'string' ? value : Ext.encode(value);
@@ -645,6 +657,11 @@ PVE.meta.Monaco = {
                 readOnly: true,
                 renderSideBySide: true,
                 minimap: { enabled: false },
+                // Monaco defaults this to true, which hides indentation-only changes --
+                // exactly what a YAML -> JSON -> YAML round trip produces. A confirm
+                // dialog that shows nothing while Apply is enabled is worse than no
+                // dialog, so show them.
+                ignoreTrimWhitespace: false,
             });
             state.editor.setModel({
                 original: monaco.editor.createModel(cfg.original, cfg.lang),
@@ -1148,6 +1165,13 @@ Ext.define('PVE.meta.TreePanel', {
                     listeners: { change: (btn, value) => me.switchTextLang(value) },
                 },
                 '->',
+                {
+                    text: gettext('Format'),
+                    itemId: 'textFormatBtn',
+                    iconCls: 'fa fa-indent',
+                    tooltip: gettext('Re-indent the buffer canonically'),
+                    handler: () => me.formatText(),
+                },
                 {
                     text: gettext('Apply'),
                     itemId: 'textApplyBtn',
@@ -1996,9 +2020,54 @@ Ext.define('PVE.meta.TreePanel', {
         }
         me.textLang = lang;
         window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
-        me.textEditor.setValue(
-            lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value),
-        );
+
+        let rendered;
+        if (lang === 'json') {
+            rendered = JSON.stringify(value, null, 2);
+        } else {
+            // Back to YAML: prefer the server's own text when the document is
+            // unchanged. js-yaml and serde_yaml lay the same document out
+            // differently (indentation of nested sequences, quoting), so re-dumping
+            // here made a *presentation* toggle report unsaved changes and offer an
+            // Apply whose only content was whitespace.
+            rendered = PVE.meta.Utils.sameDocument(value, me.textOriginal)
+                ? me.textOriginal
+                : PVE.meta.Utils.yamlDump(value);
+        }
+        me.textEditor.setValue(rendered);
+        me.annotateText();
+    },
+
+    // Re-dump the buffer canonically in whichever language is showing: two-space
+    // indent, no folding, key order preserved. For hand-written YAML that has drifted
+    // from the store's own layout, and it is the same dumper the JSON/YAML toggle uses,
+    // so formatting then toggling is a no-op.
+    //
+    // Refuses on a buffer that does not parse rather than mangling it -- the squiggle
+    // already says where.
+    formatText: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let text = me.textEditor.getValue();
+        try {
+            let value =
+                me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+            let formatted =
+                me.textLang === 'json'
+                    ? JSON.stringify(value, null, 2)
+                    : PVE.meta.Utils.yamlDump(value);
+            if (formatted !== text) {
+                me.textEditor.setValue(formatted);
+                me.annotateText();
+            }
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Cannot format'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+            );
+        }
     },
 
     applyText: function () {
@@ -2019,7 +2088,8 @@ Ext.define('PVE.meta.TreePanel', {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
-        PVE.meta.Monaco.confirmDiff({
+        let proceed = function () {
+            PVE.meta.Monaco.confirmDiff({
             title: gettext('(whole document)'),
             original: original,
             modified: edited,
@@ -2030,6 +2100,37 @@ Ext.define('PVE.meta.TreePanel', {
                 let params = { view: '', mode: 'replace', digest: me.digest };
                 params[me.textLang === 'json' ? 'data' : 'text'] = edited;
                 me.submit({ url: me.baseUrl, method: 'PUT', params: params }, () => me.refreshText());
+            },
+            });
+        };
+
+        // Advisory, exactly like the squiggles: a grammar is an operator's statement of
+        // what it expects, not a gate. The server's lint decides what is storable
+        // (DESIGN section 4), so this warns and still lets the write through -- an
+        // operator whose grammar has drifted from what the document legitimately holds
+        // must not be able to lock the administrator out of editing it.
+        let findings = me.textFindings();
+        if (!findings.length) {
+            proceed();
+            return;
+        }
+        Ext.Msg.show({
+            title: gettext('Does not match the schema'),
+            message:
+                gettext('This document does not match the schema the operators declare:') +
+                '<ul><li>' +
+                findings.slice(0, 8).map(Ext.htmlEncode).join('</li><li>') +
+                '</li></ul>' +
+                (findings.length > 8
+                    ? Ext.String.format(gettext('... and {0} more.'), findings.length - 8) + '<br>'
+                    : '') +
+                gettext('Save it anyway?'),
+            icon: Ext.Msg.WARNING,
+            buttons: Ext.Msg.YESNO,
+            fn: function (btn) {
+                if (btn === 'yes') {
+                    proceed();
+                }
             },
         });
     },
@@ -2048,13 +2149,24 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // Re-read the document and put it back in the buffer (after Apply, or Discard).
-    // Underline the lines the applicable grammars object to, and describe the key on
-    // each declared line on hover. Warnings only: the grammar is an affordance, the
-    // server's lint is the authority (DESIGN section 4), and Apply is never blocked.
+    // Underline what is wrong with the buffer *as it is now*, and describe the key on
+    // each declared line on hover.
     //
-    // Cleared while the buffer is dirty or the view is JSON: the findings come from the
-    // document the server returned and the line index is a YAML scan, so neither
-    // describes what is on screen any more.
+    // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
+    // is the authority (DESIGN section 4):
+    //
+    //   * a YAML syntax error, as one Error marker on the line js-yaml reports. Monaco
+    //     ships a JSON language service that does this for the JSON view already, but
+    //     nothing validates YAML, so this is ours.
+    //   * every grammar finding, as Warning markers (PVE.meta.Lint).
+    //
+    // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
+    // not against the document the server last sent. Parsing is js-yaml on a document
+    // that is a few KB at most; if that ever shows up in typing latency, debounce it.
+    //
+    // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
+    // view the document still gets Monaco's own syntax validation but no schema
+    // squiggles.
     annotateText: function () {
         let me = this;
         if (!me.textEditor || !window.monaco) {
@@ -2064,36 +2176,87 @@ Ext.define('PVE.meta.TreePanel', {
         if (!model) {
             return;
         }
+        let text = me.textEditor.getValue();
         let markers = [];
         let hovers = Object.create(null);
-        let clean = !me.textIsDirty() && me.textLang === 'yaml';
-        let applicable = clean ? PVE.meta.Lint.applicable(me.applicableScopes()) : [];
-        if (applicable.length) {
-            let index = PVE.meta.Lint.lineIndex(me.textOriginal);
-            markers = PVE.meta.Lint.placed(
-                PVE.meta.Lint.findings(me.docData || {}, applicable),
-                index,
-            ).map(function (f) {
-                return {
-                    startLineNumber: f.line,
-                    endLineNumber: f.line,
-                    startColumn: 1,
-                    endColumn: model.getLineMaxColumn(f.line),
-                    message: f.message,
-                    severity: monaco.MarkerSeverity.Warning,
-                };
-            });
-            let schemas = PVE.meta.Lint.schemaIndex(applicable);
-            Object.keys(schemas).forEach(function (path) {
-                let text = PVE.meta.Lint.hoverText(schemas[path]);
-                if (text && index[path] !== undefined) {
-                    hovers[index[path]] = text;
-                }
-            });
+
+        let parsed = null;
+        let parseError = null;
+        try {
+            parsed = me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+        } catch (err) {
+            parseError = err;
         }
+
+        if (parseError) {
+            if (me.textLang === 'yaml') {
+                // js-yaml's YAMLException carries a 0-based mark; anything else lands
+                // on line 1 rather than nowhere.
+                let mark = parseError.mark || {};
+                let line = typeof mark.line === 'number' ? mark.line + 1 : 1;
+                line = Math.min(Math.max(line, 1), model.getLineCount());
+                markers.push({
+                    startLineNumber: line,
+                    endLineNumber: line,
+                    startColumn: typeof mark.column === 'number' ? mark.column + 1 : 1,
+                    endColumn: model.getLineMaxColumn(line),
+                    message: parseError.reason || PVE.meta.Utils.errText(parseError),
+                    severity: monaco.MarkerSeverity.Error,
+                });
+            }
+        } else if (me.textLang === 'yaml') {
+            let applicable = PVE.meta.Lint.applicable(me.applicableScopes());
+            if (applicable.length) {
+                let index = PVE.meta.Lint.lineIndex(text);
+                markers = PVE.meta.Lint.placed(
+                    PVE.meta.Lint.findings(parsed, applicable),
+                    index,
+                ).map(function (f) {
+                    return {
+                        startLineNumber: f.line,
+                        endLineNumber: f.line,
+                        startColumn: 1,
+                        endColumn: model.getLineMaxColumn(f.line),
+                        message: f.message,
+                        severity: monaco.MarkerSeverity.Warning,
+                    };
+                });
+                let schemas = PVE.meta.Lint.schemaIndex(applicable);
+                Object.keys(schemas).forEach(function (path) {
+                    let hover = PVE.meta.Lint.hoverText(schemas[path]);
+                    if (hover && index[path] !== undefined) {
+                        hovers[index[path]] = hover;
+                    }
+                });
+            }
+        }
+
         monaco.editor.setModelMarkers(model, 'pve-meta', markers);
         me.textHovers = hovers;
         me.registerTextHover();
+    },
+
+    // The grammar findings for the current buffer, as plain messages -- what Apply
+    // warns about before it writes. Empty when the buffer does not parse (the write
+    // will fail on its own) or when no grammar applies.
+    textFindings: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return [];
+        }
+        let applicable = PVE.meta.Lint.applicable(me.applicableScopes());
+        if (!applicable.length) {
+            return [];
+        }
+        try {
+            let value =
+                me.textLang === 'json'
+                    ? Ext.decode(me.textEditor.getValue())
+                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            return PVE.meta.Lint.findings(value, applicable).map((f) => f.path + ': ' + f.message);
+        } catch (_err) {
+            return [];
+        }
     },
 
     // One hover provider for the language, reading whichever panel owns the model that
