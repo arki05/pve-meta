@@ -320,6 +320,21 @@
     // Queues every caller's callback while a load is in flight.
     var scriptLoadState = {}; // src -> 'loaded' | 'error' | [pending callbacks]
 
+    // Appends the manifest's `fingerprint` as `?ver=`, the way PVE versions its own
+    // bundle in index.html.tpl. Without it a UI upgrade is invisible to a browser that
+    // already has the old file: pveproxy sends `Last-Modified` with no `Cache-Control`
+    // or `ETag`, and dpkg installs with the mtime clamped to the changelog date for
+    // reproducible builds -- so a rebuilt file of the *same* package version has an
+    // identical `Last-Modified`, revalidates to 304, and the stale copy is kept
+    // indefinitely. No fingerprint (a URL the server could not resolve to a file)
+    // means no parameter, i.e. the previous behaviour.
+    function withVersion(url, fingerprint) {
+        if (!url || !fingerprint) {
+            return url;
+        }
+        return url + (url.indexOf('?') === -1 ? '?' : '&') + 'ver=' + encodeURIComponent(fingerprint);
+    }
+
     function loadScriptOnce(src, cb) {
         var state = scriptLoadState[src];
         if (state === 'loaded') {
@@ -532,11 +547,13 @@
                 if (isScriptForm) {
                     var scriptSrc = expandUrl(manifest.script, vars);
                     scriptSrc = expandQueryPlaceholder(scriptSrc, query);
+                    scriptSrc = withVersion(scriptSrc, manifest.fingerprint);
                     var instanceConfig = buildInstanceConfig(target, vars);
                     items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
                 } else {
                     var src = expandUrl(manifest.url, vars);
                     src = expandQueryPlaceholder(src, query);
+                    src = withVersion(src, manifest.fingerprint);
                     items.push(buildTabItem(manifest, src));
                 }
             } catch (e) {
