@@ -2,9 +2,9 @@
 // pve-manager SPA on node1, in both themes.
 //
 // Usage: node headless-tab-check.js <host> <vmid> <theme: light|dark>
-//            [--operators] [--readonly] [--scoped]
-// --operators stubs a GET /meta/operators payload, for a lab where the real
-//   registrations do not exercise every grammar shape.
+//            [--stub-registry] [--readonly] [--scoped]
+// --stub-registry stubs GET /meta/namespaces and GET /meta/grants, for a lab
+//   whose real files do not exercise every schema shape.
 // --readonly skips everything that writes.
 // --scoped / --ro stub GET /meta/access with a restricted answer (an rw scope on
 //   `traefik` only, or full read and no write) so the "Scoped write access" and
@@ -16,7 +16,7 @@ const https = require('https');
 const host = process.argv[2] || '10.10.10.154';
 const vmid = process.argv[3] || '200';
 const theme = process.argv[4] || 'light';
-const stubOperators = process.argv.includes('--operators');
+const stubRegistry = process.argv.includes('--stub-registry');
 const scoped = process.argv.includes('--scoped');
 const roOnly = process.argv.includes('--ro');
 const readOnly = scoped || roOnly || process.argv.includes('--readonly');
@@ -25,44 +25,47 @@ const ACCESS_STUB = scoped
     : { read: 1, write: 0, scopes: [] };
 const out = '/root/headless/shots';
 
-const OPERATORS = [
+const NAMESPACES = [
+    {
+        prefix: 'traefik',
+        description: 'Traefik dynamic configuration',
+        selector: { all: true },
+        schema: {
+            type: 'object',
+            properties: {
+                spec: {
+                    type: 'object',
+                    properties: {
+                        host: { type: 'string', description: 'Public host name' },
+                        port: { type: 'integer', default: 80, description: 'Backend port' },
+                        scheme: { type: 'string', enum: ['http', 'https'], default: 'http' },
+                        tls: { type: 'boolean', default: false, description: 'Terminate TLS' },
+                    },
+                },
+            },
+        },
+    },
+    { prefix: 'netbird', description: 'NetBird peer groups', selector: { tag: 'netbird' } },
+];
+
+const GRANTS = [
     {
         name: 'traefik',
         authid: 'svc@pve!traefik',
         description: 'Traefik dynamic-configuration provider',
-        scopes: [
-            {
-                prefix: 'traefik',
-                mode: 'rw',
-                selector: { all: true },
-                grammar: {
-                    type: 'object',
-                    properties: {
-                        spec: {
-                            type: 'object',
-                            properties: {
-                                host: { type: 'string', description: 'Public host name' },
-                                port: { type: 'integer', default: 80, description: 'Backend port' },
-                                scheme: { type: 'string', enum: ['http', 'https'], default: 'http' },
-                                tls: { type: 'boolean', default: false, description: 'Terminate TLS' },
-                            },
-                        },
-                    },
-                },
-            },
-        ],
+        grants: [{ prefix: 'traefik', mode: 'rw', selector: { all: true } }],
     },
     {
         name: 'netbird',
         authid: 'svc@pve!netbird',
         description: 'NetBird peer group assignment',
-        scopes: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
+        grants: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
     },
     {
         name: 'audit',
         authid: 'svc@pve!audit',
         description: 'Read-only observer of every guest',
-        scopes: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
+        grants: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
     },
 ];
 
@@ -153,7 +156,7 @@ async function main() {
                 } catch (_e) {}
             }, t.CSRFPreventionToken);
 
-            if (stubOperators || scoped || roOnly) {
+            if (stubRegistry || scoped || roOnly) {
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
                     const reply = (data) =>
@@ -162,8 +165,12 @@ async function main() {
                             contentType: 'application/json',
                             body: JSON.stringify({ success: 1, data }),
                         });
-                    if (stubOperators && /\/api2\/(extjs|json)\/meta\/operators/.test(req.url())) {
-                        reply(OPERATORS);
+                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/namespaces/.test(req.url())) {
+                        reply(NAMESPACES);
+                        return;
+                    }
+                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/grants/.test(req.url())) {
+                        reply(GRANTS);
                         return;
                     }
                     if ((scoped || roOnly) && /\/api2\/(extjs|json)\/meta\/access/.test(req.url())) {
@@ -281,7 +288,8 @@ async function main() {
                 mode: p.mode,
                 digest: p.digest,
                 access: p.access,
-                registrations: (p.registrations || []).length,
+                namespaces: (p.namespaces || []).length,
+                grants: (p.grants || []).length,
                 columns: p.tree.getColumns().map((c) => c.text),
                 rows,
                 toolbar: tb ? tb.items.items.map((i) => i.text || i.xtype) : [],
@@ -299,7 +307,7 @@ async function main() {
 
         const shotName = scoped ? 'scoped' : roOnly ? 'readonly' : 'tree';
         await page.screenshot({
-            path: `${out}/extjs-${shotName}-${theme}${stubOperators ? '-operators' : ''}.png`,
+            path: `${out}/extjs-${shotName}-${theme}${stubRegistry ? '-registry' : ''}.png`,
         });
 
         // The Access tooltip: hover the Access cell of a covered row.
@@ -365,7 +373,7 @@ async function main() {
         }
 
         // Row edits, the 409 path, and Monaco - all of which write.
-        if (!stubOperators && !readOnly) {
+        if (!stubRegistry && !readOnly) {
             // One write per value type, each through the row editor window.
             const editRow = async (path, value) => {
                 const started = await page.evaluate(

@@ -23,10 +23,13 @@ perlmod's `build.rs` compiles against Perl's `CORE` headers and therefore needs
 pve-meta-rs` (or an explicit `--workspace`) still targets it.
 
 The bindings crate is deliberately **thin**: it owns the `#[perlmod::package]` glue,
-`open_store()` (the `$PVE_META_ROOT` lookup, default `/etc/pve/meta`) and
-`open_registry()` (`registry::load_default()`), and nothing else. Every decision — the
-document model, the views, the registry, and in particular the write authorization —
-lives in `pve-meta-core`, where it can be unit-tested on any machine.
+`open_store()` (the `$PVE_META_ROOT` lookup, default `/etc/pve/meta`),
+`open_namespaces()` (`registry::load_namespaces_default()`) and `open_grants()`
+(`registry::load_grants_default()`), and nothing else. Both drop directories are read per
+request — they are tiny, pmxcfs caches them, and a stale grant is a wrong answer about
+who may write. Every decision — the document model, the views, the namespace and grant
+rules, and in particular the write authorization — lives in `pve-meta-core`, where it can
+be unit-tested on any machine.
 
 ## The boundary: native structures, one string
 
@@ -53,20 +56,19 @@ The caller crosses as one hash:
 
 `read`/`write` are the PVE ACL answers for the document being addressed (`VM.Audit` /
 `VM.Config.Options` on `/vms/<vmid>`; `Sys.Audit` / `Sys.Modify` on `/` for the
-datacenter document) and `tags` are that guest's PVE tags, which resolve the
-registrations' selectors. Rust computes the caller's scopes from it; Perl never builds a
-grant list.
+datacenter document) and `tags` are that guest's PVE tags, which resolve the grants' and
+namespaces' selectors (`DESIGN.md` §3). Rust computes the caller's scopes from it; Perl
+never builds a grant list.
 
 ## Perl API (`#[perlmod::package(name = "PVE::RS::Meta", lib = "pve_meta_rs")]`)
 
 All functions die with a readable message on error (`anyhow::Error` → Perl `die`).
 
-### Snapshot hooks
+### Lifecycle hooks
 
-The **only** lifecycle hooks (`DESIGN.md` §6). Called from one patched file,
-`PVE/AbstractConfig.pm` (package `libpve-guest-common-perl`). They run inside PVE's own
-guest locks and copy whole files; they do not consult grants. Their signatures are
-unchanged from revision 4.
+All of them (`DESIGN.md` §6), called from one patched file, `PVE/AbstractConfig.pm`
+(package `libpve-guest-common-perl`). They run inside PVE's own guest locks and move
+whole files; they do not consult grants.
 
 * `on_snapshot($vmid, $snapname)` → copies the document to the snapshot file; no-op if
   the guest has no document. Returns 1 if a copy was made, 0 otherwise.
@@ -75,14 +77,33 @@ unchanged from revision 4.
   removed (the guest had no metadata when the snapshot was taken). Returns a string:
   `restored`, `removed`, `none`.
 * `on_delsnap($vmid, $snapname)` → removes the snapshot copy. Returns 1/0.
+* `on_create($vmid)` → clears any document **and** snapshot copies left at `$vmid`.
+  Returns the number of files removed. Called from `create_and_lock_config`, and **only
+  when its `$allow_existing` is false** — that is when the `check_vmid_unused` inside it
+  has just asserted the vmid was free, so anything still there is a leftover. A restore
+  *over* an existing guest keeps its document: a backup does not carry one, so clearing
+  would be data loss.
+* `on_destroy($vmid)` → the same purge, called from `destroy_config` after the guest
+  config's own `unlink` succeeds. Returns the number of files removed; idempotent.
 
-**Removed in revision 5** (`DESIGN.md` §10): `on_clone`, `on_destroy`,
-`export_for_backup`, `import_from_backup`, `list_snapshots`, `has_document` and
-`api_grants`. Destroy is a GC; clone and backup are not carried ("metadata lives in
-`/etc/pve`; back up `/etc/pve`"); `list_snapshots`/`has_document` existed for the orphan
-machinery, which is gone with the orphan concept.
+The two are the same operation with different call sites, and are named separately so a
+warning says which path ran. `on_create` is the one a periodic sweep could never be: a
+vmid destroyed and recreated between two sweeps is never *missing* from the vmlist, so a
+sweep never nominates it and the new guest inherits the old document permanently.
 
-### Garbage collection
+**Removed in revision 5** (`DESIGN.md` §10): `on_clone`, `export_for_backup`,
+`import_from_backup`, `list_snapshots`, `has_document` and `api_grants`. Clone and backup
+are not carried ("metadata lives in `/etc/pve`; back up `/etc/pve`");
+`list_snapshots`/`has_document` existed for the orphan machinery, which is gone with the
+orphan concept. Revision 6's `api_grants` is a different function under the same name:
+that one returned the *caller's* computed grants for Perl to forward, this one lists the
+grant **files** (`DESIGN.md` §3.2).
+
+### Garbage collection (manual only)
+
+With create and destroy hooked, nothing runs this on a timer. It stays as the broom for
+the one case the hooks cannot see — a guest config removed out of band — and an
+administrator runs `/usr/libexec/pve-meta/gc` by hand.
 
 Rust never reads `/etc/pve/.vmlist` itself; the caller passes the vmlist in, as a native
 array ref of integers.
@@ -119,7 +140,8 @@ PVE::Cluster::cfs_lock_domain('pve-meta-gc', 30, sub {
             die "refusing to gc $vmid with an empty vmlist\n" if !@fresh;
             return PVE::RS::Meta::gc_purge($vmid, \@fresh);
         });
-        die $@ if $@;
+        # Best-effort per candidate: a busy lock must not stop the sweep.
+        if (my $err = $@) { syslog('warning', "skipping %d: %s", $vmid, $err); next; }
     }
 });
 die $@ if $@;
@@ -128,10 +150,14 @@ die $@ if $@;
 Three things in that shape are not optional. `cfs_update()` before every vmlist read: a
 fresh process that has not refreshed sees an empty vmlist. The **empty-vmlist guard**,
 because an empty vmlist means "every document is stale" — `gc_purge` refuses one too, so
-the guard sits on the destructive call and not only on its caller. And the explicit
-`die $@ if $@` after each `cfs_lock_domain`, which catches its callback's `die` and
-re-raises it by assigning `$@`: wrapping the call in an `eval {}` instead clears `$@` on
-the way out and swallows the failure silently.
+the guard sits on the destructive call and not only on its caller — `gc` (the
+whole-sweep form) refuses one too, so no export of this module can be handed an empty
+vmlist. And the explicit **`$@` check after each `cfs_lock_domain`**, which catches its
+callback's `die` and re-raises it by assigning `$@`: wrapping the call in an `eval {}`
+instead clears `$@` on the way out and swallows the failure silently. The outer check
+dies (a sweep that cannot take its own lock has done nothing); the inner one warns and
+moves to the next candidate, because one document whose write lock is busy must not stop
+the sweep from reaching the rest — the next run picks it up.
 
 Nesting `"pve-meta-$vmid"` inside `'pve-meta-gc'` cannot deadlock: a writer only ever
 takes the per-document lock, never the GC one, so there is no lock-order cycle. The
@@ -149,13 +175,21 @@ authorization rules and `DESIGN.md` §5 for the endpoints). They die with
 `"NNN: message"` (an HTTP status prefix) which `PVE::API2::Ext::Meta::_call` turns into a
 `PVE::Exception`.
 
-* `api_version()` → `{ token, changed }`.
-* `api_operators()` → every registration, as native hashes:
-  `[{ name, authid, description, scopes: [{ prefix, mode, selector, grammar? }] }]`.
-  `selector` is spelled as the file spells it (`{all => 1}` / `{tag => '<name>'}`).
-  A malformed registration file is skipped with a warning and does not appear.
-* `api_access($id, $acl)` → `{ read, write, scopes }` for one document, with the
-  registrations' selectors already resolved against `$acl->{tags}`. `$id` is a vmid or
+* `api_version($detail)` → `{ token, changed }`, plus `documents` (`[{ id, digest }]`,
+  sorted) when `$detail` is true.
+* `api_namespaces()` → every namespace, as native hashes, **sorted most-specific first**
+  — the order that resolves which one governs a path (`DESIGN.md` §3.1):
+  `[{ prefix, description?, selector, schema? }]`. The prefix is the file's name; a
+  namespace names no principal, so there is no `authid` on it.
+* `api_grants()` → every grant, as native hashes:
+  `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]`. Read from
+  `/etc/pve/meta.d/grants` only — there is deliberately no packaged grants directory
+  (`DESIGN.md` §3.2).
+* In both, `selector` is spelled as the file spells it (`{all => 1}` /
+  `{tag => '<name>'}`), and a malformed file is skipped with a warning and does not
+  appear — independently per directory.
+* `api_access($id, $acl)` → `{ read, write, scopes }` for one document, with the grants'
+  selectors already resolved against `$acl->{tags}`. `$id` is a vmid or
   `"datacenter"`; scopes are always empty for the latter.
 * `api_list_guests($authid, $guests, $has)` → one row per guest the caller can read
   anything of. `$guests` is the array of vmlist rows Perl already has,
@@ -188,19 +222,24 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   `$(DESTDIR)$(PERL_INSTALLVENDORLIB)/…` (paths from `perl -MConfig`).
 * Perl-side test: `crates/pve-meta-perl/test/basic.pl`, run by `make check`. It uses the
   sed-patched loader trick so it loads `target/{debug,release}/libpve_meta_rs.so`
-  directly, sets `PVE_META_ROOT` and `PVE_META_OPERATOR_DIRS` to temp dirs, and exercises
-  every export: the three snapshot hooks and their `die` behaviour; that the seven
-  removed exports really are gone; `gc` (a stale document plus both its snapshot copies,
+  directly, sets `PVE_META_ROOT`, `PVE_META_NAMESPACE_DIRS` and `PVE_META_GRANT_DIRS` to
+  temp dirs, and exercises every export: the three snapshot hooks and their `die`
+  behaviour; that the removed exports really are gone; `gc` (a stale document plus both
+  its snapshot copies,
   idempotence, never the datacenter document) and the two-phase `gc_candidates` +
   `gc_purge` (a document written after the candidate snapshot survives the re-check, an
   empty `$live` is refused, a vmid that really is gone is purged with its snapshots);
   the perlmod truthiness conversion in all
   six shapes; the `api_*` contract with native hash arguments and native results
-  (including that integers, floats, booleans and lists survive the boundary); tag
-  selectors on and off, on `access`, on reads and on writes; a read-only scope; the root
+  (including that integers, floats, booleans and lists survive the boundary);
+  `api_namespaces` listing every namespace sorted longest-prefix-first (the file name
+  being the prefix, and no `authid` on any of them) and `api_grants` listing a grant by
+  its file name with every entry's prefix, mode and native-hash selector, and no schema;
+  tag selectors on and off, on `access`, on reads and on writes; a read-only scope; the root
   view needing full write; an empty merge creating nothing; the one comment-key rule;
-  scopes never reaching the datacenter document; a malformed registration file being
-  skipped without disturbing a valid one; `api_list_guests` gating node/name/tags on
+  scopes never reaching the datacenter document; a malformed file in *either* drop
+  directory being skipped without disturbing a valid one, including a namespace file
+  whose name is not a valid prefix; `api_list_guests` gating node/name/tags on
   `VM.Audit` and `has` filtering on visible data; the one lint for both a full and a
   scoped caller with no redaction; unrecoverable documents in all three of their causes
   (yaml+`parse_error`, 422, root replace and root DELETE as the two repairs, nothing

@@ -7,38 +7,20 @@ Copyright: 2026 Julius Arkenberg <julius@rkenberg.de>
 License: AGPL-3.0-or-later
 
 # Vendored editor assets, all shipped in the built pve-meta package under
-# /usr/share/pve-manager/js/pve-meta-ui/ (see ui/Trunk.toml, ui/index.html
-# and the top-level Makefile's `ui`/`install` targets). These override the
+# /usr/share/pve-manager/js/pve-meta-extjs/ (see the top-level Makefile's
+# `ui`/`install` targets). These override the
 # Files: * default above for exactly the paths they name; everything else
 # pve-meta ships is this project's own AGPL-3.0-or-later code.
 
-Files: ui/pwt-assets/scss/*
-Copyright: 2023 Proxmox Server Solutions GmbH
-License: MIT or Apache-2.0
-Comment:
- pwt's stylesheet sources (see ui/pwt-assets/copyright, ui/pwt-assets/README.md);
- compiled by `grass` at build time (ui/Trunk.toml) into the two CSS files the
- editor UI ships (desktop-yew-style.css, crisp-yew-style.css).
-
-Files: ui/pwt-assets/assets/font-awesome.css
-Copyright: 2015, Dave Gandy
-License: MIT
-Comment: Font Awesome 4.7.0's CSS (see the file's own header comment).
-
-Files: ui/pwt-assets/assets/fonts/fontawesome-webfont.woff2
-Copyright: 2015, Dave Gandy
-License: OFL-1.1
-Comment: Font Awesome 4.7.0's icon font.
-
-Files: ui/node_modules/monaco-editor/*
+Files: ui-extjs/node_modules/monaco-editor/*
 Copyright: 2016-present, Microsoft Corporation
 License: MIT
 Comment:
- The Monaco editor (npm package monaco-editor; fetched by `npm install` at UI
- build time, see the top-level Makefile's `ui` target and ui/README.md -- never
- vendored into this source tree, but its `min/vs` distribution is copied
- verbatim into the built package by ui/Trunk.toml's `copy-dir` link, including
- its bundled codicon icon font). Licensed MIT by Microsoft Corporation; see
+ The Monaco editor (npm package monaco-editor; fetched by `npm install` at
+ build time, see the top-level Makefile's `ui` target and ui-extjs/README.md --
+ never committed to this source tree, but its `min/vs` distribution is copied
+ verbatim into the built package, including its bundled codicon icon font).
+ Licensed MIT by Microsoft Corporation; see
  https://github.com/microsoft/monaco-editor/blob/main/LICENSE.md for the
  upstream text, reproduced below under License: MIT.
 

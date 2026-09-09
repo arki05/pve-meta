@@ -1,7 +1,0 @@
-[Unit]
-Description=pve-meta metadata garbage collection
-ConditionPathIsDirectory=/etc/pve
-
-[Service]
-Type=oneshot
-ExecStart=/usr/libexec/pve-meta/gc

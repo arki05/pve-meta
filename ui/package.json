@@ -1,8 +1,0 @@
-{
-    "name": "pve-meta-ui",
-    "private": true,
-    "description": "Monaco editor assets for the pve-meta editor page; trunk copies min/vs into dist/vs",
-    "dependencies": {
-        "monaco-editor": "0.52.2"
-    }
-}

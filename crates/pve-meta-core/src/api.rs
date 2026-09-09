@@ -52,7 +52,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Registration};
+use crate::registry::{self, Grant, Namespace};
 use crate::scopes::{Grants, Scope};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
 use crate::view;
@@ -139,7 +139,7 @@ pub struct CallerAcl {
 /// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
 /// datacenter document is governed by ACLs alone, which is what keeps the
 /// registry from being able to grant access to it.
-pub fn grants(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> Grants {
+pub fn grants(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> Grants {
     let scopes = match doc_id {
         DocId::Guest(_) => registry::scopes_for(regs, &acl.authid, &acl.tags),
         DocId::Datacenter => Vec::new(),
@@ -306,6 +306,24 @@ pub struct ApiVersion {
     pub token: String,
     /// The newest document mtime, as a unix timestamp.
     pub changed: u64,
+    /// With `detail`: every document's own digest, sorted by id, so a caller
+    /// that saw the token move can tell **which** documents to re-read instead
+    /// of re-listing the store.
+    ///
+    /// Unfiltered by design. A digest is not sensitive (`docs/DESIGN.md` §1
+    /// puts digests and listings out of scope), and filtering would cost a
+    /// grant computation per document on the one endpoint whose whole purpose
+    /// is to be cheap enough to poll.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<ApiDocumentDigest>>,
+}
+
+/// One row of `GET /meta/version?detail=1`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiDocumentDigest {
+    /// A vmid, or `"datacenter"`.
+    pub id: String,
+    pub digest: String,
 }
 
 /// One row of `GET /meta/guests` (`docs/DESIGN.md` §5).
@@ -396,16 +414,25 @@ pub struct GuestInput {
 }
 
 /// `api_version()` -> `{ token, changed }`.
-pub fn version(store: &MetaStore) -> Result<ApiVersion, anyhow::Error> {
+pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Error> {
     let v = store.version().map_err(api_err)?;
     Ok(ApiVersion {
         token: v.token,
         changed: unix_secs(v.changed),
+        documents: detail.then(|| {
+            v.documents
+                .into_iter()
+                .map(|(id, digest)| ApiDocumentDigest {
+                    id: id_str(id),
+                    digest,
+                })
+                .collect()
+        }),
     })
 }
 
 /// `GET /meta/access`: `{ read, write, scopes }` for one document.
-pub fn access(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
+pub fn access(regs: &[Grant], doc_id: DocId, acl: &CallerAcl) -> ApiAccess {
     let g = grants(regs, doc_id, acl);
     ApiAccess {
         read: g.full_read,
@@ -414,11 +441,19 @@ pub fn access(regs: &[Registration], doc_id: DocId, acl: &CallerAcl) -> ApiAcces
     }
 }
 
-/// `GET /meta/operators`: every registration, readable by every
-/// authenticated user (`docs/DESIGN.md` §5). The registry is not sensitive
-/// under the threat model (§1) and the UI's ownership column needs it.
-pub fn operators(regs: &[Registration]) -> Vec<Registration> {
+/// `GET /meta/grants`: every grant, readable by every authenticated user.
+///
+/// Not filtered per caller: a grant says who may touch which prefix, which is
+/// exactly what the UI's Access column shows for every row, and the threat
+/// model puts listings out of scope (`docs/DESIGN.md` §1).
+pub fn grants_list(regs: &[Grant]) -> Vec<Grant> {
     regs.to_vec()
+}
+
+/// `GET /meta/namespaces`: every namespace, most-specific first, readable by
+/// every authenticated user.
+pub fn namespaces_list(namespaces: &[Namespace]) -> Vec<Namespace> {
+    namespaces.to_vec()
 }
 
 /// `GET /meta/guests`: for every guest Perl passed in, the metadata the
@@ -432,7 +467,7 @@ pub fn operators(regs: &[Registration]) -> Vec<Registration> {
 /// `400:` if `has` is not a valid path.
 pub fn list_guests(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     authid: &str,
     guests: &[GuestInput],
     has: Option<&str>,
@@ -497,7 +532,7 @@ pub fn list_guests(
 /// not readable. `422:` the stored document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -659,7 +694,7 @@ fn plan_write(
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
 pub fn put_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -753,7 +788,7 @@ pub fn put_document(
 /// writable, or a planned touched path is outside the caller's write grants.
 pub fn delete_document(
     store: &MetaStore,
-    regs: &[Registration],
+    regs: &[Grant],
     id: &str,
     view: Option<&str>,
     digest: Option<&str>,
@@ -875,12 +910,23 @@ pub fn gc_purge(store: &MetaStore, vmid: u32, live: &[u32]) -> Result<usize, any
 /// **`libexec/gc` does not use this**, and neither should a new caller: it
 /// holds no per-vmid lock and re-validates nothing, so a document written
 /// after `vmids` was read is deleted without a trace. It stays because it is
-/// the exact behaviour the two-phase path has to be tested against, and
-/// because it is the one place `vmids` being empty legitimately means "purge
-/// every guest document" (`crates/pve-meta-perl/test/basic.pl`).
+/// the exact behaviour the two-phase path has to be tested against.
+///
+/// An **empty `vmids` is refused**, as it is in [`gc_purge`]. "No guest
+/// exists" and "the caller has not run `PVE::Cluster::cfs_update()` yet" are
+/// the same input here, and this is the most destructive operation in the
+/// system: until now the only thing standing between the two was one line of
+/// Perl at one call site (`libexec/gc`), and this function has no production
+/// caller at all. A test that wants a whole sweep passes a vmid the store
+/// does not have.
 ///
 /// The datacenter document is never a guest and is never touched.
 pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
+    if vmids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "500: refusing to garbage-collect against an empty vmlist"
+        ));
+    }
     let mut removed = 0;
     for vmid in gc_candidates(store, vmids)? {
         removed += store.purge(vmid).map_err(api_err)?;
@@ -891,7 +937,7 @@ pub fn gc(store: &MetaStore, vmids: &[u32]) -> Result<usize, anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Registration;
+    use crate::registry::Grant;
     use serde_json::json;
 
     /// A store over a fresh tempdir. No global state: every test owns its
@@ -902,13 +948,13 @@ mod tests {
         (dir, store)
     }
 
-    /// The registrations used throughout: `scoped@pve!t1` holds `traefik` rw
-    /// on guests tagged `traefik`, and `netbird` ro on every guest.
-    fn regs() -> Vec<Registration> {
-        vec![registry::parse(
+    /// The grants used throughout: `scoped@pve!t1` holds `traefik` rw on
+    /// guests tagged `traefik`, and `netbird` ro on every guest.
+    fn regs() -> Vec<Grant> {
+        vec![registry::parse_grant(
             "scoped",
             "authid: scoped@pve!t1\n\
-             scopes:\n\
+             grants:\n\
              \x20 - prefix: traefik\n    mode: rw\n    selector: {tag: traefik}\n\
              \x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
         )
@@ -990,7 +1036,25 @@ mod tests {
     // -- grants from registrations ----------------------------------------
 
     #[test]
-    fn a_selector_resolves_against_the_guests_tags() {
+fn version_detail_names_the_documents_that_changed() {
+        let (_dir, store) = store();
+        store.put_raw(DocId::Guest(100), "a: 1\n", None).unwrap();
+        store.put_raw(DocId::Datacenter, "b: 2\n", None).unwrap();
+
+        // Without `detail` the shape is unchanged: no `documents` on the wire.
+        let plain = version(&store, false).unwrap();
+        assert!(plain.documents.is_none());
+
+        let detailed = version(&store, true).unwrap();
+        let docs = detailed.documents.expect("detail asked for");
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["100", "datacenter"]);
+        assert_eq!(docs[0].digest, store.read(DocId::Guest(100)).unwrap().digest);
+        assert_eq!(detailed.token, plain.token, "detail does not change the token");
+    }
+
+    #[test]
+        fn a_selector_resolves_against_the_guests_tags() {
         // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
         // granting the operator that guest.
         let regs = regs();
@@ -1558,11 +1622,11 @@ mod tests {
     }
 
     #[test]
-    fn operators_lists_every_registration() {
-        let ops = operators(&regs());
-        assert_eq!(ops.len(), 1);
-        assert_eq!(ops[0].authid, "scoped@pve!t1");
-        assert_eq!(ops[0].scopes.len(), 2);
+    fn grants_list_returns_every_grant() {
+        let gs = grants_list(&regs());
+        assert_eq!(gs.len(), 1);
+        assert_eq!(gs[0].authid, "scoped@pve!t1");
+        assert_eq!(gs[0].grants.len(), 2);
     }
 
     #[test]
@@ -1588,8 +1652,11 @@ mod tests {
         // Idempotent, and a full vmlist removes nothing.
         assert_eq!(gc(&store, &[100]).unwrap(), 0);
         assert_eq!(gc(&store, &[100, 999500]).unwrap(), 0);
-        // An empty vmlist removes everything that is a guest.
-        assert_eq!(gc(&store, &[]).unwrap(), 2);
+        // A whole sweep is expressed with a vmid the store does not have, not
+        // with an empty list: an empty vmlist is refused (it is what an
+        // un-refreshed pmxcfs cache looks like).
+        assert!(gc(&store, &[]).is_err(), "an empty vmlist must be refused");
+        assert_eq!(gc(&store, &[999_999]).unwrap(), 2);
         assert!(read_raw(&store, "100").is_none());
         assert!(read_raw(&store, "datacenter").is_some());
     }
@@ -1667,7 +1734,8 @@ mod tests {
         assert_eq!(listed[0].digest, "");
 
         // The version poll skips it rather than failing.
-        assert!(version(&store).is_ok());
+        assert!(version(&store, false).is_ok());
+        assert!(version(&store, true).is_ok());
 
         // A DELETE of a document another caller already removed is that
         // caller's request satisfied.

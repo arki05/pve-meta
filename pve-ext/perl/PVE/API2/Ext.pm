@@ -4,6 +4,7 @@ use strict;
 use warnings;
 
 use JSON;
+use Digest::SHA;
 
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
@@ -292,7 +293,50 @@ sub _load_page_manifest {
         return undef;
     }
 
+    # Cache-busting fingerprint for the file this manifest points at
+    # (`fingerprint`, appended by the loader as `?ver=`). Not cosmetic: pveproxy
+    # serves static files with `Last-Modified` and no `Cache-Control`/`ETag`, and
+    # dpkg installs them with the mtime clamped to the changelog date for
+    # reproducible builds -- so two different builds of the same package version
+    # are byte-different files with an *identical* `Last-Modified`, and a browser
+    # revalidating gets 304 and keeps the stale copy indefinitely. PVE has the
+    # same problem with its own bundle and solves it the same way
+    # (`pvemanagerlib.js?ver=...` in index.html.tpl).
+    $manifest->{fingerprint} = _asset_fingerprint($manifest->{script} // $manifest->{url});
+
     return $manifest;
+}
+
+# A short content fingerprint of the static file `$url` resolves to, or undef
+# when it does not name one we can stat.
+#
+# `/pve2/js/...` is served from `/usr/share/pve-manager/js/...` (pveproxy's
+# `add_dirs()`), which is the only mapping pve-ext itself relies on; anything
+# else (an absolute URL, a path we do not know how to resolve) simply gets no
+# fingerprint rather than a wrong one.
+sub _asset_fingerprint {
+    my ($url) = @_;
+
+    return undef if !defined($url) || $url eq '';
+    # Strip any query/fragment the manifest already carries.
+    my ($path) = split(/[?#]/, $url, 2);
+    return undef if $path !~ m|^/pve2/js/(.+)$|;
+    my $file = "/usr/share/pve-manager/js/$1";
+    return undef if !-f $file;
+
+    my $digest = eval {
+        open(my $fh, '<', $file) or die "open failed\n";
+        binmode($fh);
+        my $ctx = Digest::SHA->new(256);
+        $ctx->addfile($fh);
+        close($fh);
+        substr($ctx->hexdigest, 0, 16);
+    };
+    if (my $err = $@) {
+        warn "pve-ext: could not fingerprint '$file': $err";
+        return undef;
+    }
+    return $digest;
 }
 
 # -- our own API: GET /ext, /ext/modules, /ext/pages -----------------------

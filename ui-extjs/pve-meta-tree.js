@@ -5,13 +5,14 @@
  *
  *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
  *     document the caller can see. Rows are the union of the keys present in the
- *     document and the keys the applicable grammars declare (`GET /meta/operators`,
- *     matched by scope prefix and selector against this guest); a declared-but-unset key
+ *     document and the keys the governing namespaces declare (`GET /meta/namespaces`,
+ *     matched by prefix and selector against this guest, most-specific first -- schemas
+ *     shadow, they never merge); a declared-but-unset key
  *     renders faded with its default, and "setting" it is just editing it. Map rows
  *     carry a folder icon (open when expanded), value rows a document icon, both at the
  *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
  *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
- *     one text leaf. Access lists every registration whose scope covers the row.
+ *     one text leaf. Access lists every grant whose prefix covers the row.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
  *     toggle), Apply through a diff dialog and Discard.
@@ -29,8 +30,9 @@
  *
  * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
  * card on the whole document, and the diff that confirms either one's Apply. Its AMD
- * loader is fetched lazily on first use from /pve2/js/pve-meta-ui/vs/loader.js (shipped
- * by the pve-meta UI package); every editor is disposed when its owner goes away.
+ * loader is fetched lazily on first use from /pve2/js/pve-meta-extjs/vs/loader.js
+ * (Monaco is vendored into the package by `make ui`, never fetched from a CDN); every
+ * editor is disposed when its owner goes away.
  *
  * YAML is js-yaml 4.1.0, vendored in vendor/ and loaded lazily the same way. It is used
  * only for presentation — the YAML/JSON view toggle and the diff. The server stays the
@@ -93,6 +95,30 @@ PVE.meta.Utils = {
         return kind === 'string' ? String(value) : Ext.encode(value);
     },
 
+    // A grammar's `format` is a PVE::JSONSchema format name, and proxmoxlib already
+    // ships the matching client-side validator as an ExtJS vtype -- so a format is
+    // wired to PVE's own checker, with PVE's own (translated) error message, rather
+    // than to a regex of ours. A format with no vtype (or one we do not know) simply
+    // does not constrain the field: an unknown constraint must never block an edit.
+    // This is exactly the set ui/src/grammar.rs's check_format() implements, so the two
+    // UIs accept and reject the same strings; adding a format means adding it in both.
+    FORMAT_VTYPES: {
+        'ip': 'IP64Address',
+        'ipv4': 'IPAddress',
+        'ipv6': 'IP6Address',
+        'CIDR': 'IP64CIDRAddress',
+        'CIDRv4': 'IPCIDRAddress',
+        'CIDRv6': 'IP6CIDRAddress',
+        'mac-addr': 'MacAddress',
+        'dns-name': 'DnsName',
+        'address': 'DnsOrIp',
+        'email': 'proxmoxMail',
+    },
+
+    vtypeFor: function (format) {
+        return (format && PVE.meta.Utils.FORMAT_VTYPES[format]) || undefined;
+    },
+
     // The inverse, for a committed row edit: field value -> the JSON value to send.
     parseValue: function (text, kind) {
         if (kind === 'boolean') {
@@ -128,9 +154,90 @@ PVE.meta.Utils = {
         } else if (d.kind === 'boolean') {
             return { xtype: 'proxmoxcheckbox' };
         } else if (d.kind === 'number') {
-            return { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
+            let f = { xtype: 'numberfield', allowDecimals: true, hideTrigger: true, keyNavEnabled: false };
+            if (d.minimum !== undefined && d.minimum !== null) {
+                f.minValue = d.minimum;
+            }
+            if (d.maximum !== undefined && d.maximum !== null) {
+                f.maxValue = d.maximum;
+            }
+            return f;
         }
-        return { xtype: 'textfield', selectOnFocus: true };
+        let f = { xtype: 'textfield', selectOnFocus: true };
+        let vtype = PVE.meta.Utils.vtypeFor(d.format);
+        if (vtype) {
+            f.vtype = vtype;
+        }
+        return f;
+    },
+
+    // True if `value` is the same document as `yamlText` parses to, key order
+    // included. JSON.stringify preserves insertion order, and the document model is
+    // ordered maps (DESIGN section 2), so comparing the two encodings is the right
+    // test: same keys, same order, same values.
+    sameDocument: function (value, yamlText) {
+        try {
+            return JSON.stringify(value) === JSON.stringify(PVE.meta.Utils.yamlLoad(yamlText));
+        } catch (_err) {
+            return false;
+        }
+    },
+
+    // The namespace governing `path`: the one whose prefix is the LONGEST that covers
+    // it. Most-specific wins and schemas never merge (DESIGN section 3.1).
+    //
+    // The single implementation of that rule on this side. It had three call sites --
+    // the row builder, the linter and the hover index -- and lived in two of them; the
+    // third simply did not prune, so a parent namespace's `properties` reached into a
+    // child namespace's subtree and set its row kind. One function, three callers.
+    //
+    // `namespaces` must be sorted longest-prefix-first, so this is the first match.
+    governing: function (path, namespaces) {
+        let list = namespaces || [];
+        for (let i = 0; i < list.length; i++) {
+            if (PVE.meta.Utils.covers(list[i].prefix, path)) {
+                return list[i];
+            }
+        }
+        return null;
+    },
+
+    // Longest prefix first, then by name: the order `governing` relies on.
+    bySpecificity: function (namespaces) {
+        return (namespaces || []).slice().sort(function (a, b) {
+            let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
+            return d !== 0 ? d : String(a.prefix).localeCompare(String(b.prefix));
+        });
+    },
+
+    // Segment count of a dotted prefix -- how "specific" it is. `''` is 0.
+    depth: function (prefix) {
+        let p = String(prefix || '');
+        return p === '' ? 0 : p.split('.').length;
+    },
+
+    // A scalar as the string a grammar's `enum` and a hover compare and show.
+    scalarText: function (value) {
+        return typeof value === 'string' ? value : Ext.encode(value);
+    },
+
+    // Runs the vtype a format maps to, and returns that vtype's own message on failure.
+    // Reusing proxmoxlib's validator rather than a second regex of ours is what keeps
+    // the marker and the row editor agreeing about the same string -- they are literally
+    // the same check. An unmapped format constrains nothing.
+    checkFormat: function (format, value) {
+        let vtype = PVE.meta.Utils.vtypeFor(format);
+        // Defensive down the whole chain: this runs before any form field has been
+        // instantiated, so nothing guarantees the VTypes singleton exists yet, and a
+        // validator we cannot reach must constrain nothing rather than throw.
+        let vtypes = Ext.form && Ext.form.field && Ext.form.field.VTypes;
+        if (!vtype || !vtypes || typeof vtypes[vtype] !== 'function') {
+            return null;
+        }
+        if (vtypes[vtype](value)) {
+            return null;
+        }
+        return vtypes[vtype + 'Text'] || gettext('invalid value');
     },
 
     // Human-readable form of a scope's selector, for the Access tooltip.
@@ -223,11 +330,265 @@ PVE.meta.Yaml = {
 };
 
 // ---------------------------------------------------------------------------
+// Grammar findings for the text editor: what is wrong, and which line to underline.
+//
+// Mirrors ui/src/lint.rs exactly -- same rules, same messages, same line scan -- so
+// the two implementations say the same thing about the same document. Changing one
+// means changing the other.
+//
+// Two halves, kept apart on purpose. `findings()` answers *what is wrong*, from the
+// parsed document the panel already holds; `lineIndex()` answers *where to draw it*,
+// by scanning the YAML the server returned. The pairing only holds while the buffer
+// still is what the server sent, so the caller clears both once it is dirty.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Lint = {
+    // The namespaces that carry a schema, longest prefix first. Shape comes from
+    // namespaces, never from grants (DESIGN section 3.1).
+    applicable: function (namespaces) {
+        return PVE.meta.Utils.bySpecificity(
+            (namespaces || []).filter((ns) => ns && ns.schema && ns.prefix),
+        );
+    },
+
+    valueAt: function (data, path) {
+        let cur = data;
+        if (!path) {
+            return cur;
+        }
+        let parts = path.split('.');
+        for (let i = 0; i < parts.length; i++) {
+            if (!cur || typeof cur !== 'object' || Array.isArray(cur)) {
+                return undefined;
+            }
+            cur = Object.prototype.hasOwnProperty.call(cur, parts[i]) ? cur[parts[i]] : undefined;
+        }
+        return cur;
+    },
+
+    findings: function (data, applicable) {
+        let out = [];
+        let list = applicable || [];
+        list.forEach(function (ns) {
+            let value = PVE.meta.Lint.valueAt(data, ns.prefix);
+            if (value !== undefined) {
+                PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, list, ns);
+            }
+        });
+        out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+        return out;
+    },
+
+    // `list`/`owner`, when given, enforce most-specific-wins: the walk stops where a
+    // *different* namespace governs, so a parent's schema never reaches into a child
+    // namespace's subtree. Schemas shadow, they do not merge (DESIGN section 3.1).
+    walk: function (value, schema, path, out, list, owner) {
+        let message = PVE.meta.Lint.checkValue(schema, value);
+        if (message) {
+            out.push({ path: path, message: message });
+            return; // a value of the wrong shape says nothing useful about its children
+        }
+        let props = schema && schema.properties;
+        if (!props || !value || typeof value !== 'object' || Array.isArray(value)) {
+            return;
+        }
+        Object.keys(value).forEach(function (key) {
+            if (Object.prototype.hasOwnProperty.call(props, key)) {
+                let child = path ? path + '.' + key : key;
+                if (owner && PVE.meta.Utils.governing(child, list) !== owner) {
+                    return; // a more specific namespace owns this subtree
+                }
+                PVE.meta.Lint.walk(value[key], props[key], child, out, list, owner);
+            }
+        });
+    },
+
+    // Only what the row editor also enforces, so the two never disagree.
+    checkValue: function (schema, value) {
+        if (!schema) {
+            return null;
+        }
+        if (schema.enum) {
+            let shown = PVE.meta.Utils.scalarText(value);
+            let allowed = schema.enum.map((v) => String(v));
+            return allowed.indexOf(shown) === -1
+                ? gettext('expected one of') + ': ' + allowed.join(', ')
+                : null;
+        }
+        if (schema.type && !PVE.meta.Lint.typeMatches(schema.type, value)) {
+            return gettext('expected') + ' ' + schema.type;
+        }
+        if (typeof value === 'number') {
+            if (schema.minimum !== undefined && value < schema.minimum) {
+                return gettext('must be at least') + ' ' + schema.minimum;
+            }
+            if (schema.maximum !== undefined && value > schema.maximum) {
+                return gettext('must be at most') + ' ' + schema.maximum;
+            }
+        }
+        if (typeof value === 'string' && schema.format) {
+            return PVE.meta.Utils.checkFormat(schema.format, value);
+        }
+        return null;
+    },
+
+    // A boolean arriving as 1/0 is the API's own wire convention (DESIGN section 4);
+    // flagging it would put a warning on every boolean in the store.
+    typeMatches: function (declared, value) {
+        switch (declared) {
+            case 'string':
+                return typeof value === 'string';
+            case 'integer':
+                return typeof value === 'number' && Number.isInteger(value);
+            case 'number':
+                return typeof value === 'number';
+            case 'boolean':
+                return typeof value === 'boolean' || value === 0 || value === 1;
+            case 'object':
+                return !!value && typeof value === 'object' && !Array.isArray(value);
+            case 'array':
+                return Array.isArray(value);
+            default:
+                return true;
+        }
+    },
+
+    // A scan, not a parser: the store dumps canonically (block style, two-space indent,
+    // one mapping key per line), so an indent stack resolves every key's path. Sequence
+    // items are not indexed (a view addresses through maps only) and a block scalar's
+    // body is skipped, so prose that reads `foo: bar` is never taken for a key.
+    lineIndex: function (yaml) {
+        let out = Object.create(null);
+        let stack = []; // [indent, key]
+        let blockAt = null;
+        String(yaml || '')
+            .split('\n')
+            .forEach(function (raw, i) {
+                let line = raw.trim();
+                let indent = raw.length - raw.replace(/^\s+/, '').length;
+                if (blockAt !== null) {
+                    if (line === '' || indent > blockAt) {
+                        return;
+                    }
+                    blockAt = null;
+                }
+                if (line === '' || line.charAt(0) === '#' || line === '---' || line === '...') {
+                    return;
+                }
+                if (line === '-' || line.slice(0, 2) === '- ') {
+                    return;
+                }
+                let split = PVE.meta.Lint.splitKey(line);
+                if (!split) {
+                    return;
+                }
+                while (stack.length && stack[stack.length - 1][0] >= indent) {
+                    stack.pop();
+                }
+                stack.push([indent, split.key]);
+                out[stack.map((e) => e[1]).join('.')] = i + 1;
+                let value = split.rest.trim();
+                if (value.charAt(0) === '|' || value.charAt(0) === '>') {
+                    blockAt = indent;
+                }
+            });
+        return out;
+    },
+
+    splitKey: function (line) {
+        if (line.charAt(0) === '"') {
+            let key = '';
+            for (let i = 1; i < line.length; i++) {
+                let c = line.charAt(i);
+                if (c === '\\') {
+                    key += line.charAt(++i);
+                } else if (c === '"') {
+                    let after = line.slice(i + 1);
+                    return after.charAt(0) === ':' ? { key: key, rest: after.slice(1) } : null;
+                } else {
+                    key += c;
+                }
+            }
+            return null;
+        }
+        let at = line.indexOf(':');
+        if (at <= 0) {
+            return null;
+        }
+        let key = line.slice(0, at).replace(/\s+$/, '');
+        return key ? { key: key, rest: line.slice(at + 1) } : null;
+    },
+
+    // Findings paired with the line to underline; one whose path the text does not
+    // carry is dropped, because a marker on the wrong line is worse than none.
+    placed: function (findings, index) {
+        let out = [];
+        (findings || []).forEach(function (f) {
+            if (index[f.path] !== undefined) {
+                out.push({ line: index[f.path], message: f.message });
+            }
+        });
+        return out;
+    },
+
+    // Every schema node the grammars declare, by document path -- the hover index.
+    // Every schema node by document path -- the hover index. Pruned the same way as
+    // `findings`, so a path covered by two namespaces resolves to the more specific
+    // one rather than to whichever was collected last.
+    schemaIndex: function (applicable) {
+        let out = Object.create(null);
+        let list = applicable || [];
+        let collect = function (schema, path, owner) {
+            if (owner && PVE.meta.Utils.governing(path, list) !== owner) {
+                return;
+            }
+            out[path] = schema;
+            let props = schema && schema.properties;
+            if (!props) {
+                return;
+            }
+            Object.keys(props).forEach((k) =>
+                collect(props[k], path ? path + '.' + k : k, owner),
+            );
+        };
+        list.forEach((ns) => collect(ns.schema, ns.prefix, ns));
+        return out;
+    },
+
+    hoverText: function (schema) {
+        if (!schema) {
+            return null;
+        }
+        let parts = [];
+        if (schema.type) {
+            parts.push(schema.format ? schema.type + ' (' + schema.format + ')' : schema.type);
+        }
+        if (schema.enum) {
+            parts.push(gettext('one of') + ': ' + schema.enum.map((v) => String(v)).join(', '));
+        }
+        if (schema.minimum !== undefined && schema.maximum !== undefined) {
+            parts.push(schema.minimum + '..' + schema.maximum);
+        } else if (schema.minimum !== undefined) {
+            parts.push(gettext('at least') + ' ' + schema.minimum);
+        } else if (schema.maximum !== undefined) {
+            parts.push(gettext('at most') + ' ' + schema.maximum);
+        }
+        if (schema.default !== undefined) {
+            parts.push(gettext('default') + ': ' + PVE.meta.Utils.scalarText(schema.default));
+        }
+        if (schema.description) {
+            parts.push(schema.description);
+        }
+        return parts.length ? parts.join(' \u00b7 ') : null;
+    },
+};
+
+// ---------------------------------------------------------------------------
 // Monaco, loaded lazily on first use from the tree the pve-meta UI package ships.
 // ---------------------------------------------------------------------------
 
 PVE.meta.Monaco = {
-    VS: '/pve2/js/pve-meta-ui/vs',
+    VS: '/pve2/js/pve-meta-extjs/vs',
     promise: null,
 
     load: function () {
@@ -313,18 +674,72 @@ PVE.meta.Monaco = {
     // cfg: { title, original, modified, lang, apply }
     confirmDiff: function (cfg) {
         let state = {};
+        // `cfg.warnings` (grammar findings) turns this into the warned form: a banner
+        // above the diff and an Apply gated on an explicit tick.
+        let warnings = cfg.warnings || [];
         let win = Ext.create('Ext.window.Window', {
             title: gettext('Confirm') + ': ' + Ext.htmlEncode(cfg.title),
             itemId: 'pveMetaDiffWindow',
             modal: true,
             width: 1000,
             height: 620,
-            layout: 'fit',
+            layout: 'border',
             referenceHolder: true,
-            items: [{ xtype: 'component', reference: 'diff', style: 'height:100%;width:100%' }],
+            items: [
+                // The schema warning lives *in* the confirm step rather than in a
+                // dialog before it: one decision, with the diff that decision is
+                // about visible underneath it, instead of an alert to dismiss and
+                // then a second window to read.
+                {
+                    xtype: 'panel',
+                    region: 'north',
+                    hidden: !warnings.length,
+                    bodyPadding: 8,
+                    border: false,
+                    cls: 'pve-meta-diff-warning',
+                    style: 'border-bottom:1px solid var(--pwt-color-outline,#c0c0c0)',
+                    html:
+                        '<div style="display:flex;gap:8px;align-items:flex-start">' +
+                        '<i class="fa fa-exclamation-triangle" style="color:#e6a23c;margin-top:2px"></i>' +
+                        '<div><b>' +
+                        Ext.htmlEncode(gettext('This does not match the schema the operators declare')) +
+                        '</b><ul style="margin:4px 0 0 0;padding-left:18px">' +
+                        warnings.slice(0, 8).map((w) => '<li>' + Ext.htmlEncode(w) + '</li>').join('') +
+                        '</ul>' +
+                        (warnings.length > 8
+                            ? '<div>' +
+                              Ext.htmlEncode(
+                                  Ext.String.format(gettext('... and {0} more.'), warnings.length - 8),
+                              ) +
+                              '</div>'
+                            : '') +
+                        '</div></div>',
+                },
+                {
+                    xtype: 'component',
+                    region: 'center',
+                    reference: 'diff',
+                    style: 'height:100%;width:100%',
+                },
+            ],
             buttons: [
                 {
+                    xtype: 'proxmoxcheckbox',
+                    itemId: 'diffAckBox',
+                    hidden: !warnings.length,
+                    boxLabel: gettext('Save anyway'),
+                    // Advisory, not a gate: the server's lint decides what is storable
+                    // (DESIGN section 4). The tick is here so a mismatch is a deliberate
+                    // act rather than a dialog reflex -- never to make it impossible.
+                    listeners: {
+                        change: (box, value) => win.down('#diffApplyBtn').setDisabled(!value),
+                    },
+                },
+                '->',
+                {
                     text: gettext('Apply'),
+                    itemId: 'diffApplyBtn',
+                    disabled: !!warnings.length,
                     handler: function () {
                         win.close();
                         cfg.apply();
@@ -341,6 +756,11 @@ PVE.meta.Monaco = {
                 readOnly: true,
                 renderSideBySide: true,
                 minimap: { enabled: false },
+                // Monaco defaults this to true, which hides indentation-only changes --
+                // exactly what a YAML -> JSON -> YAML round trip produces. A confirm
+                // dialog that shows nothing while Apply is enabled is worse than no
+                // dialog, so show them.
+                ignoreTrimWhitespace: false,
             });
             state.editor.setModel({
                 original: monaco.editor.createModel(cfg.original, cfg.lang),
@@ -376,6 +796,9 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'expandedCls', type: 'string' }, // iconCls while this map row is open
         { name: 'defaultValue' },
         { name: 'enumValues' },
+        { name: 'minimum' }, // grammar `minimum`, honoured by the number editor
+        { name: 'maximum' }, // grammar `maximum`, honoured by the number editor
+        { name: 'format', type: 'string' }, // grammar `format` -> an ExtJS vtype
         { name: 'rawValue' },
     ],
 });
@@ -744,7 +1167,8 @@ Ext.define('PVE.meta.TreePanel', {
         me.baseUrl = me.dc ? '/meta/datacenter' : '/meta/guests/' + me.vmid;
         me.digest = '';
         me.access = { read: 1, write: 0, scopes: [] };
-        me.registrations = [];
+        me.namespaces = [];
+        me.grants = [];
         me.tags = [];
         me.token = null;
         me.editing = false; // a row editor is open
@@ -841,6 +1265,13 @@ Ext.define('PVE.meta.TreePanel', {
                     listeners: { change: (btn, value) => me.switchTextLang(value) },
                 },
                 '->',
+                {
+                    text: gettext('Format'),
+                    itemId: 'textFormatBtn',
+                    iconCls: 'fa fa-indent',
+                    tooltip: gettext('Re-indent the buffer canonically'),
+                    handler: () => me.formatText(),
+                },
                 {
                     text: gettext('Apply'),
                     itemId: 'textApplyBtn',
@@ -1074,25 +1505,48 @@ Ext.define('PVE.meta.TreePanel', {
             return;
         }
         Proxmox.Utils.setErrorMask(me, true);
-        me.loadOperators(() =>
-            me.loadTags(() =>
-                me.loadAccess(() => me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false))),
+        me.loadNamespaces(() =>
+            me.loadGrants(() =>
+                me.loadTags(() =>
+                    me.loadAccess(() =>
+                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
+                    ),
+                ),
             ),
         );
     },
 
-    // /meta/operators is revision 5; against an older API it simply fails and the
-    // Access column and the grammar-declared rows stay empty, rather than the page.
-    loadOperators: function (next) {
+    // /meta/namespaces and /meta/grants are revision 6; against an older API they
+    // simply fail and the Access column and the schema-declared rows stay empty,
+    // rather than the page.
+    loadNamespaces: function (next) {
         let me = this;
         me.request({
-            url: '/meta/operators',
+            url: '/meta/namespaces',
             success: function (response) {
-                me.registrations = response.result.data || [];
+                // Served most-specific first (DESIGN section 3.1) -- the order
+                // `Utils.governing` relies on. Sorted again here so the UI does not
+                // depend on the server's ordering for correctness.
+                me.namespaces = PVE.meta.Utils.bySpecificity(response.result.data || []);
                 next();
             },
             failure: function () {
-                me.registrations = [];
+                me.namespaces = [];
+                next();
+            },
+        });
+    },
+
+    loadGrants: function (next) {
+        let me = this;
+        me.request({
+            url: '/meta/grants',
+            success: function (response) {
+                me.grants = response.result.data || [];
+                next();
+            },
+            failure: function () {
+                me.grants = [];
                 next();
             },
         });
@@ -1102,9 +1556,11 @@ Ext.define('PVE.meta.TreePanel', {
     loadTags: function (next) {
         let me = this;
         me.tags = [];
-        let needed = me.registrations.some((r) =>
-            (r.scopes || []).some((s) => s.selector && s.selector.tag),
-        );
+        let hasTagSelector = (list, key) =>
+            (list || []).some((e) => (e[key] || []).some((x) => x.selector && x.selector.tag));
+        let needed =
+            (me.namespaces || []).some((n) => n.selector && n.selector.tag) ||
+            hasTagSelector(me.grants, 'grants');
         if (me.dc || !needed) {
             next();
             return;
@@ -1210,7 +1666,7 @@ Ext.define('PVE.meta.TreePanel', {
         );
     },
 
-    // The scopes of every registration whose selector matches this guest. Scopes
+    // The grant entries whose selector matches this guest. Grants
     // apply to guest documents only (DESIGN §3), so the datacenter gets none.
     //
     // A `tag` selector is normally resolved against `me.tags` (from
@@ -1219,30 +1675,46 @@ Ext.define('PVE.meta.TreePanel', {
     // a scope `/meta/access` already resolved for us: that endpoint resolves
     // selectors server-side without requiring VM.Audit, so it still surfaces our
     // own declared rows and Access entries even when `me.tags` is empty. The
-    // registration is still the source of the label (name, selector text).
-    applicableScopes: function () {
+    // grant file is still the source of the label (name, selector text).
+    // The namespaces that reach this guest, most-specific first. Namespaces decide
+    // *shape*: which declared-but-unset rows appear and which schema governs a path.
+    applicableNamespaces: function () {
+        let me = this;
+        if (me.dc) {
+            return []; // namespaces apply to guest documents only (DESIGN section 3.3)
+        }
+        return (me.namespaces || []).filter(function (ns) {
+            let sel = ns.selector || {};
+            return sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1);
+        });
+    },
+
+    // The grant entries that reach this guest. Grants decide *access*, and unlike
+    // namespaces they accumulate by containment: a grant on `homelab` covers
+    // `homelab.docker` (DESIGN section 3.2).
+    applicableGrants: function () {
         let me = this;
         let out = [];
         if (me.dc) {
-            return out;
+            return out; // grants apply to guest documents only
         }
-        me.registrations.forEach(function (reg) {
-            (reg.scopes || []).forEach(function (scope) {
-                let sel = scope.selector || {};
+        (me.grants || []).forEach(function (grant) {
+            (grant.grants || []).forEach(function (entry) {
+                let sel = entry.selector || {};
                 let matches =
-                    scope.prefix &&
+                    entry.prefix &&
                     (sel.all ||
                         (sel.tag && me.tags.indexOf(sel.tag) !== -1) ||
-                        me.resolvedScopeApplies(scope));
+                        me.resolvedScopeApplies(entry));
                 if (matches) {
-                    out.push(Ext.apply({ registration: reg }, scope));
+                    out.push(Ext.apply({ grant: grant }, entry));
                 }
             });
         });
         return out;
     },
 
-    // Every registration whose scope covers this row, `rw` first. Several principals
+    // Every grant whose prefix covers this row, `rw` first. Several principals
     // may read a subtree; this is about who writes and who subscribes, not ownership.
     accessFor: function (path, scopes) {
         let U = PVE.meta.Utils;
@@ -1253,9 +1725,9 @@ Ext.define('PVE.meta.TreePanel', {
             if (!U.covers(s.prefix, path)) {
                 return;
             }
-            let name = s.registration.name || s.registration.authid || '';
+            let name = s.grant.name || s.grant.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
-            let key = name + ' ' + mode;
+            let key = name + '\u0000' + mode;
             if (seen[key]) {
                 return;
             }
@@ -1327,7 +1799,13 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // A grammar is a PVE::JSONSchema object rooted at its scope's prefix.
-    addGrammar: function (root, prefix, schema) {
+    // `namespaces`/`owner`, when given, enforce most-specific-wins: the walk stops
+    // where a *different* namespace governs, so a parent's `properties` never reach
+    // into a child namespace's subtree and rewrite its row kind. The same rule
+    // `Lint.findings` and `Lint.schemaIndex` apply, through the same
+    // `Utils.governing` -- it lived in two of the three and this was the one that
+    // silently merged (DESIGN section 3.1).
+    addGrammar: function (root, prefix, schema, namespaces, owner) {
         let me = this;
         let U = PVE.meta.Utils;
         let entry = root;
@@ -1343,8 +1821,12 @@ Ext.define('PVE.meta.TreePanel', {
             }
             node.kind = node.kind || 'map';
             Object.keys(sch.properties).forEach(function (key) {
+                let childPath = U.joinPath(node.path, key);
+                if (owner && U.governing(childPath, namespaces) !== owner) {
+                    return; // a more specific namespace owns this subtree
+                }
                 let ps = sch.properties[key] || {};
-                let child = me.entry(node, key, U.joinPath(node.path, key));
+                let child = me.entry(node, key, childPath);
                 // The comment key stays the Description column; the grammar's own
                 // description is the tooltip (DESIGN §8), so they are two fields.
                 child.grammarDescription = child.grammarDescription || ps.description;
@@ -1363,6 +1845,15 @@ Ext.define('PVE.meta.TreePanel', {
                 if (ps.enum) {
                     child.enumValues = ps.enum;
                 }
+                if (ps.minimum !== undefined) {
+                    child.minimum = ps.minimum;
+                }
+                if (ps.maximum !== undefined) {
+                    child.maximum = ps.maximum;
+                }
+                if (ps.format !== undefined) {
+                    child.format = ps.format;
+                }
             });
         };
         walk(entry, schema);
@@ -1379,10 +1870,21 @@ Ext.define('PVE.meta.TreePanel', {
     buildTree: function (data) {
         let me = this;
         let I = PVE.meta.Icons;
-        let scopes = me.applicableScopes();
+        // Kept for text mode's grammar findings (annotateText): the parsed document the
+        // server returned, so nothing has to re-read the YAML to know what is in it.
+        me.docData = data;
+        // Namespaces decide shape, grants decide access -- two lists, two rules
+        // (DESIGN section 3). Declared rows come from namespaces only, and only from the
+        // one governing each prefix: most-specific wins, schemas never merge.
+        let namespaces = me.applicableNamespaces();
+        let scopes = me.applicableGrants();
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
         me.addData(root, data);
-        scopes.forEach((s) => (s.grammar ? me.addGrammar(root, s.prefix, s.grammar) : undefined));
+        namespaces.forEach(function (ns) {
+            if (ns.schema) {
+                me.addGrammar(root, ns.prefix, ns.schema, namespaces, ns);
+            }
+        });
 
         let toNodes = (entry) =>
             Object.keys(entry.children)
@@ -1401,6 +1903,9 @@ Ext.define('PVE.meta.TreePanel', {
                         grammarDescription: c.grammarDescription || '',
                         defaultValue: c.defaultValue,
                         enumValues: c.enumValues,
+                        minimum: c.minimum,
+                        maximum: c.maximum,
+                        format: c.format,
                         rawValue: c.value,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         accessList: access,
@@ -1587,6 +2092,7 @@ Ext.define('PVE.meta.TreePanel', {
                 Proxmox.Utils.setErrorMask(me, false);
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
                     return;
                 }
                 me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
@@ -1597,6 +2103,12 @@ Ext.define('PVE.meta.TreePanel', {
                     minimap: { enabled: false },
                     scrollBeyondLastLine: false,
                 });
+                // Squiggles describe the text the server sent; typing moves the lines,
+                // so they are dropped on the first edit and come back on the next load.
+                me.textEditor.onDidChangeModelContent(function () {
+                    me.annotateText();
+                });
+                me.annotateText();
             },
             function (err) {
                 Proxmox.Utils.setErrorMask(me, false);
@@ -1667,9 +2179,54 @@ Ext.define('PVE.meta.TreePanel', {
         }
         me.textLang = lang;
         window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
-        me.textEditor.setValue(
-            lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value),
-        );
+
+        let rendered;
+        if (lang === 'json') {
+            rendered = JSON.stringify(value, null, 2);
+        } else {
+            // Back to YAML: prefer the server's own text when the document is
+            // unchanged. js-yaml and serde_yaml lay the same document out
+            // differently (indentation of nested sequences, quoting), so re-dumping
+            // here made a *presentation* toggle report unsaved changes and offer an
+            // Apply whose only content was whitespace.
+            rendered = PVE.meta.Utils.sameDocument(value, me.textOriginal)
+                ? me.textOriginal
+                : PVE.meta.Utils.yamlDump(value);
+        }
+        me.textEditor.setValue(rendered);
+        me.annotateText();
+    },
+
+    // Re-dump the buffer canonically in whichever language is showing: two-space
+    // indent, no folding, key order preserved. For hand-written YAML that has drifted
+    // from the store's own layout, and it is the same dumper the JSON/YAML toggle uses,
+    // so formatting then toggling is a no-op.
+    //
+    // Refuses on a buffer that does not parse rather than mangling it -- the squiggle
+    // already says where.
+    formatText: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let text = me.textEditor.getValue();
+        try {
+            let value =
+                me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+            let formatted =
+                me.textLang === 'json'
+                    ? JSON.stringify(value, null, 2)
+                    : PVE.meta.Utils.yamlDump(value);
+            if (formatted !== text) {
+                me.textEditor.setValue(formatted);
+                me.annotateText();
+            }
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Cannot format'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+            );
+        }
     },
 
     applyText: function () {
@@ -1695,6 +2252,12 @@ Ext.define('PVE.meta.TreePanel', {
             original: original,
             modified: edited,
             lang: lang,
+            // Advisory: the banner and the tick make a schema mismatch a deliberate
+            // act, they do not forbid it. The server's lint decides what is storable
+            // (DESIGN section 4), and an operator whose grammar has drifted from what
+            // a document legitimately holds must not be able to lock the administrator
+            // out of editing it.
+            warnings: me.textFindings(),
             apply: function () {
                 // The whole document, at the root view. JSON is a subset of YAML, but
                 // `data` is the parameter that says "this is the JSON data model".
@@ -1719,6 +2282,144 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // Re-read the document and put it back in the buffer (after Apply, or Discard).
+    // Underline what is wrong with the buffer *as it is now*, and describe the key on
+    // each declared line on hover.
+    //
+    // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
+    // is the authority (DESIGN section 4):
+    //
+    //   * a YAML syntax error, as one Error marker on the line js-yaml reports. Monaco
+    //     ships a JSON language service that does this for the JSON view already, but
+    //     nothing validates YAML, so this is ours.
+    //   * every grammar finding, as Warning markers (PVE.meta.Lint).
+    //
+    // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
+    // not against the document the server last sent. Parsing is js-yaml on a document
+    // that is a few KB at most; if that ever shows up in typing latency, debounce it.
+    //
+    // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
+    // view the document still gets Monaco's own syntax validation but no schema
+    // squiggles.
+    annotateText: function () {
+        let me = this;
+        if (!me.textEditor || !window.monaco) {
+            return;
+        }
+        let model = me.textEditor.getModel();
+        if (!model) {
+            return;
+        }
+        let text = me.textEditor.getValue();
+        let markers = [];
+        let hovers = Object.create(null);
+
+        let parsed = null;
+        let parseError = null;
+        try {
+            parsed = me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+        } catch (err) {
+            parseError = err;
+        }
+
+        if (parseError) {
+            if (me.textLang === 'yaml') {
+                // js-yaml's YAMLException carries a 0-based mark; anything else lands
+                // on line 1 rather than nowhere.
+                let mark = parseError.mark || {};
+                let line = typeof mark.line === 'number' ? mark.line + 1 : 1;
+                line = Math.min(Math.max(line, 1), model.getLineCount());
+                markers.push({
+                    startLineNumber: line,
+                    endLineNumber: line,
+                    startColumn: typeof mark.column === 'number' ? mark.column + 1 : 1,
+                    endColumn: model.getLineMaxColumn(line),
+                    message: parseError.reason || PVE.meta.Utils.errText(parseError),
+                    severity: monaco.MarkerSeverity.Error,
+                });
+            }
+        } else if (me.textLang === 'yaml') {
+            let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
+            if (applicable.length) {
+                let index = PVE.meta.Lint.lineIndex(text);
+                markers = PVE.meta.Lint.placed(
+                    PVE.meta.Lint.findings(parsed, applicable),
+                    index,
+                ).map(function (f) {
+                    return {
+                        startLineNumber: f.line,
+                        endLineNumber: f.line,
+                        startColumn: 1,
+                        endColumn: model.getLineMaxColumn(f.line),
+                        message: f.message,
+                        severity: monaco.MarkerSeverity.Warning,
+                    };
+                });
+                let schemas = PVE.meta.Lint.schemaIndex(applicable);
+                Object.keys(schemas).forEach(function (path) {
+                    let hover = PVE.meta.Lint.hoverText(schemas[path]);
+                    if (hover && index[path] !== undefined) {
+                        hovers[index[path]] = hover;
+                    }
+                });
+            }
+        }
+
+        monaco.editor.setModelMarkers(model, 'pve-meta', markers);
+        me.textHovers = hovers;
+        me.registerTextHover();
+    },
+
+    // The grammar findings for the current buffer, as plain messages -- what Apply
+    // warns about before it writes. Empty when the buffer does not parse (the write
+    // will fail on its own) or when no grammar applies.
+    textFindings: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return [];
+        }
+        let applicable = PVE.meta.Lint.applicable(me.applicableNamespaces());
+        if (!applicable.length) {
+            return [];
+        }
+        try {
+            let value =
+                me.textLang === 'json'
+                    ? Ext.decode(me.textEditor.getValue())
+                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            return PVE.meta.Lint.findings(value, applicable).map((f) => f.path + ': ' + f.message);
+        } catch (_err) {
+            return [];
+        }
+    },
+
+    // One hover provider for the language, reading whichever panel owns the model that
+    // is asking. Monaco registers providers per-language, not per-editor.
+    registerTextHover: function () {
+        let me = this;
+        if (PVE.meta.textHoverRegistered || !window.monaco || !monaco.languages) {
+            return;
+        }
+        PVE.meta.textHoverRegistered = true;
+        monaco.languages.registerHoverProvider('yaml', {
+            provideHover: function (model, position) {
+                let owner = me.textEditor && me.textEditor.getModel() === model ? me : null;
+                let text = owner && owner.textHovers && owner.textHovers[position.lineNumber];
+                if (!text) {
+                    return null;
+                }
+                return {
+                    range: new monaco.Range(
+                        position.lineNumber,
+                        1,
+                        position.lineNumber,
+                        model.getLineMaxColumn(position.lineNumber),
+                    ),
+                    contents: [{ value: text }],
+                };
+            },
+        });
+    },
+
     refreshText: function () {
         let me = this;
         me.request({
@@ -1730,6 +2431,7 @@ Ext.define('PVE.meta.TreePanel', {
                 me.textOriginal = d.text || '';
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
                 }
             },
         });

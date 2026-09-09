@@ -22,9 +22,11 @@ use Test::More;
 use PVE::RS::Meta;
 
 my $root = tempdir(CLEANUP => 1);
-my $opdir = tempdir(CLEANUP => 1);
+my $nsdir = tempdir(CLEANUP => 1);
+my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
-$ENV{PVE_META_OPERATOR_DIRS} = $opdir;
+$ENV{PVE_META_NAMESPACE_DIRS} = $nsdir;
+$ENV{PVE_META_GRANT_DIRS} = $grantdir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -42,9 +44,17 @@ sub read_file {
     return $content;
 }
 
-sub write_operator {
+# The file name is the prefix (docs/DESIGN.md §3.1).
+sub write_namespace {
     my ($name, $content) = @_;
-    open(my $fh, '>', "$opdir/$name.yaml") or die "failed to write $opdir/$name.yaml: $!\n";
+    open(my $fh, '>', "$nsdir/$name.yaml") or die "failed to write $nsdir/$name.yaml: $!\n";
+    print {$fh} $content;
+    close($fh);
+}
+
+sub write_grant {
+    my ($name, $content) = @_;
+    open(my $fh, '>', "$grantdir/$name.yaml") or die "failed to write $grantdir/$name.yaml: $!\n";
     print {$fh} $content;
     close($fh);
 }
@@ -85,18 +95,43 @@ is(PVE::RS::Meta::on_rollback(9001, 'gone'), 'removed',
 ok(!file_exists('9001.yaml'), 'document file is gone after rollback-removed');
 is(PVE::RS::Meta::on_rollback(9001, 'gone'), 'none', 'on_rollback is a no-op when nothing exists');
 
+# --- on_create / on_destroy ---------------------------------------------
+#
+# The two hooks patched into PVE::AbstractConfig (docs/DESIGN.md §6). Both clear a
+# vmid's document and every snapshot copy; only the call site differs.
+write_file('9300.yaml', "traefik:\n  host: old.example\n");
+PVE::RS::Meta::on_snapshot(9300, 'snapA');
+ok(file_exists('9300.yaml'), 'the doomed guest has a document');
+ok(file_exists('9300.snapA.yaml'), '... and a snapshot copy');
+
+is(PVE::RS::Meta::on_destroy(9300), 2, 'on_destroy removes the document and its snapshots');
+ok(!file_exists('9300.yaml'), '... the document is gone');
+ok(!file_exists('9300.snapA.yaml'), '... and so is the snapshot copy');
+is(PVE::RS::Meta::on_destroy(9300), 0, 'on_destroy is idempotent');
+
+# The reuse case a periodic sweep cannot see: the vmid comes straight back, so it is
+# never "missing from the vmlist" -- only a hook at creation clears the leftover.
+write_file('9301.yaml', "traefik:\n  host: stale.example\n");
+PVE::RS::Meta::on_snapshot(9301, 'snapB');
+is(PVE::RS::Meta::on_create(9301), 2, 'on_create clears a leftover document and its snapshots');
+ok(!file_exists('9301.yaml'), 'a guest created at a recycled vmid inherits nothing');
+ok(!file_exists('9301.snapB.yaml'), '... not even an old snapshot copy');
+is(PVE::RS::Meta::on_create(9301), 0, 'on_create on a clean vmid is a no-op');
+
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone.
-for my $gone (qw(on_clone on_destroy export_for_backup import_from_backup
-                 list_snapshots has_document api_grants)) {
+# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. Two names are
+# deliberately *not* in this list: `on_destroy` came back with the create/destroy hooks
+# (§6), and `api_grants` came back in revision 6 meaning something else entirely -- the
+# grant-file listing behind GET /meta/grants, not revision 5's caller-scope lookup.
+for my $gone (qw(on_clone export_for_backup import_from_backup
+                 list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
-# =========================================================================
 # gc() -- what replaces the destroy hook and the whole orphan concept.
 # =========================================================================
 
@@ -117,7 +152,12 @@ ok(file_exists('datacenter.yaml'), 'the datacenter document is never a guest');
 
 is(PVE::RS::Meta::gc([9100]), 0, 'gc is idempotent');
 is(PVE::RS::Meta::gc([9100, 999500]), 0, 'a vmid back in the vmlist is not removed');
-is(PVE::RS::Meta::gc([]), 2, 'an empty vmlist removes every guest document and snapshot');
+# A whole sweep is a vmid the store does not have -- an empty vmlist is
+# refused, because it is also what a process that skipped cfs_update() sees.
+$res = eval { PVE::RS::Meta::gc([]) };
+ok(!defined($res), 'gc refuses an empty vmlist, like gc_purge');
+like($@, api_error_status(500), 'the empty-vmlist refusal is prefixed 500:');
+is(PVE::RS::Meta::gc([999999]), 2, 'a sweep against a vmlist with no stored vmid removes everything stale');
 ok(file_exists('datacenter.yaml'), '... still never the datacenter document');
 
 # The two-phase GC /usr/libexec/pve-meta/gc actually runs: nominate under
@@ -190,9 +230,18 @@ for my $case (
 # api_* : reads and writes
 # =========================================================================
 
-my $v = PVE::RS::Meta::api_version();
-like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token looks like a sha256 hex digest');
-ok($v->{changed} > 0, 'api_version changed is a unix timestamp');
+my $v = PVE::RS::Meta::api_version(0);
+like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
+ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
+ok(!defined($v->{documents}), 'no `documents` without detail');
+
+my $vd = PVE::RS::Meta::api_version(1);
+is($vd->{token}, $v->{token}, 'detail does not change the token');
+ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
+ok((grep { $_->{id} eq 'datacenter' } @{ $vd->{documents} }),
+    'the datacenter document is listed by id');
+ok((!grep { $_->{id} =~ /\./ } @{ $vd->{documents} }),
+    'snapshot copies are not listed as documents');
 
 # A missing document is the empty document with digest "".
 my $missing = PVE::RS::Meta::api_get('9101', undef, 'json', $FULL);
@@ -291,13 +340,43 @@ ok(!defined($res), 'a caller with no grant at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Registrations, selectors and tags (docs/DESIGN.md §3).
+# Namespaces, grants, selectors and tags (docs/DESIGN.md §3).
 # =========================================================================
 
-write_operator('scoped', <<'YAML');
+# The file name is the prefix; there is no `prefix:` field to disagree with it.
+write_namespace('traefik', <<'YAML');
+description: Traefik dynamic configuration
+selector: { tag: traefik }
+schema:
+  type: object
+  properties:
+    spec: { type: object }
+YAML
+write_namespace('homelab.docker', <<'YAML');
+selector: { all: true }
+schema: { type: object }
+YAML
+write_namespace('homelab', <<'YAML');
+selector: { all: true }
+schema: { type: object }
+YAML
+
+my $ns = PVE::RS::Meta::api_namespaces();
+is(scalar(@$ns), 3, 'api_namespaces lists every namespace');
+is($ns->[0]->{prefix}, 'homelab.docker',
+    'sorted most-specific first, which is the order that resolves who governs a path');
+is_deeply([map { $_->{prefix} } @$ns], ['homelab.docker', 'homelab', 'traefik'],
+    '... longest prefix first, then by name');
+my ($traefik_ns) = grep { $_->{prefix} eq 'traefik' } @$ns;
+is($traefik_ns->{description}, 'Traefik dynamic configuration', 'the description survives');
+is_deeply($traefik_ns->{selector}, { tag => 'traefik' }, 'and the selector, as a native hash');
+ok($traefik_ns->{schema}, 'and the schema, passed through verbatim');
+ok(!exists $traefik_ns->{authid}, 'a namespace names no principal');
+
+write_grant('scoped', <<'YAML');
 authid: scoped@pve!t1
 description: The scoped test principal
-scopes:
+grants:
   - prefix: traefik
     mode: rw
     selector: { tag: traefik }
@@ -306,16 +385,17 @@ scopes:
     selector: { all: true }
 YAML
 
-my $ops = PVE::RS::Meta::api_operators();
-is(scalar(@$ops), 1, 'api_operators lists the registration');
-is($ops->[0]->{name}, 'scoped', 'with the file name as its name');
-is($ops->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
-is($ops->[0]->{description}, 'The scoped test principal', 'and the description');
-is_deeply($ops->[0]->{scopes}->[0]->{selector}, { tag => 'traefik' },
+my $gs = PVE::RS::Meta::api_grants();
+is(scalar(@$gs), 1, 'api_grants lists the grant');
+is($gs->[0]->{name}, 'scoped', 'with the file name as its name');
+is($gs->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
+is($gs->[0]->{description}, 'The scoped test principal', 'and the description');
+is_deeply($gs->[0]->{grants}->[0]->{selector}, { tag => 'traefik' },
     'and the selector, as a native hash');
-ok($ops->[0]->{scopes}->[1]->{selector}->{all},
+ok($gs->[0]->{grants}->[1]->{selector}->{all},
     '... and { all: true } is a hash spelled the way the file spells it, not a bare string');
-is($ops->[0]->{scopes}->[1]->{prefix}, 'netbird', 'and every scope entry');
+is($gs->[0]->{grants}->[1]->{prefix}, 'netbird', 'and every grant entry');
+ok(!exists $gs->[0]->{grants}->[0]->{schema}, 'a grant carries no schema');
 
 sub scoped_acl {
     my (@tags) = @_;
@@ -398,15 +478,18 @@ $res = eval { PVE::RS::Meta::api_get('datacenter', 'traefik', 'json', scoped_acl
 ok(!defined($res), 'and a scoped datacenter read is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# A malformed registration file is skipped with a warning and grants nothing;
-# it never takes another operator's grants away.
-write_operator('broken', "authid: nope-not-an-authid\n");
-write_operator('alsobroken', "authid: a\@pve\nscopes:\n  - prefix: x\n    mode: sideways\n");
-is(scalar(@{ PVE::RS::Meta::api_operators() }), 1,
-    'a malformed registration file is skipped');
+# A malformed file is skipped with a warning and contributes nothing; it never
+# takes another file's grants away. Both directories, independently.
+write_grant('broken', "authid: nope-not-an-authid\n");
+write_grant('alsobroken', "authid: a\@pve\ngrants:\n  - prefix: x\n    mode: sideways\n");
+write_namespace('brokenns', "selector: { nonsense: true }\n");
+write_namespace('a b', "selector: { all: true }\n"); # not a valid prefix, so not a namespace
+is(scalar(@{ PVE::RS::Meta::api_grants() }), 1, 'a malformed grant file is skipped');
+is(scalar(@{ PVE::RS::Meta::api_namespaces() }), 3, 'a malformed namespace file is skipped');
 is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
-    '... and the valid one still grants exactly what it did');
-unlink("$opdir/broken.yaml", "$opdir/alsobroken.yaml");
+    '... and the valid ones still grant exactly what they did');
+unlink("$grantdir/broken.yaml", "$grantdir/alsobroken.yaml",
+    "$nsdir/brokenns.yaml", "$nsdir/a b.yaml");
 
 # =========================================================================
 # api_list_guests: native rows in, native rows out.
@@ -573,7 +656,7 @@ my ($listed_big) = grep { $_->{vmid} == 9504 }
     @{ PVE::RS::Meta::api_list_guests('root@pam', [guest_row(9504, read => 1)], undef) };
 ok(defined($listed_big), 'one oversized document does not take the listing down');
 isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
-ok(defined(PVE::RS::Meta::api_version()->{token}), '... nor the version poll');
+ok(defined(PVE::RS::Meta::api_version(0)->{token}), '... nor the version poll');
 
 $res = eval { PVE::RS::Meta::api_put('9504', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
 ok(!defined($res), 'a view write against an oversized document is refused');
@@ -588,10 +671,10 @@ PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
 # is skipped: `version()`'s token does not move for it, so `changed` must not
 # either.
 write_file('9506.yaml', "traefik:\n  spec:\n    host: x\n");
-my $noop_before = PVE::RS::Meta::api_version();
+my $noop_before = PVE::RS::Meta::api_version(0);
 my $noop = PVE::RS::Meta::api_put('9506', 'traefik.spec', 'json', '{}', 'merge', undef, 0, $FULL);
 is_deeply($noop->{touched}, [], 'a no-op merge touches nothing');
-is_deeply(PVE::RS::Meta::api_version(), $noop_before, '... and moves neither token nor changed');
+is_deeply(PVE::RS::Meta::api_version(0), $noop_before, '... and moves neither token nor changed');
 is(read_file('9506.yaml'), "traefik:\n  spec:\n    host: x\n", '... and rewrites nothing');
 unlink("$root/9506.yaml");
 

@@ -85,7 +85,7 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
   "title": "Metadata",
   "iconCls": "fa fa-tags",
   "targets": ["lxc", "qemu", "dc"],
-  "url": "/pve2/js/pve-meta-ui/index.html?{query}",
+  "url": "/pve2/js/my-app/index.html?{query}",
   "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
 }
 ```
@@ -100,6 +100,7 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
 | `script` | exactly one of `url` or `script`+`xtype` | URL of a JS file defining an ExtJS class (placeholders substituted, same as `url`), loaded once and instantiated as the tab's content instead of an iframe. Requires `xtype`. |
 | `xtype` | with `script` | The `xtype` (ExtJS alias) the script registers; the tab becomes `{ xtype, vmid, type, node, dc }` (whichever of those apply to the target — see below), not an iframe. |
 | `requires` | no | Per-capability-category privilege lists (see "Privilege check", below). Omit to show the tab to every logged-in user. |
+| `fingerprint` | — | **Server-added, never written by you.** A short content hash of the file `script`/`url` resolves to, which the loader appends as `?ver=`. See "Cache busting" below. |
 
 `GET /api2/json/ext/pages` (served by `PVE::API2::Ext`, `permissions => {
 user => 'all' }`) re-reads this directory **on every call** — no daemon
@@ -156,6 +157,24 @@ its `xtype`, to break the PVE UI itself.**
 `{query}` is the one most manifests want (it's a ready-to-use query
 string); the individual placeholders exist for a URL that needs one value
 somewhere other than the query string.
+
+### Cache busting
+
+`GET /ext/pages` adds a `fingerprint` to every manifest — a short SHA-256 of the file
+its `script` (or `url`) resolves to under `/usr/share/pve-manager/js/` — and
+`pve-ext-loader.js` appends it to the URL as `?ver=<fingerprint>`.
+
+This is not cosmetic. pveproxy serves static files with `Last-Modified` and **no**
+`Cache-Control` or `ETag`, and dpkg installs them with the mtime clamped to the
+changelog date for reproducible builds. So two different builds of the *same* package
+version are byte-different files with an identical `Last-Modified`: a browser that
+cached the old one revalidates, gets `304 Not Modified`, and keeps it — through
+reloads, indefinitely, until the package version changes. PVE hits the same thing with
+its own bundle and solves it the same way (`pvemanagerlib.js?ver=…` in
+`index.html.tpl`).
+
+A URL the server cannot resolve to a file on disk gets no fingerprint and therefore no
+parameter, which is exactly the previous behaviour.
 
 ### Privilege check (client-side; not the enforcement)
 

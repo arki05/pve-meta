@@ -42,21 +42,33 @@ snapshot copy of its metadata document that disappears again a few seconds later
 Harmless, but visible if you go looking. QEMU's vzdump path never creates an
 `AbstractConfig`-level snapshot, so this is LXC-only.
 
-## Destroy: GC, not a hook
+## Create and destroy: hooks, not a GC
 
-There is no `on_destroy` hook. Instead, a systemd timer (`pve-meta-gc.timer`, hourly)
-runs a GC job on every node that removes any guest document (and its snapshot copies)
-whose vmid is no longer in the cluster's vmlist. See `README.md` for the unit and what
-it runs.
+Both live in `PVE::AbstractConfig` — the file already patched for the snapshot trio — so
+the whole guest lifecycle costs one patched file in one package.
 
-This replaces the previous approach of patching `pve-container`'s and `qemu-server`'s
-destroy paths directly: a GC is strictly simpler (one small script instead of five call
-sites across two upstream packages, none of it reshipped on every point release) and
-covers the same case — a destroyed guest's metadata eventually disappears — with a bound
-of "up to one GC interval" instead of "immediately." There is no orphan concept in the
-API: a document with no matching vmid is invisible to `/meta/guests` and 404s if you ask
-for it directly, exactly as if it never existed; the GC just means it doesn't linger on
-disk forever.
+`destroy_config` is two lines upstream (`unlink` the config, die if that fails) and is the
+single choke point for **every** destroy path in both guest packages: primary destroy,
+create/restore failure cleanup, clone failure cleanup, remote-migration abort. Twelve call
+sites, one method. The hook runs *after* the unlink succeeds — while the config exists, so
+does the guest.
+
+`create_and_lock_config` is the matching choke point for creation (create, restore, clone
+target, `qm`/`pct` CLI, both remote-migration inbound paths). It opens with
+`PVE::Cluster::check_vmid_unused($vmid, $allow_existing)`, which is what makes the hook
+precise rather than a guess: when `$allow_existing` is false, PVE has just asserted this
+vmid was free, so anything still under `/etc/pve/meta/<vmid>.*` is a leftover and is
+cleared. When it is true — a restore *over* an existing guest — the document is kept,
+because a backup does not carry one and clearing would be data loss.
+
+This replaces the hourly GC, and it is not merely faster. A sweep nominates vmids that are
+missing from the vmlist; a guest destroyed and recreated at the same vmid between two
+sweeps is therefore never stale, and the new guest inherits the old document **for good**.
+The create hook closes that window instead of narrowing it, and covers the destroy that
+never ran because its node was down.
+
+The script survives as a manual broom (`/usr/libexec/pve-meta/gc`) for a config removed out
+of band; no timer runs it.
 
 ## What is not carried, and why
 

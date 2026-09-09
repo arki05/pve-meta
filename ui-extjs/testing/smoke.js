@@ -17,6 +17,19 @@ const ctx = {
     Promise,
     gettext: (s) => s,
     Ext: {
+        // Just enough of the VTypes singleton for PVE.meta.Utils.checkFormat: the real
+        // validators live in proxmoxlib, and the point of that helper is that it calls
+        // whatever is registered rather than reimplementing it.
+        form: {
+            field: {
+                VTypes: {
+                    DnsName: (v) => /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/.test(v),
+                    DnsNameText: 'not a valid dns-name',
+                    IPAddress: (v) => /^(\d{1,3}\.){3}\d{1,3}$/.test(v),
+                    IPAddressText: 'not a valid ipv4',
+                },
+            },
+        },
         ns(path) {
             let cur = ctx;
             path.split('.').forEach((p) => {
@@ -105,6 +118,21 @@ eq('editor enum', U.editorFor({ kind: 'string', enumValues: ['a'] }).xtype, 'com
 eq('editor boolean', U.editorFor({ kind: 'boolean' }).xtype, 'proxmoxcheckbox');
 eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
+
+// A grammar's `minimum`/`maximum` reach the number editor, and its `format` is
+// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §8).
+let numEd = U.editorFor({ kind: 'number', minimum: 1, maximum: 65535 });
+eq('editor number honours minimum', numEd.minValue, 1);
+eq('editor number honours maximum', numEd.maxValue, 65535);
+eq('editor number without a range sets none', U.editorFor({ kind: 'number' }).minValue, undefined);
+eq('a zero minimum is not dropped as falsy', U.editorFor({ kind: 'number', minimum: 0 }).minValue, 0);
+eq('editor format -> vtype', U.editorFor({ kind: 'string', format: 'ipv4' }).vtype, 'IPAddress');
+eq('editor format cidr', U.editorFor({ kind: 'string', format: 'CIDR' }).vtype, 'IP64CIDRAddress');
+eq('an unknown format does not constrain the field',
+    U.editorFor({ kind: 'string', format: 'no-such-format' }).vtype, undefined);
+eq('no format, no vtype', U.editorFor({ kind: 'string' }).vtype, undefined);
+eq('enum wins over format', U.editorFor({ kind: 'string', format: 'ipv4', enumValues: ['a'] }).xtype,
+    'combobox');
 
 console.log('\n--- selector text (the Access tooltip) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
@@ -330,39 +358,39 @@ eq('the corpus and 500 generated documents round trip', propFails, 0);
 
 console.log('\n--- row merge: document + grammar ---');
 const P = ctx.PVE.meta.TreePanel;
+const TRAEFIK_SCHEMA = {
+    type: 'object',
+    properties: {
+        spec: {
+            type: 'object',
+            properties: {
+                host: { type: 'string', description: 'Public host name' },
+                port: { type: 'integer', default: 80 },
+                scheme: { type: 'string', enum: ['http', 'https'] },
+            },
+        },
+    },
+};
 const panel = {
     dc: false,
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    registrations: [
+    // Two lists now, two rules (DESIGN section 3): namespaces decide shape, grants
+    // decide access.
+    namespaces: [
+        { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
+        { prefix: 'netbird', selector: { all: true } },
+    ],
+    grants: [
         {
             name: 'traefik',
             authid: 'svc@pve!traefik',
-            scopes: [
-                {
-                    prefix: 'traefik',
-                    mode: 'rw',
-                    selector: { tag: 'traefik' },
-                    grammar: {
-                        type: 'object',
-                        properties: {
-                            spec: {
-                                type: 'object',
-                                properties: {
-                                    host: { type: 'string', description: 'Public host name' },
-                                    port: { type: 'integer', default: 80 },
-                                    scheme: { type: 'string', enum: ['http', 'https'] },
-                                },
-                            },
-                        },
-                    },
-                },
-            ],
+            grants: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
         },
         {
             name: 'netbird',
             authid: 'svc@pve!netbird',
-            scopes: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
+            grants: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
         },
     ],
 };
@@ -371,19 +399,24 @@ const panel = {
     'addData',
     'addGrammar',
     'schemaKind',
-    'applicableScopes',
+    'applicableNamespaces',
+    'applicableGrants',
     'resolvedScopeApplies',
     'accessFor',
     'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
-const scopes = panel.applicableScopes.call(panel);
-eq('applicable scopes', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+const namespaces = panel.applicableNamespaces.call(panel);
+eq('applicable namespaces', namespaces.map((n) => n.prefix), ['traefik', 'netbird']);
+const scopes = panel.applicableGrants.call(panel);
+eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
-scopes.forEach((s) => (s.grammar ? panel.addGrammar.call(panel, root, s.prefix, s.grammar) : null));
+namespaces.forEach((ns) =>
+    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema) : null,
+);
 
 const spec = root.children.traefik.children.spec.children;
 eq('grammar adds unset rows', Object.keys(spec).sort(), ['host', 'port', 'scheme']);
@@ -399,7 +432,7 @@ eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
-panel.addGrammar.call(panel, root, 'traefik', panel.registrations[0].scopes[0].grammar);
+panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
 // Comment key becomes the sibling's Description, never a row of its own.
@@ -407,7 +440,7 @@ eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['gr
 eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
-console.log('\n--- Access: every registration whose scope covers the row ---');
+console.log('\n--- Access: every grant whose prefix covers the row ---');
 eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
     { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
 ]);
@@ -419,7 +452,7 @@ const overlapping = scopes.concat([
         prefix: 'traefik',
         mode: 'ro',
         selector: { all: true },
-        registration: { name: 'audit', authid: 'svc@pve!audit' },
+        grant: { name: 'audit', authid: 'svc@pve!audit' },
     },
 ]);
 eq(
@@ -438,18 +471,236 @@ console.log('\n--- S6: scope-only principal (no VM.Audit, so no tags) ---');
 const scopedPanel = Object.assign({}, panel);
 scopedPanel.tags = [];
 scopedPanel.access = { read: 0, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const scopedScopes = panel.applicableScopes.call(scopedPanel);
+const scopedScopes = panel.applicableGrants.call(scopedPanel);
 // `netbird` is still applicable regardless of tags (its selector is `all: true`);
 // `traefik` is a `tag` selector that only resolves via GET /meta/access now.
-eq('resolved-scope applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
+eq('resolved-grant applicability (no tags visible)', scopedScopes.map((s) => s.prefix).sort(), [
     'netbird',
     'traefik',
 ]);
 eq(
-    'access label still comes from the registration',
+    'access label still comes from the grant file',
     panel.accessSummary(panel.accessFor.call(scopedPanel, 'traefik.spec.host', scopedScopes)),
     'traefik',
 );
+
+console.log('\n--- grammar findings for the text editor (mirrors ui/src/lint.rs) ---');
+const L = ctx.PVE.meta.Lint;
+// Namespace objects, the same shape GET /meta/namespaces returns.
+const GRAMMAR = L.applicable([
+    {
+        prefix: 'traefik',
+        schema: {
+            type: 'object',
+            properties: {
+                spec: {
+                    type: 'object',
+                    properties: {
+                        host: { type: 'string', format: 'dns-name', description: 'Public host name' },
+                        port: { type: 'integer', minimum: 1, maximum: 65535, default: 80 },
+                        scheme: { type: 'string', enum: ['http', 'https'] },
+                        enabled: { type: 'boolean' },
+                    },
+                },
+            },
+        },
+    },
+]);
+
+eq('a clean document has no findings',
+    L.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } },
+        GRAMMAR),
+    []);
+
+eq('each rule is reported at its own path',
+    L.findings({ traefik: { spec: { port: 70000, scheme: 'ftp', enabled: 'yes' } } }, GRAMMAR)
+        .map((f) => f.path),
+    ['traefik.spec.enabled', 'traefik.spec.port', 'traefik.spec.scheme']);
+
+// DESIGN section 4: the JSON view renders booleans as 1/0; flagging those would put a
+// warning on every boolean in the store.
+eq('a boolean on the wire as 1 is not a finding',
+    L.findings({ traefik: { spec: { enabled: 1 } } }, GRAMMAR), []);
+eq('a boolean on the wire as 0 is not a finding',
+    L.findings({ traefik: { spec: { enabled: 0 } } }, GRAMMAR), []);
+eq('but 2 is', L.findings({ traefik: { spec: { enabled: 2 } } }, GRAMMAR).length, 1);
+
+eq('keys no grammar describes are left alone',
+    L.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }, GRAMMAR), []);
+eq('a prefix with nothing under it contributes nothing', L.findings({}, GRAMMAR), []);
+eq('a namespace with no schema contributes nothing',
+    L.applicable([{ prefix: 'netbird' }]), []);
+
+const YAML = [
+    'traefik:',
+    '  spec:',
+    '    host: a.example',
+    '    port: 80',
+    '  routers:',
+    '    - rule: Host(`a`)',
+    'netbird:',
+    '  groups:',
+    '    - lan',
+    '',
+].join('\n');
+const IDX = L.lineIndex(YAML);
+eq('line index: top level', IDX['traefik'], 1);
+eq('line index: nested', IDX['traefik.spec.host'], 3);
+eq('line index: sibling after a sequence', IDX['netbird.groups'], 8);
+eq('line index: sequence items are not keys', IDX['traefik.routers.rule'], undefined);
+
+const BLOCK = [
+    'compose:',
+    '  file: |',
+    '    services:',
+    '      web:',
+    '        image: nginx',
+    '  name: stack',
+    '',
+].join('\n');
+const BIDX = L.lineIndex(BLOCK);
+eq('block scalar: the key itself', BIDX['compose.file'], 2);
+eq('block scalar: the sibling after it', BIDX['compose.name'], 6);
+eq('block scalar: its body is not keys', BIDX['compose.file.services'], undefined);
+eq('block scalar: nor promoted to the parent', BIDX['compose.services'], undefined);
+
+const QIDX = L.lineIndex('---\n# c\nhost__: note\nhost: a.example\n"quoted: key": 1\n');
+eq('comment keys are ordinary keys', QIDX['host__'], 3);
+eq('markers and comments are skipped', QIDX['host'], 4);
+eq('a quoted key is unquoted', QIDX['quoted: key'], 5);
+
+eq('findings are placed on their lines',
+    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
+        L.lineIndex('traefik:\n  spec:\n    port: 70000\n')),
+    [{ line: 3, message: 'must be at most 65535' }]);
+eq('a finding the text does not carry is dropped, not misplaced',
+    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
+        L.lineIndex('unrelated: 1\n')),
+    []);
+
+const SCHEMAS = L.schemaIndex(GRAMMAR);
+eq('hover: type, range and default',
+    L.hoverText(SCHEMAS['traefik.spec.port']), 'integer \u00b7 1..65535 \u00b7 default: 80');
+eq('hover: type, format and description',
+    L.hoverText(SCHEMAS['traefik.spec.host']), 'string (dns-name) \u00b7 Public host name');
+eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
+    'string \u00b7 one of: http, https');
+eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
+
+console.log('\n--- nesting: most-specific wins, schemas never merge ---');
+// `homelab` and `homelab.docker` are both namespaces. The child governs its whole
+// subtree; the parent's own `properties.docker` is shadowed, not combined
+// (DESIGN section 3.1). Before revision 6 both walked and their findings unioned.
+const NESTED = L.applicable([
+    {
+        prefix: 'homelab',
+        schema: {
+            type: 'object',
+            properties: {
+                notes: { type: 'string' },
+                // The parent has an opinion about `docker` -- and must not get one.
+                docker: { type: 'string' },
+            },
+        },
+    },
+    {
+        prefix: 'homelab.docker',
+        schema: { type: 'object', properties: { compose: { type: 'string' } } },
+    },
+]);
+eq('applicable sorts longest prefix first', NESTED.map((n) => n.prefix), ['homelab.docker', 'homelab']);
+// One implementation of the rule, in Utils, shared by the row builder, the linter
+// and the hover index.
+eq('governing picks the child for the child subtree',
+    U.governing('homelab.docker.compose', NESTED).prefix, 'homelab.docker');
+eq('governing picks the parent elsewhere', U.governing('homelab.notes', NESTED).prefix, 'homelab');
+eq('governing picks the child for the boundary itself',
+    U.governing('homelab.docker', NESTED).prefix, 'homelab.docker');
+eq('governing returns null off-namespace', U.governing('unrelated.x', NESTED), null);
+
+// The parent declares `docker: string` and the document has a map there. That is a
+// finding only if the parent is allowed to reach into the child -- it is not.
+const NESTED_DOC = { homelab: { notes: 'ok', docker: { compose: 'services: {}' } } };
+eq('the parent does not lint the child subtree', L.findings(NESTED_DOC, NESTED), []);
+
+// The child does lint its own subtree.
+eq('the child lints its own subtree',
+    L.findings({ homelab: { docker: { compose: 42 } } }, NESTED).map((f) => f.path + ': ' + f.message),
+    ['homelab.docker.compose: expected string']);
+
+// And the parent still lints what it does own.
+eq('the parent lints its own keys',
+    L.findings({ homelab: { notes: 7 } }, NESTED).map((f) => f.path),
+    ['homelab.notes']);
+
+// Hovers resolve to the governing namespace rather than to whichever was collected
+// last -- which used to depend on iteration order.
+const NESTED_IDX = L.schemaIndex(NESTED);
+eq('hover at the boundary comes from the child',
+    NESTED_IDX['homelab.docker'].properties.compose.type, 'string');
+eq('hover below the boundary is the child\'s', NESTED_IDX['homelab.docker.compose'].type, 'string');
+eq('hover elsewhere is the parent\'s', NESTED_IDX['homelab.notes'].type, 'string');
+
+console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
+{
+    const nsPanel = Object.assign({}, panel);
+    nsPanel.namespaces = [
+        {
+            prefix: 'homelab.docker',
+            selector: { all: true },
+            schema: { type: 'object', properties: { compose: { type: 'string' } } },
+        },
+        {
+            prefix: 'homelab',
+            selector: { all: true },
+            // The parent has an opinion about `docker` and must not get one: the child
+            // namespace governs that subtree entirely (DESIGN section 3.1).
+            schema: {
+                type: 'object',
+                properties: {
+                    notes: { type: 'string' },
+                    docker: { type: 'string', description: 'the parent should not win here' },
+                },
+            },
+        },
+    ];
+    const nsList = nsPanel.applicableNamespaces.call(nsPanel);
+    const r = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    nsPanel.addData.call(nsPanel, r, { homelab: { docker: { compose: 'x' } } });
+    // Exactly what buildTree does: no call-site guard any more, the walk prunes itself.
+    nsList.forEach((ns) =>
+        ns.schema ? nsPanel.addGrammar.call(nsPanel, r, ns.prefix, ns.schema, nsList, ns) : null,
+    );
+    const dockerRow = r.children.homelab.children.docker;
+    eq('the child governs the boundary row kind', dockerRow.kind, 'map');
+    eq('the parent does not describe the child row', dockerRow.grammarDescription, undefined);
+    eq('the child declares its own keys', Object.keys(dockerRow.children).sort(), ['compose']);
+    eq('the parent still declares its own', r.children.homelab.children.notes.kind, 'string');
+}
+
+console.log('\n--- round trip: a view toggle must not invent changes ---');
+// serde_yaml and js-yaml lay the same document out differently, so re-dumping on the
+// way back from JSON made a *presentation* toggle report unsaved changes.
+const SERVER_YAML = [
+    'traefik:',
+    '  spec:',
+    '    host: a.example',
+    '    port: 80',
+    '  routers:',
+    '  - rule: Host(`a`)',
+    '',
+].join('\n');
+const parsed = U.yamlLoad(SERVER_YAML);
+eq('a js-yaml redump differs from the server text (the bug\'s premise)',
+    U.yamlDump(parsed) !== SERVER_YAML, true);
+eq('sameDocument sees through the layout difference',
+    U.sameDocument(parsed, SERVER_YAML), true);
+eq('sameDocument says no when a value really changed',
+    U.sameDocument({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
+eq('sameDocument says no when only the key order changed (order is data)',
+    U.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
+eq('sameDocument on unparseable text is not a match',
+    U.sameDocument({}, 'a:\n  - [\n'), false);
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
