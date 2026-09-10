@@ -5,21 +5,74 @@
 Development and CI happen on a Debian 13 (trixie) host with a [rustup](https://rustup.rs/)
 toolchain installed under `~/.cargo/bin` (rustc 1.98 at the time of writing) — **not** the
 `cargo`/`rustc` Debian packages. `pve-meta-perl` (the perlmod bindings) needs `libperl-dev`
-headers and only builds on Linux; `pve-meta-core` is pure Rust and also compiles on macOS.
-Use the Linux build host for anything else:
+headers and only builds on Linux; `pve-meta-core` and `pve-meta-wasm` are pure Rust and
+also compile on macOS. Use the Linux build host for anything else:
 
 ```sh
 rsync -az --exclude target --exclude .git --exclude dist ./ pve-meta-build:/root/pve-meta/
 ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && cargo build -p pve-meta-rs --release'
 ```
 
+### The `wasm32-unknown-unknown` target
+
+The editor's rules are `pve-meta-core` compiled for the browser (`crates/pve-meta-wasm`,
+`docs/DESIGN.md` §8), and `make build` and `make check` both depend on `make wasm`, so the
+toolchain needs the wasm32 standard library as well as the host's. rustup's
+`--profile minimal` (and a fresh `rustup-init`) installs the host target only, and building
+for a target that is not installed is a hard error, not a skip:
+
+```
+error[E0463]: can't find crate for `core`
+  = note: the `wasm32-unknown-unknown` target may not be installed
+```
+
+Install it once:
+
+```sh
+rustup target add wasm32-unknown-unknown          # rustup toolchain (the build host, CI)
+apt install libstd-rust-dev-wasm32                # a distro rustc instead, if you must
+```
+
+That is the whole requirement. The `.wasm` is a plain `cargo build --target
+wasm32-unknown-unknown --profile wasm` (the `[profile.wasm]` in the root `Cargo.toml`)
+behind a hand-written four-export ABI: no `wasm-bindgen`, no `wasm-pack`, no `wasm-opt`,
+no npm, nothing whose version has to match the crate's. `.github/workflows/build.yml`
+adds the target right after installing rustup; `docs/WASM-CORE.md` records why this
+shape was chosen.
+
 ## Plain (non-packaged) build
 
 ```sh
-make build   # builds crates/pve-meta-perl in release mode
+make wasm    # target/wasm32-unknown-unknown/wasm/pve_meta_wasm.wasm, the editor's core
+make build   # make wasm, then crates/pve-meta-perl in release mode
 make ui      # fetches Monaco into ui-extjs/monaco/vs (skipped, with a warning, without npm)
 make install DESTDIR=/some/root PREFIX=/usr
 ```
+
+`make install` ships the `.wasm` as
+`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm`, next to the editor that
+loads it, and fails if it is missing — unlike Monaco, it is not optional: an editor without
+its core cannot read a document. `make check` runs clippy, rustdoc and, when `node` is
+present, `ui-extjs/testing/smoke.js`, which instantiates that same built `.wasm`.
+
+## The gates
+
+Nothing is wired into `dh_auto_test` (`debian/rules` skips it: a packaging build has
+no guaranteed network for crates.io), so these run by hand and in CI, before the
+packages are built:
+
+```sh
+cargo test -p pve-meta-core                      # 268 across the crate's binaries; runs on macOS
+make test                                        # that plus pve-meta-wasm's own
+make check                                       # rustdoc -D warnings, clippy, make wasm, the smoke suite
+node ui-extjs/testing/smoke.js                   # 416 checks against the built .wasm (after make wasm)
+make -C crates/pve-meta-perl check               # test/basic.pl over the built .so (Linux only)
+```
+
+The Rust suites take their paths from the environment — `PVE_META_ROOT` for the store,
+`PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` (colon-separated, lowest
+precedence first) for the two registry directories — and `test/basic.pl` sets all three
+to temp dirs, so nothing here touches `/etc/pve`.
 
 ## Debian package
 
@@ -27,8 +80,9 @@ The `.deb`s are built with `dpkg-buildpackage`, but **without** relying on Debia
 `cargo`/`rustc` packages — `debian/rules` calls `make`, and the `Makefile` resolves `cargo` as
 `~/.cargo/bin/cargo` when present (the rustup toolchain), falling back to a plain `cargo` on
 `$PATH` otherwise. Because `debian/control`'s `Build-Depends` intentionally does **not** list
-`cargo`/`rustc` (they would resolve to a toolchain we don't want to build with), build with `-d`
-to skip the build-dependency check:
+`cargo`/`rustc` (they would resolve to a toolchain we don't want to build with) — nor,
+for the same reason, the wasm32 target, which on the rustup toolchain is a `rustup target
+add` and not a package — build with `-d` to skip the build-dependency check:
 
 ```sh
 # one-time, if missing:

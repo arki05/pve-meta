@@ -6,7 +6,7 @@ This document covers everything under `.github/workflows/`, `scripts/apt-repo/`,
 patched upstream Proxmox packages stays current.
 
 The design rationale in one paragraph: pve-meta patches stock Proxmox VE files it does
-not control the release cadence of (see `docs/DESIGN.md` §5, "Managed patches"). A
+not control the release cadence of (see `docs/DESIGN.md` §7, "Extension seams"). A
 signed, static apt repo (§1-§5 below) is the simplest way to distribute the resulting
 `.deb`s without asking every install to build from source; a scheduled "ceiling
 watcher" (§6) is the cheapest way to find out *before* a user's `apt dist-upgrade` that
@@ -14,7 +14,7 @@ a new upstream point release moved an anchor our diffs depend on, without ever
 *blocking* that upgrade — see "Upgrade gating" at the end of §6. `pve-ext-patch` itself
 (the tool the ceiling watcher drives) is documented in `pve-ext/README.md`; the
 research that led to pve-meta's own guest-lifecycle manifest is in
-`docs/LIFECYCLE-PATCHES.md` (lifecycle is snapshot-only: one file, `pve-ext-patch` +
+`docs/LIFECYCLE-PATCHES.md` (the whole lifecycle is one file: `pve-ext-patch` +
 `patches/lifecycle.toml`).
 
 ## 1. Repo layout
@@ -131,7 +131,10 @@ second bucket.
 
 Nothing to enable beyond the secrets in §2 -- `build.yml` triggers on push to `main`
 (builds + uploads `.deb` artifacts only) and on tags (also builds+publishes the repo);
-`watch-pve.yml` is cron + `workflow_dispatch`.
+`watch-pve.yml` is cron + `workflow_dispatch`. `build.yml` installs rustup with
+`--profile minimal` and then `rustup target add wasm32-unknown-unknown` in the same
+step: `make check` and `make build` both depend on `make wasm`, and a missing target is
+a hard `E0463`, not a skipped step (`docs/BUILD.md`).
 
 ## 4. What a user runs
 
@@ -231,7 +234,7 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
    - **pve-manager**: verifies pve-ext's own manifest,
      `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
    - **libpve-guest-common-perl**: verifies `patches/lifecycle.toml` (pve-meta's one
-     guest-lifecycle diff — lifecycle is snapshot-only, see
+     guest-lifecycle diff — one file carries the whole lifecycle, see
      `docs/LIFECYCLE-PATCHES.md`), filtered down first to that package's own `[[file]]`
      entries (a no-op today, kept for a future entry);
 4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
@@ -371,10 +374,11 @@ PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
   ran the real `pve-ext-patch verify` checks -- observed an actual **pass** for
   `qemu-server` 9.0.10, `libpve-guest-common-perl` 6.0.2, and an older `pve-manager`
   9.0.0~10 (against pve-ext's own `pve-manager.toml` manifest -- the `PVE::API2::Ext`
-  registration-ordering diff from §5 of `docs/DESIGN.md` still applies cleanly even
+  registration-ordering diff from §7 of `docs/DESIGN.md` still applies cleanly even
   that far back), and an actual **fail** for `pve-container` 6.0.10, whose
-  `API2/LXC.pm` hunk #1 no longer applies against that older release (the diffs in
-  this repo were generated against 6.1.13/6.1.14), with correct per-package pass/fail
+  `API2/LXC.pm` hunk #1 no longer applies against that older release (the repo still
+  patched `pve-container` then, with diffs generated against 6.1.13/6.1.14; that
+  manifest is gone, see `docs/LIFECYCLE-PATCHES.md`), with correct per-package pass/fail
   aggregation and correct per-package manifest filtering (no "no pristine source
   found" noise for the two packages' files not present in each other's extracted
   tree) and correct output (no `gh` calls attempted -- confirmed `gh` isn't even
@@ -392,7 +396,7 @@ PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
   real repo from this environment.
 * The Cloudflare Worker in §5 is a sketch, not deployed or tested.
 * `build.yml`'s actual run in GitHub Actions (the `debian:trixie` container steps,
-  rustup/trunk/grass install, `make deb`) -- not runnable from here since it depends on
+  rustup and wasm32-target install, `make deb`) -- not runnable from here since it depends on
   `crates/`, `debian/`, and the root `Makefile` other agents are concurrently writing;
   reviewed against the current `Makefile`/`debian/rules`/`debian/control` for shape
   (multiple binary `.deb`s from one source package are handled by the artifact-glob
