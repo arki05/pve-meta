@@ -67,6 +67,51 @@ PVE.meta.Utils = {
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
 
+    // Two document values are the same value. Key order is data (DESIGN section 2)
+    // and JSON.stringify preserves insertion order, so encoding both and comparing
+    // the text is the right test rather than a shortcut.
+    sameValue: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+
+    // Why a key name is not one, or `null` if it is fine. A dotted path is
+    // accepted and checked segment by segment, since the Key field takes one.
+    //
+    // A deliberate mirror of `path::is_valid_segment`, and the second one of
+    // those in this UI: the registry name field mirrors `is_valid_file_name` the
+    // same way. Both exist for the same reason -- the server's answer is right
+    // but arrives as `invalid path: homelab.bad key (400)` after a round trip,
+    // which reads like a bug in the editor rather than a typo in the field. The
+    // server stays the authority: this only refuses earlier and in words, and it
+    // never lets anything through that the server would refuse, because a
+    // charset is the one kind of rule you can restate without restating a
+    // judgement.
+    keyPathError: function (text) {
+        let path = String(text === undefined || text === null ? '' : text);
+        if (!path) {
+            return gettext('Key must not be empty');
+        }
+        let bad = null;
+        let empty = false;
+        path.split('.').forEach(function (seg) {
+            if (!seg) {
+                empty = true;
+            } else if (bad === null && !/^[A-Za-z0-9_@!-]+$/.test(seg)) {
+                bad = seg;
+            }
+        });
+        if (empty) {
+            return gettext('A dotted path must not have an empty segment');
+        }
+        if (bad !== null) {
+            let ch = bad.split('').find((c) => !/[A-Za-z0-9_@!-]/.test(c));
+            return Ext.String.format(
+                gettext("'{0}' is not allowed in a key ({1}). Keys are letters, digits, _ - @ ! -- and '.' separates them."),
+                ch === ' ' ? gettext('space') : ch,
+                bad,
+            );
+        }
+        return null;
+    },
+
     // A scope on prefix `p` covers the subtree `p` and the sibling comment key `p__`.
     // That is the only comment-key rule (DESIGN §3).
     covers: (p, path) => path === p || path === p + '__' || path.indexOf(p + '.') === 0,
@@ -246,6 +291,77 @@ PVE.meta.Utils = {
             }
         });
         return out;
+    },
+
+    // Every key path at which two documents differ in *value*.
+    //
+    // Not the edits needed to turn one into the other -- that is `diffDocuments`,
+    // which has to be exact and falls back to replacing the document whole when it
+    // cannot be. This one has no fallback on purpose: a pure key reordering changes
+    // no value anywhere, and its one caller must not be told that reordering a
+    // document touched every path in it.
+    //
+    // Lists are compared whole, like everywhere else: a view addresses through maps
+    // only (DESIGN section 2), so a changed member reports the list's own path.
+    changedPaths: function (was, now) {
+        let U = PVE.meta.Utils;
+        let out = [];
+        let isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+        let same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        let walk = function (a, b, path) {
+            if (same(a, b)) {
+                return;
+            }
+            if (!isMap(a) || !isMap(b)) {
+                out.push(path);
+                return;
+            }
+            let keys = Object.keys(a);
+            Object.keys(b).forEach(function (k) {
+                if (keys.indexOf(k) === -1) {
+                    keys.push(k);
+                }
+            });
+            keys.forEach((k) => walk(a[k], b[k], U.joinPath(path, k)));
+        };
+        walk(was, now, '');
+        return out;
+    },
+
+    // Of the findings a planned document has, the ones this edit is answerable for:
+    // the ones the stored document did not already have, plus any sitting on a path
+    // the edit changed.
+    //
+    // Before this, one bad value anywhere in a document made *every* later edit
+    // anywhere else in it stop at a "Save anyway" tick -- forever, and for something
+    // the edit had not done. Warning about a pre-existing violation on a path the
+    // edit never touched says nothing the amber row markers do not already say, and
+    // it trains the tick into a reflex, which is the one thing that tick must not be.
+    //
+    // Overlap counts in both directions: writing a bad `homelab.port` answers for a
+    // finding at `homelab.port`, and replacing `homelab` answers for one beneath it.
+    // So an edit that puts a *differently* wrong value on an already-wrong path still
+    // warns -- it was ours this time.
+    //
+    // Findings are `{ path, message }` here and only become text at the banner, so
+    // that this never has to take a formatted string apart.
+    introducedFindings: function (before, after, changed) {
+        let had = Object.create(null);
+        (before || []).forEach(function (f) {
+            had[f.path + '\u0000' + f.message] = true;
+        });
+        let touched = function (path) {
+            return (changed || []).some(function (p) {
+                return (
+                    p === path ||
+                    (path !== '' && p.indexOf(path + '.') === 0) ||
+                    (p !== '' && path.indexOf(p + '.') === 0)
+                );
+            });
+        };
+        return (after || []).filter(
+            (f) => !had[f.path + '\u0000' + f.message] || touched(f.path),
+        );
     },
 
     // What would have to be staged to turn `stored` into `edited`, as the same
@@ -1345,6 +1461,14 @@ Ext.define('PVE.meta.AddKeyWindow', {
                             hidden: me.list,
                             fieldLabel: gettext('Key'),
                             emptyText: gettext('key, or a dotted path'),
+                            // Leading and trailing dots are stripped on submit, so
+                            // do not fail the field for them while it is being typed.
+                            validator: (v) =>
+                                me.list && !v
+                                    ? true
+                                    : PVE.meta.Utils.keyPathError(
+                                          String(v || '').replace(/^\.+|\.+$/g, ''),
+                                      ) || true,
                         },
                         {
                             xtype: 'proxmoxKVComboBox',
@@ -1594,6 +1718,11 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                             allowBlank: false,
                             fieldLabel: gettext('Key'),
                             emptyText: gettext('the key this declares'),
+                            // A declared key becomes a real key in a real document,
+                            // so it lives under the same charset -- and a schema that
+                            // declares an unwritable key is worse than a rejected
+                            // form, because nothing rejects it until someone tries.
+                            validator: (v) => PVE.meta.Utils.keyPathError(v) || true,
                         },
                         {
                             xtype: 'proxmoxKVComboBox',
@@ -2816,6 +2945,7 @@ Ext.define('PVE.meta.TreePanel', {
         let me = this;
         let rec = me.getSelection()[0];
         let d = rec ? rec.data : null;
+        let U = PVE.meta.Utils;
         let text = me.mode === 'text';
         let set = function (id, disabled) {
             let btn = me.down('#' + id);
@@ -2856,7 +2986,18 @@ Ext.define('PVE.meta.TreePanel', {
             // Disabled, not hidden, when the document has defaults but this row is
             // not one of them: that varies per row, and a button that moves under
             // the pointer is how you aim for one thing and hit another.
-            let offers = !!row && !row.present && row.defaultValue !== undefined;
+            //
+            // Offered on any row that has a default and is not already at it --
+            // not just on unset ones. A default is the answer to "what should
+            // this be", and the moment you most want that answer is when the
+            // value in front of you is wrong; refusing then meant the only way
+            // back to a declared default was to remember it and retype it. It
+            // stages like every other edit, so an accidental click is one
+            // Discard away and nothing is written until Apply.
+            let offers =
+                !!row &&
+                row.defaultValue !== undefined &&
+                !(row.present && U.sameValue(row.rawValue, row.defaultValue));
             dflt.setHidden(!me.hasDefaults);
             dflt.setDisabled(text || !offers || !row.editable);
         }
@@ -3309,7 +3450,7 @@ Ext.define('PVE.meta.TreePanel', {
     // `Lint.findings` and `Lint.schemaIndex` apply, through the same
     // `Utils.governing` -- it lived in two of the three and this was the one that
     // silently merged (DESIGN section 3.1).
-    addGrammar: function (root, prefix, schema, prefixes, owner) {
+    addGrammar: function (root, prefix, schema, prefixes, owner, description) {
         let me = this;
         let U = PVE.meta.Utils;
         let entry = root;
@@ -3321,8 +3462,17 @@ Ext.define('PVE.meta.TreePanel', {
             prefix.split('.').forEach(function (seg) {
                 path = U.joinPath(path, seg);
                 entry = me.entry(entry, seg, path);
+                // `||`, not `=`: `addData` ran first, so a value already stored here
+                // keeps the kind it actually has. That is what lets a prefix hold a
+                // single scalar -- a prefix is a key like any other, and one that
+                // needs to say nothing but `true` should not have to grow a subkey to
+                // say it. Only an *absent* prefix falls back to a map, which is the
+                // shape almost every one of them turns out to have.
                 entry.kind = entry.kind || 'map';
             });
+            // The prefix's own description, which for a prefix with no schema is the
+            // only thing its row can say about itself.
+            entry.grammarDescription = entry.grammarDescription || description;
         }
         let walk = function (node, sch) {
             if (!sch || sch.type !== 'object' || !sch.properties) {
@@ -3441,18 +3591,30 @@ Ext.define('PVE.meta.TreePanel', {
             });
         let grammar = me.grammarFor(me.docId);
         grammar.forEach(function (ns) {
-            if (!ns.schema) {
+            // A prefix with no schema still gets its row. Declaring a prefix *is* a
+            // statement about the document -- "something of mine lives at this key" --
+            // and it is the statement the whole permission model is written in terms
+            // of. Hiding the row until someone had already put content there meant a
+            // prefix that applied to every guest was invisible on every guest that had
+            // not used it yet, which reads as "netbird is missing" rather than "netbird
+            // is empty". The rows differ in what they can say, not in whether they
+            // exist: a schema paints declared children and types, and without one there
+            // is just the key, its description, and whatever is stored under it.
+            //
+            // The empty prefix is not a prefix at all: it is a registry document's
+            // meta-schema rooted at the document (DESIGN §3.6), so with no schema there
+            // is nothing to add.
+            if (!ns.prefix) {
+                if (ns.schema) {
+                    me.addGrammar(root, '', ns.schema, [], null);
+                }
                 return;
             }
             // `prefixes`/`owner` are the most-specific-wins prune, and only guest
             // documents have more than one prefix to shadow between. A registry
             // document has exactly one schema, rooted at the document, so it is
             // walked with no owner and nothing is pruned.
-            if (ns.prefix) {
-                me.addGrammar(root, ns.prefix, ns.schema, grammar, ns);
-            } else {
-                me.addGrammar(root, '', ns.schema, [], null);
-            }
+            me.addGrammar(root, ns.prefix, ns.schema, grammar, ns, ns.description);
         });
         return root;
     },
@@ -3760,24 +3922,41 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    // The schema findings for a planned document, as plain messages -- what Apply
-    // warns about. The same `Lint.findings` the tree markers use, through the same
-    // `grammarSplit`, so the banner and the amber rows can never disagree.
+    // The schema findings a planned document would *introduce*, as plain messages --
+    // what Apply warns about. The same `Lint.findings` the tree markers use, through
+    // the same `grammarSplit`, so the banner and the amber rows can never disagree
+    // about what is wrong; they differ only in what they are for. The markers show
+    // everything wrong with the document, which is honest. The banner asks you to
+    // vouch for what this edit did, which is the only thing you can answer for.
     textFindingsFor: function (planned) {
         let me = this;
+        let U = PVE.meta.Utils;
         let g = me.grammarSplit(me.docId);
         if (!g.withSchema.length) {
             return [];
         }
-        return PVE.meta.Lint.findings(planned, g.withSchema, g.all).map(
-            (f) => f.path + ': ' + f.message,
-        );
+        let stored = me.dataOf(me.docId);
+        return U.introducedFindings(
+            PVE.meta.Lint.findings(stored, g.withSchema, g.all),
+            PVE.meta.Lint.findings(planned, g.withSchema, g.all),
+            U.changedPaths(stored, planned),
+        ).map((f) => f.path + ': ' + f.message);
     },
 
-    // Write a declared default into the document, because someone asked for it.
+    // Stage a declared default, because someone asked for it. Never on its own: an
+    // unset key stays unset, and a set one keeps whatever it was set to, until this
+    // click (DESIGN §8).
+    //
+    // A row already at its default is refused here as well as disabled in the
+    // toolbar, so the two cannot drift apart -- the button's state is a hint, this is
+    // the rule.
     setToDefault: function (rec) {
         let me = this;
-        if (!rec || !rec.data.docId || rec.data.present || rec.data.defaultValue === undefined) {
+        let U = PVE.meta.Utils;
+        if (!rec || !rec.data.docId || rec.data.defaultValue === undefined) {
+            return;
+        }
+        if (rec.data.present && U.sameValue(rec.data.rawValue, rec.data.defaultValue)) {
             return;
         }
         me.stage(rec.data.path, 'set', rec.data.defaultValue);
@@ -4321,9 +4500,13 @@ Ext.define('PVE.meta.TreePanel', {
         me.registerTextHover();
     },
 
-    // The grammar findings for the current buffer, as plain messages -- what Apply
-    // warns about before it writes. Empty when the buffer does not parse (the write
-    // will fail on its own) or when no grammar applies.
+    // The grammar findings the current buffer would *introduce*, as plain messages --
+    // what Apply warns about before it writes. Empty when the buffer does not parse
+    // (the write will fail on its own) or when no grammar applies. Same rule as the
+    // tree's Apply, through the same `introducedFindings`: a violation the document
+    // already had, on a path this buffer did not change, is not this edit's to vouch
+    // for. Reordering keys therefore stops demanding a tick, since a reordering
+    // changes no value at all.
     textGrammar: function () {
         return this.grammarSplit(this.textDocId || this.docId);
     },
@@ -4340,8 +4523,14 @@ Ext.define('PVE.meta.TreePanel', {
             return [];
         }
         try {
-            let value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
-            return PVE.meta.Lint.findings(value, applicable, all).map((f) => f.path + ': ' + f.message);
+            let U = PVE.meta.Utils;
+            let value = U.parseBuffer(me.textEditor.getValue(), me.textLang);
+            let stored = me.dataOf(me.textDocId || me.docId);
+            return U.introducedFindings(
+                PVE.meta.Lint.findings(stored, applicable, all),
+                PVE.meta.Lint.findings(value, applicable, all),
+                U.changedPaths(stored, value),
+            ).map((f) => f.path + ': ' + f.message);
         } catch (_err) {
             return [];
         }

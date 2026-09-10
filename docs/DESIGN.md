@@ -86,6 +86,16 @@ parsed independently, and a cross-file check would trade that for nothing. It is
 The selector decides which guests a prefix reaches, and therefore where its
 declared-but-unset rows appear. Nowhere else.
 
+**A prefix with no `schema` is still a declaration**, and the UI gives it a row like any
+other. Declaring the prefix says *something of mine lives at this key* — which is the
+statement permissions are written in terms of (§3.2) — and that is worth a row even
+before anyone has said what shape it has. Without a schema the row simply has less to
+offer: no declared children, no types, no defaults, just the key, the prefix's
+`description`, and whatever is stored under it. A prefix may also hold **a single
+value**: it is a key like any other, and one that needs to say nothing but `true` does
+not have to grow a subkey to say it. An absent prefix's row falls back to a map, because
+that is what nearly all of them turn out to be, but a stored scalar keeps its own type.
+
 ### 3.2 Permissions — who may touch a prefix
 
 `/etc/pve/meta.d/permissions/<name>.yaml`. Cluster-only: **there is deliberately no packaged
@@ -380,7 +390,12 @@ not in the packaged example, because it would be a claim no code reads. A missin
 is a legitimate state: an operator fills it in, or there is a reason it is not there.
 A declared `default` is shown on the greyed row and written **only** by the explicit
 **Set to default** button (or by opening the editor, which pre-fills it) — never behind
-your back, and never by merely looking at the document. (`optional` survives in the
+your back, and never by merely looking at the document. That button is offered on **any**
+row that declares a default and is not already at it, not only on unset ones: a default
+is the answer to "what should this be", and the moment you most want that answer is when
+the value in front of you is wrong. It stages like every other edit, so it is one Revert
+away and writes nothing until Apply. It is hidden when the document declares no default
+anywhere, and disabled — never hidden — on a row that has none or is already at it. (`optional` survives in the
 meta-schema (§3.6), because those files really do have required fields: a permission file with no
 `authid` is refused on the way in.)
 
@@ -415,7 +430,18 @@ planned one.
 match the schema — the one case where seeing it changes what you decide — and the
 "Save anyway" tick keeps storing it anyway a deliberate act, because a mismatch must
 stay possible: the server's lint decides what is *storable* (§4), not a schema that may
-have drifted. Otherwise there is nothing to decide, and **Diff** is a button of its own
+have drifted.
+
+**And only for what this edit did.** The banner lists the findings the edit
+*introduces*: the ones the stored document did not already have, plus any on a path the
+edit changed — so writing a differently-wrong value onto an already-wrong key still
+warns, but editing something else in the same document does not. One bad value used to
+put every later edit anywhere in that document behind the tick, forever, for something
+the edit had not done; a tick you pass every time is a tick you stop reading, which is
+the one thing that tick must not become. The row markers are unchanged and still show
+everything wrong with the document: they say what *is* wrong, the banner asks what you
+are answerable for. A pure key reordering therefore warns about nothing, since it
+changes no value at any path. Otherwise there is nothing to decide, and **Diff** is a button of its own
 in both text editors for whenever you want to look first.
 
 There is deliberately no `dry_run` pass before a write. It once existed to turn a server

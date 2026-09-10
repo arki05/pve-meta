@@ -457,6 +457,81 @@ eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['gr
 eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
+console.log('\n--- Set to Default answers "what should this be", not only "what if unset" ---');
+{
+    // It used to work on unset rows only, so the one moment you most want a declared
+    // default -- the value in front of you is wrong -- was the one moment it refused,
+    // and the only way back was to remember the default and retype it.
+    const staged = [];
+    const sd = { stage: (path, op, value) => staged.push({ path, op, value }) };
+    sd.setToDefault = P.setToDefault;
+    const row = (data) => ({ data: Object.assign({ docId: '100', path: 'traefik.spec.port' }, data) });
+
+    sd.setToDefault.call(sd, row({ present: false, defaultValue: 80 }));
+    eq('an unset row still takes the default', staged.pop(), {
+        path: 'traefik.spec.port', op: 'set', value: 80,
+    });
+
+    sd.setToDefault.call(sd, row({ present: true, rawValue: 8080, defaultValue: 80 }));
+    eq('a wrong value can be put back to the default', staged.pop(), {
+        path: 'traefik.spec.port', op: 'set', value: 80,
+    });
+
+    sd.setToDefault.call(sd, row({ present: true, rawValue: 80, defaultValue: 80 }));
+    eq('a row already at its default stages nothing', staged.length, 0);
+
+    sd.setToDefault.call(sd, row({ present: false }));
+    eq('a row with no default stages nothing', staged.length, 0);
+
+    // Structural values compare by content, not identity -- key order included, since
+    // key order is data.
+    sd.setToDefault.call(sd, row({ present: true, rawValue: ['a'], defaultValue: ['a'] }));
+    eq('an equal list is already at its default', staged.length, 0);
+    sd.setToDefault.call(sd, row({ present: true, rawValue: { b: 1, a: 1 }, defaultValue: { a: 1, b: 1 } }));
+    eq('a reordered map is not the same value', staged.length, 1);
+    staged.pop();
+}
+
+console.log('\n--- a prefix is a declaration, with or without a schema ---');
+{
+    // A prefix with no schema used to paint no row at all, so `netbird` -- which
+    // applies to every guest -- was invisible on every guest that had not used it
+    // yet. A prefix is itself a statement about the document: something of mine
+    // lives at this key. That is the statement permissions are written in terms of,
+    // so it earns a row; it just has less to say than a schema'd one.
+    const doc = (data) => {
+        const d = Object.assign({}, panel, {
+            docId: '100',
+            pending: [],
+            docState: { 100: { digest: 'x', data: data } },
+        });
+        ['documentEntries', 'plannedData', 'dataOf', 'grammarFor', 'docKind',
+         'entry', 'addData', 'addGrammar', 'applicablePrefixes'].forEach((m) => (d[m] = P[m]));
+        return d.documentEntries.call(d);
+    };
+
+    const empty = doc({});
+    eq(
+        'both prefixes get a row on an empty document',
+        Object.keys(empty.children).sort(),
+        ['netbird', 'traefik'],
+    );
+    eq('the schema-less one is unset, not missing', empty.children.netbird.present, false);
+    eq('... and is a map, which is what Add goes into', empty.children.netbird.kind, 'map');
+    eq('the schema-less prefix declares no children', Object.keys(empty.children.netbird.children), []);
+    eq('the schema\'d one still paints its declared rows',
+        Object.keys(empty.children.traefik.children.spec.children).sort(),
+        ['host', 'port', 'scheme']);
+
+    // And a prefix may simply hold a value. It is a key like any other, and one that
+    // needs to say nothing but `true` should not have to grow a subkey to say it:
+    // the stored value's own kind wins over the map the absent row falls back to.
+    const scalar = doc({ netbird: true });
+    eq('a prefix may hold a single scalar', scalar.children.netbird.kind, 'boolean');
+    eq('... and it is present', scalar.children.netbird.present, true);
+    eq('... and editable as the scalar it is', U.editorKind(scalar.children.netbird), 'inline');
+}
+
 console.log('\n--- Access: every rule whose prefix covers the row ---');
 eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
     { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
@@ -1018,6 +1093,111 @@ console.log('\n--- the registry lists ---');
     );
     // An older API returns neither field; the list must still render.
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
+}
+
+console.log('\n--- a key name is refused in the field, not after a round trip ---');
+{
+    // The server is still the authority; this only refuses earlier and in words.
+    // `invalid path: homelab.bad key (400)` is a correct answer that reads like a bug
+    // in the editor.
+    eq('a plain key is fine', U.keyPathError('homelab'), null);
+    eq('a dotted path is fine', U.keyPathError('homelab.docker.port'), null);
+    eq('the charset is the server\'s', U.keyPathError('a-b_c@d!e9'), null);
+    eq('an empty key is refused', typeof U.keyPathError(''), 'string');
+    eq('a space is refused', typeof U.keyPathError('bad key'), 'string');
+    eq('... and the message names it', U.keyPathError('bad key').indexOf('space') !== -1, true);
+    eq('a slash is refused', typeof U.keyPathError('a/b'), 'string');
+    eq('an empty segment is refused', typeof U.keyPathError('a..b'), 'string');
+
+    // Comment keys are ordinary keys under this charset, and the editor must not
+    // refuse the one spelling the document model is built on (DESIGN section 2).
+    eq('a comment key is fine', U.keyPathError('documented__'), null);
+    eq('the bare document comment key is fine', U.keyPathError('__'), null);
+
+    // Non-ASCII is refused, the same way the server refuses it. The `KEYS` corpus
+    // above is about what the YAML *codec* must round-trip -- a stored document can
+    // have arrived by hand or from an older writer -- which is a wider set than what
+    // a path may name. This field creates a key, so it is bound by the narrower rule.
+    eq('non-ascii is refused', typeof U.keyPathError('\u00fcn\u00efc\u00f8de'), 'string');
+}
+
+console.log('\n--- an edit answers for what it broke, not for what was already broken ---');
+{
+    // One bad value used to make every later edit anywhere in the document stop at a
+    // "Save anyway" tick, forever. `introducedFindings` scopes the banner to what this
+    // edit did; the amber row markers still show everything wrong with the document.
+    const stored = {
+        homelab: { owner: 'arki', port: 'not-a-number' },
+        netbird: { groups: ['lan'] },
+    };
+    const bad = { path: 'homelab.port', message: 'expected integer' };
+    const before = [bad];
+
+    // An unrelated edit: the same violation is still there, and it is not ours.
+    eq(
+        'a pre-existing violation on an untouched path does not warn',
+        U.introducedFindings(before, [bad], U.changedPaths(stored, {
+            ...stored,
+            homelab: { ...stored.homelab, owner: 'someone' },
+        })),
+        [],
+    );
+
+    // The same path, a different wrong value: ours this time, even though the message
+    // is word for word what it was.
+    eq(
+        'a new bad value on an already-bad path does warn',
+        U.introducedFindings(before, [bad], U.changedPaths(stored, {
+            ...stored,
+            homelab: { ...stored.homelab, port: 'still-not-a-number' },
+        })).length,
+        1,
+    );
+
+    // Replacing a parent answers for what is beneath it.
+    eq(
+        'replacing a subtree answers for a finding inside it',
+        U.introducedFindings(before, [bad], ['homelab']).length,
+        1,
+    );
+
+    // A violation that was not there before always warns, wherever it is.
+    const fresh = { path: 'netbird.groups', message: 'expected array' };
+    eq(
+        'a violation this edit created always warns',
+        U.introducedFindings(before, [bad, fresh], ['netbird.groups']).map((f) => f.path),
+        ['netbird.groups'],
+    );
+
+    // A pure key reordering changes no value at any path, so it introduces nothing --
+    // this is the case that used to demand a tick for reordering a broken document.
+    eq(
+        'reordering changes no path',
+        U.changedPaths(stored, { netbird: stored.netbird, homelab: stored.homelab }),
+        [],
+    );
+    eq(
+        'so reordering a document that was already wrong warns about nothing',
+        U.introducedFindings(before, [bad], []),
+        [],
+    );
+
+    // `changedPaths` reports the deepest path that differs, and compares lists whole.
+    eq(
+        'a changed leaf is reported at its own path',
+        U.changedPaths(stored, { ...stored, homelab: { ...stored.homelab, owner: 'x' } }),
+        ['homelab.owner'],
+    );
+    eq(
+        'a changed list member is reported at the list',
+        U.changedPaths(stored, { ...stored, netbird: { groups: ['lan', 'wan'] } }),
+        ['netbird.groups'],
+    );
+    eq(
+        'a removed key is a change at that key',
+        U.changedPaths(stored, { homelab: stored.homelab }),
+        ['netbird'],
+    );
 }
 
 console.log('\n--- text is just another way to edit rows ---');
