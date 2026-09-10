@@ -94,6 +94,9 @@ PVE.meta.Utils = {
     // arrives in the field rather than as `invalid path: homelab.bad key (400)`
     // after a round trip. The server still refuses on its own, with the same rule.
     keyPathError: function (text) {
+        if (!PVE.meta.Core.loaded()) {
+            return null; // no early answer, then; the server's is still the answer
+        }
         let why = PVE.meta.Core.call('key_path_check', String(text === undefined || text === null ? '' : text));
         if (!why) {
             return null;
@@ -114,6 +117,9 @@ PVE.meta.Utils = {
     // Why a registry file name is not one (`registry::is_valid_file_name`: a dotted
     // prefix, which is what the file name is), or `null`.
     fileNameError: function (text) {
+        if (!PVE.meta.Core.loaded()) {
+            return null; // as `keyPathError`
+        }
         return PVE.meta.Core.call('file_name_valid', String(text || ''))
             ? null
             : gettext("A name is one or more key segments joined by '.', e.g. homelab.docker");
@@ -450,14 +456,26 @@ PVE.meta.Core = {
 
     load: function () {
         let me = PVE.meta.Core;
-        me.promise =
-            me.promise ||
-            (me.exports
+        if (!me.promise) {
+            // `instantiateStreaming` compiles as the bytes arrive but insists on
+            // `Content-Type: application/wasm`, which pveproxy's static file
+            // table may or may not know; the buffered path takes whatever type
+            // it was given. Try the fast one, fall back to the sure one.
+            let buffered = () =>
+                fetch(me.SRC)
+                    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.status + ' ' + me.SRC))))
+                    .then((bytes) => WebAssembly.instantiate(bytes, {}));
+            let streaming = () =>
+                typeof WebAssembly.instantiateStreaming === 'function'
+                    ? WebAssembly.instantiateStreaming(fetch(me.SRC), {}).catch(buffered)
+                    : buffered();
+            me.promise = me.exports
                 ? Promise.resolve(me)
-                : WebAssembly.instantiateStreaming(fetch(me.SRC), {}).then(function (result) {
+                : streaming().then(function (result) {
                       me.attach(result.instance);
                       return me;
-                  }));
+                  });
+        }
         return me.promise;
     },
 
@@ -2863,6 +2881,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // which document it was on top of which row was selected is how the digest of
         // one document ends up on a write to another.
         me.docId = me.docId || (me.dc ? 'datacenter' : String(me.vmid));
+        // Start fetching the core now rather than at the first document read: the
+        // registry grids beside a datacenter document open their dialogs before that
+        // read lands, and a validator with no core to ask checks nothing.
+        // `loadDocument` awaits the same promise and reports its failure.
+        PVE.meta.Core.load().catch(Ext.emptyFn);
         me.docState = Object.create(null); // id -> { digest, data }
         // Edits accumulate here until Apply, in the order they were made:
         // `{ path, op: 'set' | 'delete', value }`, at most one entry per path.
@@ -3696,8 +3719,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     accessSummary: (list) => list.map((a) => a.name + (a.mode === 'ro' ? ' (ro)' : '')).join(', '),
 
+    // Nothing is editable before the core has arrived: `syncButtons` runs on
+    // render, ahead of the first load, and a row that cannot be judged yet is a
+    // row that cannot be edited yet.
     editableFor: function (path) {
-        return PVE.meta.Access.canWrite(this.access, path);
+        return PVE.meta.Core.loaded() && PVE.meta.Access.canWrite(this.access, path);
     },
 
     // The document and the grammars are two sources for the same rows, so merge them
