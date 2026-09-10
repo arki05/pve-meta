@@ -170,6 +170,8 @@ impl Shape {
         out
     }
 
+    /// Pre-order: a path comes before anything under it, so a caller
+    /// building a tree from the index meets every parent first.
     fn collect<'a>(
         &self,
         owner: &Declared,
@@ -180,12 +182,12 @@ impl Shape {
         if self.governing(&path).map(|d| &d.prefix) != Some(&owner.prefix) {
             return;
         }
+        out.push((path.clone(), schema));
         if let Some(props) = schema.get("properties").and_then(Value::as_object) {
             for (k, sub) in props {
                 self.collect(owner, sub, path.join(k.clone()), out);
             }
         }
-        out.push((path, schema));
     }
 
     /// Everything in `doc` that does not match what its governing schema
@@ -231,6 +233,26 @@ impl Shape {
             self.walk(owner, sub, child, child_path, out);
         }
     }
+}
+
+/// Of the findings a planned document has, the ones an edit is answerable
+/// for: those the stored document did not already have, plus any on a path
+/// the edit changed -- in either direction, so writing a differently-wrong
+/// value onto an already-wrong key still warns, and replacing `homelab`
+/// answers for a finding beneath it. Editing something else in the same
+/// document does not: a tick you pass every time is a tick you stop
+/// reading (`docs/DESIGN.md` §8, "And only for what this edit did").
+pub fn introduced(before: &[Finding], after: &[Finding], changed: &[Path]) -> Vec<Finding> {
+    let touched = |path: &Path| {
+        changed
+            .iter()
+            .any(|c| c.is_prefix_of(path) || path.is_prefix_of(c))
+    };
+    after
+        .iter()
+        .filter(|f| !before.contains(f) || touched(&f.path))
+        .cloned()
+        .collect()
 }
 
 /// A scalar as the string a schema's `enum` is compared against and a hover
@@ -447,6 +469,25 @@ mod tests {
         // An absent prefix has no findings; a document nothing describes has none.
         assert!(shape.findings(&json!({})).findings.is_empty());
         assert_eq!(Shape::empty().findings(&doc), Findings::default());
+    }
+
+    #[test]
+    fn an_edit_answers_for_what_it_introduced_or_touched() {
+        let f = |path: &str, msg: &str| Finding { path: p(path), msg: msg.into() };
+        let before = vec![f("a.old", "expected integer"), f("b", "expected string")];
+        let after = vec![
+            f("a.old", "expected integer"), // pre-existing, untouched: not ours
+            f("b", "expected boolean"),     // a differently-wrong value: ours
+            f("c", "expected string"),      // new: ours
+        ];
+        let changed = vec![p("b"), p("c")];
+        let got: Vec<String> = introduced(&before, &after, &changed).iter().map(|x| x.path.to_string()).collect();
+        assert_eq!(got, ["b", "c"]);
+        // Replacing a parent answers for a finding beneath it, and vice versa.
+        assert_eq!(introduced(&before, &before[..1], &[p("a")]).len(), 1);
+        assert_eq!(introduced(&before, &before[..1], &[p("a.old.deeper")]).len(), 1);
+        // A pure reordering changes nothing, so it introduces nothing.
+        assert!(introduced(&before, &before, &[]).is_empty());
     }
 
     #[test]

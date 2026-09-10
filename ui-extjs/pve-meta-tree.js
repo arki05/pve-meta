@@ -45,13 +45,17 @@
  * (Monaco is vendored into the package by `make ui`, never fetched from a CDN); every
  * editor is disposed when its owner goes away.
  *
- * YAML is js-yaml 4.1.0, vendored in vendor/ and loaded lazily the same way. It is used
- * only for presentation — the YAML/JSON view toggle and the diff. The server stays the
- * authority on YAML: an Apply in YAML view sends the buffer to the API as `text`.
+ * The rules -- YAML in and out, key names, who may touch a path, which prefix governs
+ * one, what a schema makes of a value, what staged edits do to a document -- are not
+ * implemented here. They are pve-meta-core, the server's own crate, built for the
+ * browser (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`) and asked through
+ * five named faces: Codec, Access, Shape, Edits, and the key-name checks on Utils. The
+ * server stays the authority: an Apply sends the buffer or the planned subtree to the
+ * API, which runs the same code again on the real write.
  *
  * pve-ext's page loader loads this file and instantiates `pveMetaTreePanel` as the
  * tab (see README.md), so session, CSRF, dark theme and i18n all come from the PVE
- * UI — none of it is reimplemented here. Plain ES2017, no build step.
+ * UI — none of it is reimplemented here. Plain ES2017, no build step of its own.
  */
 
 Ext.ns('PVE.meta');
@@ -85,58 +89,34 @@ PVE.meta.Utils = {
     // Why a key name is not one, or `null` if it is fine. A dotted path is
     // accepted and checked segment by segment, since the Key field takes one.
     //
-    // A deliberate mirror of `path::is_valid_segment`, and the second one of
-    // those in this UI: the registry name field mirrors `is_valid_file_name` the
-    // same way. Both exist for the same reason -- the server's answer is right
-    // but arrives as `invalid path: homelab.bad key (400)` after a round trip,
-    // which reads like a bug in the editor rather than a typo in the field. The
-    // server stays the authority: this only refuses earlier and in words, and it
-    // never lets anything through that the server would refuse, because a
-    // charset is the one kind of rule you can restate without restating a
-    // judgement.
+    // The rule is the core's (`path::is_valid_segment`, through `key_path_check`);
+    // this only puts it into words, naming the character it refused, so the answer
+    // arrives in the field rather than as `invalid path: homelab.bad key (400)`
+    // after a round trip. The server still refuses on its own, with the same rule.
     keyPathError: function (text) {
-        let path = String(text === undefined || text === null ? '' : text);
-        if (!path) {
+        let why = PVE.meta.Core.call('key_path_check', String(text === undefined || text === null ? '' : text));
+        if (!why) {
+            return null;
+        }
+        if (why.reason === 'empty') {
             return gettext('Key must not be empty');
         }
-        let bad = null;
-        let empty = false;
-        path.split('.').forEach(function (seg) {
-            if (!seg) {
-                empty = true;
-            } else if (bad === null && !/^[A-Za-z0-9_@!-]+$/.test(seg)) {
-                bad = seg;
-            }
-        });
-        if (empty) {
+        if (why.reason === 'empty_segment') {
             return gettext('A dotted path must not have an empty segment');
         }
-        if (bad !== null) {
-            let ch = bad.split('').find((c) => !/[A-Za-z0-9_@!-]/.test(c));
-            return Ext.String.format(
-                gettext("'{0}' is not allowed in a key ({1}). Keys are letters, digits, _ - @ ! -- and '.' separates them."),
-                ch === ' ' ? gettext('space') : ch,
-                bad,
-            );
-        }
-        return null;
+        return Ext.String.format(
+            gettext("'{0}' is not allowed in a key ({1}). Keys are letters, digits, _ - @ ! -- and '.' separates them."),
+            why.char === ' ' ? gettext('space') : why.char,
+            why.segment,
+        );
     },
 
-    // A scope on prefix `p` covers the subtree `p` and the sibling comment key `p__`.
-    // That is the only comment-key rule (DESIGN §3).
-    covers: (p, path) => path === p || path === p + '__' || path.indexOf(p + '.') === 0,
-
-    // May this caller write *anything* in this document: full write access, or at
-    // least one `rw` scope.
-    //
-    // A deliberate mirror of `Effective::has_any_write`, in the same spirit as
-    // `covers` above -- the server enforces the rule and the editor predicts it, so
-    // that Apply is offered exactly where a write could succeed. What the write may
-    // actually change is decided server-side, by what it changes (DESIGN §3.4); this
-    // only answers whether there is any point offering the button.
-    hasAnyWrite: function (access) {
-        let a = access || {};
-        return !!a.write || (a.scopes || []).some((s) => s.mode === 'rw');
+    // Why a registry file name is not one (`registry::is_valid_file_name`: a dotted
+    // prefix, which is what the file name is), or `null`.
+    fileNameError: function (text) {
+        return PVE.meta.Core.call('file_name_valid', String(text || ''))
+            ? null
+            : gettext("A name is one or more key segments joined by '.', e.g. homelab.docker");
     },
 
     kindOf: function (value) {
@@ -171,9 +151,9 @@ PVE.meta.Utils = {
     // does not constrain the field: an unknown constraint must never block an edit.
     // This is the ONLY implementation of the format set anywhere: the server passes a
     // prefix's `schema` through verbatim and never validates `format` (DESIGN §4 --
-    // the lint is the authority, a schema is an affordance). It used to be mirrored in
-    // a second UI that no longer exists (git tag pwt-ui-removed), so there is nothing
-    // to keep in sync; adding a format is a change here and in DESIGN §8's list.
+    // the lint is the authority, a schema is an affordance), and the shared core's
+    // schema findings hand a `format` back here to be checked (`Shape.findings`)
+    // rather than carrying a third implementation of what `ipv4` means.
     FORMAT_VTYPES: {
         'ip': 'IP64Address',
         'ipv4': 'IPAddress',
@@ -211,86 +191,22 @@ PVE.meta.Utils = {
         return String(text);
     },
 
-    // --- staged edits ------------------------------------------------------
-    //
-    // A row edit used to be a write. That works until a document has a rule spanning
-    // two keys, and then it does not work at all: a prefix definition's selector is
-    // *exactly one of* `all` or `tag` (DESIGN §3.1), so changing `{all: true}` into
-    // `{tag: web}` has no legal one-key step. Dropping `all` first is refused, adding
-    // `tag` first is refused, and the row editor could only ever do one at a time --
-    // the field was uneditable from the tree, with no error that said why.
-    //
-    // So edits are staged and applied together, the way the text editor has always
-    // worked: the tree shows what the document *would* be, and one Apply writes it.
-    // Anything with a cross-key rule needs this; nothing loses by it.
-
-    // Sets `path` in `doc`, creating the maps along the way.
-    //
-    // `defineProperty`, not assignment: keys are document data and no key is
-    // reserved (DESIGN §4), so `doc['__proto__'] = v` would set the prototype rather
-    // than a key. The same reason `entry()` builds with `Object.create(null)`.
-    setAtPath: function (doc, path, value) {
-        let segs = String(path).split('.');
-        let cur = doc;
-        for (let i = 0; i < segs.length - 1; i++) {
-            let k = segs[i];
-            let next = Object.prototype.hasOwnProperty.call(cur, k) ? cur[k] : undefined;
-            if (!next || typeof next !== 'object' || Array.isArray(next)) {
-                next = {};
-                Object.defineProperty(cur, k, {
-                    value: next,
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
-                });
-            }
-            cur = next;
+    // The value at a dotted path, through maps only -- `undefined` where a segment
+    // is missing or the path runs into a list or a scalar. A render-time lookup;
+    // the same addressing rule a view has (DESIGN §2).
+    valueAt: function (data, path) {
+        let cur = data;
+        if (!path) {
+            return cur;
         }
-        Object.defineProperty(cur, segs[segs.length - 1], {
-            value: value,
-            writable: true,
-            enumerable: true,
-            configurable: true,
-        });
-    },
-
-    deleteAtPath: function (doc, path) {
-        let segs = String(path).split('.');
-        let cur = doc;
-        for (let i = 0; i < segs.length - 1; i++) {
-            let k = segs[i];
-            if (!cur || typeof cur !== 'object' || !Object.prototype.hasOwnProperty.call(cur, k)) {
-                return;
+        let parts = path.split('.');
+        for (let i = 0; i < parts.length; i++) {
+            if (!cur || typeof cur !== 'object' || Array.isArray(cur)) {
+                return undefined;
             }
-            cur = cur[k];
+            cur = Object.prototype.hasOwnProperty.call(cur, parts[i]) ? cur[parts[i]] : undefined;
         }
-        if (cur && typeof cur === 'object') {
-            delete cur[segs[segs.length - 1]];
-        }
-    },
-
-    // The document as it would be once the staged edits are applied. This is what
-    // the tree renders, what the schema markers are computed from, and what Apply
-    // writes -- one planned document, so what you see is what is sent.
-    applyPending: function (data, pending) {
-        let U = PVE.meta.Utils;
-        let out = JSON.parse(JSON.stringify(data || {}));
-        (pending || []).forEach(function (p) {
-            // The empty path is the *document*, not a key called "". `setAtPath` walks
-            // segments and `''.split('.')` is `['']`, so without this a whole-document
-            // edit -- what `diffDocuments` falls back to when it cannot express a
-            // change as paths -- would land under a key nobody can address.
-            if (p.path === '') {
-                out = p.op === 'delete' ? {} : JSON.parse(JSON.stringify(p.value));
-                return;
-            }
-            if (p.op === 'delete') {
-                U.deleteAtPath(out, p.path);
-            } else {
-                U.setAtPath(out, p.path, p.value);
-            }
-        });
-        return out;
+        return cur;
     },
 
     // Rolls a set of `path -> message` facts up to every ancestor path.
@@ -314,165 +230,6 @@ PVE.meta.Utils = {
             }
         });
         return out;
-    },
-
-    // Every key path at which two documents differ in *value*.
-    //
-    // Not the edits needed to turn one into the other -- that is `diffDocuments`,
-    // which has to be exact and falls back to replacing the document whole when it
-    // cannot be. This one has no fallback on purpose: a pure key reordering changes
-    // no value anywhere, and its one caller must not be told that reordering a
-    // document touched every path in it.
-    //
-    // Lists are compared whole, like everywhere else: a view addresses through maps
-    // only (DESIGN section 2), so a changed member reports the list's own path.
-    changedPaths: function (was, now) {
-        let U = PVE.meta.Utils;
-        let out = [];
-        let isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-        let same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-        let walk = function (a, b, path) {
-            if (same(a, b)) {
-                return;
-            }
-            if (!isMap(a) || !isMap(b)) {
-                out.push(path);
-                return;
-            }
-            let keys = Object.keys(a);
-            Object.keys(b).forEach(function (k) {
-                if (keys.indexOf(k) === -1) {
-                    keys.push(k);
-                }
-            });
-            keys.forEach((k) => walk(a[k], b[k], U.joinPath(path, k)));
-        };
-        walk(was, now, '');
-        return out;
-    },
-
-    // Of the findings a planned document has, the ones this edit is answerable for:
-    // the ones the stored document did not already have, plus any sitting on a path
-    // the edit changed.
-    //
-    // Before this, one bad value anywhere in a document made *every* later edit
-    // anywhere else in it stop at a "Save anyway" tick -- forever, and for something
-    // the edit had not done. Warning about a pre-existing violation on a path the
-    // edit never touched says nothing the amber row markers do not already say, and
-    // it trains the tick into a reflex, which is the one thing that tick must not be.
-    //
-    // Overlap counts in both directions: writing a bad `homelab.port` answers for a
-    // finding at `homelab.port`, and replacing `homelab` answers for one beneath it.
-    // So an edit that puts a *differently* wrong value on an already-wrong path still
-    // warns -- it was ours this time.
-    //
-    // Findings are `{ path, message }` here and only become text at the banner, so
-    // that this never has to take a formatted string apart.
-    introducedFindings: function (before, after, changed) {
-        let had = Object.create(null);
-        (before || []).forEach(function (f) {
-            had[f.path + '\u0000' + f.message] = true;
-        });
-        let touched = function (path) {
-            return (changed || []).some(function (p) {
-                return (
-                    p === path ||
-                    (path !== '' && p.indexOf(path + '.') === 0) ||
-                    (p !== '' && path.indexOf(p + '.') === 0)
-                );
-            });
-        };
-        return (after || []).filter(
-            (f) => !had[f.path + '\u0000' + f.message] || touched(f.path),
-        );
-    },
-
-    // What would have to be staged to turn `stored` into `edited`, as the same
-    // `{ path, op, value }` entries a row edit produces.
-    //
-    // This is what makes text an ordinary way to edit rather than a second editing
-    // model: whatever you type there comes back as edits *on rows*, so the tree shows
-    // which keys changed and to what, a key you deleted shows struck through, and one
-    // Apply writes the lot. Before this, text mode had its own buffer, its own apply
-    // and its own write, and the two models had to be kept apart by rules -- "you may
-    // not open text while edits are staged" and the rest.
-    //
-    // Lists are compared whole, because their members are not addressable (§2). Maps
-    // recurse, so a one-key change stays a one-key edit.
-    diffDocuments: function (stored, edited) {
-        let U = PVE.meta.Utils;
-        let out = [];
-        let isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
-        let same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-        let walk = function (was, now, path) {
-            Object.keys(now).forEach(function (k) {
-                let at = U.joinPath(path, k);
-                let before = Object.prototype.hasOwnProperty.call(was, k) ? was[k] : undefined;
-                if (before === undefined) {
-                    out.push({ path: at, op: 'set', value: now[k] });
-                } else if (isMap(before) && isMap(now[k])) {
-                    walk(before, now[k], at);
-                } else if (!same(before, now[k])) {
-                    out.push({ path: at, op: 'set', value: now[k] });
-                }
-            });
-            Object.keys(was).forEach(function (k) {
-                if (!Object.prototype.hasOwnProperty.call(now, k)) {
-                    out.push({ path: U.joinPath(path, k), op: 'delete' });
-                }
-            });
-        };
-        if (!isMap(stored) || !isMap(edited)) {
-            return same(stored, edited) ? [] : [{ path: '', op: 'set', value: edited }];
-        }
-        walk(stored, edited, '');
-
-        // A self-check, because a diff that quietly loses something is worse than no
-        // diff at all: key *order* is data in this model (§2) and a pure reordering
-        // produces no per-key entries, so replay the edits and fall back to replacing
-        // the document whole if the result is not what was typed.
-        if (!same(U.applyPending(stored, out), edited)) {
-            return [{ path: '', op: 'set', value: edited }];
-        }
-        return out;
-    },
-
-    // The narrowest view that covers every staged path -- the write Apply sends.
-    //
-    // One write, because the whole point is that the intermediate states are the
-    // ones the server refuses. Narrow, because a write that names less is a write
-    // that can collide with less, and because a scope-only principal cannot name
-    // the root view at all -- it may not read the whole document (DESIGN §3.4).
-    //
-    // Narrow is no longer a *permission* requirement, and this deliberately does
-    // not consult the caller's scopes. What a write may do is decided by what it
-    // changes: a plan spanning two granted prefixes, whose narrowest view is
-    // therefore the document root, is an ordinary write the server takes.
-    //
-    // A delete cannot be expressed by replacing the thing being deleted, so a staged
-    // delete at the common ancestor moves the write one level up: the parent is
-    // replaced with a copy that no longer has the key.
-    writeView: function (pending) {
-        let list = pending || [];
-        if (!list.length) {
-            return null;
-        }
-        let common = list[0].path.split('.');
-        list.slice(1).forEach(function (p) {
-            let segs = p.path.split('.');
-            let i = 0;
-            while (i < common.length && i < segs.length && common[i] === segs[i]) {
-                i++;
-            }
-            common = common.slice(0, i);
-        });
-        let view = common.join('.');
-        if (view !== '' && list.some((p) => p.op === 'delete' && p.path === view)) {
-            let segs = view.split('.');
-            segs.pop();
-            view = segs.join('.');
-        }
-        return view;
     },
 
     // One element of a list, on one line. Presentation only -- like `format`, it
@@ -591,112 +348,6 @@ PVE.meta.Utils = {
         return f;
     },
 
-    // True if `value` is the same document as `yamlText` parses to, key order
-    // included. JSON.stringify preserves insertion order, and the document model is
-    // ordered maps (DESIGN section 2), so comparing the two encodings is the right
-    // test: same keys, same order, same values.
-    sameDocument: function (value, yamlText) {
-        try {
-            return JSON.stringify(value) === JSON.stringify(PVE.meta.Utils.yamlLoad(yamlText));
-        } catch (_err) {
-            return false;
-        }
-    },
-
-    // --- the two editor buffers (TextWindow, TreePanel's Text card) --------
-    //
-    // Both editors carry a Monaco buffer with a presentation-only YAML/JSON toggle
-    // and a Format button, and both used to parse and re-dump it inline -- six
-    // copies of "decode JSON or load YAML" and four of "stringify JSON or dump
-    // YAML" between them, one of which (TextWindow's own toggle) was missing the
-    // round-trip fix its sibling got. One set of functions now; see `renderBuffer`.
-
-    // How the buffer's own language reads it back. Used by Format, the JSON/YAML
-    // toggle and the live grammar squiggles -- everything that needs the parsed
-    // value rather than the text.
-    parseBuffer: function (text, lang) {
-        return lang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
-    },
-
-    // The inverse: `value` as text in `lang`. Always re-dumps -- what Format wants,
-    // since a re-indent is the point of clicking it.
-    dumpBuffer: function (value, lang) {
-        return lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value);
-    },
-
-    // As `dumpBuffer`, but for a switch *into* YAML prefers `originalYaml` when it is
-    // the same document. js-yaml's dump lays a document out differently from
-    // serde_yaml_ng's (indentation of nested sequences, quoting), so unconditionally
-    // re-dumping on every toggle made a round trip through JSON look like an edit --
-    // a diff of pure whitespace, offered as something to Apply. That was fixed once,
-    // in the Text card's toggle; the subtree window's own toggle inlined the same
-    // ternary without it, so the identical no-op could open its diff with Apply
-    // enabled. Both call this now.
-    renderBuffer: function (value, lang, originalYaml) {
-        if (
-            lang !== 'json' &&
-            originalYaml !== undefined &&
-            PVE.meta.Utils.sameDocument(value, originalYaml)
-        ) {
-            return originalYaml;
-        }
-        return PVE.meta.Utils.dumpBuffer(value, lang);
-    },
-
-    // The document a buffer's own editor last loaded (its `original`/`textOriginal`),
-    // rendered in `lang`. Throws if it cannot be read as YAML -- callers fall back to
-    // 'yaml' rather than lose the comparison. TextWindow's diff used to inline this
-    // exact conversion rather than share TreePanel's `textRendered`.
-    originalInLang: function (originalYaml, lang) {
-        return lang === 'json'
-            ? JSON.stringify(PVE.meta.Utils.yamlLoad(originalYaml), null, 2)
-            : originalYaml;
-    },
-
-    // The prefix governing `path`: the one whose prefix is the LONGEST that covers
-    // it. Most-specific wins and schemas never merge (DESIGN section 3.1).
-    //
-    // The single implementation of that rule on this side. It had three call sites --
-    // the row builder, the linter and the hover index -- and lived in two of them; the
-    // third simply did not prune, so a parent prefix's `properties` reached into a
-    // child prefix's subtree and set its row kind. One function, three callers.
-    //
-    // `prefixes` must be sorted longest-prefix-first, so this is the first match.
-    governing: function (path, prefixes) {
-        let list = prefixes || [];
-        for (let i = 0; i < list.length; i++) {
-            if (PVE.meta.Utils.containsPath(list[i].prefix, path)) {
-                return list[i];
-            }
-        }
-        return null;
-    },
-
-    // Plain containment: `p` itself, or anything under `p.`. Deliberately NOT
-    // `covers`, which additionally aliases the sibling comment key `p__` -- that is a
-    // *permission* rule (a scope on `p` may write the note about `p`), and it does not
-    // belong here. With prefixes `a` and `a__` both declared, `covers` would have
-    // said `a` governs the whole `a__` prefix; Rust's `registry::governing` uses
-    // plain containment and would have said `a__`. Two predicates, two jobs.
-    containsPath: (p, path) => path === p || path.indexOf(p + '.') === 0,
-
-    // Longest prefix first, then by name: the order `governing` relies on.
-    bySpecificity: function (prefixes) {
-        return (prefixes || []).slice().sort(function (a, b) {
-            let d = PVE.meta.Utils.depth(b.prefix) - PVE.meta.Utils.depth(a.prefix);
-            // Byte order, matching Rust's `String::cmp` -- `localeCompare` orders
-            // `@`, `!`, `_` and mixed case differently, and a mirror that sorts
-            // differently is a mirror that will eventually decide differently.
-            return d !== 0 ? d : (a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0);
-        });
-    },
-
-    // Segment count of a dotted prefix -- how "specific" it is. `''` is 0.
-    depth: function (prefix) {
-        let p = String(prefix || '');
-        return p === '' ? 0 : p.split('.').length;
-    },
-
     // A scalar as the string a grammar's `enum` and a hover compare and show.
     scalarText: function (value) {
         return typeof value === 'string' ? value : Ext.encode(value);
@@ -732,71 +383,6 @@ PVE.meta.Utils = {
         return Ext.encode(sel);
     },
 
-    // --- YAML, through the vendored js-yaml (see PVE.meta.Yaml) --------------
-    //
-    // Presentation only: the YAML/JSON view toggle and the diff's "original" side.
-    // `load` uses js-yaml's default schema, which is the safe one (no arbitrary
-    // JS types); `dump` is pinned to the block style the store itself emits.
-
-    yamlLib: function () {
-        let y = window.jsyaml;
-        if (!y || !y.load) {
-            throw new Error(gettext('YAML support is not loaded'));
-        }
-        return y;
-    },
-
-    yamlLoad: function (text) {
-        // JSON_SCHEMA, not js-yaml's DEFAULT_SCHEMA. The default resolves implicit
-        // timestamps, so `2020-01-01` parses to a JS Date and re-serialises as
-        // "2020-01-01T00:00:00.000Z" -- a *presentation-only* view toggle, or the
-        // Format button, would silently rewrite the stored value. The server keeps it
-        // a string (`serde_yaml_ng`, verified), and this must agree with the server
-        // about what a document *is*.
-        //
-        // js-yaml still accepts anchors, aliases and explicit tags, which the store
-        // refuses (format.rs's YAML safety scan). That divergence is one the server
-        // catches -- an Apply carrying them is a 400 -- so it is left alone rather
-        // than reimplementing that scan here.
-        let doc = PVE.meta.Utils.yamlLib().load(String(text), {
-            schema: PVE.meta.Utils.yamlLib().JSON_SCHEMA,
-        });
-        // An empty document is the empty map, not a null: the model has no nulls.
-        return doc === undefined || doc === null ? {} : doc;
-    },
-
-    // The store's own canonical YAML, produced by a different emitter.
-    //
-    // These options are not taste. The store writes documents with
-    // `serde_yaml_ng`; this writes them with js-yaml; and every line the two
-    // disagree about is a line the editor shows differently from the file, and
-    // that its diff then attributes to whatever you were actually editing. The
-    // shared table in `testdata/yaml-cases.json` is what holds them together --
-    // both suites dump the same document and expect the same bytes.
-    //
-    // `noCompatMode` turns off js-yaml's YAML 1.1 compatibility quoting, which
-    // wrapped `25565:25565` and `1:30:00` (YAML 1.1 sexagesimals) and `yes`
-    // (a YAML 1.1 boolean) in quotes the store does not write. It is safe here
-    // and only here: both ends read YAML 1.2 semantics -- the store through
-    // `serde_yaml_ng`, this editor through `JSON_SCHEMA` -- so neither resolves
-    // those forms to anything but a string, and the store already writes them
-    // bare. It does not touch quoting the *active* schema needs, so `'007'` and
-    // `'true'` stay quoted on both sides.
-    //
-    // `noArrayIndent` matches the store's block sequences, which sit flush with
-    // their key rather than indented under it.
-    yamlDump: function (value) {
-        return PVE.meta.Utils.yamlLib().dump(value, {
-            schema: PVE.meta.Utils.yamlLib().JSON_SCHEMA, // as yamlLoad, for the same reason
-            indent: 2,
-            lineWidth: -1, // never fold: a folded line is a changed line in the diff
-            noRefs: true, // anchors/aliases are not part of the document model
-            sortKeys: false, // documents are ordered maps (DESIGN §2)
-            noCompatMode: true, // see above
-            noArrayIndent: true, // see above
-        });
-    },
-
     errText: (err) => String((err && (err.message || err.msg)) || err),
 };
 
@@ -827,195 +413,310 @@ PVE.meta.compose = function (...parts) {
 };
 
 // ---------------------------------------------------------------------------
-// js-yaml, vendored under vendor/ and loaded lazily on first use.
+// The core: pve-meta-core, built for the browser (crates/pve-meta-wasm).
+//
+// The server's own code answers the questions this editor used to answer with a
+// second implementation: how a document reads and dumps, which key names are
+// legal, who may touch a path, which prefix governs one, what a schema makes of
+// a value, and what a set of staged edits does to a document. Those are the five
+// objects below it -- Codec, Access, Shape, Edits -- each a thin, named face over
+// one concept in the core, so a call site reads as the concept and not as a
+// string passed to `call`.
+//
+// The ABI is four exports and a JSON document each way (see the crate's own
+// doc comment): `pm_alloc`/`pm_free` for the request, `pm_call` to run it, and
+// `pm_output` for the response. No wasm-bindgen, no generated glue, no build
+// step beyond `cargo build --target wasm32-unknown-unknown`.
+//
+// Loaded lazily on first use like Monaco, and `attach`ed directly by the offline
+// test harness, which instantiates the same `.wasm` the package ships.
 // ---------------------------------------------------------------------------
 
-PVE.meta.Yaml = {
-    SRC: '/pve2/js/pve-meta-extjs/vendor/js-yaml.min.js',
+PVE.meta.CoreError = function (err) {
+    this.name = 'CoreError';
+    this.message = err.message;
+    // Where the parser stopped, 1-based, when it knows -- the text editor's marker.
+    this.line = err.line;
+    this.column = err.column;
+};
+PVE.meta.CoreError.prototype = Object.create(Error.prototype);
+PVE.meta.CoreError.prototype.constructor = PVE.meta.CoreError;
+
+PVE.meta.Core = {
+    SRC: '/pve2/js/pve-meta-extjs/pve-meta-core.wasm',
+    ABI: 1,
+    exports: null,
     promise: null,
 
     load: function () {
-        let me = PVE.meta.Yaml;
+        let me = PVE.meta.Core;
         me.promise =
             me.promise ||
-            new Promise(function (resolve, reject) {
-                if (window.jsyaml && window.jsyaml.load) {
-                    resolve(window.jsyaml);
-                    return;
-                }
-                // js-yaml ships a UMD bundle: if an AMD `define` is present it
-                // registers as an anonymous module instead of setting window.jsyaml.
-                // Monaco's loader installs exactly such a `define`, so hide it for
-                // the duration of this one script load and put it back afterwards.
-                // PVE.meta.Monaco.load() waits for this promise first, so the two
-                // never overlap.
-                let prevDefine = window.define;
-                let restore = (fn) =>
-                    function (arg) {
-                        window.define = prevDefine;
-                        fn(arg);
-                    };
-                window.define = undefined;
-                let script = document.createElement('script');
-                script.src = me.SRC;
-                script.onload = restore(function () {
-                    if (window.jsyaml && window.jsyaml.load) {
-                        resolve(window.jsyaml);
-                    } else {
-                        reject(new Error('js-yaml did not register (' + me.SRC + ')'));
-                    }
-                });
-                script.onerror = restore(() => reject(new Error('failed to load ' + me.SRC)));
-                document.head.appendChild(script);
-            });
+            (me.exports
+                ? Promise.resolve(me)
+                : WebAssembly.instantiateStreaming(fetch(me.SRC), {}).then(function (result) {
+                      me.attach(result.instance);
+                      return me;
+                  }));
         return me.promise;
+    },
+
+    // Hand over an instantiated module. The harness does this with the file from
+    // the build tree; the browser does it through `load`.
+    attach: function (instance) {
+        let me = PVE.meta.Core;
+        let ex = instance.exports;
+        if (typeof ex.pm_abi !== 'function' || ex.pm_abi() !== me.ABI) {
+            throw new Error('pve-meta core: ABI mismatch (wanted ' + me.ABI + ')');
+        }
+        me.exports = ex;
+        me.encoder = new TextEncoder();
+        me.decoder = new TextDecoder();
+    },
+
+    loaded: function () {
+        return !!PVE.meta.Core.exports;
+    },
+
+    // One request: `{fn, args}` in, `ok` out, or a CoreError from `err`. Every
+    // argument is a JSON value already -- a document, a path string, a listing --
+    // which is why this can be a dozen lines and needs no generated bindings.
+    call: function (name, ...args) {
+        let me = PVE.meta.Core;
+        let ex = me.exports;
+        if (!ex) {
+            throw new Error(gettext('The pve-meta core is not loaded'));
+        }
+        let bytes = me.encoder.encode(JSON.stringify({ fn: name, args: args }));
+        let ptr = ex.pm_alloc(bytes.length);
+        new Uint8Array(ex.memory.buffer, ptr, bytes.length).set(bytes);
+        let len;
+        try {
+            len = ex.pm_call(ptr, bytes.length);
+        } finally {
+            ex.pm_free(ptr, bytes.length);
+        }
+        // `memory.buffer` afresh: the call may have grown the memory, which
+        // detaches any earlier view of it.
+        let text = me.decoder.decode(new Uint8Array(ex.memory.buffer, ex.pm_output(), len));
+        let res = JSON.parse(text);
+        if (res.err !== undefined) {
+            throw new PVE.meta.CoreError(res.err);
+        }
+        return res.ok;
     },
 };
 
 // ---------------------------------------------------------------------------
-// Grammar findings for the text editor: what is wrong, and which line to underline.
+// Codec: a buffer as a document and back (`format::parse` / `format::dump`).
 //
-// The only implementation of these rules: the second UI this used to mirror is gone
-// (git tag pwt-ui-removed). What it must still agree with is the *server* -- the value
-// model (PVE.meta.Utils.yamlLoad uses JSON_SCHEMA so a bare date stays a string, as
-// the store keeps it) and the coverage rule (testdata/covers-cases.json, read by this
-// suite and by scopes.rs). Findings themselves are advisory: DESIGN §4 makes the
-// server's single lint the authority on what is storable.
+// The store writes documents with serde_yaml_ng; so does this, because it *is*
+// serde_yaml_ng. There is no second emitter to keep in step, and no setting on
+// this side that could drift -- every line the editor shows is a line the file
+// would hold.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Codec = {
+    // A buffer, in `lang` ('yaml' or 'json'), as a value. An empty buffer is the
+    // empty document. Throws a CoreError carrying `line`/`column`.
+    parse: function (text, lang) {
+        return PVE.meta.Core.call('parse', lang === 'json' ? 'json' : 'yaml', String(text));
+    },
+
+    // The inverse: `value` as canonical text in `lang`. Always re-dumps -- what
+    // Format wants, since a re-indent is the point of clicking it.
+    dump: function (value, lang) {
+        return PVE.meta.Core.call('dump', lang === 'json' ? 'json' : 'yaml', value);
+    },
+
+    // As `dump`, but for a switch *into* YAML prefers `originalYaml` when it is the
+    // same document. The store rewrites a file only when asked to write one, so what
+    // the editor is handed can be a file as somebody *wrote* it -- valid YAML in a
+    // layout no emitter would choose -- and re-dumping that on a presentation toggle
+    // invents changes to a document nobody edited.
+    render: function (value, lang, originalYaml) {
+        if (lang !== 'json' && originalYaml !== undefined && PVE.meta.Codec.same(value, originalYaml)) {
+            return originalYaml;
+        }
+        return PVE.meta.Codec.dump(value, lang);
+    },
+
+    // True if `value` is the same document as `yamlText` parses to, key order
+    // included (key order is data, DESIGN §2).
+    same: function (value, yamlText) {
+        try {
+            return PVE.meta.Core.call('same_ordered', value, PVE.meta.Codec.parse(yamlText, 'yaml'));
+        } catch (_err) {
+            return false;
+        }
+    },
+
+    // The text an editor loaded (its `original`), rendered in `lang`. Throws if it
+    // cannot be read as YAML -- callers fall back to 'yaml' rather than lose the
+    // comparison.
+    originalInLang: function (originalYaml, lang) {
+        return lang === 'json'
+            ? PVE.meta.Codec.dump(PVE.meta.Codec.parse(originalYaml, 'yaml'), 'json')
+            : originalYaml;
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Access: who may touch a path (`scopes::Effective`).
 //
-// Two halves, kept apart on purpose. `findings()` answers *what is wrong*, from the
-// parsed document the panel already holds; `lineIndex()` answers *where to draw it*,
-// by scanning the YAML the server returned. The pairing only holds while the buffer
+// A `GET /meta/access` answer is the caller's effective access to one document;
+// the same struct the server builds per request, read here from the wire.
+// Permissions accumulate by containment, and a rule on `p` covers `p`, its
+// comment key `p__` and everything under `p.` -- the only comment-key rule
+// there is (DESIGN §3.3).
+// ---------------------------------------------------------------------------
+
+PVE.meta.Access = {
+    covers: (prefix, path) => PVE.meta.Core.call('covers', prefix, path),
+
+    canRead: (access, path) => PVE.meta.Core.call('access_can_read', access || {}, path),
+
+    canWrite: (access, path) => PVE.meta.Core.call('access_can_write', access || {}, path),
+
+    // May this caller write *anything* here: full write, or at least one `rw`
+    // scope. What a write may actually change is decided by what it changes
+    // (DESIGN §3.4); this only says whether there is any point offering Apply.
+    hasAnyWrite: (access) => PVE.meta.Core.call('access_has_any_write', access || {}),
+
+    // Every rule, from every permission file in the `GET /meta/permissions`
+    // listing, whose selector matches a guest carrying `tags` -- with the file it
+    // came from: `{ name, authid, prefix, mode, selector }`. A file that did not
+    // load grants nothing.
+    rulesReaching: (permissions, tags) =>
+        PVE.meta.Core.call('rules_reaching', permissions || [], tags || []),
+};
+
+// ---------------------------------------------------------------------------
+// Shape: what describes one document (`shape::Shape`).
+//
+// The prefixes that reach a guest, most-specific first; which of them governs a
+// path; what its schema says about the value there. Schemas shadow, they never
+// merge (DESIGN §3.1). A registry document is shaped by its meta-schema rooted at
+// the document itself; the datacenter document by nothing.
+//
+// A Shape is the `GET /meta/prefixes` listing plus the guest's tags, and every
+// question is put to the core with both -- the core builds the shape afresh and
+// answers. The listing is a few kilobytes, the questions are asked once per
+// render, and holding a handle to state inside the wasm instead would be a
+// lifetime to manage for no measurable gain.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Shape = {
+    // The shape of a guest document: the listed prefixes (loaded or not), the
+    // guest's tags.
+    of: function (prefixes, tags) {
+        return PVE.meta.Shape.make(prefixes || [], tags || []);
+    },
+
+    // The shape of a registry document: one schema, rooted at the document. The
+    // empty prefix is a prefix of everything and the least specific of all, so it
+    // governs the whole document without a special case anywhere.
+    rooted: function (schema) {
+        return PVE.meta.Shape.make(schema ? [{ prefix: '', selector: { all: true }, schema: schema }] : [], []);
+    },
+
+    empty: function () {
+        return PVE.meta.Shape.make([], []);
+    },
+
+    make: function (prefixes, tags) {
+        let byPrefix = Object.create(null);
+        prefixes.forEach((p) => (byPrefix[p.prefix] = p));
+        let ask = (fn, ...rest) => PVE.meta.Core.call(fn, prefixes, tags, ...rest);
+        return {
+            // The prefixes that reach this document, most-specific first, as the
+            // listing entries they came from (a failed one never appears).
+            declared: () => ask('shape_prefixes').map((name) => byPrefix[name]),
+            // Whether anything here carries a schema at all -- if not, there are no
+            // findings and no hovers to compute.
+            hasSchema: () => ask('shape_prefixes').some((name) => byPrefix[name].schema),
+            // The prefix governing `path`, as its listing entry, or `null`.
+            governing: function (path) {
+                let name = ask('shape_governing', path);
+                return name === null ? null : byPrefix[name];
+            },
+            // Every declared path with its schema node, parents first, pruned where
+            // a more specific prefix governs: `[{ path, prefix, schema }]`.
+            schemaIndex: () => ask('shape_schema_index'),
+            // Everything in `doc` that does not match what its governing schema
+            // says: `[{ path, msg }]`, sorted by path. Type, enum and range come
+            // from the core; a `format` is checked here with proxmoxlib's own
+            // validator for that name, which is the one thing the core leaves to
+            // whoever holds one.
+            findings: function (doc) {
+                let got = ask('shape_findings', doc);
+                let out = got.findings.slice();
+                got.formats.forEach(function (f) {
+                    let msg = PVE.meta.Utils.checkFormat(f.format, f.value);
+                    if (msg) {
+                        out.push({ path: f.path, msg: msg });
+                    }
+                });
+                out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+                return out;
+            },
+        };
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Edits: the staged edits on a document (`edit::EditSet`).
+//
+// A row edit stages `{ path, op: 'set' | 'delete', value }`; the tree renders
+// `apply` -- the document as it would be; switching to text renders that same
+// planned document and switching back turns the buffer into edits again with
+// `between`; one Apply writes the planned subtree at `writeView`. A set is the
+// server's `view::replace` and a delete its `view::remove`, so what the editor
+// predicts and what a `PUT ?view=` does are the same function.
+//
+// The panel holds the list; these are the operations on it.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Edits = {
+    // `edit` staged on top of `list`: every earlier edit at or under its path is
+    // dropped, since a write of `a` says everything about `a.b`.
+    stage: (list, edit) => PVE.meta.Core.call('edits_stage', list || [], edit),
+
+    // The edits at or under `path` -- what discarding one row's edits removes.
+    under: (list, path) => PVE.meta.Core.call('edits_under', list || [], path),
+
+    discardUnder: (list, path) => PVE.meta.Core.call('edits_discard_under', list || [], path),
+
+    // The document as it would be once `list` is applied to `stored`.
+    apply: (stored, list) => PVE.meta.Core.call('edits_apply', stored || {}, list || []),
+
+    // What would have to be staged to turn `stored` into `edited`, as row edits;
+    // one whole-document set when the change has no per-key expression (a key
+    // reordering -- key order is data and must not be lost).
+    between: (stored, edited) => PVE.meta.Core.call('edits_between', stored, edited),
+
+    // The narrowest view covering every staged path (`''` is the document root),
+    // or `null` with nothing staged.
+    writeView: (list) => PVE.meta.Core.call('edits_write_view', list || []),
+
+    // Every path at which two documents differ in *value* -- what an edit is
+    // answerable for. A pure reordering changes none.
+    changedPaths: (was, now) => PVE.meta.Core.call('changed_paths', was, now),
+
+    // Of the findings `after` has, those an edit is answerable for: not already
+    // in `before`, or on a path in `changed` (in either direction).
+    introduced: (before, after, changed) =>
+        PVE.meta.Core.call('findings_introduced', before || [], after || [], changed || []),
+};
+
+// ---------------------------------------------------------------------------
+// Markers for the text editor: which line a finding goes on, and what a hover
+// says. The findings themselves come from the Shape (the core); this only places
+// them, by scanning the YAML the editor holds. The pairing holds while the buffer
 // still is what the server sent, so the caller clears both once it is dirty.
 // ---------------------------------------------------------------------------
 
-PVE.meta.Lint = {
-    // The prefixes that carry a schema, longest prefix first. Shape comes from
-    // prefixes, never from permissions (DESIGN section 3.1).
-    applicable: function (prefixes) {
-        return PVE.meta.Utils.bySpecificity(
-            (prefixes || []).filter((ns) => ns && ns.schema && ns.prefix),
-        );
-    },
-
-    valueAt: function (data, path) {
-        let cur = data;
-        if (!path) {
-            return cur;
-        }
-        let parts = path.split('.');
-        for (let i = 0; i < parts.length; i++) {
-            if (!cur || typeof cur !== 'object' || Array.isArray(cur)) {
-                return undefined;
-            }
-            cur = Object.prototype.hasOwnProperty.call(cur, parts[i]) ? cur[parts[i]] : undefined;
-        }
-        return cur;
-    },
-
-    // `withSchema` is what to walk; `all` is what *shadows*, which is every applicable
-    // prefix whether or not it carries a schema. Two jobs, two lists: a prefix
-    // with a selector and no schema (the lab's `netbird`) still governs its subtree, so
-    // reusing the filtered list for pruning let a parent's schema reach into a
-    // schema-less child. Defaults to `withSchema` only for callers that have no
-    // schema-less prefixes to worry about.
-    findings: function (data, withSchema, all) {
-        let out = [];
-        let list = withSchema || [];
-        let shadow = all && all.length ? PVE.meta.Utils.bySpecificity(all) : list;
-        list.forEach(function (ns) {
-            let value = PVE.meta.Lint.valueAt(data, ns.prefix);
-            if (value === undefined) {
-                return;
-            }
-            if (ns.prefix) {
-                PVE.meta.Lint.walk(value, ns.schema, ns.prefix, out, shadow, ns);
-            } else {
-                // The empty prefix is the document itself -- a registry document's
-                // meta-schema (DESIGN §3.6). It governs everything and shadows
-                // nothing, so it is walked with no owner: `governing` answers about
-                // prefixes, the empty prefix is not one, and passing an owner here
-                // would prune every path in the document.
-                PVE.meta.Lint.walk(value, ns.schema, '', out, [], null);
-            }
-        });
-        out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-        return out;
-    },
-
-    // `list`/`owner`, when given, enforce most-specific-wins: the walk stops where a
-    // *different* prefix governs, so a parent's schema never reaches into a child
-    // prefix's subtree. Schemas shadow, they do not merge (DESIGN section 3.1).
-    walk: function (value, schema, path, out, list, owner) {
-        let message = PVE.meta.Lint.checkValue(schema, value);
-        if (message) {
-            out.push({ path: path, message: message });
-            return; // a value of the wrong shape says nothing useful about its children
-        }
-        let props = schema && schema.properties;
-        if (!props || !value || typeof value !== 'object' || Array.isArray(value)) {
-            return;
-        }
-        Object.keys(value).forEach(function (key) {
-            if (Object.prototype.hasOwnProperty.call(props, key)) {
-                let child = path ? path + '.' + key : key;
-                if (owner && PVE.meta.Utils.governing(child, list) !== owner) {
-                    return; // a more specific prefix owns this subtree
-                }
-                PVE.meta.Lint.walk(value[key], props[key], child, out, list, owner);
-            }
-        });
-    },
-
-    // Only what the row editor also enforces, so the two never disagree.
-    checkValue: function (schema, value) {
-        if (!schema) {
-            return null;
-        }
-        if (schema.enum) {
-            let shown = PVE.meta.Utils.scalarText(value);
-            let allowed = schema.enum.map((v) => String(v));
-            return allowed.indexOf(shown) === -1
-                ? gettext('expected one of') + ': ' + allowed.join(', ')
-                : null;
-        }
-        if (schema.type && !PVE.meta.Lint.typeMatches(schema.type, value)) {
-            return gettext('expected') + ' ' + schema.type;
-        }
-        if (typeof value === 'number') {
-            if (schema.minimum !== undefined && value < schema.minimum) {
-                return gettext('must be at least') + ' ' + schema.minimum;
-            }
-            if (schema.maximum !== undefined && value > schema.maximum) {
-                return gettext('must be at most') + ' ' + schema.maximum;
-            }
-        }
-        if (typeof value === 'string' && schema.format) {
-            return PVE.meta.Utils.checkFormat(schema.format, value);
-        }
-        return null;
-    },
-
-    // A boolean arriving as 1/0 is the API's own wire convention (DESIGN section 4);
-    // flagging it would put a warning on every boolean in the store.
-    typeMatches: function (declared, value) {
-        switch (declared) {
-            case 'string':
-                return typeof value === 'string';
-            case 'integer':
-                return typeof value === 'number' && Number.isInteger(value);
-            case 'number':
-                return typeof value === 'number';
-            case 'boolean':
-                return typeof value === 'boolean' || value === 0 || value === 1;
-            case 'object':
-                return !!value && typeof value === 'object' && !Array.isArray(value);
-            case 'array':
-                return Array.isArray(value);
-            default:
-                return true;
-        }
-    },
-
+PVE.meta.Markers = {
     // A scan, not a parser: the store dumps canonically (block style, two-space indent,
     // one mapping key per line), so an indent stack resolves every key's path. Sequence
     // items are not indexed (a view addresses through maps only) and a block scalar's
@@ -1041,7 +742,7 @@ PVE.meta.Lint = {
                 if (line === '-' || line.slice(0, 2) === '- ') {
                     return;
                 }
-                let split = PVE.meta.Lint.splitKey(line);
+                let split = PVE.meta.Markers.splitKey(line);
                 if (!split) {
                     return;
                 }
@@ -1088,34 +789,9 @@ PVE.meta.Lint = {
         let out = [];
         (findings || []).forEach(function (f) {
             if (index[f.path] !== undefined) {
-                out.push({ line: index[f.path], message: f.message });
+                out.push({ line: index[f.path], message: f.msg });
             }
         });
-        return out;
-    },
-
-    // Every schema node by document path -- the hover index. Pruned the same way as
-    // `findings`, so a path covered by two prefixes resolves to the more specific
-    // one rather than to whichever was collected last.
-    schemaIndex: function (withSchema, all) {
-        let out = Object.create(null);
-        let list = withSchema || [];
-        let shadow = all && all.length ? PVE.meta.Utils.bySpecificity(all) : list;
-        let collect = function (schema, path, owner) {
-            if (owner && PVE.meta.Utils.governing(path, shadow) !== owner) {
-                return;
-            }
-            out[path] = schema;
-            let props = schema && schema.properties;
-            if (!props) {
-                return;
-            }
-            Object.keys(props).forEach((k) =>
-                collect(props[k], path ? path + '.' + k : k, owner),
-            );
-        };
-        // `ns.prefix || null` as the owner: the same root-schema case as `findings`.
-        list.forEach((ns) => collect(ns.schema, ns.prefix, ns.prefix ? ns : null));
         return out;
     },
 
@@ -1143,7 +819,7 @@ PVE.meta.Lint = {
         if (schema.description) {
             parts.push(schema.description);
         }
-        return parts.length ? parts.join(' \u00b7 ') : null;
+        return parts.length ? parts.join(' · ') : null;
     },
 };
 
@@ -1159,10 +835,9 @@ PVE.meta.Monaco = {
         let me = PVE.meta.Monaco;
         me.promise =
             me.promise ||
-            // js-yaml first, deliberately: its UMD bundle and Monaco's AMD loader
-            // both want the global `define`, and every caller of Monaco here also
-            // needs the YAML codec.
-            PVE.meta.Yaml.load().then(
+            // The core first: every caller of Monaco here also needs the codec, and
+            // a buffer rendered before it is loaded is a buffer rendered from nothing.
+            PVE.meta.Core.load().then(
                 () =>
                     new Promise(function (resolve, reject) {
                         if (window.monaco && window.monaco.editor) {
@@ -1255,11 +930,11 @@ PVE.meta.Monaco = {
     showDiffWindow: function (cfg) {
         let state = {};
         // Rendering a document rather than a buffer: only reachable from here, which
-        // is after the YAML codec is loaded.
+        // is after the core is loaded.
         if (cfg.originalValue !== undefined || cfg.modifiedValue !== undefined) {
             cfg = Ext.apply({}, cfg);
-            cfg.original = PVE.meta.Utils.yamlDump(cfg.originalValue);
-            cfg.modified = PVE.meta.Utils.yamlDump(cfg.modifiedValue);
+            cfg.original = PVE.meta.Codec.dump(cfg.originalValue, 'yaml');
+            cfg.modified = PVE.meta.Codec.dump(cfg.modifiedValue, 'yaml');
             cfg.lang = 'yaml';
         }
         // `cfg.warnings` (grammar findings) turns this into the warned form: a banner
@@ -1767,7 +1442,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
             me.down('[name=format]').setDisabled(!isString());
             me.down('[name=multiline]').setDisabled(!isString());
             // A boolean picks its default from a list; a map has no default the
-            // editor would ever read (`addGrammar` stops at an object and walks into
+            // editor would ever read (`addShape` stops at an object and walks into
             // it), so offering one would be a field that does nothing.
             me.down('[name=defaultBool]').setHidden(type !== 'boolean');
             let plain = me.down('[name=default]');
@@ -2139,7 +1814,7 @@ Ext.define('PVE.meta.TextWindow', {
         let lang = me.lang;
         let original;
         try {
-            original = PVE.meta.Utils.originalInLang(me.original, lang);
+            original = PVE.meta.Codec.originalInLang(me.original, lang);
         } catch (_err) {
             lang = 'yaml';
             original = me.original;
@@ -2181,7 +1856,7 @@ Ext.define('PVE.meta.TextWindow', {
         let text = ed.getValue();
         try {
             let U = PVE.meta.Utils;
-            let formatted = U.dumpBuffer(U.parseBuffer(text, me.lang), me.lang);
+            let formatted = PVE.meta.Codec.dump(PVE.meta.Codec.parse(text, me.lang), me.lang);
             if (formatted !== text) {
                 ed.setValue(formatted);
             }
@@ -2201,7 +1876,7 @@ Ext.define('PVE.meta.TextWindow', {
         }
         let value;
         try {
-            value = PVE.meta.Utils.parseBuffer(me.editor.getValue(), me.lang);
+            value = PVE.meta.Codec.parse(me.editor.getValue(), me.lang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -2222,7 +1897,7 @@ Ext.define('PVE.meta.TextWindow', {
         // no-op round trip into a whitespace diff (see the comment on that function).
         // This editor used to dump unconditionally here, which the Text card's own
         // toggle did not.
-        me.editor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.original));
+        me.editor.setValue(PVE.meta.Codec.render(value, lang, me.original));
     },
 
     // Apply applies, and the window closes when the write lands. The diff is a button
@@ -2235,7 +1910,7 @@ Ext.define('PVE.meta.TextWindow', {
         let edited = me.editor.getValue();
         let original = me.original;
         try {
-            original = PVE.meta.Utils.originalInLang(me.original, me.lang);
+            original = PVE.meta.Codec.originalInLang(me.original, me.lang);
         } catch (_err) {
             original = me.original;
         }
@@ -2385,10 +2060,10 @@ PVE.meta.Doc = {
         me.request({
             url: '/meta/prefixes',
             success: function (response) {
-                // Served most-specific first (DESIGN section 3.1) -- the order
-                // `Utils.governing` relies on. Sorted again here so the UI does not
-                // depend on the server's ordering for correctness.
-                me.prefixes = PVE.meta.Utils.bySpecificity(response.result.data || []);
+                // The listing as served, failures included (the registry grid shows
+                // them). Which of these reach a guest, and in what order, is the
+                // Shape's question, answered by the core from this list every time.
+                me.prefixes = response.result.data || [];
                 next();
             },
             failure: function () {
@@ -2478,8 +2153,8 @@ PVE.meta.Doc = {
     // its rows; the file changed anyway. The canonical YAML text is the one
     // representation on this wire that carries the order the store actually holds.
     //
-    // js-yaml is loaded first rather than assumed: it is lazy, and calling into it
-    // before it is there is a bug this editor has already had once.
+    // The core is loaded first rather than assumed: it is lazy, and calling into it
+    // before it is there is a bug this editor has already had once (with js-yaml).
     //
     // One narrower loss remains and cannot be fixed here: JavaScript objects order
     // integer-like keys first, so a document with keys `2` and `1` cannot round
@@ -2487,7 +2162,7 @@ PVE.meta.Doc = {
     // language, and it is a far smaller hole than the one it replaces.
     loadDocument: function (next) {
         let me = this;
-        PVE.meta.Yaml.load().then(
+        PVE.meta.Core.load().then(
             function () {
                 me.request({
                     url: me.urlFor(me.docId),
@@ -2519,7 +2194,7 @@ PVE.meta.Doc = {
                         }
                         let data;
                         try {
-                            data = PVE.meta.Utils.yamlLoad(d.text || '');
+                            data = PVE.meta.Codec.parse(d.text || '', 'yaml');
                         } catch (err) {
                             Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
                             return;
@@ -2532,7 +2207,7 @@ PVE.meta.Doc = {
                 });
             },
             function (err) {
-                // Without YAML this panel cannot read a document faithfully, and
+                // Without the core this panel cannot read a document faithfully, and
                 // reading it unfaithfully is what this whole path exists to stop.
                 Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             },
@@ -2657,7 +2332,7 @@ PVE.meta.TextCard = {
         let lang = me.textLang;
         let original;
         try {
-            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+            original = PVE.meta.Codec.originalInLang(me.textOriginal, lang);
         } catch (_err) {
             lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
             original = me.textOriginal;
@@ -2705,7 +2380,7 @@ PVE.meta.TextCard = {
             // against the planned one would call a staged edit "not dirty".
             return (
                 me.textEditor.getValue() !==
-                PVE.meta.Utils.originalInLang(me.textOriginal, me.textLang)
+                PVE.meta.Codec.originalInLang(me.textOriginal, me.textLang)
             );
         } catch (_err) {
             return true; // cannot tell: assume there is something to lose
@@ -2723,9 +2398,9 @@ PVE.meta.TextCard = {
     textRendered: function (lang) {
         let me = this;
         if (!me.isDirty()) {
-            return PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+            return PVE.meta.Codec.originalInLang(me.textOriginal, lang);
         }
-        return PVE.meta.Utils.renderBuffer(me.plannedData(), lang, me.textOriginal);
+        return PVE.meta.Codec.render(me.plannedData(), lang, me.textOriginal);
     },
 
     enterTextMode: function () {
@@ -2819,7 +2494,7 @@ PVE.meta.TextCard = {
         let me = this;
         let parsed;
         try {
-            parsed = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+            parsed = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
         } catch (err) {
             me.setModeButton('text');
             Ext.Msg.alert(
@@ -2830,7 +2505,7 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        me.pending = PVE.meta.Utils.diffDocuments(me.dataOf(me.textDocId), parsed);
+        me.pending = PVE.meta.Edits.between(me.dataOf(me.textDocId), parsed);
         PVE.meta.Monaco.dispose(me.textEditor);
         me.textEditor = null;
         me.mode = 'tree';
@@ -2849,7 +2524,7 @@ PVE.meta.TextCard = {
         }
         let value;
         try {
-            value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+            value = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -2870,7 +2545,7 @@ PVE.meta.TextCard = {
         // `renderBuffer`: switching back to YAML prefers the server's own text when
         // the document is unchanged (see the comment on that function) rather than
         // re-dumping unconditionally.
-        me.textEditor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.textOriginal));
+        me.textEditor.setValue(PVE.meta.Codec.render(value, lang, me.textOriginal));
         me.annotateText();
     },
 
@@ -2889,7 +2564,7 @@ PVE.meta.TextCard = {
         let text = me.textEditor.getValue();
         try {
             let U = PVE.meta.Utils;
-            let formatted = U.dumpBuffer(U.parseBuffer(text, me.textLang), me.textLang);
+            let formatted = PVE.meta.Codec.dump(PVE.meta.Codec.parse(text, me.textLang), me.textLang);
             if (formatted !== text) {
                 me.textEditor.setValue(formatted);
                 me.annotateText();
@@ -2916,7 +2591,7 @@ PVE.meta.TextCard = {
         // It said "No changes." and wrote nothing.
         let original;
         try {
-            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+            original = PVE.meta.Codec.originalInLang(me.textOriginal, lang);
         } catch (_err) {
             lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
             original = me.textOriginal;
@@ -2993,13 +2668,13 @@ PVE.meta.TextCard = {
     // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
     // is the authority (DESIGN section 4):
     //
-    //   * a YAML syntax error, as one Error marker on the line js-yaml reports. Monaco
+    //   * a YAML syntax error, as one Error marker on the line the parser reports. Monaco
     //     ships a JSON language service that does this for the JSON view already, but
     //     nothing validates YAML, so this is ours.
-    //   * every grammar finding, as Warning markers (PVE.meta.Lint).
+    //   * every schema finding, as Warning markers (the Shape, placed by PVE.meta.Markers).
     //
     // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
-    // not against the document the server last sent. Parsing is js-yaml on a document
+    // not against the document the server last sent. Parsing is the core on a document
     // that is a few KB at most; if that ever shows up in typing latency, debounce it.
     //
     // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
@@ -3021,37 +2696,31 @@ PVE.meta.TextCard = {
         let parsed = null;
         let parseError = null;
         try {
-            parsed = PVE.meta.Utils.parseBuffer(text, me.textLang);
+            parsed = PVE.meta.Codec.parse(text, me.textLang);
         } catch (err) {
             parseError = err;
         }
 
         if (parseError) {
             if (me.textLang === 'yaml') {
-                // js-yaml's YAMLException carries a 0-based mark; anything else lands
-                // on line 1 rather than nowhere.
-                let mark = parseError.mark || {};
-                let line = typeof mark.line === 'number' ? mark.line + 1 : 1;
+                // A CoreError carries the parser's own 1-based line and column;
+                // anything else lands on line 1 rather than nowhere.
+                let line = typeof parseError.line === 'number' ? parseError.line : 1;
                 line = Math.min(Math.max(line, 1), model.getLineCount());
                 markers.push({
                     startLineNumber: line,
                     endLineNumber: line,
-                    startColumn: typeof mark.column === 'number' ? mark.column + 1 : 1,
+                    startColumn: typeof parseError.column === 'number' ? parseError.column : 1,
                     endColumn: model.getLineMaxColumn(line),
-                    message: parseError.reason || PVE.meta.Utils.errText(parseError),
+                    message: PVE.meta.Utils.errText(parseError),
                     severity: monaco.MarkerSeverity.Error,
                 });
             }
         } else if (me.textLang === 'yaml') {
-            let g = me.textGrammar();
-            let all = g.all;
-            let applicable = g.withSchema;
-            if (applicable.length) {
-                let index = PVE.meta.Lint.lineIndex(text);
-                markers = PVE.meta.Lint.placed(
-                    PVE.meta.Lint.findings(parsed, applicable, all),
-                    index,
-                ).map(function (f) {
+            let shape = me.textShape();
+            if (shape.hasSchema()) {
+                let index = PVE.meta.Markers.lineIndex(text);
+                markers = PVE.meta.Markers.placed(shape.findings(parsed), index).map(function (f) {
                     return {
                         startLineNumber: f.line,
                         endLineNumber: f.line,
@@ -3061,11 +2730,10 @@ PVE.meta.TextCard = {
                         severity: monaco.MarkerSeverity.Warning,
                     };
                 });
-                let schemas = PVE.meta.Lint.schemaIndex(applicable, all);
-                Object.keys(schemas).forEach(function (path) {
-                    let hover = PVE.meta.Lint.hoverText(schemas[path]);
-                    if (hover && index[path] !== undefined) {
-                        hovers[index[path]] = hover;
+                shape.schemaIndex().forEach(function (entry) {
+                    let hover = PVE.meta.Markers.hoverText(entry.schema);
+                    if (hover && index[entry.path] !== undefined) {
+                        hovers[index[entry.path]] = hover;
                     }
                 });
             }
@@ -3083,8 +2751,8 @@ PVE.meta.TextCard = {
     // already had, on a path this buffer did not change, is not this edit's to vouch
     // for. Reordering keys therefore stops demanding a tick, since a reordering
     // changes no value at all.
-    textGrammar: function () {
-        return this.grammarSplit(this.textDocId || this.docId);
+    textShape: function () {
+        return this.shapeFor(this.textDocId || this.docId);
     },
 
     textFindings: function () {
@@ -3092,21 +2760,18 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return [];
         }
-        let g = me.textGrammar();
-        let all = g.all;
-        let applicable = g.withSchema;
-        if (!applicable.length) {
+        let shape = me.textShape();
+        if (!shape.hasSchema()) {
             return [];
         }
         try {
-            let U = PVE.meta.Utils;
-            let value = U.parseBuffer(me.textEditor.getValue(), me.textLang);
+            let value = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
             let stored = me.dataOf(me.textDocId || me.docId);
-            return U.introducedFindings(
-                PVE.meta.Lint.findings(stored, applicable, all),
-                PVE.meta.Lint.findings(value, applicable, all),
-                U.changedPaths(stored, value),
-            ).map((f) => f.path + ': ' + f.message);
+            return PVE.meta.Edits.introduced(
+                shape.findings(stored),
+                shape.findings(value),
+                PVE.meta.Edits.changedPaths(stored, value),
+            ).map((f) => f.path + ': ' + f.msg);
         } catch (_err) {
             return [];
         }
@@ -3619,38 +3284,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         ];
     },
 
-    // What describes one document, in the two lists `Lint.findings` wants: what to
-    // walk, and what shadows. A guest document has prefixes (which shadow each
-    // other); a registry document has one schema at its root (which shadows nothing,
-    // so it is its own list); the datacenter document has neither.
-    //
-    // One function, every caller that needs it -- the row markers, the text editor's
-    // squiggles, and the warning banner Apply shows. They are the same question asked
-    // three times, and a rule with more than one implementation is one waiting to
-    // disagree with itself.
-    grammarSplit: function (docId) {
-        let all = this.grammarFor(docId);
-        let rooted = all.filter((ns) => ns.schema && !ns.prefix);
-        if (rooted.length) {
-            return { all: rooted, withSchema: rooted };
-        }
-        return { all: all, withSchema: PVE.meta.Lint.applicable(all) };
-    },
-
     // Every path in `docId` whose value does not match its schema, by path. The tree
     // shows these on the rows themselves: the text editor has squiggled them since
     // revision 6, but the tree is the view people actually open, and a value the
-    // schema refuses looked exactly like one it liked.
+    // schema refuses looked exactly like one it liked. The same Shape answers here,
+    // for the text editor's squiggles and for the warning banner Apply shows: one
+    // question asked three times, through one implementation.
     findingsFor: function () {
         let out = Object.create(null);
-        let g = this.grammarSplit(this.docId);
-        if (!g.withSchema.length) {
+        let shape = this.shapeFor(this.docId);
+        if (!shape.hasSchema()) {
             return out;
         }
         // Against the *planned* document: a staged value that the schema refuses is
         // marked the moment it is staged, not after it has been written.
-        PVE.meta.Lint.findings(this.plannedData(), g.withSchema, g.all).forEach(function (f) {
-            out[f.path] = f.message;
+        shape.findings(this.plannedData()).forEach(function (f) {
+            out[f.path] = f.msg;
         });
         return out;
     },
@@ -3659,7 +3308,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // The list at `path`, as it currently stands (staged edits included).
     listAt: function (path) {
-        let v = PVE.meta.Lint.valueAt(this.plannedData(), path);
+        let v = PVE.meta.Utils.valueAt(this.plannedData(), path);
         return Array.isArray(v) ? v.slice() : [];
     },
 
@@ -3685,12 +3334,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // re-apply it on top of the new value.
     stage: function (path, op, value) {
         let me = this;
-        // `containsPath` plus one case it does not have: the empty path is the
-        // *document*, and replacing that replaces everything -- including edits staged
-        // under keys the new document does not have.
-        let under = (p) => path === '' || PVE.meta.Utils.containsPath(path, p);
-        me.pending = me.pending.filter((e) => !under(e.path));
-        me.pending.push({ path: path, op: op, value: value });
+        let edit = { path: path, op: op };
+        if (op === 'set') {
+            edit.value = value;
+        }
+        me.pending = PVE.meta.Edits.stage(me.pending, edit);
         me.buildTree();
         me.syncButtons();
     },
@@ -3702,7 +3350,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
     // so "what would Discard drop" and "what did staging replace" are one rule.
     pendingUnder: function (path) {
-        return this.pending.filter((e) => PVE.meta.Utils.containsPath(path, e.path));
+        return PVE.meta.Edits.under(this.pending, path);
     },
 
     // Drops the staged edits on one row, leaving the rest alone.
@@ -3721,18 +3369,17 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.discardListMember(d.path, d.arrayIndex);
             return;
         }
-        let drop = me.pendingUnder(d.path);
-        if (!drop.length) {
+        if (!me.pendingUnder(d.path).length) {
             return;
         }
-        me.pending = me.pending.filter((e) => drop.indexOf(e) === -1);
+        me.pending = PVE.meta.Edits.discardUnder(me.pending, d.path);
         me.buildTree();
         me.syncButtons();
     },
 
     discardListMember: function (path, index) {
         let me = this;
-        let stored = PVE.meta.Lint.valueAt(me.dataOf(me.docId), path);
+        let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), path);
         let list = me.listAt(path);
         if (!Array.isArray(stored)) {
             return;
@@ -3755,7 +3402,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The document as it would be. Everything the tree shows is computed from this,
     // so a staged value is linted, hovered and diffed exactly like a stored one.
     plannedData: function () {
-        return PVE.meta.Utils.applyPending(this.dataOf(this.docId), this.pending);
+        return PVE.meta.Edits.apply(this.dataOf(this.docId), this.pending);
     },
 
     revertPending: function () {
@@ -3773,26 +3420,27 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return (rec && rec.data && rec.data.docId) || this.docId;
     },
 
-    // What describes this document's shape. A guest document is described by the
-    // prefixes that reach it, most-specific first (they shadow); a prefix or
-    // permission file by the one meta-schema for its kind, rooted at the document itself;
-    // the datacenter document by nothing at all -- prefixes are guest-only
-    // (DESIGN §3.3), which is what keeps a prefix from painting rows onto it.
-    grammarFor: function (id) {
+    // What describes this document's shape (`PVE.meta.Shape`). A guest document is
+    // described by the prefixes that reach it, most-specific first (they shadow); a
+    // prefix or permission file by the one meta-schema for its kind, rooted at the
+    // document itself; the datacenter document by nothing at all -- prefixes are
+    // guest-only (DESIGN §3.3), which is what keeps a prefix from painting rows onto
+    // it. One function, every caller that needs it -- the row builder, the row
+    // markers, the text editor's squiggles and hovers, and the warning banner Apply
+    // shows -- so they cannot disagree about what describes the document.
+    shapeFor: function (id) {
         let me = this;
         let kind = me.docKind(id);
         if (kind === 'guest') {
-            return me.applicablePrefixes();
+            // The server resolved the selectors it enforces; these tags are for the
+            // rendering decisions the client makes on top, and the client only ever
+            // matches tags it was given (DESIGN §8).
+            return PVE.meta.Shape.of(me.prefixes, me.tags);
         }
         if (kind !== 'prefix' && kind !== 'permission') {
-            return []; // the datacenter document: nothing describes its shape
+            return PVE.meta.Shape.empty();
         }
-        let schema = kind === 'prefix' ? me.schemas.prefix : me.schemas.permission;
-        // A pseudo-prefix at the root. Its prefix is empty, so it governs the
-        // whole document and there is nothing for it to shadow -- which is why it is
-        // never passed as the shadowing list: `governing` answers about prefixes, and
-        // the empty prefix is not one.
-        return schema ? [{ prefix: '', schema: schema }] : [];
+        return PVE.meta.Shape.rooted(kind === 'prefix' ? me.schemas.prefix : me.schemas.permission);
     },
 
     // --- selection and buttons ----------------------------------------------
@@ -3934,7 +3582,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // changes are inside it -- and the server refuses the rest, naming the path
             // it refused. Requiring full write here disabled the button for exactly the
             // callers this view is most useful to.
-            canApply: textMode ? PVE.meta.Utils.hasAnyWrite(me.access) : me.isDirty(),
+            canApply: textMode ? PVE.meta.Access.hasAnyWrite(me.access) : me.isDirty(),
             // The same count in both views: the buffer is rendered from the planned
             // document, so those staged edits are in it. Showing it only in the tree
             // made switching to Text look like it had dropped them.
@@ -3995,54 +3643,26 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // --- rows ---------------------------------------------------------------
 
-    // Both lists below resolve `selector: { tag: t }` against `me.tags`, which
-    // `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §5).
+    // `shapeFor` (the prefixes that reach this guest) and `applicablePermissions`
+    // (the rules that do) both resolve `selector: { tag: t }` against `me.tags`,
+    // which `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §5).
     // That is not a gap here: this is a guest tab, and a caller without VM.Audit
     // on `/vms/<vmid>` never sees the guest in the resource tree at all
     // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
     // panel has tags we cannot read. A scope-only principal is still bound by
     // its permissions -- they are enforced server-side, on the API it actually uses.
 
-    // The prefixes that reach this guest, most-specific first. Prefixes decide
-    // *shape*: which declared-but-unset rows appear and which schema governs a path.
-    applicablePrefixes: function () {
-        let me = this;
-        if (me.dc) {
-            return []; // prefixes apply to guest documents only (DESIGN section 3.3)
-        }
-        return (me.prefixes || []).filter(function (ns) {
-            // A file that did not load is in this list so the registry grid can show
-            // it (DESIGN §3.3), and it must never describe anything: it has no
-            // selector, so the test below would drop it anyway, but relying on that
-            // would make a safety property an accident of another rule.
-            if (ns.error) {
-                return false;
-            }
-            let sel = ns.selector || {};
-            return sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1);
-        });
-    },
-
-    // The permission rules that reach this guest. Permissions decide *access*, and
-    // unlike prefixes they accumulate by containment: a rule on `homelab` covers
-    // `homelab.docker` (DESIGN section 3.2).
+    // The permission rules that reach this guest, with the file each came from.
+    // Permissions decide *access*, and unlike prefixes they accumulate by
+    // containment: a rule on `homelab` covers `homelab.docker` (DESIGN section 3.2).
+    // The core answers from the listing and this guest's tags, the same way the
+    // server computes a caller's scopes, and a file that did not load grants nothing.
     applicablePermissions: function () {
         let me = this;
-        let out = [];
         if (me.dc) {
-            return out; // permissions apply to guest documents only
+            return []; // permissions apply to guest documents only
         }
-        (me.permissions || []).forEach(function (file) {
-            (file.rules || []).forEach(function (entry) {
-                let sel = entry.selector || {};
-                let matches =
-                    entry.prefix && (sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1));
-                if (matches) {
-                    out.push(Ext.apply({ file: file }, entry));
-                }
-            });
-        });
-        return out;
+        return PVE.meta.Access.rulesReaching(me.permissions, me.tags);
     },
 
     // Every rule whose prefix covers this row, `rw` first. Several principals
@@ -4053,10 +3673,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // Registration names are operator-chosen strings, so no plain `{}` here.
         let seen = Object.create(null);
         scopes.forEach(function (s) {
-            if (!U.covers(s.prefix, path)) {
+            if (!PVE.meta.Access.covers(s.prefix, path)) {
                 return;
             }
-            let name = s.file.name || s.file.authid || '';
+            let name = s.name || s.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
             let key = name + '\u0000' + mode;
             if (seen[key]) {
@@ -4077,13 +3697,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     accessSummary: (list) => list.map((a) => a.name + (a.mode === 'ro' ? ' (ro)' : '')).join(', '),
 
     editableFor: function (path) {
-        let me = this;
-        return (
-            !!me.access.write ||
-            (me.access.scopes || []).some(
-                (s) => s.mode === 'rw' && PVE.meta.Utils.covers(s.prefix, path),
-            )
-        );
+        return PVE.meta.Access.canWrite(this.access, path);
     },
 
     // The document and the grammars are two sources for the same rows, so merge them
@@ -4157,91 +3771,101 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // A grammar is a PVE::JSONSchema object rooted at its scope's prefix.
-    // `prefixes`/`owner`, when given, enforce most-specific-wins: the walk stops
-    // where a *different* prefix governs, so a parent's `properties` never reach
-    // into a child prefix's subtree and rewrite its row kind. The same rule
-    // `Lint.findings` and `Lint.schemaIndex` apply, through the same
-    // `Utils.governing` -- it lived in two of the three and this was the one that
-    // silently merged (DESIGN section 3.1).
-    addGrammar: function (root, prefix, schema, prefixes, owner, description) {
+    // The rows a document's shape declares, on top of what `addData` found in it.
+    //
+    // Two things, from the one Shape. Every prefix that reaches the document gets a
+    // row: declaring a prefix *is* a statement about the document -- "something of
+    // mine lives at this key" -- and it is the statement the whole permission model
+    // is written in terms of. Hiding the row until someone had already put content
+    // there meant a prefix that applied to every guest was invisible on every guest
+    // that had not used it yet, which reads as "netbird is missing" rather than
+    // "netbird is empty". Then every path a schema declares gets its declared type,
+    // default, enum, range, format and description -- from the core's schema index,
+    // which is already pruned where a more specific prefix governs, so a parent's
+    // `properties` never reach into a child prefix's subtree and rewrite its row
+    // kind. Schemas shadow, they never merge (DESIGN section 3.1); the same rule
+    // the findings and the hovers come through, from the same Shape.
+    //
+    // A registry document's meta-schema is rooted at the document (DESIGN §3.6):
+    // its "prefix" is the empty path, which is the root row itself and gets nothing.
+    addShape: function (root, shape) {
         let me = this;
         let U = PVE.meta.Utils;
-        let entry = root;
-        let path = '';
-        // The empty prefix is the document root itself -- how a registry document's
-        // meta-schema is rooted (DESIGN §3.6). `''.split('.')` is `['']`, which would
-        // otherwise create a child with an empty key.
-        if (prefix) {
-            prefix.split('.').forEach(function (seg) {
-                path = U.joinPath(path, seg);
-                entry = me.entry(entry, seg, path);
-                // `||`, not `=`: `addData` ran first, so a value already stored here
-                // keeps the kind it actually has. That is what lets a prefix hold a
-                // single scalar -- a prefix is a key like any other, and one that
-                // needs to say nothing but `true` should not have to grow a subkey to
-                // say it. Only an *absent* prefix falls back to a map, which is the
-                // shape almost every one of them turns out to have.
-                entry.kind = entry.kind || 'map';
-            });
-            // The prefix's own description, which for a prefix with no schema is the
-            // only thing its row can say about itself.
-            entry.grammarDescription = entry.grammarDescription || description;
-        }
-        let walk = function (node, sch) {
-            if (!sch || sch.type !== 'object' || !sch.properties) {
+        let ensure = function (path) {
+            let entry = root;
+            let at = '';
+            if (path) {
+                path.split('.').forEach(function (seg) {
+                    at = U.joinPath(at, seg);
+                    entry = me.entry(entry, seg, at);
+                });
+            }
+            return entry;
+        };
+        shape.declared().forEach(function (d) {
+            if (!d.prefix) {
                 return;
             }
-            node.kind = node.kind || 'map';
-            Object.keys(sch.properties).forEach(function (key) {
-                let childPath = U.joinPath(node.path, key);
-                if (owner && U.governing(childPath, prefixes) !== owner) {
-                    return; // a more specific prefix owns this subtree
-                }
-                let ps = sch.properties[key] || {};
-                let child = me.entry(node, key, childPath);
-                // The comment key stays the Description column; the grammar's own
-                // description is the tooltip (DESIGN §8), so they are two fields.
-                child.grammarDescription = child.grammarDescription || ps.description;
-                if (ps.type === 'object') {
-                    child.kind = 'map';
-                    walk(child, ps);
-                    return;
-                }
-                // A declared type wins over the type inferred from the stored value:
-                // it is the operator's statement of what the key means, and the API's
-                // JSON view cannot tell a boolean from the integer 1 anyway.
-                child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
-                // First writer wins, like `grammarDescription` above: prefixes are
-                // walked most-specific first, so the closest one should win. The
-                // governing prune makes this unobservable today -- it is here so the
-                // six fields cannot disagree if that prune is ever loosened.
-                if (ps.default !== undefined && child.defaultValue === undefined) {
-                    child.defaultValue = ps.default;
-                }
-                if (ps.enum && child.enumValues === undefined) {
-                    child.enumValues = ps.enum;
-                }
-                if (ps.minimum !== undefined && child.minimum === undefined) {
-                    child.minimum = ps.minimum;
-                }
-                if (ps.maximum !== undefined && child.maximum === undefined) {
-                    child.maximum = ps.maximum;
-                }
-                if (ps.format !== undefined && child.format === undefined) {
-                    child.format = ps.format;
-                }
-                // The one extension to the PVE::JSONSchema dialect: "this string is
-                // a block of text". Only a declaration can say so before the key has
-                // a value, which is exactly what `Utils.editorKind` cannot see for
-                // itself. It is an editor hint and nothing else -- the server neither
-                // reads it nor validates against it, like `format` (DESIGN §4).
-                if (ps.multiline !== undefined && child.multiline === undefined) {
-                    child.multiline = !!ps.multiline;
-                }
-            });
-        };
-        walk(entry, schema);
+            let entry = ensure(d.prefix);
+            // `||`, not `=`: `addData` ran first, so a value already stored here
+            // keeps the kind it actually has. That is what lets a prefix hold a
+            // single scalar -- a prefix is a key like any other, and one that needs
+            // to say nothing but `true` should not have to grow a subkey to say it.
+            // Only an *absent* prefix falls back to a map, which is the shape
+            // almost every one of them turns out to have.
+            entry.kind = entry.kind || 'map';
+            // The prefix's own description, which for a prefix with no schema is
+            // the only thing its row can say about itself.
+            entry.grammarDescription = entry.grammarDescription || d.description;
+        });
+        shape.schemaIndex().forEach(function (ix) {
+            if (ix.path === ix.prefix) {
+                // The prefix's own node: its row exists from the loop above, and
+                // its type is the value's (or a map). A schema with `properties`
+                // says it is a map, which it already is.
+                return;
+            }
+            let ps = ix.schema || {};
+            let child = ensure(ix.path);
+            // The comment key stays the Description column; the grammar's own
+            // description is the tooltip (DESIGN §8), so they are two fields.
+            child.grammarDescription = child.grammarDescription || ps.description;
+            if (ps.type === 'object') {
+                child.kind = 'map';
+                return;
+            }
+            // A declared type wins over the type inferred from the stored value:
+            // it is the operator's statement of what the key means, and the API's
+            // JSON view cannot tell a boolean from the integer 1 anyway.
+            child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
+            // First writer wins, like `grammarDescription` above: the index lists
+            // each path once, under the prefix that governs it, so this is only
+            // ever the same declaration twice -- it is here so the six fields
+            // cannot disagree if that ever changes.
+            if (ps.default !== undefined && child.defaultValue === undefined) {
+                child.defaultValue = ps.default;
+            }
+            if (ps.enum && child.enumValues === undefined) {
+                child.enumValues = ps.enum;
+            }
+            if (ps.minimum !== undefined && child.minimum === undefined) {
+                child.minimum = ps.minimum;
+            }
+            if (ps.maximum !== undefined && child.maximum === undefined) {
+                child.maximum = ps.maximum;
+            }
+            if (ps.format !== undefined && child.format === undefined) {
+                child.format = ps.format;
+            }
+            // The one extension to the PVE::JSONSchema dialect: "this string is
+            // a block of text". Only a declaration can say so before the key has
+            // a value, which is exactly what `Utils.editorKind` cannot see for
+            // itself. It is an editor hint and nothing else -- the server neither
+            // reads it nor validates against it, like `format` (DESIGN §4).
+            if (ps.multiline !== undefined && child.multiline === undefined) {
+                child.multiline = !!ps.multiline;
+            }
+        });
     },
 
     // The declared type as the kind the editor and `parseValue` speak. One mapping:
@@ -4268,11 +3892,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (e.op !== 'set' || !Array.isArray(e.value)) {
                 return;
             }
-            let before = PVE.meta.Lint.valueAt(storedDoc, e.path);
+            let before = PVE.meta.Utils.valueAt(storedDoc, e.path);
             if (!Array.isArray(before) || before.length <= e.value.length) {
                 return;
             }
-            let list = PVE.meta.Lint.valueAt(me.plannedData(), e.path);
+            let list = PVE.meta.Utils.valueAt(me.plannedData(), e.path);
             let entry = root;
             let path = '';
             e.path.split('.').forEach(function (seg) {
@@ -4303,33 +3927,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 entry.pendingDelete = true;
                 entry.present = false;
             });
-        let grammar = me.grammarFor(me.docId);
-        grammar.forEach(function (ns) {
-            // A prefix with no schema still gets its row. Declaring a prefix *is* a
-            // statement about the document -- "something of mine lives at this key" --
-            // and it is the statement the whole permission model is written in terms
-            // of. Hiding the row until someone had already put content there meant a
-            // prefix that applied to every guest was invisible on every guest that had
-            // not used it yet, which reads as "netbird is missing" rather than "netbird
-            // is empty". The rows differ in what they can say, not in whether they
-            // exist: a schema paints declared children and types, and without one there
-            // is just the key, its description, and whatever is stored under it.
-            //
-            // The empty prefix is not a prefix at all: it is a registry document's
-            // meta-schema rooted at the document (DESIGN §3.6), so with no schema there
-            // is nothing to add.
-            if (!ns.prefix) {
-                if (ns.schema) {
-                    me.addGrammar(root, '', ns.schema, [], null);
-                }
-                return;
-            }
-            // `prefixes`/`owner` are the most-specific-wins prune, and only guest
-            // documents have more than one prefix to shadow between. A registry
-            // document has exactly one schema, rooted at the document, so it is
-            // walked with no owner and nothing is pruned.
-            me.addGrammar(root, ns.prefix, ns.schema, grammar, ns, ns.description);
-        });
+        me.addShape(root, me.shapeFor(me.docId));
         return root;
     },
 
@@ -4350,14 +3948,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // the whole list -- members are not addressable (§2) -- but wearing the mark on
         // the list said "all of this changed" when one entry did.
         let memberChanged = function (listPath, index, item) {
-            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            let before = PVE.meta.Utils.valueAt(storedDoc, listPath);
             if (!Array.isArray(before) || index >= before.length) {
                 return true; // appended
             }
             return JSON.stringify(before[index]) !== JSON.stringify(item);
         };
         let storedMember = function (listPath, index) {
-            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            let before = PVE.meta.Utils.valueAt(storedDoc, listPath);
             if (!Array.isArray(before) || index >= before.length) {
                 return '';
             }
@@ -4440,7 +4038,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                             if (c.pendingDelete && c.value !== undefined) {
                                 return c.value; // a ghost carries what was there
                             }
-                            let v = PVE.meta.Lint.valueAt(storedDoc, c.path);
+                            let v = PVE.meta.Utils.valueAt(storedDoc, c.path);
                             return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
                         })(),
                         editable: me.editableFor(c.path),
@@ -4564,10 +4162,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The dry run, the diff and the write.
     confirmAndApply: function () {
         let me = this;
-        let U = PVE.meta.Utils;
-        let view = U.writeView(me.pending);
+        let view = PVE.meta.Edits.writeView(me.pending);
         let planned = me.plannedData();
-        let subtree = view === '' ? planned : PVE.meta.Lint.valueAt(planned, view);
+        let subtree = view === '' ? planned : PVE.meta.Utils.valueAt(planned, view);
         if (subtree === undefined) {
             subtree = {};
         }
@@ -4577,7 +4174,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             data: Ext.encode(subtree),
             digest: me.digestOf(me.docId),
         };
-        let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Lint.valueAt(me.dataOf(me.docId), view);
+        let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Utils.valueAt(me.dataOf(me.docId), view);
 
         // One staged delete is a DELETE, not a replace of its parent.
         //
@@ -4653,24 +4250,23 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // The schema findings a planned document would *introduce*, as plain messages --
-    // what Apply warns about. The same `Lint.findings` the tree markers use, through
-    // the same `grammarSplit`, so the banner and the amber rows can never disagree
-    // about what is wrong; they differ only in what they are for. The markers show
-    // everything wrong with the document, which is honest. The banner asks you to
-    // vouch for what this edit did, which is the only thing you can answer for.
+    // what Apply warns about. The same Shape the tree markers use, through the same
+    // `shapeFor`, so the banner and the amber rows can never disagree about what is
+    // wrong; they differ only in what they are for. The markers show everything
+    // wrong with the document, which is honest. The banner asks you to vouch for
+    // what this edit did, which is the only thing you can answer for.
     applyFindingsFor: function (planned) {
         let me = this;
-        let U = PVE.meta.Utils;
-        let g = me.grammarSplit(me.docId);
-        if (!g.withSchema.length) {
+        let shape = me.shapeFor(me.docId);
+        if (!shape.hasSchema()) {
             return [];
         }
         let stored = me.dataOf(me.docId);
-        return U.introducedFindings(
-            PVE.meta.Lint.findings(stored, g.withSchema, g.all),
-            PVE.meta.Lint.findings(planned, g.withSchema, g.all),
-            U.changedPaths(stored, planned),
-        ).map((f) => f.path + ': ' + f.message);
+        return PVE.meta.Edits.introduced(
+            shape.findings(stored),
+            shape.findings(planned),
+            PVE.meta.Edits.changedPaths(stored, planned),
+        ).map((f) => f.path + ': ' + f.msg);
     },
 
     // Stage a declared default, because someone asked for it. Never on its own: an
@@ -4906,8 +4502,11 @@ Ext.define('PVE.meta.NewRegistryWindow', {
                 allowBlank: false,
                 fieldLabel: isPrefix ? gettext('Prefix') : gettext('Name'),
                 // The file name *is* the prefix, so a nested one is dotted and this
-                // field is the whole identity of what is being created.
+                // field is the whole identity of what is being created. The rule is
+                // the core's (`registry::is_valid_file_name`); the server refuses the
+                // same names on its own, this only says so before the round trip.
                 emptyText: isPrefix ? gettext('e.g. homelab.docker') : gettext('file name'),
+                validator: (v) => PVE.meta.Utils.fileNameError(v) || true,
             },
         ];
         if (isPrefix) {

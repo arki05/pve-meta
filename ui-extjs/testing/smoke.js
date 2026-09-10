@@ -1,20 +1,36 @@
-// Offline smoke test of the parts of pve-meta-tree.js that are pure JS: the
-// YAML wrappers around the vendored js-yaml, the value helpers, and the
-// entry-merge that builds the rows. A minimal Ext/PVE shim is enough - none of
-// this touches the DOM.
+// Offline smoke test of pve-meta-tree.js: the editor's helpers, the row builder,
+// the staging model and the text-editor markers -- through the real pve-meta core,
+// loaded from the same `.wasm` the package ships. A minimal Ext/PVE shim is enough;
+// none of this touches the DOM.
+//
+// The rules themselves (the YAML codec, key names, coverage, shadowing, the edit
+// set, the schema findings) are tested where they live, in Rust. What this suite
+// shows is that the wasm build loads and answers, that the JavaScript faces over it
+// (Codec, Access, Shape, Edits) hand the right things in and out, and that the
+// editor's own logic on top of them still does what it did.
+//
+// Build the core first: `make wasm` (or `cargo build -p pve-meta-wasm --target
+// wasm32-unknown-unknown --profile wasm`). PVE_META_WASM overrides the path.
 const fs = require('fs');
 const vm = require('vm');
 const path = require('path');
 
-// The same file the panel loads lazily in the browser (vendor/js-yaml.min.js is
-// a UMD bundle, so `require` gets the exact build that ships in the package).
-const jsyaml = require(path.join(__dirname, '..', 'vendor', 'js-yaml.min.js'));
+const WASM =
+    process.env.PVE_META_WASM ||
+    path.join(__dirname, '..', '..', 'target', 'wasm32-unknown-unknown', 'wasm', 'pve_meta_wasm.wasm');
+if (!fs.existsSync(WASM)) {
+    console.log('FAIL the core is not built: ' + WASM + '\n  run `make wasm` first');
+    process.exit(1);
+}
 
 const ctx = {
     console,
-    window: { jsyaml },
+    window: {},
     document: { createElement: () => ({}), head: { appendChild() {} } },
     Promise,
+    WebAssembly,
+    TextEncoder,
+    TextDecoder,
     gettext: (s) => s,
     Ext: {
         // Just enough of the VTypes singleton for PVE.meta.Utils.checkFormat: the real
@@ -71,7 +87,6 @@ vm.runInContext(
     { filename: 'pve-meta-tree.js' },
 );
 
-const U = ctx.PVE.meta.Utils;
 let fails = 0;
 const eq = (name, got, want) => {
     const g = JSON.stringify(got);
@@ -83,8 +98,54 @@ const eq = (name, got, want) => {
         console.log(`ok   ${name}`);
     }
 };
+const throws = (name, fn, contains) => {
+    let err = null;
+    try {
+        fn();
+    } catch (e) {
+        err = e;
+    }
+    eq(name, !!err && (!contains || String(err.message).indexOf(contains) !== -1), true);
+    return err;
+};
 
-console.log('--- classes defined ---');
+console.log('--- the core loads and answers (the real .wasm, through the real glue) ---');
+// What the browser does with `instantiateStreaming`, done synchronously here: the
+// same bytes, the same four exports, the same `PVE.meta.Core.attach`.
+const bytes = fs.readFileSync(WASM);
+const t0 = process.hrtime.bigint();
+const wasmModule = new WebAssembly.Module(bytes);
+const instance = new WebAssembly.Instance(wasmModule, {});
+const loadMs = Number(process.hrtime.bigint() - t0) / 1e6;
+ctx.PVE.meta.Core.attach(instance);
+const Core = ctx.PVE.meta.Core;
+console.log(`     ${WASM}\n     ${bytes.length} bytes, compiled and instantiated in ${loadMs.toFixed(1)} ms`);
+eq('the ABI version is the one the glue expects', Core.call('abi'), Core.ABI);
+eq('a call goes through the linear-memory ABI and back', Core.call('parse', 'yaml', 'a: 1\nb: [x, y]\n'), { a: 1, b: ['x', 'y'] });
+eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde 日本語 🚀\n'), { k: 'ünïcøde 日本語 🚀' });
+{
+    // A document larger than the initial output buffer, and than a wasm page: the
+    // memory grows under the call and the glue must read `memory.buffer` afresh.
+    const big = {};
+    for (let i = 0; i < 20000; i++) {
+        big['key' + i] = 'value ' + i + ' ' + 'x'.repeat(40);
+    }
+    const text = Core.call('dump', 'yaml', big);
+    eq('a megabyte round trips through the buffer', text.length > 1000000 && JSON.stringify(Core.call('parse', 'yaml', text)) === JSON.stringify(big), true);
+    // And a call after the growth still works (the output pointer moved).
+    eq('the instance is fine afterwards', Core.call('covers', 'a', 'a.b'), true);
+}
+{
+    const err = throws('a parse error is a CoreError, not a trap', () => Core.call('parse', 'yaml', 'a: 1\nb: [\n'), 'failed to parse');
+    eq('... carrying the line the parser stopped on', err && err.line, 3);
+    // (`instanceof Error` would be the vm context's own Error, not this realm's.)
+    eq('... and it is a CoreError with a message', err instanceof ctx.PVE.meta.CoreError && typeof err.message === 'string', true);
+    throws('an unknown function is an error', () => Core.call('no_such_function'), 'unknown function');
+    throws('a bad argument is an error', () => Core.call('covers', 'a', 'a b'), 'invalid path');
+    eq('the instance is fine after errors', Core.call('parse', 'yaml', 'ok: 1\n'), { ok: 1 });
+}
+
+console.log('\n--- classes defined ---');
 eq('defined', ctx.__defined, [
     'PVE.meta.Footer',
     'PVE.meta.TreeModel',
@@ -101,6 +162,13 @@ eq('defined', ctx.__defined, [
     'PVE.meta.DatacenterPanel',
 ]);
 
+const U = ctx.PVE.meta.Utils;
+const Codec = ctx.PVE.meta.Codec;
+const Access = ctx.PVE.meta.Access;
+const Shape = ctx.PVE.meta.Shape;
+const Edits = ctx.PVE.meta.Edits;
+const Markers = ctx.PVE.meta.Markers;
+
 console.log('\n--- PVE.meta.compose: how the panel is three method sets sharing one `this` ---');
 eq('merges left to right into a new object', ctx.PVE.meta.compose({ a: 1 }, { b: 2 }, { c: 3 }), { a: 1, b: 2, c: 3 });
 const composeParts = [{ a: 1 }, { b: 2 }];
@@ -114,45 +182,23 @@ try {
 }
 eq('throws on a duplicate member instead of picking a winner', composeThrew, true);
 
-console.log('\n--- covers / paths (shared fixture, mirrored in Rust) ---');
-// `covers` is mirrored in crates/pve-meta-core/src/scopes.rs on purpose: the server
-// enforces the rule, this editor predicts it, and an editor that predicts it
-// differently shows rows a write then rejects. Both suites read the same table, so a
-// case added on one side cannot be missing on the other. Add cases to the file.
-const coversCases = JSON.parse(
-    fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'covers-cases.json'), 'utf8'),
-).cases;
-eq('the shared covers fixture is present', coversCases.length >= 15, true);
-coversCases.forEach((c) => {
-    eq(`covers(${JSON.stringify(c.prefix)}, ${JSON.stringify(c.path)}) -- ${c.why}`,
-        U.covers(c.prefix, c.path), c.covered);
-});
-
-console.log('\n--- governing (shared fixture, mirrored in Rust) ---');
-// The other mirrored rule, and the one that had no shared table until now:
-// `crates/pve-meta-core/src/registry.rs`'s `governing` says the same thing this
-// does, and only one of the two runs in production. Testing each side against its
-// own hand-written cases is how a mirror drifts.
-//
-// The fixture hands over the declared prefixes UNSORTED and WITH their selectors,
-// because that is what a caller really has. The two sides factor the rest
-// differently -- Rust's `governing` filters by selector itself, while this side
-// filters first (`applicablePrefixes`) and then asks -- and both must sort
-// most-specific-first before asking. Running each side's whole chain is what makes
-// the table mean the same thing on both.
-const governingCases = JSON.parse(
-    fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'governing-cases.json'), 'utf8'),
-).cases;
-eq('the shared governing fixture is present', governingCases.length >= 12, true);
-governingCases.forEach((c) => {
-    // What `TreePanel.applicablePrefixes` does, then what `grammarFor` hands to
-    // `governing`: the selector filter, then the specificity sort.
-    const applicable = c.prefixes.filter(
-        (p) => p.selector.all || (p.selector.tag && c.tags.indexOf(p.selector.tag) !== -1),
-    );
-    const got = U.governing(c.path, U.bySpecificity(applicable));
-    eq(`governing(${JSON.stringify(c.path)}) -- ${c.why}`, got && got.prefix, c.governing);
-});
+console.log('\n--- Access: the coverage rule is the core\'s, read from a /meta/access answer ---');
+// The rule itself (a scope on `p` covers `p`, `p__` and `p.*`, and nothing else)
+// is tested in Rust; these show the face hands the right shapes across, Perl's
+// `1`/`0` booleans included.
+eq('a scope covers its subtree', Access.covers('traefik', 'traefik.spec.host'), true);
+eq('and the sibling comment key -- the one comment-key rule', Access.covers('traefik', 'traefik__'), true);
+eq('a longer name is not a child', Access.covers('traefik', 'traefikx'), false);
+eq('never the root', Access.covers('traefik', ''), false);
+eq('full write access', Access.hasAnyWrite({ write: 1, scopes: [] }), true);
+eq('one rw scope', Access.hasAnyWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }), true);
+eq('read-only scopes are not write access', Access.hasAnyWrite({ write: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }), false);
+eq('an auditor holds nothing', Access.hasAnyWrite({ read: 1, write: 0, scopes: [] }), false);
+eq('a missing access object is not write access', Access.hasAnyWrite(undefined), false);
+eq('canWrite inside an rw scope', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'traefik.spec'), true);
+eq('canWrite outside it', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'netbird'), false);
+eq('canRead with an ro scope', Access.canRead({ read: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }, 'netbird.groups'), true);
+eq('a scope-only principal cannot read the root', Access.canRead({ read: 0, scopes: [{ prefix: 'netbird', mode: 'rw' }] }, ''), false);
 
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
@@ -168,6 +214,9 @@ eq('parse bool', U.parseValue('true', 'boolean'), true);
 eq('parse array json', U.parseValue('["a","b"]', 'array'), ['a', 'b']);
 eq('parse array csv', U.parseValue('a, b', 'array'), ['a', 'b']);
 eq('parse array empty', U.parseValue('', 'array'), []);
+eq('valueAt walks maps', U.valueAt({ a: { b: 1 } }, 'a.b'), 1);
+eq('valueAt stops at a list', U.valueAt({ a: [1] }, 'a.0'), undefined);
+eq('valueAt of the root', U.valueAt({ a: 1 }, ''), { a: 1 });
 
 console.log('\n--- the row editor field comes from the grammar first ---');
 eq('editor enum', U.editorFor({ kind: 'string', enumValues: ['a'] }).xtype, 'combobox');
@@ -201,36 +250,37 @@ eq('icons', ctx.PVE.meta.Icons, {
     leaf: 'fa fa-file-text-o',
 });
 
-console.log('\n--- YAML: the vendored js-yaml, through the panel wrappers ---');
-eq('vendored version', jsyaml.dump !== undefined && typeof jsyaml.load, 'function');
-// The exact canonical dump the live store produced for guest 200: js-yaml must
-// read what the server writes (the server stays the YAML authority).
+console.log('\n--- Codec: the store\'s YAML, in the browser ---');
+// The exact canonical dump the live store produced for guest 200. There is no
+// second emitter any more: this IS serde_yaml_ng, so reading what the server writes
+// and writing what the server reads is the same code rather than a settled dispute.
 const storeYaml =
     'traefik:\n  spec:\n    host: ct200.example\nnetbird:\n  groups__: asdf\n  groups:\n  - lan\n';
 const storeDoc = {
     traefik: { spec: { host: 'ct200.example' } },
     netbird: { groups__: 'asdf', groups: ['lan'] },
 };
-eq('load the store dump', U.yamlLoad(storeYaml), storeDoc);
-eq('round trip the store document', U.yamlLoad(U.yamlDump(storeDoc)), storeDoc);
-eq('empty document is the empty map', U.yamlLoad(''), {});
-// noRefs: a repeated subtree must not come back as an anchor/alias.
+eq('load the store dump', Codec.parse(storeYaml, 'yaml'), storeDoc);
+eq('dump the store document -- the same bytes', Codec.dump(storeDoc, 'yaml'), storeYaml);
+eq('round trip the store document', Codec.parse(Codec.dump(storeDoc, 'yaml'), 'yaml'), storeDoc);
+eq('empty document is the empty map', Codec.parse('', 'yaml'), {});
+eq('a null document is the empty map too', Codec.parse('~\n', 'yaml'), {});
+// A repeated subtree must not come back as an anchor/alias.
 const shared = { a: 1 };
-eq('no anchors', U.yamlDump({ x: shared, y: shared }).indexOf('&') === -1, true);
-// lineWidth -1: a long scalar stays on one line.
-eq('no folding', U.yamlDump({ a: 'x'.repeat(300) }).split('\n').length, 2);
-// sortKeys false: documents are ordered maps (DESIGN §2).
-eq('key order preserved', Object.keys(U.yamlLoad(U.yamlDump({ b: 1, a: 2 }))), ['b', 'a']);
-// The safe (default) schema: no arbitrary JS types out of a document.
-let unsafeThrew = false;
-try {
-    U.yamlLoad('a: !!js/function "function () {}"\n');
-} catch (_e) {
-    unsafeThrew = true;
-}
-eq('default schema rejects !!js/function', unsafeThrew, true);
+eq('no anchors', Codec.dump({ x: shared, y: shared }, 'yaml').indexOf('&') === -1, true);
+// A long scalar stays on one line: a folded line is a changed line in the diff.
+eq('no folding', Codec.dump({ a: 'x'.repeat(300) }, 'yaml').split('\n').length, 2);
+// Documents are ordered maps (DESIGN §2).
+eq('key order preserved', Object.keys(Codec.parse(Codec.dump({ b: 1, a: 2 }, 'yaml'), 'yaml')), ['b', 'a']);
+// The store's own safety rules, now in the editor too rather than left to the 400.
+throws('anchors and aliases are refused', () => Codec.parse('a: &x 1\nb: *x\n', 'yaml'), 'anchor');
+throws('explicit tags are refused', () => Codec.parse('a: !!str 1\n', 'yaml'), 'tag');
+throws('complex keys are refused', () => Codec.parse('? [1, 2]\n: v\n', 'yaml'), 'complex');
+eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true }] });
+eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
+throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
 
-console.log('\n--- YAML property test: load(dump(x)) deep-equals x ---');
+console.log('\n--- YAML property test: parse(dump(x)) deep-equals x ---');
 // A seeded PRNG, so a failure names a document that can be reproduced exactly.
 const rng = (seed) =>
     function () {
@@ -390,8 +440,8 @@ for (let i = 0; i < 500 + CORPUS.length; i++) {
     let text;
     let back;
     try {
-        text = U.yamlDump(doc);
-        back = U.yamlLoad(text);
+        text = Codec.dump(doc, 'yaml');
+        back = Codec.parse(text, 'yaml');
     } catch (err) {
         propFails++;
         if (propFails <= 3) {
@@ -412,7 +462,7 @@ for (let i = 0; i < 500 + CORPUS.length; i++) {
 }
 eq('the corpus and 500 generated documents round trip', propFails, 0);
 
-console.log('\n--- row merge: document + grammar ---');
+console.log('\n--- row merge: document + shape ---');
 const P = ctx.PVE.meta.TreePanel;
 const TRAEFIK_SCHEMA = {
     type: 'object',
@@ -429,6 +479,7 @@ const TRAEFIK_SCHEMA = {
 };
 const panel = {
     dc: false,
+    docId: '200',
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
     // Two lists now, two rules (DESIGN section 3): prefixes decide shape, permissions
@@ -453,30 +504,30 @@ const panel = {
 [
     'entry',
     'addData',
-    'addGrammar',
+    'addShape',
     'schemaKind',
-    'applicablePrefixes',
+    'shapeFor',
+    'docKind',
     'applicablePermissions',
     'accessFor',
     'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
-const prefixes = panel.applicablePrefixes.call(panel);
-eq('applicable prefixes', prefixes.map((n) => n.prefix), ['traefik', 'netbird']);
+const shape = panel.shapeFor('200');
+// Most-specific first, then by name: the order the server lists in, and the one
+// the Shape resolves in, whatever order the listing arrived in.
+eq('the prefixes that reach this guest', shape.declared().map((n) => n.prefix), ['netbird', 'traefik']);
 const scopes = panel.applicablePermissions.call(panel);
-eq('applicable permissions', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+eq('the rules that reach it', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+eq('... each carrying its file', scopes.map((s) => s.name + '/' + s.authid), ['traefik/svc@pve!traefik', 'netbird/svc@pve!netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
-prefixes.forEach((ns) =>
-    // The 5-argument form buildTree actually uses -- the 3-argument one silently
-    // disables pruning, so a test using it is not testing what the panel does.
-    ns.schema ? panel.addGrammar.call(panel, root, ns.prefix, ns.schema, prefixes, ns) : null,
-);
+panel.addShape.call(panel, root, shape);
 
 const spec = root.children.traefik.children.spec.children;
-eq('grammar adds unset rows', Object.keys(spec).sort(), ['host', 'port', 'scheme']);
+eq('the shape adds unset rows', Object.keys(spec).sort(), ['host', 'port', 'scheme']);
 eq('present key stays present', spec.host.present, true);
 eq('declared key is unset', spec.port.present, false);
 eq('display boolean', U.displayValue(1, 'boolean'), 'Yes');
@@ -489,7 +540,7 @@ eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
-panel.addGrammar.call(panel, root, 'traefik', TRAEFIK_SCHEMA, prefixes, prefixes[0]);
+panel.addShape.call(panel, root, shape);
 eq('grammar type wins', root.children.traefik.children.spec.children.host.kind, 'string');
 
 // Comment key becomes the sibling's Description, never a row of its own.
@@ -532,17 +583,18 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
     staged.pop();
 }
 
-console.log('\n--- the two YAML emitters write the same bytes (shared fixture) ---');
+console.log('\n--- the hostile document: the editor writes exactly what the store writes ---');
 {
-    // The store writes documents with serde_yaml_ng and this editor writes them
-    // with js-yaml. Every line the two disagree about is a line the editor shows
-    // differently from the file, and that its diff then blames on whatever you
-    // were editing. Both suites read this table; add a value to the file.
+    // testdata/yaml-cases.json used to hold two emitters together. There is one
+    // emitter now, and this is the end-to-end check that it is the one the store
+    // uses: the document of values that historically break hand-written YAML, and
+    // the exact bytes the store writes for it, through the wasm. The Rust suite
+    // pins the same bytes natively (tests/formats.rs).
     const y = JSON.parse(
         fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'yaml-cases.json'), 'utf8'),
     );
-    eq('the shared yaml fixture is present', Object.keys(y.document).length >= 40, true);
-    const dumped = U.yamlDump(y.document);
+    eq('the fixture is present', Object.keys(y.document).length >= 40, true);
+    const dumped = Codec.dump(y.document, 'yaml');
     if (dumped !== y.canonical) {
         const a = y.canonical.split('\n');
         const b = dumped.split('\n');
@@ -556,12 +608,10 @@ console.log('\n--- the two YAML emitters write the same bytes (shared fixture) -
             }
         }
     } else {
-        console.log('ok   the editor dumps a document exactly as the store writes it');
+        console.log('ok   the editor dumps the hostile document exactly as the store writes it');
     }
-    // And the other direction: the store's own text reads back as the document.
-    eq('the editor reads the store\'s canonical text back exactly', U.yamlLoad(y.canonical), y.document);
-    // The round trip the JSON/YAML toggle makes, on the hardest values there are.
-    eq('a JSON round trip changes nothing', U.yamlLoad(U.yamlDump(JSON.parse(JSON.stringify(y.document)))), y.document);
+    eq('and reads the store\'s canonical text back exactly', Codec.parse(y.canonical, 'yaml'), y.document);
+    eq('a JSON round trip changes nothing', Codec.parse(Codec.dump(JSON.parse(JSON.stringify(y.document)), 'yaml'), 'yaml'), y.document);
 }
 
 console.log('\n--- the document is read as YAML because key order is data ---');
@@ -572,29 +622,14 @@ console.log('\n--- the document is read as YAML because key order is data ---');
     // YAML text instead, because `plannedData()` is what an Apply at the root view
     // writes back, and writing back an order nobody chose rewrites the file.
     const text = 'zebra: 1\nalpha: 2\nmiddle:\n  z: 1\n  a: 2\n';
-    eq('yamlLoad keeps the document order', Object.keys(U.yamlLoad(text)), ['zebra', 'alpha', 'middle']);
-    eq('... at every level', Object.keys(U.yamlLoad(text).middle), ['z', 'a']);
+    eq('parse keeps the document order', Object.keys(Codec.parse(text, 'yaml')), ['zebra', 'alpha', 'middle']);
+    eq('... at every level', Object.keys(Codec.parse(text, 'yaml').middle), ['z', 'a']);
 
     // And the order survives the trip the editor actually makes: parse, stage an
     // edit, dump. This is the property that keeps an Apply from churning the file.
-    const planned = U.applyPending(U.yamlLoad(text), [{ path: 'alpha', op: 'set', value: 9 }]);
+    const planned = Edits.apply(Codec.parse(text, 'yaml'), [{ path: 'alpha', op: 'set', value: 9 }]);
     eq('order survives a staged edit', Object.keys(planned), ['zebra', 'alpha', 'middle']);
-    eq('... and the dump preserves it', U.yamlDump(planned).indexOf('zebra') === 0, true);
-}
-
-console.log('\n--- Apply is offered wherever a write could succeed ---');
-{
-    // Mirrors `Effective::has_any_write`. The server decides what a write may
-    // change; this only decides whether offering the button is honest.
-    eq('full write access', U.hasAnyWrite({ write: 1, scopes: [] }), true);
-    eq('one rw scope', U.hasAnyWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }), true);
-    eq(
-        'read-only scopes are not write access',
-        U.hasAnyWrite({ write: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }),
-        false,
-    );
-    eq('an auditor holds nothing', U.hasAnyWrite({ read: 1, write: 0, scopes: [] }), false);
-    eq('a missing access object is not write access', U.hasAnyWrite(undefined), false);
+    eq('... and the dump preserves it', Codec.dump(planned, 'yaml').indexOf('zebra') === 0, true);
 }
 
 console.log('\n--- a registry file that did not load is still a row ---');
@@ -622,19 +657,20 @@ console.log('\n--- a registry file that did not load is still a row ---');
     eq('a failed permission claims no authid', perm[1].authid, '');
     eq('... and no rules', perm[1].summary, '');
 
-    // The safety half: a file that did not load must never describe anything.
+    // The safety half: a file that did not load must never describe anything, and
+    // never grant anything. The listing carries it; the Shape and the rules drop it.
     const p2 = Object.assign({}, panel, {
         prefixes: [
             { prefix: 'netbird', selector: { all: true } },
             { prefix: 'broken', selector: { all: true }, error: 'nope' },
         ],
+        permissions: [
+            { name: 'ok', authid: 'a@pve', rules: [{ prefix: 'netbird', mode: 'rw', selector: { all: true } }] },
+            { name: 'bad', authid: 'b@pve', error: 'nope', rules: [{ prefix: 'netbird', mode: 'rw', selector: { all: true } }] },
+        ],
     });
-    p2.applicablePrefixes = P.applicablePrefixes;
-    eq(
-        'a failed prefix reaches no guest, even carrying a selector',
-        p2.applicablePrefixes.call(p2).map((n) => n.prefix),
-        ['netbird'],
-    );
+    eq('a failed prefix reaches no guest, even carrying a selector', p2.shapeFor('200').declared().map((n) => n.prefix), ['netbird']);
+    eq('a failed permission file grants nothing, even carrying rules', p2.applicablePermissions().map((r) => r.name), ['ok']);
 }
 
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
@@ -650,8 +686,8 @@ console.log('\n--- a prefix is a declaration, with or without a schema ---');
             pending: [],
             docState: { 100: { digest: 'x', data: data } },
         });
-        ['documentEntries', 'plannedData', 'dataOf', 'grammarFor', 'docKind',
-         'entry', 'addData', 'addGrammar', 'applicablePrefixes'].forEach((m) => (d[m] = P[m]));
+        ['documentEntries', 'plannedData', 'dataOf', 'shapeFor', 'docKind',
+         'entry', 'addData', 'addShape'].forEach((m) => (d[m] = P[m]));
         return d.documentEntries.call(d);
     };
 
@@ -685,12 +721,7 @@ eq('access ro marked', panel.accessSummary(panel.accessFor.call(panel, 'netbird.
 eq('access of an unclaimed row', panel.accessFor.call(panel, 'mine.key', scopes), []);
 // Several principals may cover the same subtree; rw sorts before ro.
 const overlapping = scopes.concat([
-    {
-        prefix: 'traefik',
-        mode: 'ro',
-        selector: { all: true },
-        file: { name: 'audit', authid: 'svc@pve!audit' },
-    },
+    { name: 'audit', authid: 'svc@pve!audit', prefix: 'traefik', mode: 'ro', selector: { all: true } },
 ]);
 eq(
     'rw first, then ro',
@@ -701,6 +732,7 @@ eq(
 panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
 eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
 eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), false);
+eq('scoped write on the comment key of the prefix', panel.editableFor.call(panel, 'traefik__'), true);
 
 console.log('\n--- S6: a guest that does not carry the tag ---');
 // A tag selector resolves against this guest's tags and nothing else. Holding a
@@ -720,16 +752,16 @@ eq(
 // Same rule on the shape side: no tag, no declared rows from that prefix.
 eq(
     'prefix applicability follows the same tags',
-    panel.applicablePrefixes.call(untagged).map((n) => n.prefix),
+    untagged.shapeFor('200').declared().map((n) => n.prefix),
     ['netbird'],
 );
 
 console.log('\n--- schema findings for the text editor ---');
-const L = ctx.PVE.meta.Lint;
 // Prefix objects, the same shape GET /meta/prefixes returns.
-const GRAMMAR = L.applicable([
+const GRAMMAR = Shape.of([
     {
         prefix: 'traefik',
+        selector: { all: true },
         schema: {
             type: 'object',
             properties: {
@@ -745,31 +777,37 @@ const GRAMMAR = L.applicable([
             },
         },
     },
-]);
+], []);
 
 eq('a clean document has no findings',
-    L.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } },
-        GRAMMAR),
+    GRAMMAR.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } }),
     []);
 
 eq('each rule is reported at its own path',
-    L.findings({ traefik: { spec: { port: 70000, scheme: 'ftp', enabled: 'yes' } } }, GRAMMAR)
+    GRAMMAR.findings({ traefik: { spec: { port: 70000, scheme: 'ftp', enabled: 'yes' } } })
         .map((f) => f.path),
     ['traefik.spec.enabled', 'traefik.spec.port', 'traefik.spec.scheme']);
+
+// A `format` is the one thing the core hands back: it is checked with proxmoxlib's
+// own validator for that name, and lands among the findings like any other.
+eq('a format is checked by the vtype and lands in the findings',
+    GRAMMAR.findings({ traefik: { spec: { host: 'not a host name!' } } }),
+    [{ path: 'traefik.spec.host', msg: 'not a valid dns-name' }]);
+eq('a format that passes says nothing', GRAMMAR.findings({ traefik: { spec: { host: 'a.example' } } }), []);
 
 // DESIGN section 4: the JSON view renders booleans as 1/0; flagging those would put a
 // warning on every boolean in the store.
 eq('a boolean on the wire as 1 is not a finding',
-    L.findings({ traefik: { spec: { enabled: 1 } } }, GRAMMAR), []);
+    GRAMMAR.findings({ traefik: { spec: { enabled: 1 } } }), []);
 eq('a boolean on the wire as 0 is not a finding',
-    L.findings({ traefik: { spec: { enabled: 0 } } }, GRAMMAR), []);
-eq('but 2 is', L.findings({ traefik: { spec: { enabled: 2 } } }, GRAMMAR).length, 1);
+    GRAMMAR.findings({ traefik: { spec: { enabled: 0 } } }), []);
+eq('but 2 is', GRAMMAR.findings({ traefik: { spec: { enabled: 2 } } }).length, 1);
 
 eq('keys no grammar describes are left alone',
-    L.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }, GRAMMAR), []);
-eq('a prefix with nothing under it contributes nothing', L.findings({}, GRAMMAR), []);
-eq('a prefix with no schema contributes nothing',
-    L.applicable([{ prefix: 'netbird' }]), []);
+    GRAMMAR.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }), []);
+eq('a prefix with nothing under it contributes nothing', GRAMMAR.findings({}), []);
+eq('a prefix with no schema has none to offer', Shape.of([{ prefix: 'netbird', selector: { all: true } }], []).hasSchema(), false);
+eq('... but is still declared', Shape.of([{ prefix: 'netbird', selector: { all: true } }], []).declared().length, 1);
 
 const YAML = [
     'traefik:',
@@ -783,7 +821,7 @@ const YAML = [
     '    - lan',
     '',
 ].join('\n');
-const IDX = L.lineIndex(YAML);
+const IDX = Markers.lineIndex(YAML);
 eq('line index: top level', IDX['traefik'], 1);
 eq('line index: nested', IDX['traefik.spec.host'], 3);
 eq('line index: sibling after a sequence', IDX['netbird.groups'], 8);
@@ -798,42 +836,46 @@ const BLOCK = [
     '  name: stack',
     '',
 ].join('\n');
-const BIDX = L.lineIndex(BLOCK);
+const BIDX = Markers.lineIndex(BLOCK);
 eq('block scalar: the key itself', BIDX['compose.file'], 2);
 eq('block scalar: the sibling after it', BIDX['compose.name'], 6);
 eq('block scalar: its body is not keys', BIDX['compose.file.services'], undefined);
 eq('block scalar: nor promoted to the parent', BIDX['compose.services'], undefined);
 
-const QIDX = L.lineIndex('---\n# c\nhost__: note\nhost: a.example\n"quoted: key": 1\n');
+const QIDX = Markers.lineIndex('---\n# c\nhost__: note\nhost: a.example\n"quoted: key": 1\n');
 eq('comment keys are ordinary keys', QIDX['host__'], 3);
 eq('markers and comments are skipped', QIDX['host'], 4);
 eq('a quoted key is unquoted', QIDX['quoted: key'], 5);
 
 eq('findings are placed on their lines',
-    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
-        L.lineIndex('traefik:\n  spec:\n    port: 70000\n')),
+    Markers.placed(GRAMMAR.findings({ traefik: { spec: { port: 70000 } } }),
+        Markers.lineIndex('traefik:\n  spec:\n    port: 70000\n')),
     [{ line: 3, message: 'must be at most 65535' }]);
 eq('a finding the text does not carry is dropped, not misplaced',
-    L.placed(L.findings({ traefik: { spec: { port: 70000 } } }, GRAMMAR),
-        L.lineIndex('unrelated: 1\n')),
+    Markers.placed(GRAMMAR.findings({ traefik: { spec: { port: 70000 } } }),
+        Markers.lineIndex('unrelated: 1\n')),
     []);
 
-const SCHEMAS = L.schemaIndex(GRAMMAR);
+const SCHEMAS = Object.create(null);
+GRAMMAR.schemaIndex().forEach((e) => (SCHEMAS[e.path] = e.schema));
+eq('the index lists parents before children', GRAMMAR.schemaIndex().map((e) => e.path).slice(0, 3), ['traefik', 'traefik.spec', 'traefik.spec.host']);
 eq('hover: type, range and default',
-    L.hoverText(SCHEMAS['traefik.spec.port']), 'integer \u00b7 1..65535 \u00b7 default: 80');
+    Markers.hoverText(SCHEMAS['traefik.spec.port']), 'integer \u00b7 1..65535 \u00b7 default: 80');
 eq('hover: type, format and description',
-    L.hoverText(SCHEMAS['traefik.spec.host']), 'string (dns-name) \u00b7 Public host name');
-eq('hover: an enum', L.hoverText(SCHEMAS['traefik.spec.scheme']),
+    Markers.hoverText(SCHEMAS['traefik.spec.host']), 'string (dns-name) \u00b7 Public host name');
+eq('hover: an enum', Markers.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
-eq('hover: nothing declared, nothing shown', L.hoverText(undefined), null);
+eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null);
 
 console.log('\n--- nesting: most-specific wins, schemas never merge ---');
 // `homelab` and `homelab.docker` are both prefixes. The child governs its whole
 // subtree; the parent's own `properties.docker` is shadowed, not combined
 // (DESIGN section 3.1). Before revision 6 both walked and their findings unioned.
-const NESTED = L.applicable([
+// The rule lives in one place now (shape::Shape); this shows the face over it.
+const NESTED = Shape.of([
     {
         prefix: 'homelab',
+        selector: { all: true },
         schema: {
             type: 'object',
             properties: {
@@ -845,37 +887,38 @@ const NESTED = L.applicable([
     },
     {
         prefix: 'homelab.docker',
+        selector: { all: true },
         schema: { type: 'object', properties: { compose: { type: 'string' } } },
     },
-]);
-eq('applicable sorts longest prefix first', NESTED.map((n) => n.prefix), ['homelab.docker', 'homelab']);
-// One implementation of the rule, in Utils, shared by the row builder, the linter
-// and the hover index.
+], []);
+eq('declared sorts longest prefix first', NESTED.declared().map((n) => n.prefix), ['homelab.docker', 'homelab']);
 eq('governing picks the child for the child subtree',
-    U.governing('homelab.docker.compose', NESTED).prefix, 'homelab.docker');
-eq('governing picks the parent elsewhere', U.governing('homelab.notes', NESTED).prefix, 'homelab');
+    NESTED.governing('homelab.docker.compose').prefix, 'homelab.docker');
+eq('governing picks the parent elsewhere', NESTED.governing('homelab.notes').prefix, 'homelab');
 eq('governing picks the child for the boundary itself',
-    U.governing('homelab.docker', NESTED).prefix, 'homelab.docker');
-eq('governing returns null off-prefix', U.governing('unrelated.x', NESTED), null);
+    NESTED.governing('homelab.docker').prefix, 'homelab.docker');
+eq('governing returns null off-prefix', NESTED.governing('unrelated.x'), null);
+eq('governing returns null for the root', NESTED.governing(''), null);
 
 // The parent declares `docker: string` and the document has a map there. That is a
 // finding only if the parent is allowed to reach into the child -- it is not.
 const NESTED_DOC = { homelab: { notes: 'ok', docker: { compose: 'services: {}' } } };
-eq('the parent does not lint the child subtree', L.findings(NESTED_DOC, NESTED), []);
+eq('the parent does not lint the child subtree', NESTED.findings(NESTED_DOC), []);
 
 // The child does lint its own subtree.
 eq('the child lints its own subtree',
-    L.findings({ homelab: { docker: { compose: 42 } } }, NESTED).map((f) => f.path + ': ' + f.message),
+    NESTED.findings({ homelab: { docker: { compose: 42 } } }).map((f) => f.path + ': ' + f.msg),
     ['homelab.docker.compose: expected string']);
 
 // And the parent still lints what it does own.
 eq('the parent lints its own keys',
-    L.findings({ homelab: { notes: 7 } }, NESTED).map((f) => f.path),
+    NESTED.findings({ homelab: { notes: 7 } }).map((f) => f.path),
     ['homelab.notes']);
 
 // Hovers resolve to the governing prefix rather than to whichever was collected
 // last -- which used to depend on iteration order.
-const NESTED_IDX = L.schemaIndex(NESTED);
+const NESTED_IDX = Object.create(null);
+NESTED.schemaIndex().forEach((e) => (NESTED_IDX[e.path] = e.schema));
 eq('hover at the boundary comes from the child',
     NESTED_IDX['homelab.docker'].properties.compose.type, 'string');
 eq('hover below the boundary is the child\'s', NESTED_IDX['homelab.docker.compose'].type, 'string');
@@ -904,13 +947,11 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
             },
         },
     ];
-    const nsList = nsPanel.applicablePrefixes.call(nsPanel);
     const r = { key: '', path: '', children: {}, present: true, kind: 'map' };
     nsPanel.addData.call(nsPanel, r, { homelab: { docker: { compose: 'x' } } });
-    // Exactly what buildTree does: no call-site guard any more, the walk prunes itself.
-    nsList.forEach((ns) =>
-        ns.schema ? nsPanel.addGrammar.call(nsPanel, r, ns.prefix, ns.schema, nsList, ns) : null,
-    );
+    // Exactly what buildTree does: one Shape, and the index it hands over is
+    // already pruned.
+    nsPanel.addShape.call(nsPanel, r, nsPanel.shapeFor('200'));
     const dockerRow = r.children.homelab.children.docker;
     eq('the child governs the boundary row kind', dockerRow.kind, 'map');
     eq('the parent does not describe the child row', dockerRow.grammarDescription, undefined);
@@ -919,38 +960,37 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
 }
 
 console.log('\n--- the client model must agree with the server model ---');
-// js-yaml's DEFAULT_SCHEMA resolves implicit timestamps; the store does not. Under the
-// default, a *presentation-only* YAML/JSON toggle or the Format button rewrote
-// `2020-01-01` to "2020-01-01T00:00:00.000Z" and Apply wrote that back.
+// It is the server model: the same parser. A bare date stays the string the store
+// keeps (js-yaml's default schema once turned it into a JS Date, and a
+// presentation-only toggle then rewrote it).
 eq('a bare date stays the string the server stores',
-    U.yamlLoad('date: 2020-01-01\n'), { date: '2020-01-01' });
+    Codec.parse('date: 2020-01-01\n', 'yaml'), { date: '2020-01-01' });
 eq('... and survives a dump/load round trip unchanged',
-    U.yamlLoad(U.yamlDump({ date: '2020-01-01' })), { date: '2020-01-01' });
-eq('a quoted numeric string is still a string', U.yamlLoad('v: "1"\n'), { v: '1' });
-eq('an unquoted integer is still a number', U.yamlLoad('v: 1\n'), { v: 1 });
-eq('booleans still parse', U.yamlLoad('v: true\n'), { v: true });
-eq('an empty document is the empty map, not null', U.yamlLoad(''), {});
+    Codec.parse(Codec.dump({ date: '2020-01-01' }, 'yaml'), 'yaml'), { date: '2020-01-01' });
+eq('a quoted numeric string is still a string', Codec.parse('v: "1"\n', 'yaml'), { v: '1' });
+eq('an unquoted integer is still a number', Codec.parse('v: 1\n', 'yaml'), { v: 1 });
+eq('booleans still parse', Codec.parse('v: true\n', 'yaml'), { v: true });
+eq('YAML 1.1 words stay strings', Codec.parse('a: yes\nb: on\n', 'yaml'), { a: 'yes', b: 'on' });
+eq('an empty document is the empty map, not null', Codec.parse('', 'yaml'), {});
 
 console.log('\n--- governing uses containment, not the permission predicate ---');
-// `covers` aliases the sibling comment key `p__` -- that is a GRANT rule. Using it to
-// pick a governing prefix made `a` govern the whole `a__` prefix, where Rust's
-// registry::governing (plain containment) says `a__`.
-eq('covers aliases the comment key (grant rule)', U.covers('a', 'a__'), true);
-eq('containsPath does not (prefix rule)', U.containsPath('a', 'a__'), false);
-eq('containsPath: the prefix itself', U.containsPath('a', 'a'), true);
-eq('containsPath: a child', U.containsPath('a', 'a.b'), true);
-eq('containsPath: not a name prefix', U.containsPath('a', 'ab'), false);
+// `covers` aliases the sibling comment key `p__` -- that is a PERMISSION rule. Using
+// it to pick a governing prefix would make `a` govern the whole `a__` prefix; the
+// Shape uses plain containment and says `a__`. Two predicates, two jobs, and the
+// core keeps them apart (docs: shape.rs vs scopes.rs).
+eq('covers aliases the comment key (permission rule)', Access.covers('a', 'a__'), true);
 {
-    const two = U.bySpecificity([{ prefix: 'a' }, { prefix: 'a__' }]);
-    eq('a comment-key prefix governs itself, not its subject',
-        U.governing('a__', two).prefix, 'a__');
+    const two = Shape.of([{ prefix: 'a', selector: { all: true } }, { prefix: 'a__', selector: { all: true } }], []);
+    eq('a comment-key prefix governs itself, not its subject', two.governing('a__').prefix, 'a__');
+    eq('... and `a` alone does not reach `a__`',
+        Shape.of([{ prefix: 'a', selector: { all: true } }], []).governing('a__'), null);
 }
 
 console.log('\n--- nesting: a schema-less prefix still shadows ---');
 {
     // A prefix may declare a selector and no schema (the lab's `netbird` does).
     // It still governs its subtree -- so a parent's schema must not reach into it.
-    const all = [
+    const all = Shape.of([
         { prefix: 'homelab.docker', selector: { all: true } },   // no schema
         {
             prefix: 'homelab',
@@ -963,24 +1003,20 @@ console.log('\n--- nesting: a schema-less prefix still shadows ---');
                 },
             },
         },
-    ];
+    ], []);
     const doc = { homelab: { notes: 'ok', docker: { compose: 'x' } } };
-    eq('a schema-less child still shadows its parent',
-        L.findings(doc, L.applicable(all), all).map((f) => f.path), []);
+    eq('a schema-less child still shadows its parent', all.findings(doc).map((f) => f.path), []);
     eq('the parent still lints what it owns',
-        L.findings({ homelab: { notes: 7 } }, L.applicable(all), all).map((f) => f.path),
-        ['homelab.notes']);
+        all.findings({ homelab: { notes: 7 } }).map((f) => f.path), ['homelab.notes']);
     eq('and the hover index does not cross the boundary either',
-        L.schemaIndex(L.applicable(all), all)['homelab.docker'], undefined);
+        all.schemaIndex().some((e) => e.path === 'homelab.docker'), false);
 }
 
 console.log('\n--- round trip: a view toggle must not invent changes ---');
-// Re-dumping on the way back from JSON made a *presentation* toggle report unsaved
-// changes. The two emitters agreeing (the fixture block above) removes most of that,
-// but not the reason `renderBuffer` exists: the store rewrites a file only when it is
-// asked to write one, so what the editor is handed can be a file as somebody *wrote*
-// it -- valid YAML in a layout no emitter would choose. Re-dumping that on a toggle
-// still invents changes to a document nobody edited.
+// The store rewrites a file only when it is asked to write one, so what the editor
+// is handed can be a file as somebody *wrote* it -- valid YAML in a layout no
+// emitter would choose. Re-dumping that on a presentation toggle invents changes to
+// a document nobody edited, which is what `Codec.render` exists to prevent.
 const SERVER_YAML = [
     'traefik:',
     '  spec:',
@@ -990,40 +1026,35 @@ const SERVER_YAML = [
     '    - rule: Host(`a`)',
     '',
 ].join('\n');
-const parsed = U.yamlLoad(SERVER_YAML);
+const parsed = Codec.parse(SERVER_YAML, 'yaml');
 eq('a redump differs from a hand-written file (the bug\'s premise)',
-    U.yamlDump(parsed) !== SERVER_YAML, true);
-eq('sameDocument sees through the layout difference',
-    U.sameDocument(parsed, SERVER_YAML), true);
-eq('sameDocument says no when a value really changed',
-    U.sameDocument({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
-eq('sameDocument says no when only the key order changed (order is data)',
-    U.sameDocument({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
-eq('sameDocument on unparseable text is not a match',
-    U.sameDocument({}, 'a:\n  - [\n'), false);
+    Codec.dump(parsed, 'yaml') !== SERVER_YAML, true);
+eq('same sees through the layout difference',
+    Codec.same(parsed, SERVER_YAML), true);
+eq('same says no when a value really changed',
+    Codec.same({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
+eq('same says no when only the key order changed (order is data)',
+    Codec.same({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
+eq('same on unparseable text is not a match',
+    Codec.same({}, 'a:\n  - [\n'), false);
 
-// `renderBuffer` is what both editors' JSON/YAML toggle now call -- TextWindow's own
-// toggle used to dump unconditionally here, which is exactly the bug the fixture
-// above is named for; a round trip through JSON has to land back on the server's
-// own text, not a fresh js-yaml dump of it.
-eq('renderBuffer prefers the server text on an unchanged round trip',
-    U.renderBuffer(parsed, 'yaml', SERVER_YAML), SERVER_YAML);
-eq('renderBuffer re-dumps once the value actually changed',
-    U.renderBuffer({ a: 1 }, 'yaml', SERVER_YAML), U.yamlDump({ a: 1 }));
-eq('renderBuffer for json is a plain stringify, original or not',
-    U.renderBuffer(parsed, 'json', SERVER_YAML), JSON.stringify(parsed, null, 2));
-eq('parseBuffer reads JSON as JSON and everything else as YAML',
-    [U.parseBuffer('{"a":1}', 'json'), U.parseBuffer('a: 1\n', 'yaml')],
+// `render` is what both editors' JSON/YAML toggle call: a round trip through JSON
+// has to land back on the server's own text, not a fresh dump of it.
+eq('render prefers the server text on an unchanged round trip',
+    Codec.render(parsed, 'yaml', SERVER_YAML), SERVER_YAML);
+eq('render re-dumps once the value actually changed',
+    Codec.render({ a: 1 }, 'yaml', SERVER_YAML), Codec.dump({ a: 1 }, 'yaml'));
+eq('render for json is a plain dump, original or not',
+    Codec.render(parsed, 'json', SERVER_YAML), Codec.dump(parsed, 'json'));
+eq('parse reads JSON as JSON and everything else as YAML',
+    [Codec.parse('{"a":1}', 'json'), Codec.parse('a: 1\n', 'yaml')],
     [{ a: 1 }, { a: 1 }]);
-eq('dumpBuffer is the plain, unconditional inverse (what Format wants)',
-    U.dumpBuffer(parsed, 'yaml') !== SERVER_YAML, true);
-// And what Format produces is now the store's own layout, so Format then Apply does
-// not hand back something the server immediately writes differently.
-eq('Format lands on canonical text', U.dumpBuffer(parsed, 'yaml'), U.yamlDump(parsed));
+eq('dump is the plain, unconditional inverse (what Format wants)',
+    Codec.dump(parsed, 'yaml') !== SERVER_YAML, true);
 eq('originalInLang renders the loaded document in the other syntax',
-    U.originalInLang(SERVER_YAML, 'json'), JSON.stringify(parsed, null, 2));
+    Codec.originalInLang(SERVER_YAML, 'json'), Codec.dump(parsed, 'json'));
 eq('originalInLang is the identity for yaml -- no reparse, so it never throws',
-    U.originalInLang(SERVER_YAML, 'yaml'), SERVER_YAML);
+    Codec.originalInLang(SERVER_YAML, 'yaml'), SERVER_YAML);
 
 console.log('\n--- many documents in one panel ---');
 const D = ctx.PVE.meta.DeclareKeyWindow;
@@ -1057,17 +1088,18 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
 // prefixes reach guest documents only (DESIGN §3.3).
 {
     const META = { type: 'object', properties: { selector: { type: 'object' } } };
-    const panelG = Object.assign({}, panel, { dc: true, schemas: { prefix: META, grant: {} } });
-    ['grammarFor', 'docKind', 'applicablePrefixes'].forEach((m) => (panelG[m] = P[m]));
-    eq('a prefix document is described by the meta-schema',
-        panelG.grammarFor('prefixes/x').map((g) => g.prefix), ['']);
+    const panelG = Object.assign({}, panel, { dc: true, schemas: { prefix: META, permission: {} } });
+    ['shapeFor', 'docKind'].forEach((m) => (panelG[m] = P[m]));
+    eq('a prefix document is described by the meta-schema, rooted at the document',
+        panelG.shapeFor('prefixes/x').declared().map((g) => g.prefix), ['']);
     eq('... which is the schema served for its kind',
-        panelG.grammarFor('prefixes/x')[0].schema, META);
-    eq('the datacenter document is described by nothing', panelG.grammarFor('datacenter'), []);
+        panelG.shapeFor('prefixes/x').declared()[0].schema, META);
+    eq('the datacenter document is described by nothing', panelG.shapeFor('datacenter').declared(), []);
+    eq('... and has no findings to offer', panelG.shapeFor('datacenter').hasSchema(), false);
 }
 
-// A root-prefix schema governs the whole document. It must not be pruned away: the
-// prune asks `governing`, which answers about prefixes, and '' is not one.
+// A root-rooted schema governs the whole document. There is no special case for it:
+// the empty prefix is a prefix of everything, and the least specific of all.
 {
     const META = {
         type: 'object',
@@ -1076,24 +1108,26 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
             description: { type: 'string' },
         },
     };
-    const rooted = [{ prefix: '', schema: META }];
+    const rooted = Shape.rooted(META);
+    eq('the meta-schema governs everything, the root included', [rooted.governing('').prefix, rooted.governing('rules.0').prefix], ['', '']);
     eq(
         'the meta-schema lints the document it is rooted at',
-        L.findings({ description: 5, selector: { tag: 7 } }, rooted, rooted).map((f) => f.path + ': ' + f.message),
+        rooted.findings({ description: 5, selector: { tag: 7 } }).map((f) => f.path + ': ' + f.msg),
         ['description: expected string', 'selector.tag: expected string'],
     );
     eq(
         'and indexes it for hovers',
-        Object.keys(L.schemaIndex(rooted, rooted)).sort(),
+        rooted.schemaIndex().map((e) => e.path).sort(),
         ['', 'description', 'selector', 'selector.tag'],
     );
+    eq('a missing meta-schema (an older API) describes nothing', Shape.rooted(undefined).declared(), []);
     // The same rows the tree would show, including a declared-but-unset one.
     const panelR = Object.assign({}, panel, {
         dc: true,
         docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
         schemas: { prefix: META },
     });
-    ['grammarFor', 'docKind', 'documentEntries', 'addData', 'addGrammar', 'entry', 'schemaKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+    ['shapeFor', 'docKind', 'documentEntries', 'addData', 'addShape', 'entry', 'schemaKind', 'dataOf', 'plannedData'].forEach(
         (m) => (panelR[m] = P[m]),
     );
     panelR.pending = [];
@@ -1102,6 +1136,7 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
     eq('a prefix document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
     eq('what it holds is present', entries.children.selector.children.tag.present, true);
     eq('what it does not hold is a declared-but-unset row', entries.children.description.present, false);
+    eq('the root row itself is untouched', entries.kind, 'map');
 }
 
 console.log('\n--- a marker has to survive collapsing the branch it is in ---');
@@ -1146,49 +1181,62 @@ console.log('\n--- staged edits: the change that had no legal single step ---');
         { path: 'selector.all', op: 'delete' },
         { path: 'selector.tag', op: 'set', value: 'web' },
     ];
-    eq('both edits land in one planned document', U.applyPending(stored, pending), {
+    eq('both edits land in one planned document', Edits.apply(stored, pending), {
         description: 'Home',
         selector: { tag: 'web' },
     });
     // ... and go out as ONE write, at the narrowest view covering both.
-    eq('written as one view', U.writeView(pending), 'selector');
+    eq('written as one view', Edits.writeView(pending), 'selector');
     eq('the stored document is untouched until then', stored, {
         description: 'Home',
         selector: { all: true },
     });
 
     // A single row edit is still exactly the one-key write it always was.
-    eq('one set writes that key', U.writeView([{ path: 'a.b.c', op: 'set', value: 1 }]), 'a.b.c');
+    eq('one set writes that key', Edits.writeView([{ path: 'a.b.c', op: 'set', value: 1 }]), 'a.b.c');
     // A delete cannot be expressed by replacing the thing being deleted, so the
     // write moves one level up and replaces the parent without the key.
-    eq('one delete writes its parent', U.writeView([{ path: 'a.b.c', op: 'delete' }]), 'a.b');
-    eq('a top-level delete writes the document', U.writeView([{ path: 'a', op: 'delete' }]), '');
-    eq('unrelated subtrees write the document', U.writeView([
+    eq('one delete writes its parent', Edits.writeView([{ path: 'a.b.c', op: 'delete' }]), 'a.b');
+    eq('a top-level delete writes the document', Edits.writeView([{ path: 'a', op: 'delete' }]), '');
+    eq('unrelated subtrees write the document', Edits.writeView([
         { path: 'traefik.spec.host', op: 'set', value: 'x' },
         { path: 'netbird.groups', op: 'set', value: [] },
     ]), '');
-    eq('nothing staged, nothing to write', U.writeView([]), null);
+    eq('nothing staged, nothing to write', Edits.writeView([]), null);
 
     // Deletes and sets applied in the order they were made.
-    eq('order is what was done', U.applyPending({ a: 1 }, [
+    eq('order is what was done', Edits.apply({ a: 1 }, [
         { path: 'a', op: 'delete' },
         { path: 'a', op: 'set', value: 2 },
     ]), { a: 2 });
-    eq('a set then a delete leaves nothing', U.applyPending({}, [
+    eq('a set then a delete leaves nothing', Edits.apply({}, [
         { path: 'x.y', op: 'set', value: 1 },
         { path: 'x.y', op: 'delete' },
     ]), { x: {} });
     // Intermediate maps are created for a new nested key.
-    eq('a new nested key builds its parents', U.applyPending({}, [
+    eq('a new nested key builds its parents', Edits.apply({}, [
         { path: 'schema.properties.port.type', op: 'set', value: 'integer' },
     ]), { schema: { properties: { port: { type: 'integer' } } } });
 
     // Keys are document data and no key is reserved: staging one named `__proto__`
-    // must set a key, not the prototype. (`entry()` guards the same way.)
-    const planned = U.applyPending({}, [{ path: '__proto__', op: 'set', value: 'oops' }]);
+    // must set a key, not the prototype. The document crosses as JSON text, so there
+    // is no object for a prototype setter to touch on the way -- but the answer has
+    // to come back as a key too. (`entry()` guards the same way on its side.)
+    const planned = Edits.apply({}, [{ path: '__proto__', op: 'set', value: 'oops' }]);
     eq('a proto-named key is a key', Object.prototype.hasOwnProperty.call(planned, '__proto__'), true);
     eq('and the prototype is untouched', {}.oops, undefined);
     eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
+
+    // Staging subsumes: an edit at `p` drops what was staged under `p`, the root drops all.
+    let list = Edits.stage([], { path: 'a.b', op: 'set', value: 1 });
+    list = Edits.stage(list, { path: 'a.c', op: 'set', value: 2 });
+    list = Edits.stage(list, { path: 'x', op: 'set', value: 3 });
+    list = Edits.stage(list, { path: 'a', op: 'set', value: { whole: true } });
+    eq('an edit at a path replaces the edits under it', list.map((e) => e.path), ['x', 'a']);
+    eq('the edits under a path', Edits.under(list, 'a').length, 1);
+    eq('`ab` is not under `a`', Edits.under(Edits.stage(list, { path: 'ab', op: 'set', value: 1 }), 'a').length, 1);
+    eq('discarding under a path', Edits.discardUnder(list, 'a').map((e) => e.path), ['x']);
+    eq('the root replaces everything', Edits.stage(list, { path: '', op: 'set', value: {} }), [{ path: '', op: 'set', value: {} }]);
 }
 
 console.log('\n--- the registry lists ---');
@@ -1249,15 +1297,16 @@ console.log('\n--- the registry lists ---');
 
 console.log('\n--- a key name is refused in the field, not after a round trip ---');
 {
-    // The server is still the authority; this only refuses earlier and in words.
-    // `invalid path: homelab.bad key (400)` is a correct answer that reads like a bug
-    // in the editor.
+    // The rule is the core's (`path::is_valid_segment`); this only puts it into
+    // words. `invalid path: homelab.bad key (400)` is a correct answer that reads
+    // like a bug in the editor.
     eq('a plain key is fine', U.keyPathError('homelab'), null);
     eq('a dotted path is fine', U.keyPathError('homelab.docker.port'), null);
     eq('the charset is the server\'s', U.keyPathError('a-b_c@d!e9'), null);
     eq('an empty key is refused', typeof U.keyPathError(''), 'string');
     eq('a space is refused', typeof U.keyPathError('bad key'), 'string');
     eq('... and the message names it', U.keyPathError('bad key').indexOf('space') !== -1, true);
+    eq('... and the segment', U.keyPathError('ok.bad key').indexOf('bad key') !== -1, true);
     eq('a slash is refused', typeof U.keyPathError('a/b'), 'string');
     eq('an empty segment is refused', typeof U.keyPathError('a..b'), 'string');
 
@@ -1271,24 +1320,34 @@ console.log('\n--- a key name is refused in the field, not after a round trip --
     // have arrived by hand or from an older writer -- which is a wider set than what
     // a path may name. This field creates a key, so it is bound by the narrower rule.
     eq('non-ascii is refused', typeof U.keyPathError('\u00fcn\u00efc\u00f8de'), 'string');
+
+    // A registry file name is a dotted prefix (`registry::is_valid_file_name`): the
+    // rule the loader, the API id and the New dialog all apply -- the dialog through
+    // the same function now, rather than through no check at all.
+    eq('a file name is a prefix', U.fileNameError('homelab.docker'), null);
+    eq('a plain one too', U.fileNameError('traefik'), null);
+    eq('a space is not a file name', typeof U.fileNameError('my file'), 'string');
+    eq('nor a slash', typeof U.fileNameError('a/b'), 'string');
+    eq('nor a leading dot', typeof U.fileNameError('.hidden'), 'string');
+    eq('nor nothing', typeof U.fileNameError(''), 'string');
 }
 
 console.log('\n--- an edit answers for what it broke, not for what was already broken ---');
 {
     // One bad value used to make every later edit anywhere in the document stop at a
-    // "Save anyway" tick, forever. `introducedFindings` scopes the banner to what this
+    // "Save anyway" tick, forever. `Edits.introduced` scopes the banner to what this
     // edit did; the amber row markers still show everything wrong with the document.
     const stored = {
         homelab: { owner: 'arki', port: 'not-a-number' },
         netbird: { groups: ['lan'] },
     };
-    const bad = { path: 'homelab.port', message: 'expected integer' };
+    const bad = { path: 'homelab.port', msg: 'expected integer' };
     const before = [bad];
 
     // An unrelated edit: the same violation is still there, and it is not ours.
     eq(
         'a pre-existing violation on an untouched path does not warn',
-        U.introducedFindings(before, [bad], U.changedPaths(stored, {
+        Edits.introduced(before, [bad], Edits.changedPaths(stored, {
             ...stored,
             homelab: { ...stored.homelab, owner: 'someone' },
         })),
@@ -1299,7 +1358,7 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
     // is word for word what it was.
     eq(
         'a new bad value on an already-bad path does warn',
-        U.introducedFindings(before, [bad], U.changedPaths(stored, {
+        Edits.introduced(before, [bad], Edits.changedPaths(stored, {
             ...stored,
             homelab: { ...stored.homelab, port: 'still-not-a-number' },
         })).length,
@@ -1309,15 +1368,15 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
     // Replacing a parent answers for what is beneath it.
     eq(
         'replacing a subtree answers for a finding inside it',
-        U.introducedFindings(before, [bad], ['homelab']).length,
+        Edits.introduced(before, [bad], ['homelab']).length,
         1,
     );
 
     // A violation that was not there before always warns, wherever it is.
-    const fresh = { path: 'netbird.groups', message: 'expected array' };
+    const fresh = { path: 'netbird.groups', msg: 'expected array' };
     eq(
         'a violation this edit created always warns',
-        U.introducedFindings(before, [bad, fresh], ['netbird.groups']).map((f) => f.path),
+        Edits.introduced(before, [bad, fresh], ['netbird.groups']).map((f) => f.path),
         ['netbird.groups'],
     );
 
@@ -1325,29 +1384,29 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
     // this is the case that used to demand a tick for reordering a broken document.
     eq(
         'reordering changes no path',
-        U.changedPaths(stored, { netbird: stored.netbird, homelab: stored.homelab }),
+        Edits.changedPaths(stored, { netbird: stored.netbird, homelab: stored.homelab }),
         [],
     );
     eq(
         'so reordering a document that was already wrong warns about nothing',
-        U.introducedFindings(before, [bad], []),
+        Edits.introduced(before, [bad], []),
         [],
     );
 
     // `changedPaths` reports the deepest path that differs, and compares lists whole.
     eq(
         'a changed leaf is reported at its own path',
-        U.changedPaths(stored, { ...stored, homelab: { ...stored.homelab, owner: 'x' } }),
+        Edits.changedPaths(stored, { ...stored, homelab: { ...stored.homelab, owner: 'x' } }),
         ['homelab.owner'],
     );
     eq(
         'a changed list member is reported at the list',
-        U.changedPaths(stored, { ...stored, netbird: { groups: ['lan', 'wan'] } }),
+        Edits.changedPaths(stored, { ...stored, netbird: { groups: ['lan', 'wan'] } }),
         ['netbird.groups'],
     );
     eq(
         'a removed key is a change at that key',
-        U.changedPaths(stored, { homelab: stored.homelab }),
+        Edits.changedPaths(stored, { homelab: stored.homelab }),
         ['netbird'],
     );
 }
@@ -1355,13 +1414,13 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
 console.log('\n--- text is just another way to edit rows ---');
 {
     // Editing as text used to be a second model with its own buffer, apply and write,
-    // kept apart from the tree by rules. `diffDocuments` turns whatever was typed back
+    // kept apart from the tree by rules. `Edits.between` turns whatever was typed back
     // into edits *on rows*, so both are the same model and the rules go away.
     const stored = {
         homelab: { owner: 'arki', notes: 'the box', docker: { port: 80, restart: 'always' } },
         netbird: { groups: ['lan'] },
     };
-    const d = (edited) => U.diffDocuments(stored, edited);
+    const d = (edited) => Edits.between(stored, edited);
 
     eq('an unchanged document stages nothing', d(JSON.parse(JSON.stringify(stored))), []);
 
@@ -1393,7 +1452,7 @@ console.log('\n--- text is just another way to edit rows ---');
     const reorder = d(reordered);
     eq('a pure reordering falls back to the whole document', reorder.length, 1);
     eq('... at the document root', reorder[0].path, '');
-    eq('... and it round trips', U.applyPending(stored, reorder), reordered);
+    eq('... and it round trips', Edits.apply(stored, reorder), reordered);
 
     // Whatever comes back, replaying it on the stored document must equal what was
     // typed -- that is the property the fallback exists to guarantee.
@@ -1402,7 +1461,7 @@ console.log('\n--- text is just another way to edit rows ---');
         { homelab: stored.homelab },
         {},
     ].forEach(function (edited, i) {
-        eq('case ' + i + ' round trips', U.applyPending(stored, d(edited)), edited);
+        eq('case ' + i + ' round trips', Edits.apply(stored, d(edited)), edited);
     });
 
     // A root-level edit subsumes narrower ones: it replaces the whole document, so a
@@ -1413,6 +1472,8 @@ console.log('\n--- text is just another way to edit rows ---');
     stub.syncButtons = () => {};
     stub.stage('', 'set', { a: 1 });
     eq('the document replaces everything under it', stub.pending, [{ path: '', op: 'set', value: { a: 1 } }]);
+    stub.stage('b', 'delete');
+    eq('a delete is staged without a value', stub.pending[1], { path: 'b', op: 'delete' });
 }
 
 console.log('\n--- a single delete has to stay a DELETE ---');
@@ -1421,13 +1482,13 @@ console.log('\n--- a single delete has to stay a DELETE ---');
     // it -- but for a top-level key that step lands on the document root, and a root
     // write needs full write access. A scoped writer removing its own prefix would get
     // a 403 for something the server would have taken as `DELETE ?view=traefik`.
-    eq('a top-level delete would write the document', U.writeView([{ path: 'traefik', op: 'delete' }]), '');
+    eq('a top-level delete would write the document', Edits.writeView([{ path: 'traefik', op: 'delete' }]), '');
     // ... so Apply sends the narrow DELETE instead, which is what this shape is for.
-    eq('a nested delete writes its parent', U.writeView([{ path: 'a.b', op: 'delete' }]), 'a');
+    eq('a nested delete writes its parent', Edits.writeView([{ path: 'a.b', op: 'delete' }]), 'a');
     // Two edits are a replace again: only a lone delete has a narrower spelling.
     eq(
         'a delete beside a set is not one',
-        U.writeView([{ path: 'a', op: 'delete' }, { path: 'b', op: 'set', value: 1 }]),
+        Edits.writeView([{ path: 'a', op: 'delete' }, { path: 'b', op: 'set', value: 1 }]),
         '',
     );
 }
@@ -1445,8 +1506,7 @@ console.log('\n--- a staged value is linted like a stored one ---');
         tags: [],
         pending: [],
     });
-    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData',
-     'applicablePrefixes', 'pendingUnder'].forEach((m) => (panelS[m] = P[m]));
+    ['shapeFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'pendingUnder'].forEach((m) => (panelS[m] = P[m]));
 
     eq('a stored value that fits is not marked', panelS.findingsFor()['docker.port'], undefined);
     panelS.pending = [{ path: 'docker.port', op: 'set', value: 70000 }];
@@ -1463,6 +1523,9 @@ console.log('\n--- a staged value is linted like a stored one ---');
     eq('the row knows its own edits', panelS.pendingUnder('docker.port').length, 1);
     eq('and a subtree knows all of them', panelS.pendingUnder('docker').length, 2);
     eq('an untouched path has none', panelS.pendingUnder('netbird').length, 0);
+    ['discardRow', 'buildTree', 'syncButtons'].forEach((m) => (panelS[m] = m === 'discardRow' ? P[m] : () => {}));
+    panelS.discardRow({ data: { path: 'docker.port' } });
+    eq('discarding a row drops its edit and keeps the rest', panelS.pending.map((e) => e.path), ['docker.host']);
 }
 
 console.log('\n--- acting on one member rewrites its list ---');
@@ -1619,8 +1682,8 @@ console.log('\n--- reloading must not fold the tree up ---');
 console.log('\n--- the tree marks a row its schema refuses ---');
 {
     // The text editor has squiggled these since revision 6; the tree, which is what
-    // people open, said nothing. Same rule, same function -- `grammarSplit` is shared
-    // by both callers so they cannot answer differently.
+    // people open, said nothing. Same rule, same function -- `shapeFor` is shared by
+    // both callers so they cannot answer differently.
     const SCHEMA = {
         type: 'object',
         properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
@@ -1631,7 +1694,7 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
         tags: [],
     });
-    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+    ['shapeFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach(
         (m) => (panelF[m] = P[m]),
     );
     panelF.pending = [];
@@ -1646,7 +1709,7 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
         schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
     });
-    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'applicablePrefixes'].forEach(
+    ['shapeFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach(
         (m) => (panelR[m] = P[m]),
     );
     panelR.pending = [];
@@ -1660,6 +1723,18 @@ console.log('\n--- the tree marks a row its schema refuses ---');
     panelR.docState.datacenter = { digest: 'd', data: { anything: 5 } };
     panelR.docId = 'datacenter';
     eq('the datacenter document is never marked', panelR.findingsFor(), {});
+
+    // And the banner Apply shows asks the same Shape, through `applyFindingsFor`.
+    panelF.applyFindingsFor = P.applyFindingsFor;
+    eq('the banner names what an edit introduced',
+        panelF.applyFindingsFor({ docker: { port: 70000, host: 5 } }),
+        []);
+    eq('... but not what was already wrong and untouched',
+        panelF.applyFindingsFor({ docker: { port: 70000, host: 'changed' } }),
+        []);
+    eq('... and a fresh violation, wherever it is',
+        panelF.applyFindingsFor({ docker: { port: 'eighty', host: 'ok' } }),
+        ['docker.port: expected integer']);
 }
 
 console.log('\n--- declaring one key of a prefix schema ---');
@@ -1703,7 +1778,7 @@ eq(
     D.schemaFrom({ type: 'boolean', default: 'yes', defaultBool: '' }),
     { type: 'boolean' },
 );
-// A map has no default the editor would ever read: `addGrammar` stops at an object and
+// A map has no default the editor would ever read: `addShape` stops at an object and
 // walks into it. Writing one would be a declaration nothing consumes -- and a string.
 eq('a map takes no default', D.schemaFrom({ type: 'object', default: '{}' }), { type: 'object' });
 eq('an array default still parses as a list', D.schemaFrom({ type: 'array', default: 'a,b' }), { type: 'array', default: ['a', 'b'] });
@@ -1738,12 +1813,13 @@ eq('an empty value is empty', U.previewText(undefined), '');
 // A declared `multiline` reaches the row through the same path as `format`.
 {
     const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
-    const ns = [{ prefix: 'notes', selector: { all: true }, schema: {
+    const ns = Shape.of([{ prefix: 'notes', selector: { all: true }, schema: {
         type: 'object',
         properties: { body: { type: 'string', multiline: 1, description: 'Free text' } },
-    } }];
-    panel.addGrammar.call(panel, root, 'notes', ns[0].schema, ns, ns[0]);
+    } }], []);
+    panel.addShape.call(panel, root, ns);
     eq('multiline reaches the row', root.children.notes.children.body.multiline, true);
+    eq('and so does the description', root.children.notes.children.body.grammarDescription, 'Free text');
 }
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
@@ -1765,6 +1841,8 @@ eq('proto-named keys become rows', Object.keys(protoRoot.children).sort(), [
     eq(`${k} row value`, protoRoot.children[k].value, protoDoc[k]);
 });
 eq('global Object untouched', typeof Object.create, 'function');
+// And they cross the ABI as keys, both ways.
+eq('proto-named keys survive the core', Codec.parse(Codec.dump(protoDoc, 'yaml'), 'yaml'), protoDoc);
 
 console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
 process.exit(fails ? 1 : 0);

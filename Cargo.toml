@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pve-meta-core",
     "crates/pve-meta-perl",
+    "crates/pve-meta-wasm",
 ]
 # pve-meta-perl (PVE::RS::Meta perlmod bindings) needs `libperl-dev` headers
 # and only builds on the Linux build host; it is a workspace member (so
@@ -12,6 +13,7 @@ members = [
 # `cargo build --workspace` still targets every member, pve-meta-rs included.
 default-members = [
     "crates/pve-meta-core",
+    "crates/pve-meta-wasm",
 ]
 
 # Keep debug info in release builds, like upstream `pve-rs` does (it sets the
@@ -24,6 +26,20 @@ default-members = [
 # installed package; it only makes `target/release/libpve_meta_rs.so` larger.
 [profile.release]
 debug = true
+
+# The browser build (crates/pve-meta-wasm, `make wasm`). Everything the
+# release profile keeps for `coredumpctl` is dead weight in a download:
+# no debug info, size over speed, one codegen unit and LTO so the store and
+# api modules -- compiled in, never called -- are dropped, and `abort` on
+# panic since wasm32-unknown-unknown cannot unwind anyway.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
 
 [workspace.package]
 version = "0.1.0"

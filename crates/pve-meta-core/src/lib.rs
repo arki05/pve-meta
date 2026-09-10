@@ -50,7 +50,7 @@
 //!   say what a prefix is and carry its schema, and **grants**
 //!   (`/etc/pve/meta.d/permissions`, cluster-only), which say who may touch one
 //!   (`docs/DESIGN.md` §3). They nest by opposite rules: prefixes shadow
-//!   most-specific-first ([`registry::governing`]), grants accumulate by
+//!   most-specific-first ([`shape::Shape::governing`]), grants accumulate by
 //!   containment ([`registry::scopes_for`]).
 //! - [`scopes`] — [`scopes::Effective`], a principal's effective access to one
 //!   document: the PVE ACL answers plus the grant scopes whose selector

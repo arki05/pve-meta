@@ -133,9 +133,11 @@ fn parse_yaml(text: &str) -> Result<Value, Error> {
     })
 }
 
-/// Where a saphyr span starts, 1-based. A saphyr `Marker` is 0-based.
-fn span_start(span: &saphyr_parser::Span) -> Location {
-    Location { line: span.start.line() + 1, column: span.start.col() + 1 }
+/// A saphyr `Marker` as a [`Location`]. saphyr (like yaml-rust before it)
+/// counts lines from 1 and columns from 0 -- its own messages print the
+/// line as is -- so only the column moves.
+fn at_marker(m: &saphyr_parser::Marker) -> Location {
+    Location { line: m.line(), column: m.col() + 1 }
 }
 
 /// Context used while walking saphyr's event stream to reject anchors,
@@ -174,11 +176,8 @@ fn scan_yaml_safety(text: &str) -> Result<(), Error> {
     }
 
     for ev in parser {
-        let (event, span) = ev.map_err(|e| {
-            let m = e.marker();
-            yaml_err(e.to_string(), Location { line: m.line() + 1, column: m.col() + 1 })
-        })?;
-        let at = span_start(&span);
+        let (event, span) = ev.map_err(|e| yaml_err(e.to_string(), at_marker(e.marker())))?;
+        let at = at_marker(&span.start);
         match &event {
             Event::Alias(_) => {
                 return Err(yaml_err("YAML aliases are not allowed", at));

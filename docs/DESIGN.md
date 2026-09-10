@@ -539,12 +539,17 @@ you deleted shows struck through. Switching is therefore never a decision about 
 work — it used to ask you to discard it, and the Text card used to be refused outright
 while anything was staged.
 
-`Utils.diffDocuments` is what makes that true, and it checks itself: key order is data
-(§2), so a pure reordering produces no per-key entries, and rather than lose it the diff
-replays its own result and falls back to replacing the document whole when the replay
-does not match what was typed. The one thing that can refuse the switch is a buffer that
-does not parse — there is no document to draw as a tree, and guessing at one would lose
-what was typed, so it says so and stays put.
+The core's `EditSet` is what makes that true (`edit.rs`; the editor reaches it as
+`PVE.meta.Edits`). An edit set is the one model behind both views: a `set` is
+`view::replace` and a `delete` is `view::remove` — the same two operations a `PUT ?view=`
+and a `DELETE ?view=` perform on the server — so what the tree predicts and what the
+store does are one function. `EditSet::between` recovers the edits from a typed
+document and checks itself: key order is data (§2), so a pure reordering produces no
+per-key entries, and rather than lose it the diff replays its own result and falls back
+to replacing the document whole when the replay does not match what was typed. The one
+thing that can refuse the switch is a buffer that does not parse — there is no document
+to draw as a tree, and guessing at one would lose what was typed, so it says so and
+stays put.
 
 Applying **from text** still sends the buffer rather than a dump of the model, and that
 is deliberate: a `#` comment is not part of the document model, so it survives only for
@@ -554,12 +559,12 @@ contains them.
 
 **One buffer grammar, two editors.** "How do I read this buffer, and how do I render
 it back" is one rule, and it lived twice: the Text card preferred the server's own YAML
-whenever a round trip through JSON left the document unchanged — js-yaml and `serde_yaml`
-lay the same document out differently, so re-dumping made a *presentation* toggle report
-unsaved changes — and the subtree window, five hundred lines away, dumped unconditionally.
-Toggling to JSON and back there produced a whitespace-only diff with Apply enabled: the
-exact bug the sibling's comment describes preventing. Both now call
-`Utils.parseBuffer`/`renderBuffer`, and a test pins the round trip.
+whenever a round trip through JSON left the document unchanged — the browser's emitter
+and the store's laid the same document out differently, so re-dumping made a
+*presentation* toggle report unsaved changes — and the subtree window, five hundred lines
+away, dumped unconditionally. Toggling to JSON and back there produced a whitespace-only
+diff with Apply enabled: the exact bug the sibling's comment describes preventing. Both
+now call `PVE.meta.Codec.parse`/`render`, and a test pins the round trip.
 
 **One footer, three editors.** There are three places you edit a document — the tree,
 the text card behind the Tree | Text toggle, and the text window over one subtree — and
@@ -596,8 +601,8 @@ legitimately holds must not be able to lock the administrator out of editing it.
 **Format** re-dumps the buffer canonically in whichever language is showing (two-space
 indent, no folding, key order preserved), and refuses a buffer that does not parse rather
 than mangling it. The **YAML | JSON** toggle is presentation only and says so: coming back
-to YAML restores the server's own text whenever the document is unchanged, because
-js-yaml and `serde_yaml` lay the same document out differently and re-dumping made a view
+to YAML restores the server's own text whenever the document is unchanged, because a
+hand-edited file keeps a layout no emitter would choose, and re-dumping it made a view
 toggle report unsaved changes. The diff dialog sets `ignoreTrimWhitespace: false` —
 Monaco defaults it to `true`, which hid exactly the indentation-only changes that shape
 produces, leaving a confirm dialog that showed nothing while Apply was enabled. A muted "Scoped write access"
@@ -705,22 +710,35 @@ lose nothing by that: they bind server-side, on the API a scope-only principal a
 uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
 exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.
 
-**The editor's YAML is the store's YAML.** Two emitters write documents a user reads
-— `serde_yaml_ng` on the server, js-yaml in the browser — and every line they disagree
-about is a line the editor shows differently from the file, and that its diff then
-attributes to whatever was actually being edited. js-yaml's YAML 1.1 compatibility
-quoted `25565:25565` and `1:30:00` (sexagesimals) and `yes` (a boolean) that the store
-writes bare, and it indented block sequences the store writes flush. Both were settings;
-`testdata/yaml-cases.json` is what keeps them together, holding one document of the
-values that historically break hand-written YAML and the exact bytes the store writes
-for it, checked by both suites. Turning off the 1.1 compatibility is safe only because
-both ends read YAML 1.2 semantics and neither resolves those forms to anything but a
-string — the store already wrote them bare.
+**The editor's YAML is the store's YAML — by construction.** It was once by agreement:
+two emitters wrote documents a user reads — `serde_yaml_ng` on the server, js-yaml in
+the browser — and every line they disagreed about was a line the editor showed
+differently from the file, and that its diff then attributed to whatever was actually
+being edited (js-yaml's YAML 1.1 compatibility quoted `25565:25565` and `yes` that the
+store writes bare, and indented block sequences the store writes flush). Two settings
+and a shared fixture held them together. There is one emitter now: the editor's codec
+*is* `pve-meta-core::format`, compiled for the browser (`crates/pve-meta-wasm`, §9), and
+`testdata/yaml-cases.json` has one job left — to notice when a `serde_yaml_ng` upgrade
+moves the bytes.
 
-`renderBuffer` still prefers the text the editor was handed when the document is
-unchanged, for the case the alignment does not cover: the store rewrites a file only
+`Codec.render` still prefers the text the editor was handed when the document is
+unchanged, for the case a shared emitter does not cover: the store rewrites a file only
 when asked to write one, so a hand-edited file keeps its own valid-but-not-canonical
 layout until someone applies something.
+
+**The browser reimplements nothing.** That is the rule the Perl layer has always
+followed — `PVE::API2::Ext::Meta` calls the Rust through perlmod and restates none of it
+— and the editor now follows it the same way. Every rule the editor once held a
+JavaScript copy of is a type in the core, asked through the wasm: the codec
+(`format`), the key charset (`path`), who may touch a path (`scopes::Effective`),
+which prefixes reach a document and what governs a path in it (`shape::Shape`), and
+what staged edits do (`edit::EditSet`). The two opposite nesting rules are two types
+on purpose: a `Shape` answers "what describes this path" with the most specific prefix
+and plain containment; an `Effective` answers "who may touch it" with the union of
+every covering rule and the one comment-key alias. What stays JavaScript is what is
+genuinely presentation: the rows, the markers' line placement, the hover text, and the
+`format:` check, which the core hands back to be run through proxmoxlib's own vtype for
+that name rather than carrying a third implementation of what `ipv4` means.
 
 **The editor reads the document as YAML, never as JSON**, and that is a correctness
 requirement. perlmod renders a document as a native Perl hash on the way out, and a Perl
@@ -735,23 +753,30 @@ JSON consumer, not just the editor: `format=json` is a convenient view of a docu
 
 `ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
 mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
-theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe,
-no wasm and no build step beyond vendoring Monaco. YAML is a vendored js-yaml, used for
-presentation only (the YAML/JSON toggle and the diff's original side) — the server stays
-the authority, and an Apply sends the buffer back as `text`.
+theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe
+and no build step of the editor's own. The core arrives as `pve-meta-core.wasm`, a plain
+`cargo build` of `crates/pve-meta-wasm` for `wasm32-unknown-unknown` behind a
+four-export JSON-string ABI — no wasm-bindgen, no generated glue, no tool the Debian
+build would have to pin — loaded lazily like Monaco (`docs/WASM-SPIKE.md`). The server
+stays the authority: an Apply sends the buffer back as `text` or the planned subtree as
+`data`, and the server runs the same code again on the real write.
 
 A second implementation in pwt/Yew was built to the same specification and compared on
 the lab; it was removed once the choice was made (git tag `pwt-ui-removed`). It cost
-~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript, measured at the time of the comparison,
-and its only structural advantage — that it never parses YAML itself — was answered by
-vendoring a real parser with a property test. What it was genuinely better at, native
-unit tests, is the thing `ui-extjs/testing/` has to keep earning.
+~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript, measured at the
+time of the comparison. Its one structural advantage — that it never parsed YAML itself,
+or restated any other rule — was first answered by vendoring a parser with a property
+test, and is now simply taken: the rules run in the browser as the crate they are,
+without the UI framework that came with pwt. What pwt was genuinely better at, native
+unit tests, the crate keeps: the rules are tested in Rust, and `ui-extjs/testing/` tests
+the editor.
 
 ## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, prefixes+permissions+selectors, lint, api layer, store, gc
+crates/pve-meta-core     document model, views, prefixes+permissions+selectors, shape, edit set, lint, api layer, store, gc
 crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
+crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
 perl/PVE/API2/Ext/Meta.pm
 prefixes/              packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)

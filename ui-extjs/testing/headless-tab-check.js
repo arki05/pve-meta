@@ -455,7 +455,7 @@ async function main() {
                     open: !!w,
                     title: w ? w.title : null,
                     monacoLoaded: !!(window.monaco && window.monaco.editor),
-                    jsyamlLoaded: !!(window.jsyaml && window.jsyaml.load),
+                    coreLoaded: !!(PVE.meta.Core && PVE.meta.Core.loaded()),
                     text: w && w.editor ? w.editor.getValue() : null,
                 };
             });

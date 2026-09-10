@@ -1,9 +1,16 @@
 # ui-extjs — the native ExtJS editor
 
-One file, `pve-meta-tree.js`, plain ES2017, no build step, plus `vendor/` (js-yaml) and
-`monaco/` (fetched by `make ui`, gitignored). It defines a panel (`xtype: pveMetaTreePanel`)
-that pve-ext's page loader instantiates as a native tab inside the PVE guest and
-datacenter config panels.
+One file, `pve-meta-tree.js`, plain ES2017 with no build step of its own, plus the core
+(`pve-meta-core.wasm`, built by `make wasm` from `crates/pve-meta-wasm`) and `monaco/`
+(fetched by `make ui`, gitignored). It defines a panel (`xtype: pveMetaTreePanel`) that
+pve-ext's page loader instantiates as a native tab inside the PVE guest and datacenter
+config panels.
+
+The editor implements no rules. The YAML codec, the key-name charset, who may touch a
+path, which prefix governs one, what a schema makes of a value and what staged edits do
+to a document are all `pve-meta-core` -- the server's own crate -- compiled for the
+browser and asked through five named faces (`PVE.meta.Codec`, `Access`, `Shape`,
+`Edits`, and the key-name checks on `Utils`). See `docs/WASM-SPIKE.md` for how and why.
 
 This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
 same specification and compared on the lab; it was removed once the choice was made (git
@@ -90,27 +97,29 @@ segmented button at the right end of the toolbar.
   top-level `make ui` (npm), never fetched from a CDN — and every editor and model is
   disposed when its owner goes away.
 
-## YAML
+## The core
 
-`vendor/js-yaml.min.js` is js-yaml **4.1.0**'s `dist/js-yaml.min.js`, downloaded verbatim
-from the upstream release tag, with its `LICENSE` beside it (MIT; recorded in
-`debian/copyright`). It installs next to the panel as
-`/usr/share/pve-manager/js/pve-meta-extjs/vendor/` and is loaded lazily, the same way
-Monaco is.
+`pve-meta-core.wasm` is `crates/pve-meta-wasm`: `pve-meta-core` behind a four-export
+JSON-string ABI (`pm_alloc`/`pm_free` for the request, `pm_call` to run it, `pm_output`
+for the response), built with a plain `cargo build --target wasm32-unknown-unknown
+--profile wasm` and nothing else -- no wasm-bindgen, no generated glue. It installs next
+to the panel as `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm` and is
+loaded lazily by `PVE.meta.Core.load()` (`WebAssembly.instantiateStreaming`), the same
+way Monaco is; `PVE.meta.Monaco.load()` waits for it, since every Monaco caller also
+needs the codec.
 
-`jsyaml.load` runs on js-yaml's default schema, which is the safe one; `jsyaml.dump` is
-pinned to `{ indent: 2, lineWidth: -1, noRefs: true, sortKeys: false }` — never fold a
-long line (a folded line is a changed line in the diff), never emit an anchor, never
-reorder an ordered map.
+`PVE.meta.Core.call(name, ...args)` is the whole glue: encode `{fn, args}` as UTF-8 into
+a buffer the module hands out, call, decode the response, and turn an `err` into a
+`PVE.meta.CoreError` carrying the parser's `line`/`column` when it has one. Nothing
+holds state inside the module between calls; a Shape is rebuilt from the prefix
+listing and the guest's tags on every question, which costs microseconds and no
+lifetime to manage.
 
-It is used for **presentation only**: the YAML/JSON view toggle and the "original" side
-of a diff. The server stays the authority on YAML — an Apply in YAML view sends the
-buffer to the API untouched as `text`, and only an Apply made in JSON view sends `data`.
-
-One loading subtlety: js-yaml ships a UMD bundle that prefers an AMD `define` if one is
-present, and Monaco's loader installs exactly such a `define`. The loader here hides
-`window.define` for the duration of that one script load and puts it back afterwards, and
-`PVE.meta.Monaco.load()` waits for `PVE.meta.Yaml.load()` first so the two never overlap.
+The YAML the editor shows is therefore the YAML the store writes, by construction: one
+emitter, not two kept in step by settings. The server stays the authority all the same --
+an Apply in YAML view sends the buffer to the API untouched as `text`, an Apply from the
+tree sends the planned subtree as `data`, and the server runs the same code again on the
+real write.
 
 ## How it is wired
 
@@ -133,9 +142,9 @@ uses the second form:
 }
 ```
 
-The file installs to `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-tree.js` and
-`vendor/` next to it, which pveproxy serves at the `script` path above (top-level
-`Makefile`, `install` target).
+The file installs to `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-tree.js` with
+`pve-meta-core.wasm` next to it, which pveproxy serves at the `script` path above
+(top-level `Makefile`, `install` target).
 
 **The contract this panel expects from the loader.** The loader loads the script once
 per URL, waits until the `xtype` resolves to a defined class, then instantiates
@@ -156,15 +165,17 @@ repository copy's header still says otherwise.
 * eslint 9 (`no-unused-vars` with `caughtErrorsIgnorePattern: '^_'`, `no-undef`,
   `eqeqeq`, `no-var`, …) with `Ext`, `PVE`, `Proxmox` and `gettext` as globals — clean,
   for the panel and for `testing/*.js`.
-* `node testing/smoke.js` — offline, no DOM. It loads the real file into `node:vm` behind
-  a small `Ext`/`Proxmox` shim (with the *vendored* js-yaml `require`d in as
-  `window.jsyaml`, so the shipped build is what gets tested) and drives the pure parts:
-  the path and scope helpers, the row-editor field choice, the document+grammar row
-  merge, Access resolution and per-row editability, and the YAML codec — including a
-  **round-trip property test**: a fixed corpus of hostile documents plus 500 generated
+* `node testing/smoke.js` — offline, no DOM, after `make wasm`. It loads the real file
+  into `node:vm` behind a small `Ext`/`Proxmox` shim, instantiates the *built*
+  `pve-meta-core.wasm` synchronously and hands it to `PVE.meta.Core.attach`, so the
+  shipped bytes and the shipped glue are what gets tested. It starts with the raw ABI
+  (a megabyte through the buffer, a memory growth, non-ASCII, error locations) and then
+  drives the editor's own logic: the row-editor field choice, the document+shape row
+  merge, Access resolution and per-row editability, staging, and the codec — including
+  a **round-trip property test**: a fixed corpus of hostile documents plus 500 generated
   ones (keys and values with colons, quotes, hashes, unicode, numeric-looking strings,
-  booleans, nested maps and arrays), asserting `load(dump(x))` deep-equals `x` with key
-  order intact.
+  booleans, nested maps and arrays), asserting `parse(dump(x))` deep-equals `x` with key
+  order intact. The rules themselves are tested where they live, in Rust.
 * `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
   Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]

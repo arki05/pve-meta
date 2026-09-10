@@ -151,36 +151,42 @@ mod tests {
     use crate::patch::Op;
     use pretty_assertions::assert_eq;
 
-    /// The prefix-coverage rule against the fixture the JavaScript editor's suite
-    /// reads too (`testdata/covers-cases.json`).
+    /// The prefix-coverage rule, one case per line (`docs/DESIGN.md` §3.3).
     ///
-    /// `covers` is mirrored in `ui-extjs`'s `PVE.meta.Utils.covers` on purpose: the
-    /// server enforces the rule, the editor predicts it, and an editor that predicts
-    /// it differently shows rows a write then rejects. Testing each side against its
-    /// own hand-written cases is how those two drift, so both read one table. Add a
-    /// case to the file, never to one suite.
+    /// This table used to be `testdata/covers-cases.json`, read by this crate and
+    /// by the editor's JavaScript suite, because the editor held its own copy of
+    /// `covers` to predict what the server would enforce -- and an editor that
+    /// predicts differently shows rows a write then rejects. The editor asks
+    /// this function now (through `crates/pve-meta-wasm`), so the table lives
+    /// with the one implementation.
     #[test]
-    fn covers_matches_the_shared_cases() {
-        let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/covers-cases.json"
-        ))
-        .expect("the shared fixture is part of the repository");
-        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let cases = doc["cases"].as_array().expect("cases array");
-        assert!(cases.len() >= 15, "the fixture should not have been emptied");
-
-        for case in cases {
-            let prefix = Path::parse(case["prefix"].as_str().unwrap()).unwrap();
-            let path = Path::parse(case["path"].as_str().unwrap()).unwrap();
-            let want = case["covered"].as_bool().unwrap();
+    fn covers_is_containment_plus_the_one_comment_key_alias() {
+        let cases: &[(&str, &str, bool, &str)] = &[
+            ("traefik", "traefik", true, "the prefix itself"),
+            ("traefik", "traefik.spec", true, "a child"),
+            ("traefik", "traefik.spec.host", true, "a grandchild"),
+            ("traefik", "traefik__", true, "the sibling comment key travels with its subject"),
+            ("traefik", "traefikx", false, "a longer name is not a child -- the separator is what makes one"),
+            ("traefik", "traefikx.spec", false, "... and still is not, deeper"),
+            ("traefik", "netbird", false, "unrelated"),
+            ("traefik", "", false, "the root is above the prefix, not under it"),
+            ("a.b", "a.b", true, "a nested prefix, exactly"),
+            ("a.b", "a.b.c", true, "under a nested prefix"),
+            ("a.b", "a.b__", true, "the comment key of a nested prefix"),
+            ("a.b", "a.c", false, "a sibling of the nested prefix"),
+            ("a.b", "a", false, "the parent is not covered by the child"),
+            ("a.b", "a__", false, "nor is the parent's comment key"),
+            ("a", "a.b__", true, "a comment key deeper inside the subtree"),
+            ("a", "__", false, "the bare `__` documents the map it sits in, so it is readable only where that map is -- it has no subject key to travel with"),
+            ("a", "a.__", true, "but the bare `__` *inside* the subtree is part of it"),
+            ("homelab.docker", "homelab.docker.compose", true, "the nesting case revision 6 is about"),
+            ("homelab.docker", "homelab.notes", false, "a sibling subtree of the nested prefix"),
+        ];
+        for (prefix, path, want, why) in cases {
             assert_eq!(
-                covers(&prefix, &path),
-                want,
-                "covers({:?}, {:?}) should be {want}: {}",
-                case["prefix"].as_str().unwrap(),
-                case["path"].as_str().unwrap(),
-                case["why"].as_str().unwrap(),
+                covers(&p(prefix), &p(path)),
+                *want,
+                "covers({prefix:?}, {path:?}) should be {want}: {why}"
             );
         }
     }

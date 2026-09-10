@@ -178,9 +178,13 @@ maintenance: no operator, no token, no daemon.
 
 The tab is `ui-extjs/`: plain JavaScript, a native `Ext.tree.Panel` mounted through
 pve-ext's `script`+`xtype` manifest form, so session, CSRF, theme and i18n all come from
-the PVE UI. No iframe, no wasm, no build step beyond vendoring Monaco. A second
-implementation in pwt/Yew was built to the same spec and compared on the lab before being
-removed — `docs/DESIGN.md` §8 and §11, git tag `pwt-ui-removed`.
+the PVE UI. No iframe. The rules it needs -- the YAML codec, key names, access, which
+prefix governs a path, what a schema says, what staged edits do -- are the server's own
+crate compiled for the browser (`crates/pve-meta-wasm`, a plain `cargo build` for
+wasm32, no wasm-bindgen), so the editor reimplements none of them; see
+`docs/WASM-SPIKE.md`. A second implementation in pwt/Yew was built to the same spec and
+compared on the lab before being removed — `docs/DESIGN.md` §8 and §11, git tag
+`pwt-ui-removed`.
 
 ## Lifecycle
 
@@ -267,10 +271,12 @@ guests its selector matches, to a principal that may hold no VM privilege at all
 ## Building
 
 Build host: Debian 13 (trixie) with a [rustup](https://rustup.rs/) toolchain under
-`~/.cargo/bin` (not the distro `cargo`/`rustc` packages), `libperl-dev` for the perlmod
-crate, and `npm` to vendor Monaco (only `pve-meta-core` builds on macOS — develop the
-rest on Linux and `rsync` over). `make build` builds `crates/pve-meta-perl`, `make ui`
-fetches Monaco into `ui-extjs/monaco/vs`, and `make deb` builds
+`~/.cargo/bin` (not the distro `cargo`/`rustc` packages) with the `wasm32-unknown-unknown`
+target added, `libperl-dev` for the perlmod crate, and `npm` to vendor Monaco (only
+`pve-meta-core` and `pve-meta-wasm` build on macOS — develop the rest on Linux and
+`rsync` over). `make build` builds `crates/pve-meta-perl` and the editor's `.wasm`
+(`make wasm` on its own), `make ui` fetches Monaco into `ui-extjs/monaco/vs`, and
+`make deb` builds
 `pve-ext` (its own source package) plus `pve-meta` and `libpve-meta-rs-perl`, dropping
 all three `.deb`s next to each other in the parent directory. See `docs/BUILD.md` for
 the exact rsync/ssh incantation and the safe way to replace the installed `.so` on a
@@ -282,6 +288,7 @@ live node.
 |---|---|
 | `crates/pve-meta-core` | Document model, views, prefixes/permissions/selectors, lint, api layer, store, gc — pure Rust |
 | `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
+| `crates/pve-meta-wasm` | The same core for the browser: a JSON-string ABI over `wasm32-unknown-unknown`, loaded by the editor |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `prefixes/` | Packaged example prefixes (none required) |
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
@@ -298,9 +305,9 @@ live node.
 ## License
 
 AGPL-3.0-or-later for this project's own code (every crate inherits
-`license.workspace = true` from the root `Cargo.toml`); a handful of vendored editor
-assets (Monaco, js-yaml) carry their own upstream MIT/
-Apache-2.0/OFL-1.1 licenses — see `debian/copyright` for the full, per-file breakdown.
+`license.workspace = true` from the root `Cargo.toml`); the vendored editor assets
+(Monaco) carry their own upstream MIT/Apache-2.0/OFL-1.1 licenses — see
+`debian/copyright` for the full, per-file breakdown.
 
 ---
 

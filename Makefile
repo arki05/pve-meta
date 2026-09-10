@@ -27,20 +27,25 @@ PREFIX ?= /usr
 
 UI_DIR := ui-extjs
 MONACO := $(UI_DIR)/monaco/vs
+# The browser build of pve-meta-core (crates/pve-meta-wasm): the same crate the
+# perlmod bindings link, compiled for wasm32 and shipped next to the editor. Needs
+# the target installed on the build host -- `rustup target add
+# wasm32-unknown-unknown`, or Debian's `libstd-rust-dev-wasm32` with a distro rustc.
+# No other tool: no wasm-bindgen, no wasm-pack, no npm (see docs/WASM-SPIKE.md).
+WASM_TARGET := wasm32-unknown-unknown
+WASM := target/$(WASM_TARGET)/wasm/pve_meta_wasm.wasm
 
-.PHONY: build ui deb install clean check test doc
+.PHONY: build ui wasm deb install clean check test doc
 
-build:
+build: wasm
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
+
+wasm:
+	$(CARGO) build -p pve-meta-wasm --target $(WASM_TARGET) --profile wasm
 
 # Fetches Monaco into ui-extjs/monaco/vs. The editor is a plain JS panel with no build
 # step of its own (see ui-extjs/README.md); the only thing to fetch is Monaco's minified
 # AMD tree, which ships *in the package* and is never loaded from a CDN.
-#
-# Deliberately NOT under ui-extjs/vendor/: that directory is committed third-party
-# source (js-yaml and its LICENSE) and `install` copies it wholesale, so a build-time
-# tree living there would be shipped twice -- once inside vendor/ and once at vs/.
-# It was, until the first real package build showed it.
 #
 # Tolerant of `npm` being absent: a package built without it simply has no Text card and
 # no diff dialog, which is a degraded editor rather than a failed build. `make deb` in CI
@@ -140,13 +145,11 @@ install:
 	if ls ui-extjs/*.js >/dev/null 2>&1; then \
 		cp ui-extjs/*.js $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/; \
 	fi
-	# ui-extjs/vendor/: js-yaml's dist bundle plus its LICENSE, loaded lazily
-	# by pve-meta-tree.js from .../js/pve-meta-extjs/vendor/ (see
-	# debian/copyright's js-yaml stanza and ui-extjs/README.md).
-	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor
-	if [ -d ui-extjs/vendor ]; then \
-		cp -a ui-extjs/vendor/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vendor/; \
-	fi
+	# The core, built for the browser by the `wasm` target and loaded lazily by
+	# pve-meta-tree.js from .../js/pve-meta-extjs/pve-meta-core.wasm
+	# (`PVE.meta.Core.SRC`). Not optional: without it the editor cannot read a
+	# document, so a missing build is a failed install rather than a degraded one.
+	install -D -m 0644 $(WASM) $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm
 	# Monaco's minified AMD tree, vendored by the `ui` target above and served
 	# from .../js/pve-meta-extjs/vs (pve-meta-tree.js's `VS` constant). Absent
 	# when the build host had no npm; the panel degrades rather than breaking.
@@ -193,10 +196,11 @@ deb:
 doc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps -p pve-meta-core
 
-check: doc
+check: doc wasm
 	$(CARGO) clippy --workspace -- -D warnings
-	# The editor is plain JS with no build step; its offline suite covers the
-	# YAML round trip, the row/value helpers and the grammar findings.
+	# The editor's offline suite loads the `.wasm` the package ships and drives
+	# the editor's helpers through it: the codec round trip, the row builder,
+	# the staging model and the schema findings, all answered by the core.
 	@if command -v node >/dev/null 2>&1; then \
 		node ui-extjs/testing/smoke.js; \
 	else \
@@ -204,7 +208,7 @@ check: doc
 	fi
 
 test:
-	$(CARGO) test -p pve-meta-core
+	$(CARGO) test -p pve-meta-core -p pve-meta-wasm
 
 clean:
 	$(CARGO) clean

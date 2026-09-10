@@ -128,17 +128,16 @@ fn lint_errors_surface_through_parse() {
     assert!(matches!(err, Error::Lint(_)));
 }
 
-/// The canonical YAML this crate writes, against the table the editor's suite
-/// reads too (`testdata/yaml-cases.json`).
+/// The canonical YAML this crate writes, pinned byte for byte against
+/// `testdata/yaml-cases.json`.
 ///
-/// `serde_yaml_ng` here, js-yaml over there, and both write documents a user
-/// reads. Every line the two disagree about is a line the editor shows
-/// differently from the file, and that its diff then attributes to whatever
-/// was actually being edited: js-yaml's YAML 1.1 compatibility quoted
-/// `25565:25565` and `1:30:00` that this side writes bare, and indented block
-/// sequences this side writes flush. Both were settings on the other end;
-/// neither was guessable, and nothing would have said so if they drifted apart
-/// again.
+/// The editor used to write documents with a second emitter (js-yaml), and this
+/// table was what held the two together. The editor now writes them with this
+/// crate, built for the browser (`crates/pve-meta-wasm`), so the table has one
+/// job left: to notice when a `serde_yaml_ng` upgrade changes the bytes -- every
+/// line that moves is a line the editor's diff would then attribute to whatever
+/// was being edited. The editor's suite runs the same document through the
+/// wasm as its end-to-end "the core loads and answers" check.
 ///
 /// The values are the ones that historically break hand-written YAML --
 /// structural punctuation, quote characters, comment markers, strings that
@@ -147,7 +146,7 @@ fn lint_errors_surface_through_parse() {
 /// document key is limited to the path charset (`docs/DESIGN.md` §2), so only
 /// values can be hostile.
 #[test]
-fn canonical_yaml_matches_the_shared_cases() {
+fn canonical_yaml_is_pinned() {
     let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../testdata/yaml-cases.json"

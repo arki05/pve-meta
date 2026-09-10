@@ -698,21 +698,25 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 /// Permissions apply to **guest documents only**; the datacenter document is
 /// governed by ACLs alone, so this is never called for it.
 pub fn scopes_for(files: &[Permission], authid: &str, tags: &[String]) -> Vec<Scope> {
-    let mut out = Vec::new();
-    for g in files {
-        if g.authid != authid {
-            continue;
-        }
-        for e in &g.rules {
-            if e.selector.matches(tags) {
-                out.push(Scope {
-                    prefix: e.prefix.clone(),
-                    mode: e.mode,
-                });
-            }
-        }
-    }
-    out
+    rules_reaching(files, tags)
+        .filter(|(file, _)| file.authid == authid)
+        .map(|(_, rule)| Scope { prefix: rule.prefix.clone(), mode: rule.mode })
+        .collect()
+}
+
+/// Every rule, from every permission file, whose selector matches a guest
+/// carrying `tags` -- with the file it came from. [`scopes_for`] is this
+/// narrowed to one principal; the editor's Access column is this for all of
+/// them ("who may touch this row"), and the two must not decide reach
+/// differently.
+pub fn rules_reaching<'a>(
+    files: &'a [Permission],
+    tags: &'a [String],
+) -> impl Iterator<Item = (&'a Permission, &'a Rule)> + 'a {
+    files
+        .iter()
+        .flat_map(|file| file.rules.iter().map(move |rule| (file, rule)))
+        .filter(move |(_, rule)| rule.selector.matches(tags))
 }
 
 #[cfg(test)]
