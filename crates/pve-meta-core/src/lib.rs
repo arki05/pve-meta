@@ -68,24 +68,80 @@
 // `make doc` still fails on a link that resolves to nothing at all.
 #![allow(rustdoc::private_intra_doc_links)]
 
-/// Warns to stderr, with a `pve-meta:` tag so the line is greppable in the
-/// journal.
+/// Warns about something the caller cannot see: a file being skipped, a
+/// document that would not parse. Tagged `pve-meta:` so the line is greppable
+/// wherever it lands.
 ///
-/// `libpve_meta_rs.so` is loaded into pvedaemon and pveproxy, and **nothing
-/// anywhere initialises a `tracing` subscriber** -- so every `tracing::warn!`
-/// this crate used to emit was discarded, and `docs/DESIGN.md` §3.3's "a
-/// malformed file is skipped with a warning" was simply not true in
-/// production. stderr is the one sink already wired up in every caller: the
-/// daemons capture their workers' stderr into the journal, the `pve-meta` CLI
-/// writes it to the terminal, and the test binaries show it on failure.
+/// **Where a warning has to go, and why it is two places.** Nothing anywhere
+/// initialises a `tracing` subscriber, so every `tracing::warn!` this crate
+/// used to emit was discarded outright, and `docs/DESIGN.md` §3.3's "a
+/// malformed file is skipped with a warning" was not true. stderr looked like
+/// the obvious replacement and is not: `PVE::Daemon` opens STDOUT to
+/// `/dev/null` and dups STDERR onto it before a worker ever runs
+/// (`/usr/share/perl5/PVE/Daemon.pm`), so a `.so` inside pvedaemon or pveproxy
+/// writes its warnings into the void just as thoroughly. Verified on the lab:
+/// a malformed prefix file produced nothing in the journal at all.
 ///
-/// The structure a subscriber would have added is not worth a dependency
-/// inside a `.so` that lives in pvedaemon, for four call sites nobody
-/// machine-reads.
+/// So both, because the two sinks are each right in a different caller and
+/// neither is right in both:
+///
+/// * **syslog** is the daemons' only route out, and it is the one PVE's own
+///   Perl uses for exactly this kind of line.
+/// * **stderr** is what the `pve-meta` CLI and the test binaries show, where
+///   syslog would be an odd place to look for the answer to a command you just
+///   typed.
+///
+/// Deliberately no `openlog`: the ident is process-global, and setting it
+/// from inside a library would relabel the host process's own log lines with
+/// ours. The line therefore inherits whatever ident that process last set --
+/// on PVE that turns out to be `IPCC.xs`, not `pveproxy`, which is exactly why
+/// the message carries its own tag. Grep the journal for `pve-meta:`, not for
+/// a unit or an ident.
+///
+/// This is a report, not a channel. A caller that must *act* on the failure
+/// needs it in a return value, not in a log line -- see `docs/DESIGN.md` §3.3
+/// on surfacing an unreadable registry file in the UI.
+pub fn warn(msg: &str) {
+    eprintln!("pve-meta: {msg}");
+    syslog_warning(msg);
+}
+
+#[cfg(unix)]
+fn syslog_warning(msg: &str) {
+    // An interior NUL would truncate the line at the C boundary; a warning is
+    // often *about* a hostile or corrupt file name, so it is not a case that
+    // can be assumed away.
+    let line: String = format!("pve-meta: {msg}")
+        .chars()
+        .map(|c| if c == '\0' { ' ' } else { c })
+        .collect();
+    let Ok(c) = std::ffi::CString::new(line) else {
+        return;
+    };
+    // `"%s"`, never the message as the format string: a file name containing a
+    // `%` would otherwise be read as a conversion and print whatever happened
+    // to be next on the stack.
+    //
+    // SAFETY: `syslog` is async-signal-safe and thread-safe, both pointers are
+    // valid NUL-terminated C strings that outlive the call, and the variadic
+    // argument matches the `%s` in the format.
+    unsafe {
+        libc::syslog(
+            libc::LOG_WARNING | libc::LOG_DAEMON,
+            c"%s".as_ptr(),
+            c.as_ptr(),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn syslog_warning(_msg: &str) {}
+
+/// Warns through [`warn`], formatting like `println!`.
 #[macro_export]
 macro_rules! warn_line {
     ($($arg:tt)*) => {
-        eprintln!("pve-meta: {}", format_args!($($arg)*))
+        $crate::warn(&format!($($arg)*))
     };
 }
 

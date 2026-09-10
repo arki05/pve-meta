@@ -237,6 +237,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hex",
+ "libc",
  "pretty_assertions",
  "regex",
  "saphyr-parser",

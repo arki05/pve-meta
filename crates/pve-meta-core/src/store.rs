@@ -44,8 +44,8 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
 
-/// Warn threshold for document size (informational only; warned to stderr via
-/// [`crate::warn_line`]).
+/// Warn threshold for document size (informational only; reported through
+/// [`crate::warn`]).
 pub const WARN_BYTES: u64 = 256 * 1024;
 /// Hard limit for document size; exceeding it is [`Error::TooLarge`].
 ///
