@@ -336,6 +336,11 @@ cell. A member with structure of its own shows one readable line (a permission r
 as `traefik (rw, tag: traefik)`; anything else falls back to JSON) and carries its real
 value along for whatever edits it.
 
+A staged list edit is one write of the whole list, but almost never a change to the
+whole list — so the mark goes on the members that actually differ, and the list itself
+carries only the dot that says something below it changed. A member the edit dropped
+comes back as a ghost, struck through, the same as a deleted key.
+
 Member rows are **not addressable**: a view addresses through maps only, so there is no
 path to `groups[1]` (§2) and nothing may try to write one. They carry their index instead,
 and everything that acts on one — Edit, Remove, Add — rewrites the list it is in. That
@@ -406,13 +411,18 @@ the text editors, which write immediately, are unavailable until the staged set 
 settled, since they would be showing the stored document while the tree shows the
 planned one.
 
-Apply asks the server **twice**: once with `dry_run=1`, whose refusal becomes the diff
-dialog's warning banner, and then for real. That is how a rule the client cannot know
-gets said before the write rather than after: "exactly one of `all`/`tag`" is not
-expressible in the schema dialect (§3.6), so the client never learns it — it asks. The
-banner and the diff are the same warned-apply dialog the text editor uses, with the same
-explicit tick, because a schema mismatch must stay possible: the server's lint decides
-what is storable (§4), not a schema that may have drifted.
+**Apply applies.** It stops to show the diff only when the planned document would not
+match the schema — the one case where seeing it changes what you decide — and the
+"Save anyway" tick keeps storing it anyway a deliberate act, because a mismatch must
+stay possible: the server's lint decides what is *storable* (§4), not a schema that may
+have drifted. Otherwise there is nothing to decide, and **Diff** is a button of its own
+in both text editors for whenever you want to look first.
+
+There is deliberately no `dry_run` pass before a write. It once existed to turn a server
+refusal into that same banner — but a refusal is not advisory: the server refuses the
+real write for the same reason, tick or no tick. Showing it as an error is honest;
+offering it as something you can override is not, and it cost every Apply a second
+request.
 
 A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
 colour, a triangle, and the message in the tooltip ahead of the schema's description.
@@ -432,6 +442,49 @@ still stored — the server's lint decides what is storable (§4).
 * **Access**: every rule whose prefix covers the row, `rw` ones by name, `ro` ones
   muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
   "access" is about who writes and who subscribes, not ownership.
+
+**One document, one edited document, two views of it.** Tree and Text are not two
+editors with two models kept apart by rules; they are two ways of looking at the same
+edited document. The buffer is rendered from the **planned** document, so staged row
+edits are visible in it; switching back parses the buffer and turns whatever was typed
+into staged edits *on rows*, so the tree shows which keys changed and to what, and a key
+you deleted shows struck through. Switching is therefore never a decision about your
+work — it used to ask you to discard it, and the Text card used to be refused outright
+while anything was staged.
+
+`Utils.diffDocuments` is what makes that true, and it checks itself: key order is data
+(§2), so a pure reordering produces no per-key entries, and rather than lose it the diff
+replays its own result and falls back to replacing the document whole when the replay
+does not match what was typed. The one thing that can refuse the switch is a buffer that
+does not parse — there is no document to draw as a tree, and guessing at one would lose
+what was typed, so it says so and stays put.
+
+Applying **from text** still sends the buffer rather than a dump of the model, and that
+is deliberate: a `#` comment is not part of the document model, so it survives only for
+as long as nothing rewrites the file from the model. Sending the buffer keeps what was
+typed. It is one apply that spends the staged edits too, since the buffer already
+contains them.
+
+**One buffer grammar, two editors.** "How do I read this buffer, and how do I render
+it back" is one rule, and it lived twice: the Text card preferred the server's own YAML
+whenever a round trip through JSON left the document unchanged — js-yaml and `serde_yaml`
+lay the same document out differently, so re-dumping made a *presentation* toggle report
+unsaved changes — and the subtree window, five hundred lines away, dumped unconditionally.
+Toggling to JSON and back there produced a whitespace-only diff with Apply enabled: the
+exact bug the sibling's comment describes preventing. Both now call
+`Utils.parseBuffer`/`renderBuffer`, and a test pins the round trip.
+
+**One footer, three editors.** There are three places you edit a document — the tree,
+the text card behind the Tree | Text toggle, and the text window over one subtree — and
+they had grown three different chromes: the subtree window put its view switch on *top*
+and had no Format button at all, the tree put Apply and Revert on top, and a document
+window's Close sat at the bottom while the Apply for the same document sat at the top of
+the panel inside it. So: **which view you are looking at goes bottom-left, what you can
+do about it goes bottom-right**, built from one place (`PVE.meta.Footer`). The top
+toolbar is left for acting on the document's *contents*, which is a different kind of
+thing from committing. In a window the secondary button is Close, and becomes **Discard**
+once there is something to lose — the way out and the way to abandon the edits are the
+same gesture; in a tab there is nothing to close, so it is Revert.
 
 Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
 parent of a selected leaf, or the root), **Set to default**, **Declare Key** (only on a
@@ -511,6 +564,12 @@ itself is not validated in the browser: `schema.properties.<key>` is a document 
 like any other, so the server's one lint decides what a key may be and says so. A
 *dotted* key is refused, because it would silently declare a nested property rather than
 the one the form is asking about.
+
+**Add is hidden where nothing can be added.** A permission file has three keys and the
+parser refuses a fourth (`deny_unknown_fields`), so an arbitrary Add there could only
+ever produce a file the loader would skip — the one thing you add to one is a rule, and
+**Add Rule** is that. A prefix definition's root keys are fixed the same way, so Add is
+disabled at its root and available inside `schema`, where you may declare anything.
 
 **Two forms behind the two registry lists.** A prefix definition's schema gets
 **Declare Key** (§8, above); a permission file's `rules` gets **Add Rule** — the same

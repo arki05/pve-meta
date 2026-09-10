@@ -207,6 +207,14 @@ PVE.meta.Utils = {
         let U = PVE.meta.Utils;
         let out = JSON.parse(JSON.stringify(data || {}));
         (pending || []).forEach(function (p) {
+            // The empty path is the *document*, not a key called "". `setAtPath` walks
+            // segments and `''.split('.')` is `['']`, so without this a whole-document
+            // edit -- what `diffDocuments` falls back to when it cannot express a
+            // change as paths -- would land under a key nobody can address.
+            if (p.path === '') {
+                out = p.op === 'delete' ? {} : JSON.parse(JSON.stringify(p.value));
+                return;
+            }
             if (p.op === 'delete') {
                 U.deleteAtPath(out, p.path);
             } else {
@@ -236,6 +244,56 @@ PVE.meta.Utils = {
                 }
             }
         });
+        return out;
+    },
+
+    // What would have to be staged to turn `stored` into `edited`, as the same
+    // `{ path, op, value }` entries a row edit produces.
+    //
+    // This is what makes text an ordinary way to edit rather than a second editing
+    // model: whatever you type there comes back as edits *on rows*, so the tree shows
+    // which keys changed and to what, a key you deleted shows struck through, and one
+    // Apply writes the lot. Before this, text mode had its own buffer, its own apply
+    // and its own write, and the two models had to be kept apart by rules -- "you may
+    // not open text while edits are staged" and the rest.
+    //
+    // Lists are compared whole, because their members are not addressable (§2). Maps
+    // recurse, so a one-key change stays a one-key edit.
+    diffDocuments: function (stored, edited) {
+        let U = PVE.meta.Utils;
+        let out = [];
+        let isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+        let same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        let walk = function (was, now, path) {
+            Object.keys(now).forEach(function (k) {
+                let at = U.joinPath(path, k);
+                let before = Object.prototype.hasOwnProperty.call(was, k) ? was[k] : undefined;
+                if (before === undefined) {
+                    out.push({ path: at, op: 'set', value: now[k] });
+                } else if (isMap(before) && isMap(now[k])) {
+                    walk(before, now[k], at);
+                } else if (!same(before, now[k])) {
+                    out.push({ path: at, op: 'set', value: now[k] });
+                }
+            });
+            Object.keys(was).forEach(function (k) {
+                if (!Object.prototype.hasOwnProperty.call(now, k)) {
+                    out.push({ path: U.joinPath(path, k), op: 'delete' });
+                }
+            });
+        };
+        if (!isMap(stored) || !isMap(edited)) {
+            return same(stored, edited) ? [] : [{ path: '', op: 'set', value: edited }];
+        }
+        walk(stored, edited, '');
+
+        // A self-check, because a diff that quietly loses something is worse than no
+        // diff at all: key *order* is data in this model (§2) and a pure reordering
+        // produces no per-key entries, so replay the edits and fall back to replacing
+        // the document whole if the result is not what was typed.
+        if (!same(U.applyPending(stored, out), edited)) {
+            return [{ path: '', op: 'set', value: edited }];
+        }
         return out;
     },
 
@@ -398,6 +456,56 @@ PVE.meta.Utils = {
         } catch (_err) {
             return false;
         }
+    },
+
+    // --- the two editor buffers (TextWindow, TreePanel's Text card) --------
+    //
+    // Both editors carry a Monaco buffer with a presentation-only YAML/JSON toggle
+    // and a Format button, and both used to parse and re-dump it inline -- six
+    // copies of "decode JSON or load YAML" and four of "stringify JSON or dump
+    // YAML" between them, one of which (TextWindow's own toggle) was missing the
+    // round-trip fix its sibling got. One set of functions now; see `renderBuffer`.
+
+    // How the buffer's own language reads it back. Used by Format, the JSON/YAML
+    // toggle and the live grammar squiggles -- everything that needs the parsed
+    // value rather than the text.
+    parseBuffer: function (text, lang) {
+        return lang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+    },
+
+    // The inverse: `value` as text in `lang`. Always re-dumps -- what Format wants,
+    // since a re-indent is the point of clicking it.
+    dumpBuffer: function (value, lang) {
+        return lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value);
+    },
+
+    // As `dumpBuffer`, but for a switch *into* YAML prefers `originalYaml` when it is
+    // the same document. js-yaml's dump lays a document out differently from
+    // serde_yaml_ng's (indentation of nested sequences, quoting), so unconditionally
+    // re-dumping on every toggle made a round trip through JSON look like an edit --
+    // a diff of pure whitespace, offered as something to Apply. That was fixed once,
+    // in the Text card's toggle; the subtree window's own toggle inlined the same
+    // ternary without it, so the identical no-op could open its diff with Apply
+    // enabled. Both call this now.
+    renderBuffer: function (value, lang, originalYaml) {
+        if (
+            lang !== 'json' &&
+            originalYaml !== undefined &&
+            PVE.meta.Utils.sameDocument(value, originalYaml)
+        ) {
+            return originalYaml;
+        }
+        return PVE.meta.Utils.dumpBuffer(value, lang);
+    },
+
+    // The document a buffer's own editor last loaded (its `original`/`textOriginal`),
+    // rendered in `lang`. Throws if it cannot be read as YAML -- callers fall back to
+    // 'yaml' rather than lose the comparison. TextWindow's diff used to inline this
+    // exact conversion rather than share TreePanel's `textRendered`.
+    originalInLang: function (originalYaml, lang) {
+        return lang === 'json'
+            ? JSON.stringify(PVE.meta.Utils.yamlLoad(originalYaml), null, 2)
+            : originalYaml;
     },
 
     // The prefix governing `path`: the one whose prefix is the LONGEST that covers
@@ -1023,16 +1131,20 @@ PVE.meta.Monaco = {
                     },
                 },
                 '->',
+                // Without an `apply` this window is just a look at the difference --
+                // the same view, without the decision. Being able to see the diff
+                // without committing to it is the point of offering it outside Apply.
                 {
                     text: gettext('Apply'),
                     itemId: 'diffApplyBtn',
+                    hidden: !cfg.apply,
                     disabled: !!warnings.length,
                     handler: function () {
                         win.close();
                         cfg.apply();
                     },
                 },
-                { text: gettext('Back'), handler: () => win.close() },
+                { text: cfg.apply ? gettext('Back') : gettext('Close'), handler: () => win.close() },
             ],
         });
         win.on('afterrender', function () {
@@ -1062,6 +1174,96 @@ PVE.meta.Monaco = {
         return win;
     },
 };
+
+// ---------------------------------------------------------------------------
+// The editor footer — one bar, three editors.
+//
+// There are three places you edit a document here: the tree, the text card behind
+// the Tree | Text toggle, and the text window over one subtree. They had grown
+// three different chromes — the subtree window put its view switch on *top* and had
+// no Format button at all, the tree put Apply and Revert on top, and a document
+// window's Close sat at the bottom while the Apply for the same document sat at the
+// top of the panel inside it. Nothing about the three is different enough to
+// justify that.
+//
+// So: **which view you are looking at goes bottom-left, what you can do about it
+// goes bottom-right**, and every editor builds both halves from here. The top
+// toolbar is left for acting on the document's *contents* (Add, Edit, Remove,
+// Declare Key, Add Rule), which is a different kind of thing from committing.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.Footer', {
+    singleton: true,
+
+    // cfg: { format: handler?, apply: handler, secondary: handler, secondaryText }
+    actions: function (cfg) {
+        let out = [];
+        if (cfg.format) {
+            out.push({
+                text: gettext('Format'),
+                itemId: 'metaFormat',
+                iconCls: 'fa fa-indent',
+                tooltip: gettext('Re-indent the buffer canonically'),
+                handler: cfg.format,
+            });
+        }
+        if (cfg.diff) {
+            out.push({
+                text: gettext('Diff'),
+                itemId: 'metaDiff',
+                iconCls: 'fa fa-exchange',
+                tooltip: gettext('Show this buffer against the stored document'),
+                handler: cfg.diff,
+            });
+        }
+        out.push('->');
+        out.push({
+            text: gettext('Apply'),
+            itemId: 'metaApply',
+            iconCls: 'fa fa-check',
+            // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
+            // a caller that never called `sync` got a button that looked ordinary and
+            // did nothing at all -- no click, no request, no message -- which is
+            // exactly what happened to the subtree window. A shared builder whose
+            // default only one of its callers undoes is a rule with two meanings,
+            // which is the thing extracting it was meant to stop.
+            disabled: !!cfg.applyDisabled,
+            handler: cfg.apply,
+        });
+        out.push({
+            text: cfg.secondaryText || gettext('Revert'),
+            itemId: 'metaSecondary',
+            iconCls: 'fa fa-undo',
+            handler: cfg.secondary,
+        });
+        return out;
+    },
+
+    // `count` on the button it acts on rather than in a label beside it: a label is
+    // the first thing clipped when an editor opens in a window, and a counter you
+    // cannot read is not one.
+    sync: function (owner, state) {
+        let apply = owner.down('#metaApply');
+        if (apply) {
+            apply.setDisabled(!state.canApply);
+            apply.setText(
+                state.count
+                    ? Ext.String.format(gettext('Apply ({0})'), state.count)
+                    : gettext('Apply'),
+            );
+        }
+        let second = owner.down('#metaSecondary');
+        if (second) {
+            // The icon has to agree with the word: an undo arrow on a button that says
+            // Close is a button that looks like it will throw your work away.
+            second.setIconCls(state.dirty ? 'fa fa-undo' : 'fa fa-times');
+            // A window's Close becomes Discard once there is something to lose, which
+            // is the one moment the difference matters.
+            second.setText(state.dirty ? state.dirtyText : state.cleanText);
+            second.setDisabled(!!state.secondaryOnlyWhenDirty && !state.dirty);
+        }
+    },
+});
 
 // ---------------------------------------------------------------------------
 // The row model.
@@ -1655,7 +1857,7 @@ Ext.define('PVE.meta.TextWindow', {
 
         Ext.apply(me, {
             items: [{ xtype: 'component', reference: 'mount', style: 'height:100%;width:100%' }],
-            tbar: [
+            bbar: [
                 {
                     xtype: 'segmentedbutton',
                     reference: 'langbtn',
@@ -1670,11 +1872,15 @@ Ext.define('PVE.meta.TextWindow', {
                     ],
                     listeners: { change: (btn, value) => me.switchLang(value) },
                 },
-            ],
-            buttons: [
-                { text: gettext('Apply'), handler: () => me.showDiff() },
-                { text: gettext('Cancel'), handler: () => me.close() },
-            ],
+            ].concat(
+                PVE.meta.Footer.actions({
+                    diff: () => me.showBufferDiff(),
+                    format: () => me.formatBuffer(),
+                    apply: () => me.showDiff(),
+                    secondary: () => me.close(),
+                    secondaryText: gettext('Close'),
+                }),
+            ),
         });
         me.callParent();
 
@@ -1704,8 +1910,70 @@ Ext.define('PVE.meta.TextWindow', {
         });
     },
 
+    // The buffer against what was loaded, without committing to it -- the same view
+    // Apply ends with, offered on its own.
+    showBufferDiff: function () {
+        let me = this;
+        if (!me.editor) {
+            return;
+        }
+        let lang = me.lang;
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.original, lang);
+        } catch (_err) {
+            lang = 'yaml';
+            original = me.original;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: me.view || gettext('(whole document)'),
+            original: original,
+            modified: me.editor.getValue(),
+            lang: lang,
+        });
+    },
+
+    // Apply is live as soon as there is a buffer; the diff decides whether there is
+    // anything in it worth writing. Close becomes Discard once the buffer differs from
+    // what was loaded -- the same rule the panel's footer follows, and for the same
+    // reason: that is the moment there is something to lose.
+    syncFooter: function () {
+        let me = this;
+        PVE.meta.Footer.sync(me, {
+            canApply: !!me.editor,
+            count: 0,
+            dirty: !!me.editor && me.editor.getValue() !== me.original,
+            dirtyText: gettext('Discard'),
+            cleanText: gettext('Close'),
+        });
+    },
+
     // Presentation only: re-render the same value in the other syntax. If we cannot
     // parse the buffer we say so and stay put; the server remains the YAML authority.
+    // The same canonical re-dump the text card's Format does, on this window's own
+    // editor -- through `Utils.parseBuffer`/`dumpBuffer`, so the two Format buttons
+    // cannot drift. It refuses a buffer that does not parse rather than mangling it.
+    formatBuffer: function () {
+        let me = this;
+        let ed = me.editor;
+        if (!ed) {
+            return;
+        }
+        let text = ed.getValue();
+        try {
+            let U = PVE.meta.Utils;
+            let formatted = U.dumpBuffer(U.parseBuffer(text, me.lang), me.lang);
+            if (formatted !== text) {
+                ed.setValue(formatted);
+            }
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Cannot format'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+            );
+        }
+    },
+
     switchLang: function (lang) {
         let me = this;
         let btn = me.lookupReference('langbtn');
@@ -1714,10 +1982,7 @@ Ext.define('PVE.meta.TextWindow', {
         }
         let value;
         try {
-            value =
-                me.lang === 'json'
-                    ? Ext.decode(me.editor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.editor.getValue());
+            value = PVE.meta.Utils.parseBuffer(me.editor.getValue(), me.lang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -1734,37 +1999,32 @@ Ext.define('PVE.meta.TextWindow', {
         }
         me.lang = lang;
         window.monaco.editor.setModelLanguage(me.editor.getModel(), lang);
-        me.editor.setValue(
-            lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value),
-        );
+        // `renderBuffer`, not a bare dump: switching JSON -> YAML must not turn a
+        // no-op round trip into a whitespace diff (see the comment on that function).
+        // This editor used to dump unconditionally here, which the Text card's own
+        // toggle did not.
+        me.editor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.original));
     },
 
+    // Apply applies, and the window closes when the write lands. The diff is a button
+    // of its own now, so stopping to show it again was asking twice for one decision.
     showDiff: function () {
         let me = this;
         if (!me.editor) {
             return;
         }
-        let lang = me.lang;
         let edited = me.editor.getValue();
         let original = me.original;
-        if (lang === 'json') {
-            try {
-                original = JSON.stringify(PVE.meta.Utils.yamlLoad(me.original), null, 2);
-            } catch (_err) {
-                lang = 'yaml'; // cannot render the original as JSON; diff the YAML
-            }
+        try {
+            original = PVE.meta.Utils.originalInLang(me.original, me.lang);
+        } catch (_err) {
+            original = me.original;
         }
         if (edited === original) {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
-        PVE.meta.Monaco.confirmDiff({
-            title: me.view || gettext('(whole document)'),
-            original: original,
-            modified: edited,
-            lang: lang,
-            apply: () => me.apply(edited, me.lang),
-        });
+        me.apply(edited, me.lang);
     },
 
     apply: function (text, lang) {
@@ -1795,6 +2055,9 @@ Ext.define('PVE.meta.TreePanel', {
     // vmid/node/type/dc arrive as config properties from pve-ext's page loader;
     // pveSelNode is the fallback for anything that adds this panel the PVE way.
     pveSelNode: undefined,
+    // Set when this panel is inside a window: its footer then carries the way out,
+    // which is also the way to abandon staged edits.
+    onClose: undefined,
 
     initComponent: function () {
         let me = this;
@@ -1835,6 +2098,7 @@ Ext.define('PVE.meta.TreePanel', {
 
         Ext.apply(me, {
             tbar: me.buildToolbar(),
+            bbar: me.buildFooter(),
             items: [me.buildTreeCard(), me.buildTextCard()],
         });
         me.callParent();
@@ -1876,6 +2140,12 @@ Ext.define('PVE.meta.TreePanel', {
             columns: me.buildColumns(),
             listeners: {
                 selectionchange: () => me.syncButtons(),
+                cellclick: function (view, td, cellIndex, rec, tr, rowIndex, e) {
+                    if (e.getTarget('.pve-meta-undo')) {
+                        me.discardRow(rec);
+                        e.stopEvent();
+                    }
+                },
                 itemdblclick: (view, rec) => me.editRow(rec),
                 itemkeydown: function (view, rec, item, index, e) {
                     if (e.getKey() === e.ENTER && rec) {
@@ -1908,44 +2178,21 @@ Ext.define('PVE.meta.TreePanel', {
             layout: 'fit',
             border: false,
             items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
-            bbar: [
-                {
-                    xtype: 'segmentedbutton',
-                    itemId: 'textLangBtn',
-                    value: 'yaml',
-                    items: [
-                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
-                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
-                    ],
-                    listeners: { change: (btn, value) => me.switchTextLang(value) },
-                },
-                '->',
-                {
-                    text: gettext('Format'),
-                    itemId: 'textFormatBtn',
-                    iconCls: 'fa fa-indent',
-                    tooltip: gettext('Re-indent the buffer canonically'),
-                    handler: () => me.formatText(),
-                },
-                {
-                    text: gettext('Apply'),
-                    itemId: 'textApplyBtn',
-                    iconCls: 'fa fa-check',
-                    handler: () => me.applyText(),
-                },
-                {
-                    text: gettext('Discard'),
-                    itemId: 'textDiscardBtn',
-                    iconCls: 'fa fa-undo',
-                    handler: () => me.discardText(),
-                },
-            ],
         };
     },
 
     buildToolbar: function () {
         let me = this;
         return [
+            {
+                // The permission-document twin of Declare Key, and hidden by the same
+                // rule: a missing concept elsewhere, not a missing permission.
+                text: gettext('Add Rule'),
+                itemId: 'ruleBtn',
+                iconCls: 'fa fa-key',
+                hidden: true,
+                handler: () => me.addRule(),
+            },
             {
                 text: gettext('Add'),
                 itemId: 'addBtn',
@@ -1980,15 +2227,6 @@ Ext.define('PVE.meta.TreePanel', {
                 handler: () => me.setToDefault(me.getSelection()[0]),
             },
             {
-                // The permission-document twin of Declare Key, and hidden by the same
-                // rule: a missing concept elsewhere, not a missing permission.
-                text: gettext('Add Rule'),
-                itemId: 'ruleBtn',
-                iconCls: 'fa fa-key',
-                hidden: true,
-                handler: () => me.addRule(),
-            },
-            {
                 // Only ever shown on a prefix document, where declaring a key is a
                 // thing you can do; hidden everywhere else rather than disabled, since
                 // on a guest tab it is not a missing permission but a missing concept.
@@ -2014,30 +2252,44 @@ Ext.define('PVE.meta.TreePanel', {
                 handler: () => me.editSelectionAsText(),
             },
             '-',
-            {
-                // The one write. Disabled until something is staged, so the tree has
-                // exactly the shape the text editor has always had: edit freely,
-                // then decide.
-                text: gettext('Apply'),
-                itemId: 'applyBtn',
-                // The count lives on this button (`Apply (2)`) rather than in a
-                // toolbar label: the label was the first thing to be clipped when the
-                // editor opens in a window, and a counter you cannot read is not one.
-                iconCls: 'fa fa-check',
-                disabled: true,
-                handler: () => me.applyPending(),
-            },
-            {
-                text: gettext('Revert'),
-                itemId: 'revertBtn',
-                iconCls: 'fa fa-undo',
-                disabled: true,
-                handler: () => me.revertPending(),
-            },
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
             // Only shown when the caller is restricted (DESIGN §8).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
+        ];
+    },
+
+    // The buffer against the file, without committing to anything. Text mode's Apply
+    // shows the same diff, but only as the last step before writing -- and wanting to
+    // see what you changed is not the same as wanting to write it.
+    showTextDiff: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let lang = me.textLang;
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+        } catch (_err) {
+            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
+            original = me.textOriginal;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
+            original: original,
+            modified: me.textEditor.getValue(),
+            lang: lang,
+            // No `apply`: this is the view, not the decision.
+        });
+    },
+
+    // The one bar at the bottom, for both cards. Which view you are looking at on
+    // the left, what you can do about it on the right; the top toolbar acts on the
+    // document's *contents*, which is a different kind of thing from committing.
+    buildFooter: function () {
+        let me = this;
+        return [
             {
                 xtype: 'segmentedbutton',
                 itemId: 'modeBtn',
@@ -2048,10 +2300,52 @@ Ext.define('PVE.meta.TreePanel', {
                 ],
                 listeners: { change: (btn, value) => me.onModeChange(value) },
             },
-        ];
+            {
+                xtype: 'segmentedbutton',
+                itemId: 'textLangBtn',
+                hidden: true,
+                value: 'yaml',
+                items: [
+                    { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                    { text: 'JSON', value: 'json', ui: 'default-toolbar' },
+                ],
+                listeners: { change: (btn, value) => me.switchTextLang(value) },
+            },
+        ].concat(
+            PVE.meta.Footer.actions({
+                applyDisabled: true, // nothing staged yet; `syncFooter` decides after
+                diff: () => me.showTextDiff(),
+                format: () => me.formatText(),
+                apply: () => (me.mode === 'text' ? me.applyText() : me.applyPending()),
+                secondary: () => me.footerSecondary(),
+                // In a window the exit *is* the discard, so there is one button for
+                // both; in a tab there is nothing to close, so it is Revert.
+                secondaryText: me.onClose ? gettext('Close') : gettext('Revert'),
+            }),
+        );
+    },
+
+    // Close, or Discard-and-close, or Revert — one button, because in a window the
+    // way out and the way to abandon the edits are the same gesture.
+    footerSecondary: function () {
+        let me = this;
+        if (me.mode === 'text') {
+            me.discardText();
+            return;
+        }
+        if (me.isDirty()) {
+            me.revertPending();
+            if (!me.onClose) {
+                return;
+            }
+        }
+        if (me.onClose) {
+            me.onClose();
+        }
     },
 
     buildColumns: function () {
+        let me = this;
         let U = PVE.meta.Utils;
         let fade = (rec, html) => (rec.data.present ? html : '<span class="faded">' + html + '</span>');
         // `html` is already content-encoded; this only escapes it for the attribute.
@@ -2173,13 +2467,25 @@ Ext.define('PVE.meta.TreePanel', {
                               (stored || '&nbsp;') +
                               '</div>'
                             : shown;
+                    // The discard sits on the row it acts on. It used to be a button
+                    // in the top toolbar, which meant reading the toolbar to find out
+                    // what it would apply to -- and on a list member it applied to the
+                    // whole list, which was worse than unclear.
+                    let undo =
+                        ' <i class="fa fa-undo pve-meta-undo" style="cursor:pointer" ' +
+                        'data-qtip="' + Ext.htmlEncode(gettext('Discard this change')) + '"></i>';
                     return (
                         (d.pending === 'delete' ? '' : stored) +
-                        '<div style="color:darkorange">' + after + '</div>'
+                        '<div style="color:darkorange">' + after + undo + '</div>'
                     );
                 },
             },
             {
+                // Guest documents only, structurally: a registry document's top-level
+                // keys are fixed and `deny_unknown_fields` refuses a fourth, so a
+                // comment key cannot exist there to describe one (DESIGN §3.5). An
+                // always-empty column is a column that teaches you to ignore columns.
+                hidden: me.docKind(me.docId) !== 'guest' && me.docKind(me.docId) !== 'datacenter',
                 // The row's own comment key (`k__`) if present, else nothing.
                 text: gettext('Description'),
                 dataIndex: 'description',
@@ -2193,6 +2499,9 @@ Ext.define('PVE.meta.TreePanel', {
                 },
             },
             {
+                // Permissions reach guest documents only (DESIGN §3.3), so on anything
+                // else this column can only ever be blank.
+                hidden: me.docKind(me.docId) !== 'guest',
                 text: gettext('Access'),
                 dataIndex: 'accessText',
                 flex: 2,
@@ -2338,7 +2647,9 @@ Ext.define('PVE.meta.TreePanel', {
     // re-apply it on top of the new value.
     stage: function (path, op, value) {
         let me = this;
-        let under = (p) => p === path || p.indexOf(path + '.') === 0;
+        // The empty path is the document: it replaces everything, including edits
+        // staged under keys that no longer exist in it.
+        let under = (p) => path === '' || p === path || p.indexOf(path + '.') === 0;
         me.pending = me.pending.filter((e) => !under(e.path));
         me.pending.push({ path: path, op: op, value: value });
         me.buildTree();
@@ -2347,6 +2658,59 @@ Ext.define('PVE.meta.TreePanel', {
 
     isDirty: function () {
         return this.pending.length > 0;
+    },
+
+    // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
+    // so "what would Discard drop" and "what did staging replace" are one rule.
+    pendingUnder: function (path) {
+        return this.pending.filter((e) => e.path === path || e.path.indexOf(path + '.') === 0);
+    },
+
+    // Drops the staged edits on one row, leaving the rest alone.
+    //
+    // A list member needs more care than "drop what is staged at this path": the edit
+    // is staged on the *list*, so dropping it would throw away every other member's
+    // change too. Put that one member back to what the document says instead, and
+    // drop the whole staged edit only once the list matches again.
+    discardRow: function (rec) {
+        let me = this;
+        if (!rec || !rec.data.path) {
+            return;
+        }
+        let d = rec.data;
+        if (d.arrayIndex !== undefined && d.arrayIndex !== null) {
+            me.discardListMember(d.path, d.arrayIndex);
+            return;
+        }
+        let drop = me.pendingUnder(d.path);
+        if (!drop.length) {
+            return;
+        }
+        me.pending = me.pending.filter((e) => drop.indexOf(e) === -1);
+        me.buildTree();
+        me.syncButtons();
+    },
+
+    discardListMember: function (path, index) {
+        let me = this;
+        let stored = PVE.meta.Lint.valueAt(me.dataOf(me.docId), path);
+        let list = me.listAt(path);
+        if (!Array.isArray(stored)) {
+            return;
+        }
+        if (index < stored.length) {
+            list[index] = JSON.parse(JSON.stringify(stored[index]));
+        } else {
+            list.splice(index, 1); // it was appended; putting it back means removing it
+        }
+        if (JSON.stringify(list) === JSON.stringify(stored)) {
+            // Nothing of this list's edit is left to keep.
+            me.pending = me.pending.filter((e) => e.path !== path);
+            me.buildTree();
+            me.syncButtons();
+            return;
+        }
+        me.stage(path, 'set', list);
     },
 
     // The document as it would be. Everything the tree shows is computed from this,
@@ -2444,26 +2808,26 @@ Ext.define('PVE.meta.TreePanel', {
             }
         };
         let target = me.addTarget();
-        set('addBtn', text || !target || !me.editableFor(target.path));
+        // A permission file has three keys and the parser refuses a fourth
+        // (`deny_unknown_fields`), so an arbitrary Add can only ever produce a file
+        // the loader would skip: the one thing you add to one is a rule, and Add Rule
+        // is that. On a prefix definition Add stays, because `schema` holds whatever
+        // you declare -- but its *root* keys are fixed the same way, so Add there is
+        // disabled until you are somewhere it means something.
+        let kind = me.docKind(me.docId);
+        let addBtn = me.down('#addBtn');
+        if (addBtn) {
+            addBtn.setHidden(kind === 'permission');
+        }
+        let fixedRoot = kind === 'prefix' && target && target.path === '';
+        set('addBtn', text || !target || fixedRoot || !me.editableFor(target.path));
         let row = d;
         set('editBtn', text || !row || !row.editable);
         set('removeBtn', text || !row || !row.present || !row.editable);
         let dirty = me.isDirty();
-        // The text editors write immediately -- "edit as text" *is* an apply. With
-        // edits staged they would be showing the stored document while the tree
-        // shows the planned one, so they wait until this is settled either way.
-        set('textSelBtn', text || !row || dirty);
+        set('textSelBtn', text || !row);
         set('reloadBtn', text);
-        set('applyBtn', text || !dirty);
-        set('revertBtn', text || !dirty);
-        let applyBtn = me.down('#applyBtn');
-        if (applyBtn) {
-            applyBtn.setText(
-                dirty
-                    ? Ext.String.format(gettext('Apply ({0})'), me.pending.length)
-                    : gettext('Apply'),
-            );
-        }
+        me.syncFooter();
         let dflt = me.down('#defaultBtn');
         if (dflt) {
             // Disabled, not hidden. What varies per *document* may hide (Declare Key
@@ -2471,7 +2835,13 @@ Ext.define('PVE.meta.TreePanel', {
             // per *row* must not, or the buttons beside it shift under the pointer
             // every time the selection changes -- which is how you click Remove and
             // hit something else.
+            // Hidden entirely when nothing in this document declares a default --
+            // a permission file never can, so the button was pure furniture there.
+            // Disabled, not hidden, when the document has defaults but this row is
+            // not one of them: that varies per row, and a button that moves under
+            // the pointer is how you aim for one thing and hit another.
             let offers = !!row && !row.present && row.defaultValue !== undefined;
+            dflt.setHidden(!me.hasDefaults);
             dflt.setDisabled(text || !offers || !row.editable);
         }
         // The Text toggle's enabled state depends on staged edits too, and this is
@@ -2491,6 +2861,28 @@ Ext.define('PVE.meta.TreePanel', {
             declare.setHidden(me.docKind(me.docId) !== 'prefix');
             declare.setDisabled(text || !row || !row.editable);
         }
+    },
+
+    // One place decides what the footer says, in either mode.
+    syncFooter: function () {
+        let me = this;
+        let textMode = me.mode === 'text';
+        ['textLangBtn', 'metaFormat', 'metaDiff'].forEach(function (id) {
+            let c = me.down('#' + id);
+            if (c) {
+                c.setHidden(!textMode);
+            }
+        });
+        PVE.meta.Footer.sync(me, {
+            // In text mode the buffer is the edit, and Apply is offered whenever the
+            // caller may write at all -- the diff is what decides if it is worth it.
+            canApply: textMode ? !!me.access.write : me.isDirty(),
+            count: textMode ? 0 : me.pending.length,
+            dirty: textMode ? true : me.isDirty(),
+            dirtyText: me.onClose ? gettext('Discard') : gettext('Revert'),
+            cleanText: me.onClose ? gettext('Close') : gettext('Revert'),
+            secondaryOnlyWhenDirty: !me.onClose,
+        });
     },
 
     setModeButton: function (value) {
@@ -2645,19 +3037,17 @@ Ext.define('PVE.meta.TreePanel', {
         let modeBtn = me.down('#modeBtn');
         if (modeBtn && modeBtn.items.getAt(1)) {
             // The Text card is the whole document at the root view, and a scope-only
-            // principal may not read that at all (DESIGN §3): do not offer it. Nor
-            // while edits are staged, which the tree is showing and the text card
-            // would not be.
-            modeBtn.items.getAt(1).setDisabled(!me.access.read || me.isDirty());
+            // principal may not read that at all (DESIGN §3): do not offer it. Staged
+            // edits are no longer a reason to refuse -- the buffer is rendered from the
+            // planned document, so they are *in* it, and switching back turns whatever
+            // was typed into staged edits again.
+            modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
         // A Text-mode Apply is a root replace, which needs full write and nothing else
         // (DESIGN §3.4, `authorize_view_write`). Without this a read-only caller could
         // compose a whole document, open the diff, tick through the schema warning and
         // collect a 403 at the very end -- the server was right, the button was a lie.
-        let applyBtn = me.down('#textApplyBtn');
-        if (applyBtn) {
-            applyBtn.setDisabled(!me.access.write);
-        }
+        me.syncFooter();
         let label = me.down('#accessText');
         if (!label) {
             return;
@@ -2995,6 +3385,36 @@ Ext.define('PVE.meta.TreePanel', {
         // A row staged for deletion is gone from the planned document, but it should
         // not vanish off the screen before it is applied -- you would be looking at a
         // tree that already claims the write happened. It comes back as a ghost.
+        // A staged list edit is one write of the whole list, but it is almost never a
+        // change to the whole list: show it on the members that actually differ. Any
+        // member the edit dropped comes back as a ghost, the same as a deleted key.
+        let storedDoc = me.dataOf(me.docId);
+        me.pending.forEach(function (e) {
+            if (e.op !== 'set' || !Array.isArray(e.value)) {
+                return;
+            }
+            let before = PVE.meta.Lint.valueAt(storedDoc, e.path);
+            if (!Array.isArray(before) || before.length <= e.value.length) {
+                return;
+            }
+            let list = PVE.meta.Lint.valueAt(me.plannedData(), e.path);
+            let entry = root;
+            let path = '';
+            e.path.split('.').forEach(function (seg) {
+                path = PVE.meta.Utils.joinPath(path, seg);
+                entry = me.entry(entry, seg, path);
+            });
+            before.slice(Array.isArray(list) ? list.length : 0).forEach(function (item, i) {
+                let row = me.entry(entry, String((list || []).length + i), e.path);
+                row.present = false;
+                row.pendingDelete = true;
+                row.arrayIndex = null; // gone: there is no member to act on
+                row.addressable = false;
+                row.kind = 'string';
+                row.value = PVE.meta.Utils.itemSummary(item);
+            });
+        });
+
         me.pending
             .filter((e) => e.op === 'delete')
             .forEach(function (e) {
@@ -3038,6 +3458,27 @@ Ext.define('PVE.meta.TreePanel', {
         let staged = Object.create(null);
         me.pending.forEach((e) => (staged[e.path] = e.op));
         let storedDoc = me.dataOf(me.docId);
+
+        // Which *member* of a staged list actually differs. The edit is one write of
+        // the whole list -- members are not addressable (§2) -- but wearing the mark on
+        // the list said "all of this changed" when one entry did.
+        let memberChanged = function (listPath, index, item) {
+            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            if (!Array.isArray(before) || index >= before.length) {
+                return true; // appended
+            }
+            return JSON.stringify(before[index]) !== JSON.stringify(item);
+        };
+        let storedMember = function (listPath, index) {
+            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            if (!Array.isArray(before) || index >= before.length) {
+                return '';
+            }
+            let v = before[index];
+            return v !== null && typeof v === 'object'
+                ? PVE.meta.Utils.itemSummary(v)
+                : PVE.meta.Utils.displayValue(v, PVE.meta.Utils.kindOf(v));
+        };
         // What each branch has to answer for: schema findings beneath it, and staged
         // edits beneath it. Both are invisible once the branch is collapsed.
         let below = PVE.meta.Utils.rollUp(findings);
@@ -3054,6 +3495,9 @@ Ext.define('PVE.meta.TreePanel', {
                 .map(function (key) {
                     let c = entry.children[key];
                     let kind = c.kind || 'string';
+                    if (c.defaultValue !== undefined) {
+                        me.hasDefaults = true;
+                    }
                     let access = me.accessFor(c.path, scopes);
                     let node = {
                         key: key,
@@ -3078,15 +3522,37 @@ Ext.define('PVE.meta.TreePanel', {
                         accessList: access,
                         accessText: me.accessSummary(access),
                         finding: findings[c.path] || '',
-                        pending: staged[c.path] || '',
+                        pending: (function () {
+                            if (c.pendingDelete) {
+                                return 'delete';
+                            }
+                            if (!staged[c.path]) {
+                                return '';
+                            }
+                            // A member carries the mark when it is the one that
+                            // changed; the list itself carries only the dot that says
+                            // something below it did.
+                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
+                                return memberChanged(c.path, c.arrayIndex, c.rawItem) ? 'set' : '';
+                            }
+                            return kind === 'array' ? '' : staged[c.path];
+                        })(),
                         belowCount: (below[c.path] || {}).count || 0,
                         belowText: ((below[c.path] || {}).messages || []).join('\n'),
-                        stagedBelow: (stagedBelow[c.path] || {}).count || 0,
+                        stagedBelow:
+                            (stagedBelow[c.path] || {}).count ||
+                            (kind === 'array' && staged[c.path] ? 1 : 0),
                         // Rendered with the row's own kind, not one inferred from the
                         // raw value: the API returns booleans as 1/0 (DESIGN §4), so
                         // inferring would print a struck-through "1" under a row whose
                         // stored value reads "Yes".
                         storedText: (function () {
+                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
+                                return storedMember(c.path, c.arrayIndex);
+                            }
+                            if (c.pendingDelete && c.value !== undefined) {
+                                return c.value; // a ghost carries what was there
+                            }
                             let v = PVE.meta.Lint.valueAt(storedDoc, c.path);
                             return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
                         })(),
@@ -3105,6 +3571,9 @@ Ext.define('PVE.meta.TreePanel', {
                 });
         };
 
+        // Does anything in this document declare a default? If not, "Set to default"
+        // is furniture -- a permission file can never have one.
+        me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
         // Reloading (including from the version poll) must not fold the tree up.
@@ -3136,6 +3605,25 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- editing ------------------------------------------------------------
 
+    // Opens one of this panel's modal editor windows (Edit Value, Add Key, Add Rule,
+    // Declare Key) and wires the one thing all seven call sites did by hand: `editing`
+    // goes true so a reload or the version poll cannot pull the document out from
+    // under an open window, `on`/`handler` is the window's one result event, and
+    // `editing` goes false again on `destroy` -- whether the window committed or was
+    // cancelled. A copy of this that forgot the `destroy` listener would leave
+    // `editing` stuck true and quietly stop this panel from ever reloading again.
+    openEditor: function (xtype, cfg, on, handler) {
+        let me = this;
+        me.editing = true;
+        let win = Ext.create(xtype, cfg);
+        win.on(on, handler);
+        win.on('destroy', function () {
+            me.editing = false;
+        });
+        win.show();
+        return win;
+    },
+
     editRow: function (rec) {
         let me = this;
         if (!rec || !rec.data.editable) {
@@ -3152,24 +3640,19 @@ Ext.define('PVE.meta.TreePanel', {
             me.editAsText(rec);
             return;
         }
-        me.editing = true;
-        let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
-        win.on('setvalue', (value) => me.stage(rec.data.path, 'set', value));
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
+            me.stage(rec.data.path, 'set', value),
+        );
     },
 
     addKey: function (docId, parentPath) {
         let me = this;
-        me.editing = true;
-        let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: parentPath || '' });
-        win.on('addkey', (path, value) => me.stage(path, 'set', value));
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
+        me.openEditor(
+            'PVE.meta.AddKeyWindow',
+            { parentPath: parentPath || '' },
+            'addkey',
+            (path, value) => me.stage(path, 'set', value),
+        );
     },
 
     // Applies everything staged, as ONE write.
@@ -3210,43 +3693,36 @@ Ext.define('PVE.meta.TreePanel', {
         };
         let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Lint.valueAt(me.dataOf(me.docId), view);
 
-        Proxmox.Utils.API2Request({
-            url: me.urlFor(me.docId),
-            method: 'PUT',
-            waitMsgTarget: me,
-            params: Ext.apply({ dry_run: 1 }, params),
-            // A refusal is not a failure to report and stop on: it is the banner. The
-            // administrator still gets the diff and an explicit "apply anyway", the
-            // same as a schema mismatch in the text editor -- and the server refuses
-            // it again for real if it really is unstorable.
-            callback: function (options, success, response) {
-                let warnings = me.textFindingsFor(planned);
-                if (!success) {
-                    // `htmlStatus` is already HTML -- PVE encodes it -- and the banner
-                    // encodes every warning again, so the server's own quotes and
-                    // angle brackets arrived as `&#39;` and `&lt;` on screen. Back to
-                    // plain text here; the banner does the one encoding.
-                    let msg = response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response);
-                    msg = Ext.util.Format.htmlDecode(Ext.util.Format.stripTags(String(msg)));
-                    warnings = [msg.replace(/\s+/g, ' ').trim()].concat(warnings);
-                }
-                PVE.meta.Monaco.confirmDiff({
-                    title: Ext.String.format(gettext('Apply: {0}'), me.docId),
-                    // Documents, not text: `confirmDiff` renders them once it has the
-                    // YAML codec, so this cannot run before it is loaded.
-                    originalValue: stored === undefined ? {} : stored,
-                    modifiedValue: subtree,
-                    warnings: warnings,
-                    apply: function () {
-                        me.submit(
-                            { url: me.urlFor(me.docId), method: 'PUT', params: params },
-                            function () {
-                                me.pending = [];
-                            },
-                        );
-                    },
-                });
-            },
+        let write = function () {
+            me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
+                me.pending = [];
+            });
+        };
+
+        // Apply applies. It stops to show the diff only when the document would not
+        // match the schema, which is the one case where seeing it changes what you
+        // decide -- and the tick is what makes storing it anyway a deliberate act
+        // rather than a dialog reflex. Otherwise there is nothing to decide: the diff
+        // is a button of its own now, for whenever you want to look first.
+        //
+        // There is deliberately no `dry_run` pass any more. It existed to turn a
+        // server refusal into a banner with a "Save anyway" tick -- but a refusal is
+        // not advisory: the server refuses the real write for the same reason, tick or
+        // no tick. Showing it as an error is honest; showing it as something you can
+        // override is not, and it cost every Apply a second request.
+        let warnings = me.textFindingsFor(planned);
+        if (!warnings.length) {
+            write();
+            return;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Apply: {0}'), me.docId),
+            // Documents, not text: `confirmDiff` renders them once it has the YAML
+            // codec, so this cannot run before it is loaded.
+            originalValue: stored === undefined ? {} : stored,
+            modifiedValue: subtree,
+            warnings: warnings,
+            apply: write,
         });
     },
 
@@ -3283,13 +3759,12 @@ Ext.define('PVE.meta.TreePanel', {
             me.addRule();
             return;
         }
-        me.editing = true;
-        let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: path, list: true });
-        win.on('addkey', function (_path, value) {
+        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
+            _path,
+            value,
+        ) {
             me.stage(path, 'set', list.concat([value]));
         });
-        win.on('destroy', () => (me.editing = false));
-        win.show();
     },
 
     // Editing one member of a list. Three cases, in the order they are worth having:
@@ -3307,30 +3782,25 @@ Ext.define('PVE.meta.TreePanel', {
             Object.prototype.hasOwnProperty.call(item, 'prefix') &&
             Object.prototype.hasOwnProperty.call(item, 'mode');
         if (isRule) {
-            me.editing = true;
-            let win = Ext.create('PVE.meta.AddRuleWindow', {
-                title: gettext('Edit Rule'),
-                prefixes: me.prefixes,
-                rule: item,
-            });
-            win.on('addrule', function (rules) {
-                // The form appends to what it was given; for an edit it was given
-                // nothing, so the one rule it produced replaces this member.
-                me.stageListMember(d.path, d.arrayIndex, rules[rules.length - 1]);
-            });
-            win.on('destroy', () => (me.editing = false));
-            win.show();
+            me.openEditor(
+                'PVE.meta.AddRuleWindow',
+                { title: gettext('Edit Rule'), prefixes: me.prefixes, rule: item },
+                'addrule',
+                function (rules) {
+                    // The form appends to what it was given; for an edit it was given
+                    // nothing, so the one rule it produced replaces this member.
+                    me.stageListMember(d.path, d.arrayIndex, rules[rules.length - 1]);
+                },
+            );
             return;
         }
         if (item !== null && typeof item === 'object') {
             me.editAsText(rec);
             return;
         }
-        me.editing = true;
-        let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
-        win.on('setvalue', (value) => me.stageListMember(d.path, d.arrayIndex, value));
-        win.on('destroy', () => (me.editing = false));
-        win.show();
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
+            me.stageListMember(d.path, d.arrayIndex, value),
+        );
     },
 
     // Append one rule to this permission file. The prefix combobox is filled from
@@ -3342,16 +3812,12 @@ Ext.define('PVE.meta.TreePanel', {
         if (me.docKind(me.docId) !== 'permission') {
             return;
         }
-        me.editing = true;
-        let win = Ext.create('PVE.meta.AddRuleWindow', {
-            prefixes: me.prefixes,
-            existing: me.plannedData().rules,
-        });
-        win.on('addrule', (rules) => me.stage('rules', 'set', rules));
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
+        me.openEditor(
+            'PVE.meta.AddRuleWindow',
+            { prefixes: me.prefixes, existing: me.plannedData().rules },
+            'addrule',
+            (rules) => me.stage('rules', 'set', rules),
+        );
     },
 
     // Declare one key of the selected prefix's schema: a view PUT into
@@ -3363,15 +3829,12 @@ Ext.define('PVE.meta.TreePanel', {
             return;
         }
         let docId = rec.data.docId;
-        me.editing = true;
-        let win = Ext.create('PVE.meta.DeclareKeyWindow', { prefix: me.docTitle(docId) });
-        win.on('declarekey', (key, schema) =>
-            me.stage('schema.properties.' + key, 'set', schema),
+        me.openEditor(
+            'PVE.meta.DeclareKeyWindow',
+            { prefix: me.docTitle(docId) },
+            'declarekey',
+            (key, schema) => me.stage('schema.properties.' + key, 'set', schema),
         );
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
     },
 
     // Staged like every other edit, so no confirm: nothing has happened yet, the row
@@ -3456,13 +3919,19 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // The loaded document rendered in `lang`; the diff's "original" side and the
-    // yardstick the dirty check uses.
+    // yardstick the dirty check uses. `Utils.originalInLang` -- the subtree
+    // window's own diff used to inline the same conversion rather than share this.
+    // What the buffer should show: the **planned** document -- stored plus whatever is
+    // staged -- in `lang`. With nothing staged this is the server's own text, comments
+    // and all, because `renderBuffer` prefers the original when the document is
+    // unchanged. That is what makes Tree and Text two views of one thing rather than
+    // two editors that have to be kept apart.
     textRendered: function (lang) {
         let me = this;
-        if (lang !== 'json') {
-            return me.textOriginal;
+        if (!me.isDirty()) {
+            return PVE.meta.Utils.originalInLang(me.textOriginal, lang);
         }
-        return JSON.stringify(PVE.meta.Utils.yamlLoad(me.textOriginal), null, 2);
+        return PVE.meta.Utils.renderBuffer(me.plannedData(), lang, me.textOriginal);
     },
 
     enterTextMode: function () {
@@ -3483,6 +3952,11 @@ Ext.define('PVE.meta.TreePanel', {
             success: function (response) {
                 let d = response.result.data || {};
                 me.setDigest(me.textDocId, d.digest);
+                // The server's own text, comments and all -- but what the buffer shows
+                // is the *planned* document, so staged edits are there too. With
+                // nothing staged the two are the same text (`renderBuffer` prefers the
+                // original when the document is unchanged), so opening text mode on an
+                // untouched document still shows the file as it was written.
                 me.textOriginal = d.text || '';
                 me.showTextEditor();
             },
@@ -3508,7 +3982,7 @@ Ext.define('PVE.meta.TreePanel', {
                     return;
                 }
                 me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
-                    value: me.textOriginal,
+                    value: me.textRendered(me.textLang),
                     language: 'yaml',
                     theme: PVE.meta.Monaco.theme(),
                     automaticLayout: true,
@@ -3539,27 +4013,37 @@ Ext.define('PVE.meta.TreePanel', {
         me.syncButtons();
     },
 
+    // Going back to the tree keeps whatever was typed: the buffer is turned into
+    // staged edits on rows, so the tree shows which keys changed and to what, and one
+    // Apply writes them. Switching views is not a decision about your work any more --
+    // it used to ask you to discard it, which is why it felt like a trap.
+    //
+    // The one thing that can stop it is a buffer that does not parse: there is no
+    // document to show as a tree, and guessing at one would lose what was typed. So it
+    // says so and stays put.
     leaveTextMode: function () {
         let me = this;
-        let finish = function () {
-            PVE.meta.Monaco.dispose(me.textEditor);
-            me.textEditor = null;
-            me.mode = 'tree';
-            me.setModeButton('tree');
-            me.getLayout().setActiveItem(me.down('#metaTree'));
-            me.syncButtons();
-            me.reload();
-        };
-        if (!me.textIsDirty()) {
-            finish();
+        let parsed;
+        try {
+            parsed = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+        } catch (err) {
+            me.setModeButton('text');
+            Ext.Msg.alert(
+                gettext('Cannot show this as a tree'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)) +
+                    '<br><br>' +
+                    Ext.htmlEncode(gettext('Fix the text, or Discard it, and try again.')),
+            );
             return;
         }
-        me.setModeButton('text'); // stay put until the question is answered
-        Ext.Msg.confirm(
-            gettext('Confirm'),
-            gettext('Discard the unapplied changes in the text editor?'),
-            (btn) => (btn === 'yes' ? finish() : undefined),
-        );
+        me.pending = PVE.meta.Utils.diffDocuments(me.dataOf(me.textDocId), parsed);
+        PVE.meta.Monaco.dispose(me.textEditor);
+        me.textEditor = null;
+        me.mode = 'tree';
+        me.setModeButton('tree');
+        me.getLayout().setActiveItem(me.down('#metaTree'));
+        me.buildTree();
+        me.syncButtons();
     },
 
     // Presentation only, exactly like the selection window's toggle.
@@ -3571,10 +4055,7 @@ Ext.define('PVE.meta.TreePanel', {
         }
         let value;
         try {
-            value =
-                me.textLang === 'json'
-                    ? Ext.decode(me.textEditor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -3592,20 +4073,10 @@ Ext.define('PVE.meta.TreePanel', {
         me.textLang = lang;
         window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
 
-        let rendered;
-        if (lang === 'json') {
-            rendered = JSON.stringify(value, null, 2);
-        } else {
-            // Back to YAML: prefer the server's own text when the document is
-            // unchanged. js-yaml and serde_yaml lay the same document out
-            // differently (indentation of nested sequences, quoting), so re-dumping
-            // here made a *presentation* toggle report unsaved changes and offer an
-            // Apply whose only content was whitespace.
-            rendered = PVE.meta.Utils.sameDocument(value, me.textOriginal)
-                ? me.textOriginal
-                : PVE.meta.Utils.yamlDump(value);
-        }
-        me.textEditor.setValue(rendered);
+        // `renderBuffer`: switching back to YAML prefers the server's own text when
+        // the document is unchanged (see the comment on that function) rather than
+        // re-dumping unconditionally.
+        me.textEditor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.textOriginal));
         me.annotateText();
     },
 
@@ -3623,12 +4094,8 @@ Ext.define('PVE.meta.TreePanel', {
         }
         let text = me.textEditor.getValue();
         try {
-            let value =
-                me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
-            let formatted =
-                me.textLang === 'json'
-                    ? JSON.stringify(value, null, 2)
-                    : PVE.meta.Utils.yamlDump(value);
+            let U = PVE.meta.Utils;
+            let formatted = U.dumpBuffer(U.parseBuffer(text, me.textLang), me.textLang);
             if (formatted !== text) {
                 me.textEditor.setValue(formatted);
                 me.annotateText();
@@ -3659,40 +4126,62 @@ Ext.define('PVE.meta.TreePanel', {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
+        // The whole document, at the root view, as **text** -- not as a dump of the
+        // planned document. That is the one thing this path does that the tree's Apply
+        // cannot: a `#` comment is not part of the document model (DESIGN §2), so it
+        // survives only for as long as nothing rewrites the file from the model.
+        // Sending the buffer keeps what was typed, comments included.
+        //
+        // The buffer already contains whatever was staged in the tree -- it is rendered
+        // from the planned document -- so this applies all of it, and the staged edits
+        // are spent.
+        let write = function () {
+            let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
+            params[me.textLang === 'json' ? 'data' : 'text'] = edited;
+            me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
+                me.pending = [];
+                me.refreshText();
+            });
+        };
+
+        // Same rule as the tree's Apply: stop only when the document would not match
+        // the schema, because that is the one case where seeing the diff changes what
+        // you decide. The tick keeps storing it anyway a deliberate act -- the server's
+        // lint decides what is *storable* (DESIGN §4), and an operator whose schema has
+        // drifted must not be able to lock the administrator out of editing.
+        let warnings = me.textFindings();
+        if (!warnings.length) {
+            write();
+            return;
+        }
         PVE.meta.Monaco.confirmDiff({
             title: gettext('(whole document)'),
             original: original,
             modified: edited,
             lang: lang,
-            // Advisory: the banner and the tick make a schema mismatch a deliberate
-            // act, they do not forbid it. The server's lint decides what is storable
-            // (DESIGN section 4), and an operator whose grammar has drifted from what
-            // a document legitimately holds must not be able to lock the administrator
-            // out of editing it.
-            warnings: me.textFindings(),
-            apply: function () {
-                // The whole document, at the root view. JSON is a subset of YAML, but
-                // `data` is the parameter that says "this is the JSON data model".
-                let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
-                params[me.textLang === 'json' ? 'data' : 'text'] = edited;
-                me.submit(
-                    { url: me.urlFor(me.textDocId), method: 'PUT', params: params },
-                    () => me.refreshText(),
-                );
-            },
+            warnings: warnings,
+            apply: write,
         });
     },
 
+    // Drops everything unapplied -- the buffer's edits and the staged ones behind it,
+    // which are the same set: the buffer is rendered from the planned document.
     discardText: function () {
         let me = this;
-        if (!me.textIsDirty()) {
+        if (!me.textIsDirty() && !me.isDirty()) {
             me.refreshText();
             return;
         }
         Ext.Msg.confirm(
             gettext('Confirm'),
             gettext('Discard the unapplied changes in the text editor?'),
-            (btn) => (btn === 'yes' ? me.refreshText() : undefined),
+            function (btn) {
+                if (btn !== 'yes') {
+                    return;
+                }
+                me.pending = [];
+                me.refreshText();
+            },
         );
     },
 
@@ -3731,7 +4220,7 @@ Ext.define('PVE.meta.TreePanel', {
         let parsed = null;
         let parseError = null;
         try {
-            parsed = me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+            parsed = PVE.meta.Utils.parseBuffer(text, me.textLang);
         } catch (err) {
             parseError = err;
         }
@@ -3805,10 +4294,7 @@ Ext.define('PVE.meta.TreePanel', {
             return [];
         }
         try {
-            let value =
-                me.textLang === 'json'
-                    ? Ext.decode(me.textEditor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            let value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
             return PVE.meta.Lint.findings(value, applicable, all).map((f) => f.path + ': ' + f.message);
         } catch (_err) {
             return [];
@@ -3932,9 +4418,12 @@ Ext.define('PVE.meta.DocumentWindow', {
                     dc: true,
                     docId: me.docId,
                     border: false,
+                    // The panel's footer is the only bar: a window with Close at the
+                    // bottom and the Apply for the same document at the top of the
+                    // panel inside it was the worst of the three chromes.
+                    onClose: () => me.close(),
                 },
             ],
-            buttons: [{ text: gettext('Close'), handler: () => me.close() }],
         });
         me.callParent();
     },

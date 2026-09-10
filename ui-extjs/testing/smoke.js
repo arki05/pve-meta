@@ -86,6 +86,7 @@ const eq = (name, got, want) => {
 
 console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
+    'PVE.meta.Footer',
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
     'PVE.meta.AddRuleWindow',
@@ -777,6 +778,26 @@ eq('sameDocument says no when only the key order changed (order is data)',
 eq('sameDocument on unparseable text is not a match',
     U.sameDocument({}, 'a:\n  - [\n'), false);
 
+// `renderBuffer` is what both editors' JSON/YAML toggle now call -- TextWindow's own
+// toggle used to dump unconditionally here, which is exactly the bug the fixture
+// above is named for; a round trip through JSON has to land back on the server's
+// own text, not a fresh js-yaml dump of it.
+eq('renderBuffer prefers the server text on an unchanged round trip',
+    U.renderBuffer(parsed, 'yaml', SERVER_YAML), SERVER_YAML);
+eq('renderBuffer re-dumps once the value actually changed',
+    U.renderBuffer({ a: 1 }, 'yaml', SERVER_YAML), U.yamlDump({ a: 1 }));
+eq('renderBuffer for json is a plain stringify, original or not',
+    U.renderBuffer(parsed, 'json', SERVER_YAML), JSON.stringify(parsed, null, 2));
+eq('parseBuffer reads JSON as JSON and everything else as YAML',
+    [U.parseBuffer('{"a":1}', 'json'), U.parseBuffer('a: 1\n', 'yaml')],
+    [{ a: 1 }, { a: 1 }]);
+eq('dumpBuffer is the plain, unconditional inverse (what Format wants)',
+    U.dumpBuffer(parsed, 'yaml') !== SERVER_YAML, true);
+eq('originalInLang renders the loaded document in the other syntax',
+    U.originalInLang(SERVER_YAML, 'json'), JSON.stringify(parsed, null, 2));
+eq('originalInLang is the identity for yaml -- no reparse, so it never throws',
+    U.originalInLang(SERVER_YAML, 'yaml'), SERVER_YAML);
+
 console.log('\n--- many documents in one panel ---');
 const D = ctx.PVE.meta.DeclareKeyWindow;
 // An id is an address: the path it is served at, for every kind of document.
@@ -997,6 +1018,102 @@ console.log('\n--- the registry lists ---');
     );
     // An older API returns neither field; the list must still render.
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
+}
+
+console.log('\n--- text is just another way to edit rows ---');
+{
+    // Editing as text used to be a second model with its own buffer, apply and write,
+    // kept apart from the tree by rules. `diffDocuments` turns whatever was typed back
+    // into edits *on rows*, so both are the same model and the rules go away.
+    const stored = {
+        homelab: { owner: 'arki', notes: 'the box', docker: { port: 80, restart: 'always' } },
+        netbird: { groups: ['lan'] },
+    };
+    const d = (edited) => U.diffDocuments(stored, edited);
+
+    eq('an unchanged document stages nothing', d(JSON.parse(JSON.stringify(stored))), []);
+
+    // A one-key change stays a one-key edit, so the tree marks that row and no other.
+    eq(
+        'a changed leaf is one edit on its own path',
+        d({ ...stored, homelab: { ...stored.homelab, owner: 'someone' } }),
+        [{ path: 'homelab.owner', op: 'set', value: 'someone' }],
+    );
+    // A key that is gone comes back as a delete, which is what draws it struck through.
+    const withoutNotes = { ...stored, homelab: { owner: 'arki', docker: stored.homelab.docker } };
+    eq('a removed key is a delete', d(withoutNotes), [{ path: 'homelab.notes', op: 'delete' }]);
+    eq(
+        'a new key is a set at its full path',
+        d({ ...stored, homelab: { ...stored.homelab, tags: 'x' } }),
+        [{ path: 'homelab.tags', op: 'set', value: 'x' }],
+    );
+    // Lists are compared whole: their members are not addressable (DESIGN §2).
+    eq(
+        'a changed list is one edit on the list',
+        d({ ...stored, netbird: { groups: ['lan', 'wan'] } }),
+        [{ path: 'netbird.groups', op: 'set', value: ['lan', 'wan'] }],
+    );
+
+    // The self-check: key order is data, and a pure reordering produces no per-key
+    // entries -- so the diff must notice it cannot express the change and replace the
+    // document whole rather than silently dropping it.
+    const reordered = { netbird: stored.netbird, homelab: stored.homelab };
+    const reorder = d(reordered);
+    eq('a pure reordering falls back to the whole document', reorder.length, 1);
+    eq('... at the document root', reorder[0].path, '');
+    eq('... and it round trips', U.applyPending(stored, reorder), reordered);
+
+    // Whatever comes back, replaying it on the stored document must equal what was
+    // typed -- that is the property the fallback exists to guarantee.
+    [
+        { ...stored, homelab: { ...stored.homelab, docker: { port: 8080, restart: 'no' } } },
+        { homelab: stored.homelab },
+        {},
+    ].forEach(function (edited, i) {
+        eq('case ' + i + ' round trips', U.applyPending(stored, d(edited)), edited);
+    });
+
+    // A root-level edit subsumes narrower ones: it replaces the whole document, so a
+    // staged edit under a key it does not have would otherwise be re-applied on top.
+    const stub = { pending: [{ path: 'homelab.owner', op: 'set', value: 'x' }], docId: '1' };
+    ['stage'].forEach((m) => (stub[m] = P[m]));
+    stub.buildTree = () => {};
+    stub.syncButtons = () => {};
+    stub.stage('', 'set', { a: 1 });
+    eq('the document replaces everything under it', stub.pending, [{ path: '', op: 'set', value: { a: 1 } }]);
+}
+
+console.log('\n--- a staged value is linted like a stored one ---');
+{
+    // Findings are computed against the *planned* document, so a value that breaks
+    // the schema is marked the moment it is staged -- not after it is written.
+    const SCHEMA = { type: 'object', properties: { port: { type: 'integer', maximum: 65535 } } };
+    const panelS = Object.assign({}, panel, {
+        dc: false,
+        docId: '201',
+        docState: { 201: { digest: 'd', data: { docker: { port: 80 } } } },
+        prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
+        tags: [],
+        pending: [],
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData',
+     'applicablePrefixes', 'pendingUnder'].forEach((m) => (panelS[m] = P[m]));
+
+    eq('a stored value that fits is not marked', panelS.findingsFor()['docker.port'], undefined);
+    panelS.pending = [{ path: 'docker.port', op: 'set', value: 70000 }];
+    eq('a staged value that does not fit is', panelS.findingsFor()['docker.port'], 'must be at most 65535');
+    // ... and it is still allowed to be staged and applied: the marker is advisory,
+    // the server's lint is the authority (DESIGN §4).
+    eq('the planned document keeps it', panelS.plannedData().docker.port, 70000);
+
+    // Discarding one row drops that row's edits and nothing else.
+    panelS.pending = [
+        { path: 'docker.port', op: 'set', value: 70000 },
+        { path: 'docker.host', op: 'set', value: 'x' },
+    ];
+    eq('the row knows its own edits', panelS.pendingUnder('docker.port').length, 1);
+    eq('and a subtree knows all of them', panelS.pendingUnder('docker').length, 2);
+    eq('an untouched path has none', panelS.pendingUnder('netbird').length, 0);
 }
 
 console.log('\n--- acting on one member rewrites its list ---');
