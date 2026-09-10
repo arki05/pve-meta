@@ -200,6 +200,9 @@ check: doc wasm
 # Every shell and Perl file, compiled but not run. The PVE modules the Perl
 # files `use` are stubbed (scripts/perl-stubs) so this runs on a laptop and in
 # CI's plain Debian container; on a PVE host `perl -c` without -I is stricter.
+# Only PVE's own modules are stubbed: pve-ext's loader uses JSON, which is a
+# real dependency (libjson-perl, always present on a PVE node) and has to be
+# installed wherever this runs.
 # pve-ext-patch rewrites files inside pve-manager and libpve-guest-common-perl,
 # which is the strongest reason for it to be the one script shellcheck sees.
 check-perl:

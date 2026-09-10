@@ -29,7 +29,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential curl git pkg-config libssl-dev libperl-dev perl \
             debhelper dh-cargo devscripts fakeroot dpkg-dev lintian \
-            nodejs npm shellcheck
+            nodejs npm shellcheck libjson-perl
 
       # `--profile minimal` is rustc, cargo and rust-std for the host only.
       # `make wasm` (a dependency of `make build` and `make check`) needs the
