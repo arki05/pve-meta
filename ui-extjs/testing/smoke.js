@@ -1799,9 +1799,8 @@ eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'alwa
 // A range on a string, or a format on a number, would be a declaration nothing reads.
 eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
 eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
-// A KVComboBox whose key is the empty string hands back the store record's internal
-// id (`KeyValue-1`) instead of the key, so "no format" is the sentinel `none`. This
-// wrote `format: KeyValue-1` into a namespace schema until a browser check caught it.
+// "No format" is the sentinel `none`, never `''` (the `KeyValue-1` bug; see the
+// Declare Key form's format combobox in pve-meta-tree.js), so it must not land.
 eq('the none sentinel is not a format', D.schemaFrom({ type: 'string', format: 'none' }), { type: 'string' });
 eq('a real format still lands', D.schemaFrom({ type: 'string', format: 'ip' }), { type: 'string', format: 'ip' });
 eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });

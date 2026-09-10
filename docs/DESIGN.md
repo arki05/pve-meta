@@ -248,7 +248,7 @@ Four things are specific to them:
   replace. (That is not hypothetical. The lab's `homelab.docker` prefix held
   `compose: { type: string, description: The compose file, as text }`, where the unquoted
   comma inside a flow mapping had silently made a second key `as text: null`. The loader
-  never looked inside `schema`, so nothing had complained for weeks.)
+  never looked inside `schema`, so nothing had complained.)
 * **No permission ever reaches them.** These documents get no scopes at all, so an operator
   holding `rw` on a prefix cannot edit the permission file that gave it that prefix, nor the
   prefix that declares it. Self-registration is refused by there being no way to
@@ -496,8 +496,7 @@ does not work at all: a prefix definition's selector is *exactly one of* `all` o
 (§3.1), so turning `{all: true}` into `{tag: web}` has **no legal single-key step** —
 dropping `all` is refused, adding `tag` is refused, and the row editor could only ever
 do one at a time. The field was uneditable from the tree, with nothing on screen saying
-why. (Reproduced on the lab: both routes 400, only the combined write at `selector`
-succeeds.)
+why.
 
 So the tree works the way the text editor always has. Edits accumulate, the tree renders
 the document as it *would* be, and **Apply** sends them as one write: a `replace` at the
@@ -590,13 +589,10 @@ typed. It is one apply that spends the staged edits too, since the buffer alread
 contains them.
 
 **One buffer grammar, two editors.** "How do I read this buffer, and how do I render
-it back" is one rule, and it lived twice: the Text card preferred the server's own YAML
-whenever a round trip through JSON left the document unchanged — the browser's emitter
-and the store's laid the same document out differently, so re-dumping made a
-*presentation* toggle report unsaved changes — and the subtree window, five hundred lines
-away, dumped unconditionally. Toggling to JSON and back there produced a whitespace-only
-diff with Apply enabled: the exact bug the sibling's comment describes preventing. Both
-now call `PVE.meta.Codec.parse`/`render`, and a test pins the round trip.
+it back" is one rule, and it lived twice: the Text card knew the toggle rule below and
+the subtree window, five hundred lines away, did not, so toggling to JSON and back there
+produced a whitespace-only diff with Apply enabled. Both now call
+`PVE.meta.Codec.parse`/`render`, and a test pins the round trip.
 
 **One footer, three editors.** There are three places you edit a document — the tree,
 the text card behind the Tree | Text toggle, and the text window over one subtree — and
@@ -650,7 +646,7 @@ document's is `Sys.Audit`, and a registry file's is **open to every authenticate
 while its write is `Sys.Modify` (§3.5). The write bits of the last two coincide, which is
 exactly why asking the wrong question was invisible until someone held `Sys.Modify`
 without `Sys.Audit`: the editor then greyed out Text mode on a file that caller could
-certainly read. Verified on the lab with a token holding only `Sys.Modify`.
+certainly read.
 
 **The datacenter tab has three sub-tabs.** A guest tab is one document's editor, and
 looks as it always did. The datacenter tab is a tab panel: **Document** (the datacenter
@@ -750,12 +746,9 @@ store writes bare, and indented block sequences the store writes flush). Two set
 and a shared fixture held them together. There is one emitter now: the editor's codec
 *is* `pve-meta-core::format`, compiled for the browser (`crates/pve-meta-wasm`, §9), and
 `testdata/yaml-cases.json` has one job left — to notice when a `serde_yaml_ng` upgrade
-moves the bytes.
-
-`Codec.render` still prefers the text the editor was handed when the document is
-unchanged, for the case a shared emitter does not cover: the store rewrites a file only
-when asked to write one, so a hand-edited file keeps its own valid-but-not-canonical
-layout until someone applies something.
+moves the bytes. (`Codec.render` still prefers the text the editor was handed while the
+document is unchanged — the toggle rule above — because a shared emitter does not cover
+a file somebody wrote by hand.)
 
 **The browser reimplements nothing.** That is the rule the Perl layer has always
 followed — `PVE::API2::Ext::Meta` calls the Rust through perlmod and restates none of it
@@ -816,6 +809,7 @@ prefixes/                packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor tab (plain JS, native ExtJS panel)
+testdata/yaml-cases.json the canonical YAML bytes, pinned by both suites (§8)
 debian/, Makefile        packages: pve-ext, pve-meta, libpve-meta-rs-perl
 ```
 
