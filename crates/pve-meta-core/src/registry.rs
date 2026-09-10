@@ -66,6 +66,7 @@
 //! made this two concepts and not one (`docs/DESIGN.md` §12).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path as FsPath, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,6 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::path::Path;
 use crate::scopes::{Mode, Scope};
-use crate::store::RegistryKind;
 
 /// The packaged prefix directory.
 pub const PREFIX_PACKAGED_DIR: &str = "/usr/share/pve-meta/prefixes";
@@ -90,6 +90,33 @@ pub const PERMISSION_CLUSTER_DIR: &str = "/etc/pve/meta.d/permissions";
 pub const PREFIX_DIRS_ENV: &str = "PVE_META_PREFIX_DIRS";
 /// Environment variable overriding the permissions directories, likewise.
 pub const PERMISSION_DIRS_ENV: &str = "PVE_META_PERMISSION_DIRS";
+
+/// Which of the two drop directories a [`crate::store::DocId::Registry`] document lives in
+/// .
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum RegistryKind {
+    /// A prefix: what a prefix is ([`PrefixDef`]).
+    PrefixDef,
+    /// A permission file: who may touch one ([`Permission`]).
+    Permission,
+}
+
+impl RegistryKind {
+    /// The kind's wire name, and the first segment of a registry document's
+    /// API id: `prefixes` / `permissions`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RegistryKind::PrefixDef => "prefixes",
+            RegistryKind::Permission => "permissions",
+        }
+    }
+}
+
+impl fmt::Display for RegistryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// Which guests something applies to (`docs/DESIGN.md` §3). Room is left in
 /// the format for `{ pool: <name> }`; it is deliberately not implemented.

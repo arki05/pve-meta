@@ -43,6 +43,7 @@ use crate::error::{Error, Result};
 use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
+pub use crate::registry::RegistryKind;
 use crate::registry::Registry;
 
 /// Warn threshold for document size (informational only; reported through
@@ -82,33 +83,6 @@ pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 /// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
 pub const DISK_FORMAT: Format = Format::Yaml;
 
-/// Which of the two drop directories a [`DocId::Registry`] document lives in
-/// (`crate::registry`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RegistryKind {
-    /// A prefix: what a prefix is (`crate::registry::PrefixDef`).
-    PrefixDef,
-    /// A permission file: who may touch one (`crate::registry::Permission`).
-    Permission,
-}
-
-impl RegistryKind {
-    /// The kind's wire name, and the first segment of a registry document's
-    /// API id: `prefixes` / `permissions`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RegistryKind::PrefixDef => "prefixes",
-            RegistryKind::Permission => "permissions",
-        }
-    }
-}
-
-impl fmt::Display for RegistryKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Identifies a top-level document in the store: a guest's metadata, the
 /// datacenter's, or one registry file. Snapshots are addressed separately, by
 /// `(vmid, name)`, via the dedicated snapshot methods.
@@ -147,10 +121,13 @@ impl DocId {
     }
 }
 
+/// The id as the API spells it and as `parse_id` reads it back: `105`,
+/// `datacenter`, `prefixes/<name>`, `permissions/<name>`. The one string
+/// form of a document id, used on the wire and in error messages alike.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DocId::Guest(vmid) => write!(f, "guest {vmid}"),
+            DocId::Guest(vmid) => write!(f, "{vmid}"),
             DocId::Datacenter => write!(f, "datacenter"),
             DocId::Registry(kind, name) => write!(f, "{kind}/{name}"),
         }

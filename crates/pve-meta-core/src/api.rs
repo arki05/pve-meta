@@ -57,9 +57,9 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Permission, PrefixDef, RegistryFailure};
+use crate::registry::{self, Permission, PrefixDef, RegistryFailure, RegistryKind};
 use crate::scopes::Effective;
-use crate::store::{DocId, MetaStore, RegistryKind, DISK_FORMAT};
+use crate::store::{DocId, MetaStore, DISK_FORMAT};
 use crate::view;
 
 mod types;
@@ -200,14 +200,6 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
              'prefixes/<name>' or 'permissions/<name>'"
         ))
     })
-}
-
-fn id_str(id: &DocId) -> String {
-    match id {
-        DocId::Guest(vmid) => vmid.to_string(),
-        DocId::Datacenter => "datacenter".to_string(),
-        DocId::Registry(kind, name) => format!("{kind}/{name}"),
-    }
 }
 
 /// Parses a `view` parameter (a dotted/slash path, or absent = the whole
@@ -362,7 +354,7 @@ pub fn version(
             v.documents
                 .into_iter()
                 .map(|(id, digest)| ApiDocumentDigest {
-                    id: id_str(&id),
+                    id: id.to_string(),
                     digest,
                 })
                 .collect()
@@ -525,7 +517,7 @@ pub fn get_document(
         if fmt == Format::Yaml && access.full_read {
             if let Some(raw) = &stored.raw {
                 return Ok(ApiViewDocument {
-                    id: id_str(&doc_id),
+                    id: doc_id.to_string(),
                     view: view_out(view),
                     digest: stored.digest,
                     data: None,
@@ -565,7 +557,7 @@ pub fn get_document(
     };
 
     Ok(ApiViewDocument {
-        id: id_str(&doc_id),
+        id: doc_id.to_string(),
         view: view_out(view),
         digest: stored.digest,
         data,
@@ -837,7 +829,7 @@ pub fn put_document(
     };
 
     Ok(ApiPutResult {
-        id: id_str(&doc_id),
+        id: doc_id.to_string(),
         view: view_out(view),
         digest: new_digest,
         touched: touched_out(&touched),
@@ -902,7 +894,7 @@ pub fn delete_document(
     };
 
     Ok(ApiPutResult {
-        id: id_str(&doc_id),
+        id: doc_id.to_string(),
         view: view_out(view),
         digest: new_digest,
         touched: touched_out(&touched),
