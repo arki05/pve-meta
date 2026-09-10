@@ -1213,14 +1213,21 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
-    fn a_scoped_version_names_only_its_own_document() {
-        let (_dir, store) = store();
+    fn a_scoped_detail_lists_exactly_what_the_scoped_token_covers() {
+        // `detail` answers "which of the things this token covers changed", so
+        // it lists what the token is over and nothing else: this document, and
+        // the registry documents -- which the scoped token watches too, because
+        // they decide how the document is rendered and who may write it.
+        let (dir, store) = store();
         store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
         store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
+        let prefixes = dir.path().join("registry/prefixes");
+        std::fs::create_dir_all(&prefixes).unwrap();
+        std::fs::write(prefixes.join("homelab.yaml"), "selector: {all: true}\n").unwrap();
 
         let docs = version(&store, true, Some("100")).unwrap().documents.unwrap();
         let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-        assert_eq!(ids, vec!["100"]);
+        assert_eq!(ids, vec!["100", "prefixes/homelab"]);
     }
 
     #[test]

@@ -255,10 +255,12 @@ is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200', 'datac
 my $scoped_v = PVE::RS::Meta::api_version(0, '9100');
 like($scoped_v->{token}, qr/^[0-9a-f]{64}$/, 'api_version takes an id');
 isnt($scoped_v->{token}, $v->{token}, 'a scoped token is its own token, not the store-wide one');
+# `detail` lists what the token covers, which for a scoped token is this
+# document plus the registry documents -- never the other guests.
 is_deeply(
     [map { $_->{id} } @{ PVE::RS::Meta::api_version(1, '9100')->{documents} }],
     ['9100'],
-    'detail with an id names only that document',
+    'detail with an id lists that document and no other guest',
 );
 write_file('9200.yaml', "moved: yes\n");
 is(PVE::RS::Meta::api_version(0, '9100')->{token}, $scoped_v->{token},

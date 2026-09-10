@@ -378,8 +378,10 @@ __PACKAGE__->register_method({
             documents => {
                 type => 'array',
                 optional => 1,
-                description => "With 'detail': [{ id, digest }] for every document, sorted by id. "
-                    . "Snapshot copies are not documents and are not listed, though they do move 'token'.",
+                description => "With 'detail': [{ id, digest }] for every document, sorted by id -- "
+                    . "or, with 'id', for the documents that scoped token covers: that one plus "
+                    . "the registry documents. Snapshot copies are not documents and are never "
+                    . "listed, though they do move an unscoped 'token'.",
                 items => {
                     type => 'object',
                     properties => {
