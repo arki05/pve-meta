@@ -102,6 +102,13 @@ sub cmd_get {
     }
 
     if ($format eq 'json') {
+        # Canonical, i.e. keys sorted -- deliberately *not* the document's own key
+        # order, which this hash could not carry anyway: perlmod renders a document
+        # as a native Perl hash, and a Perl hash has no order (two reads of one
+        # document can come back in two different orders). Sorted is at least
+        # stable, which is what a script diffing this output needs. The default
+        # `yaml` output below is the server's canonical text and does carry the
+        # document's order.
         print JSON::PP->new->canonical->encode($data), "\n";
         return;
     }
