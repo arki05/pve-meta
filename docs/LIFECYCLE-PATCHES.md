@@ -32,8 +32,9 @@ guest operation over a sidecar file, exactly as PVE already treats
 The patch, its manifest (`patches/lifecycle.toml`) and the one diff
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
 `pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst` — see
-`pve-ext/README.md` ("Managed patches") for the tool itself. Function contracts
-(`on_snapshot`/`on_rollback`/`on_delsnap`) are specified in `docs/PERL-BINDINGS-SPEC.md`.
+`pve-ext/README.md` ("Managed patches") for the tool itself. What each hook does is
+`docs/DESIGN.md` §6; the exports themselves, with their arguments and return values,
+are documented where they are defined, in `crates/pve-meta-perl/src/lib.rs`.
 
 One caveat worth knowing, not fixing: vzdump's own transient `'vzdump'` snapshot for LXC
 containers goes through this same `snapshot_create`/`snapshot_delete` code, so it fires

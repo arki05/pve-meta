@@ -25,6 +25,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Not on crates.io (checked 2026-09-07: `perlmod` returns 404 there) --
-# pinned to the same commit used by upstream `pve-rs` 0.15.3, per
-# docs/PERL-BINDINGS-SPEC.md.
+# pinned to the same commit used by upstream `pve-rs` 0.15.3 (see
+# PACKAGING.md next to this file).
 perlmod = { git = "https://git.proxmox.com/git/perlmod.git", rev = "d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e", features = ["exporter"] }

@@ -308,6 +308,21 @@ covering only the keywords we happened to think of. The small form that *does* e
   names. Reads are unlocked, so a file can vanish under one: that is a 404 (or, in a
   listing or a poll, a skipped entry), never a 500, and a `DELETE` of a document someone
   else already removed succeeds. Errors name paths; there is no disclosure filtering.
+* YAML is read strictly: anchors, aliases, explicit tags and non-string keys are
+  refused, and the YAML 1.1 words `yes`/`no`/`on`/`off` stay strings — the store's
+  parser decides what a document can hold, and a client that wants a boolean writes
+  `true`. A document is always rewritten canonically from its value (block style,
+  two-space indent, key order kept), so a free-form `#` comment survives only until
+  something writes the file; comment *keys* are data and survive anything.
+* Sizes: a write above 512 KiB is refused, with a warning logged above 256 KiB. That is
+  a backstop for a hand-written or replicated file being rewritten, and for the pmxcfs
+  budget — not the operative limit for an API write, since pveproxy refuses a body of
+  about that size first (measured: 520 000 B through, 530 000 B → 501 "for data too
+  large"). Reads cap at 4 MiB, eight times the write cap, so nothing the store wrote
+  can hit it. A file above it is never parsed; `digest` and the version token identify
+  it by a surrogate over its size and mtime rather than its bytes, so a multi-megabyte
+  file dropped in out of band is not hashed by every poll, and it stays replaceable
+  against that identity.
 
 ## 5. API (native, `/api2/json/meta`, served by pveproxy/pvedaemon)
 
@@ -334,6 +349,19 @@ Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over
 `pve_meta_core::api` through the perlmod bindings. **Grants, guest lists and results
 cross the Perl/Rust boundary as native hashes/arrays**, never as JSON strings; only the
 client-supplied `data` parameter is a JSON string, decoded once in Rust.
+
+Two conventions of that boundary are worth knowing before reading either side. perlmod
+converts a Perl scalar to a Rust `bool` by truthiness — `1`, `"1"` and any non-empty
+string are true; `0`, `""` and `undef` are false — which is the property that replaced
+a hand-built JSON string for the ACL answers (`encode_json` renders Perl's `1`/`0` as
+numbers, and serde wanted `true`/`false`); `test/basic.pl` asserts all six cases. An
+error from the Rust side is `die`d as `"NNN: message"`, an HTTP status prefix that
+`Meta.pm`'s `_call` turns into a `PVE::Exception`; there is no second error vocabulary.
+The bindings add nothing else: a store rooted at `$PVE_META_ROOT` (default
+`/etc/pve/meta`) and the two registry directories, with `PVE_META_PREFIX_DIRS` and
+`PVE_META_PERMISSION_DIRS` as colon-separated overrides for the tests, all opened per
+request — they are tiny, pmxcfs caches them, and a stale grant is a wrong answer about
+who may write.
 
 ## 6. Guest lifecycle
 
@@ -367,7 +395,10 @@ client-supplied `data` parameter is a JSON string, decoded once in Rust.
   `move_config_to_node`'d.
 
   A **manual broom** remains at `/usr/libexec/pve-meta/gc` (`PVE::RS::Meta::gc_candidates`
-  + `gc_purge`, two-phase under `cfs_lock_domain`) for the one case the hooks cannot see:
+  + `gc_purge` — two-phase because a write and a sweep lock disjoint domains, so a
+  one-pass sweep could purge a document written after its vmlist snapshot; the sweep
+  only nominates, and each vmid is purged under its own write lock against a vmlist
+  re-read inside it) for the one case the hooks cannot see:
   a config removed out of band. **Nothing runs it on a timer.** There is no orphan concept
   in the API.
 * **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up

@@ -16,12 +16,13 @@
 //!
 //! ## Authorization
 //!
-//! Authorization is decided **from the request, never from a diff**
-//! (`docs/DESIGN.md` §3):
+//! A write is authorized **by what it changes, not by what it is addressed
+//! to** (`docs/DESIGN.md` §3.4):
 //!
-//! 1. [`Effective::can_write`] must hold for the view before anything is
-//!    computed, and a caller without `full_write` may not write the root view
-//!    at all;
+//! 1. [`authorize_view_write`] refuses the two request shapes that must not
+//!    reach the content check at all: the caller must be able to *read* the
+//!    view it names, and must hold some write permission on the document
+//!    ([`Effective::has_any_write`]); `full_write` short-circuits both;
 //! 2. the mutation is planned against a **clone** of the stored document and
 //!    every path the plan touches is checked with [`Effective::check_write`];
 //! 3. the planned document is linted — once, the same way for every caller
