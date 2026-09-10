@@ -227,10 +227,10 @@ async function main() {
         await handle.asElement().click();
         await sleep(1500);
 
-        // Click the "Metadata (ExtJS)" nav item the pve-ext loader should have added.
+        // Click the "Metadata" nav item the pve-ext loader should have added.
         const navHandle = await page.evaluateHandle(() =>
             Array.from(document.querySelectorAll('.x-treelist-item-text')).find(
-                (e) => e.textContent.trim() === 'Metadata (ExtJS)',
+                (e) => e.textContent.trim() === 'Metadata',
             ),
         );
         result.checks.navItemPresent = !!navHandle.asElement();

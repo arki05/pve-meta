@@ -73,10 +73,10 @@ async function openTab(page, kind, id) {
     await sleep(1500);
     const nav = await page.evaluateHandle(() =>
         Array.from(document.querySelectorAll('.x-treelist-item-text')).find(
-            (e) => e.textContent.trim() === 'Metadata (ExtJS)',
+            (e) => e.textContent.trim() === 'Metadata',
         ),
     );
-    if (!nav.asElement()) throw new Error('no Metadata (ExtJS) nav item for ' + kind);
+    if (!nav.asElement()) throw new Error('no Metadata nav item for ' + kind);
     await nav.asElement().click();
     await sleep(5000);
 }
