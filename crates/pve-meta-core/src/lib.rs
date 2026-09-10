@@ -42,7 +42,7 @@
 //!   (`docs/DESIGN.md` §3). They nest by opposite rules: prefixes shadow
 //!   most-specific-first ([`registry::governing`]), grants accumulate by
 //!   containment ([`registry::scopes_for`]).
-//! - [`scopes`] — [`scopes::Grants`], a principal's effective access to one
+//! - [`scopes`] — [`scopes::Effective`], a principal's effective access to one
 //!   document: the PVE ACL answers plus the grant scopes whose selector
 //!   matches the guest.
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]

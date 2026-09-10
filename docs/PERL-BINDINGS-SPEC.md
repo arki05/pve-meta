@@ -24,8 +24,8 @@ pve-meta-rs` (or an explicit `--workspace`) still targets it.
 
 The bindings crate is deliberately **thin**: it owns the `#[perlmod::package]` glue,
 `open_store()` (the `$PVE_META_ROOT` lookup, default `/etc/pve/meta`),
-`open_prefixes()` (`registry::load_prefixes_default()`) and `open_grants()`
-(`registry::load_grants_default()`), and nothing else. Both drop directories are read per
+`open_prefixes()` (`registry::load_prefixes_default()`) and `open_permissions()`
+(`registry::load_permissions_default()`), and nothing else. Both drop directories are read per
 request — they are tiny, pmxcfs caches them, and a stale grant is a wrong answer about
 who may write. Every decision — the document model, the views, the prefix and grant
 rules, and in particular the write authorization — lives in `pve-meta-core`, where it can
@@ -33,16 +33,16 @@ be unit-tested on any machine.
 
 ## The boundary: native structures, one string
 
-`DESIGN.md` §5: **grants, guest lists and results cross as native Perl hashes and
+`DESIGN.md` §5: **permissions, guest lists and results cross as native Perl hashes and
 arrays.** perlmod does serde-based conversion of native Perl structures; that is its
 purpose. The single exception is the client-supplied `data` parameter, which is a JSON
 string because that is what the REST parameter is, decoded once in Rust.
 
-Revision 4 passed grants, view data and guest lists as JSON *strings*, which cost an
-encode plus a decode per request and created a bug class: `Meta.pm`'s `_grants_json` was
+Revision 4 passed permissions, view data and guest lists as JSON *strings*, which cost an
+encode plus a decode per request and created a bug class: `Meta.pm`'s `_permissions_json` was
 a hand-built JSON string, because `encode_json` renders Perl's `1`/`0` as JSON numbers
-and serde wanted `true`/`false`. `_grants_json`, `_inflate_view`, `api::parse_grants`,
-`GuestInput::grants`-as-string and `ApiViewDocument::data_json` are all gone.
+and serde wanted `true`/`false`. `_permissions_json`, `_inflate_view`, `api::parse_permissions`,
+`GuestInput::permissions`-as-string and `ApiViewDocument::data_json` are all gone.
 
 **perlmod converts a Perl scalar to a Rust `bool` by truthiness** — `1`, `"1"` and any
 non-empty string are true; `0`, `""` and `undef` are false. `test/basic.pl` asserts all
@@ -56,9 +56,9 @@ The caller crosses as one hash:
 
 `read`/`write` are the PVE ACL answers for the document being addressed (`VM.Audit` /
 `VM.Config.Options` on `/vms/<vmid>`; `Sys.Audit` / `Sys.Modify` on `/` for the
-datacenter document) and `tags` are that guest's PVE tags, which resolve the grants' and
+datacenter document) and `tags` are that guest's PVE tags, which resolve the permissions' and
 prefixes' selectors (`DESIGN.md` §3). Rust computes the caller's scopes from it; Perl
-never builds a grant list.
+never builds a permission list.
 
 ## Perl API (`#[perlmod::package(name = "PVE::RS::Meta", lib = "pve_meta_rs")]`)
 
@@ -68,7 +68,7 @@ All functions die with a readable message on error (`anyhow::Error` → Perl `di
 
 All of them (`DESIGN.md` §6), called from one patched file, `PVE/AbstractConfig.pm`
 (package `libpve-guest-common-perl`). They run inside PVE's own guest locks and move
-whole files; they do not consult grants.
+whole files; they do not consult permissions.
 
 * `on_snapshot($vmid, $snapname)` → copies the document to the snapshot file; no-op if
   the guest has no document. Returns 1 if a copy was made, 0 otherwise.
@@ -92,10 +92,10 @@ vmid destroyed and recreated between two sweeps is never *missing* from the vmli
 sweep never nominates it and the new guest inherits the old document permanently.
 
 **Removed in revision 5** (`DESIGN.md` §10): `on_clone`, `export_for_backup`,
-`import_from_backup`, `list_snapshots`, `has_document` and `api_grants`. Clone and backup
+`import_from_backup`, `list_snapshots`, `has_document` and `api_permissions`. Clone and backup
 are not carried ("metadata lives in `/etc/pve`; back up `/etc/pve`");
 `list_snapshots`/`has_document` existed for the orphan machinery, which is gone with the
-orphan concept. Revision 6's `api_grants` is a different function under the same name:
+orphan concept. Revision 6's `api_permissions` is a different function under the same name:
 that one returned the *caller's* computed grants for Perl to forward, this one lists the
 grant **files** (`DESIGN.md` §3.2).
 
@@ -181,14 +181,14 @@ authorization rules and `DESIGN.md` §5 for the endpoints). They die with
   — the order that resolves which one governs a path (`DESIGN.md` §3.1):
   `[{ prefix, description?, selector, schema? }]`. The prefix is the file's name; a
   prefix names no principal, so there is no `authid` on it.
-* `api_grants()` → every grant, as native hashes:
+* `api_permissions()` → every permission, as native hashes:
   `[{ name, authid, description?, grants: [{ prefix, mode, selector }] }]`. Read from
-  `/etc/pve/meta.d/grants` only — there is deliberately no packaged grants directory
+  `/etc/pve/meta.d/permissions` only — there is deliberately no packaged permissions directory
   (`DESIGN.md` §3.2).
 * In both, `selector` is spelled as the file spells it (`{all => 1}` /
   `{tag => '<name>'}`), and a malformed file is skipped with a warning and does not
   appear — independently per directory.
-* `api_access($id, $acl)` → `{ read, write, scopes }` for one document, with the grants'
+* `api_access($id, $acl)` → `{ read, write, scopes }` for one document, with the permissions'
   selectors already resolved against `$acl->{tags}`. `$id` is a vmid or
   `"datacenter"`; scopes are always empty for the latter.
 * `api_list_guests($authid, $guests, $has)` → one row per guest the caller can read
@@ -222,7 +222,7 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   `$(DESTDIR)$(PERL_INSTALLVENDORLIB)/…` (paths from `perl -MConfig`).
 * Perl-side test: `crates/pve-meta-perl/test/basic.pl`, run by `make check`. It uses the
   sed-patched loader trick so it loads `target/{debug,release}/libpve_meta_rs.so`
-  directly, sets `PVE_META_ROOT`, `PVE_META_PREFIX_DIRS` and `PVE_META_GRANT_DIRS` to
+  directly, sets `PVE_META_ROOT`, `PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` to
   temp dirs, and exercises every export: the three snapshot hooks and their `die`
   behaviour; that the removed exports really are gone; `gc` (a stale document plus both
   its snapshot copies,
@@ -233,7 +233,7 @@ across nodes (`DESIGN.md` §4) — the Perl API module is responsible for holdin
   six shapes; the `api_*` contract with native hash arguments and native results
   (including that integers, floats, booleans and lists survive the boundary);
   `api_prefixes` listing every prefix sorted longest-prefix-first (the file name
-  being the prefix, and no `authid` on any of them) and `api_grants` listing a grant by
+  being the prefix, and no `authid` on any of them) and `api_permissions` listing a permission by
   its file name with every entry's prefix, mode and native-hash selector, and no schema;
   tag selectors on and off, on `access`, on reads and on writes; a read-only scope; the root
   view needing full write; an empty merge creating nothing; the one comment-key rule;

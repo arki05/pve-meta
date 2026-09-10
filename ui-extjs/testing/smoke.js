@@ -86,14 +86,17 @@ const eq = (name, got, want) => {
 
 console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
+    'PVE.meta.Footer',
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
+    'PVE.meta.AddRuleWindow',
     'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
     'PVE.meta.DocumentWindow',
     'PVE.meta.NewRegistryWindow',
+    'PVE.meta.ServiceToken',
     'PVE.meta.RegistryGrid',
     'PVE.meta.DatacenterPanel',
 ]);
@@ -388,22 +391,22 @@ const panel = {
     dc: false,
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, grants
+    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, permissions
     // decide access.
     prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
     ],
-    grants: [
+    permissions: [
         {
             name: 'traefik',
             authid: 'svc@pve!traefik',
-            grants: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
+            rules: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
         },
         {
             name: 'netbird',
             authid: 'svc@pve!netbird',
-            grants: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
+            rules: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
         },
     ],
 };
@@ -413,7 +416,7 @@ const panel = {
     'addGrammar',
     'schemaKind',
     'applicablePrefixes',
-    'applicableGrants',
+    'applicablePermissions',
     'accessFor',
     'accessSummary',
     'editableFor',
@@ -421,8 +424,8 @@ const panel = {
 
 const prefixes = panel.applicablePrefixes.call(panel);
 eq('applicable prefixes', prefixes.map((n) => n.prefix), ['traefik', 'netbird']);
-const scopes = panel.applicableGrants.call(panel);
-eq('applicable grants', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
+const scopes = panel.applicablePermissions.call(panel);
+eq('applicable permissions', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
@@ -454,7 +457,7 @@ eq('comment not a row', Object.keys(root.children.netbird.children).sort(), ['gr
 eq('comment is the description', root.children.netbird.children.groups.description, 'asdf');
 eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
-console.log('\n--- Access: every grant whose prefix covers the row ---');
+console.log('\n--- Access: every rule whose prefix covers the row ---');
 eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
     { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
 ]);
@@ -466,7 +469,7 @@ const overlapping = scopes.concat([
         prefix: 'traefik',
         mode: 'ro',
         selector: { all: true },
-        grant: { name: 'audit', authid: 'svc@pve!audit' },
+        file: { name: 'audit', authid: 'svc@pve!audit' },
     },
 ]);
 eq(
@@ -482,13 +485,13 @@ eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), fals
 console.log('\n--- S6: a guest that does not carry the tag ---');
 // A tag selector resolves against this guest's tags and nothing else. Holding a
 // `traefik` rw scope of our own must not drag another principal's tag-selected
-// grant onto a guest that is not tagged `traefik` -- the Access column would
+// rule onto a guest that is not tagged `traefik` -- the Access column would
 // then name a writer who cannot in fact write here.
 const untagged = Object.assign({}, panel);
 untagged.tags = [];
 untagged.access = { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const untaggedScopes = panel.applicableGrants.call(untagged);
-eq('a tag grant needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
+const untaggedScopes = panel.applicablePermissions.call(untagged);
+eq('a tag rule needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
 eq(
     'no Access row for the prefix whose selector missed',
     panel.accessFor.call(untagged, 'traefik.spec.host', untaggedScopes),
@@ -708,7 +711,7 @@ eq('an unquoted integer is still a number', U.yamlLoad('v: 1\n'), { v: 1 });
 eq('booleans still parse', U.yamlLoad('v: true\n'), { v: true });
 eq('an empty document is the empty map, not null', U.yamlLoad(''), {});
 
-console.log('\n--- governing uses containment, not the grant predicate ---');
+console.log('\n--- governing uses containment, not the permission predicate ---');
 // `covers` aliases the sibling comment key `p__` -- that is a GRANT rule. Using it to
 // pick a governing prefix made `a` govern the whole `a__` prefix, where Rust's
 // registry::governing (plain containment) says `a__`.
@@ -775,17 +778,37 @@ eq('sameDocument says no when only the key order changed (order is data)',
 eq('sameDocument on unparseable text is not a match',
     U.sameDocument({}, 'a:\n  - [\n'), false);
 
+// `renderBuffer` is what both editors' JSON/YAML toggle now call -- TextWindow's own
+// toggle used to dump unconditionally here, which is exactly the bug the fixture
+// above is named for; a round trip through JSON has to land back on the server's
+// own text, not a fresh js-yaml dump of it.
+eq('renderBuffer prefers the server text on an unchanged round trip',
+    U.renderBuffer(parsed, 'yaml', SERVER_YAML), SERVER_YAML);
+eq('renderBuffer re-dumps once the value actually changed',
+    U.renderBuffer({ a: 1 }, 'yaml', SERVER_YAML), U.yamlDump({ a: 1 }));
+eq('renderBuffer for json is a plain stringify, original or not',
+    U.renderBuffer(parsed, 'json', SERVER_YAML), JSON.stringify(parsed, null, 2));
+eq('parseBuffer reads JSON as JSON and everything else as YAML',
+    [U.parseBuffer('{"a":1}', 'json'), U.parseBuffer('a: 1\n', 'yaml')],
+    [{ a: 1 }, { a: 1 }]);
+eq('dumpBuffer is the plain, unconditional inverse (what Format wants)',
+    U.dumpBuffer(parsed, 'yaml') !== SERVER_YAML, true);
+eq('originalInLang renders the loaded document in the other syntax',
+    U.originalInLang(SERVER_YAML, 'json'), JSON.stringify(parsed, null, 2));
+eq('originalInLang is the identity for yaml -- no reparse, so it never throws',
+    U.originalInLang(SERVER_YAML, 'yaml'), SERVER_YAML);
+
 console.log('\n--- many documents in one panel ---');
 const D = ctx.PVE.meta.DeclareKeyWindow;
 // An id is an address: the path it is served at, for every kind of document.
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('the datacenter id', P.urlFor.call(P, 'datacenter'), '/meta/datacenter');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
-eq('a grant id', P.urlFor.call(P, 'grants/scoped'), '/meta/grants/scoped');
+eq('a permission id', P.urlFor.call(P, 'permissions/scoped'), '/meta/permissions/scoped');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of the datacenter', P.docKind.call(P, 'datacenter'), 'datacenter');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
-eq('kind of a grant', P.docKind.call(P, 'grants/scoped'), 'grant');
+eq('kind of a permission file', P.docKind.call(P, 'permissions/scoped'), 'permission');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
 
 // Per-document digests. One shared field would have sent a prefix's digest with a
@@ -798,7 +821,7 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
     panelM.docId = 'datacenter';
     eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
     eq('and its own data', panelM.dataOf('datacenter'), { a: 1 });
-    eq('an unknown document has no digest', panelM.digestOf('grants/nope'), '');
+    eq('an unknown document has no digest', panelM.digestOf('permissions/nope'), '');
     eq('a row names its document', panelM.docOf({ data: { docId: 'prefixes/x' } }), 'prefixes/x');
     eq('no row means the default one', panelM.docOf(null), 'datacenter');
 }
@@ -976,41 +999,277 @@ console.log('\n--- the registry lists ---');
     eq('an administrator\'s own', G.originText(rows[1]), 'cluster');
     eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
 
-    const grants = G.rowsFrom('grants', [
+    const permRows = G.rowsFrom('permissions', [
         {
             name: 'scoped',
             authid: 'svc@pve!t1',
-            grants: [
+            rules: [
                 { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
                 { prefix: 'netbird', mode: 'ro', selector: { all: true } },
             ],
             origin: 'cluster',
         },
     ]);
-    eq('a grant row is addressed the same way', grants[0].id, 'grants/scoped');
+    eq('a permission row is addressed the same way', permRows[0].id, 'permissions/scoped');
     eq(
-        'and says what it actually grants',
-        grants[0].summary,
+        'and says what it actually permits',
+        permRows[0].summary,
         'traefik (rw, tag: traefik), netbird (ro, all guests)',
     );
     // An older API returns neither field; the list must still render.
-    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('grants', [{ name: 'x' }])[0]), 'cluster');
+    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
+}
+
+console.log('\n--- text is just another way to edit rows ---');
+{
+    // Editing as text used to be a second model with its own buffer, apply and write,
+    // kept apart from the tree by rules. `diffDocuments` turns whatever was typed back
+    // into edits *on rows*, so both are the same model and the rules go away.
+    const stored = {
+        homelab: { owner: 'arki', notes: 'the box', docker: { port: 80, restart: 'always' } },
+        netbird: { groups: ['lan'] },
+    };
+    const d = (edited) => U.diffDocuments(stored, edited);
+
+    eq('an unchanged document stages nothing', d(JSON.parse(JSON.stringify(stored))), []);
+
+    // A one-key change stays a one-key edit, so the tree marks that row and no other.
+    eq(
+        'a changed leaf is one edit on its own path',
+        d({ ...stored, homelab: { ...stored.homelab, owner: 'someone' } }),
+        [{ path: 'homelab.owner', op: 'set', value: 'someone' }],
+    );
+    // A key that is gone comes back as a delete, which is what draws it struck through.
+    const withoutNotes = { ...stored, homelab: { owner: 'arki', docker: stored.homelab.docker } };
+    eq('a removed key is a delete', d(withoutNotes), [{ path: 'homelab.notes', op: 'delete' }]);
+    eq(
+        'a new key is a set at its full path',
+        d({ ...stored, homelab: { ...stored.homelab, tags: 'x' } }),
+        [{ path: 'homelab.tags', op: 'set', value: 'x' }],
+    );
+    // Lists are compared whole: their members are not addressable (DESIGN §2).
+    eq(
+        'a changed list is one edit on the list',
+        d({ ...stored, netbird: { groups: ['lan', 'wan'] } }),
+        [{ path: 'netbird.groups', op: 'set', value: ['lan', 'wan'] }],
+    );
+
+    // The self-check: key order is data, and a pure reordering produces no per-key
+    // entries -- so the diff must notice it cannot express the change and replace the
+    // document whole rather than silently dropping it.
+    const reordered = { netbird: stored.netbird, homelab: stored.homelab };
+    const reorder = d(reordered);
+    eq('a pure reordering falls back to the whole document', reorder.length, 1);
+    eq('... at the document root', reorder[0].path, '');
+    eq('... and it round trips', U.applyPending(stored, reorder), reordered);
+
+    // Whatever comes back, replaying it on the stored document must equal what was
+    // typed -- that is the property the fallback exists to guarantee.
+    [
+        { ...stored, homelab: { ...stored.homelab, docker: { port: 8080, restart: 'no' } } },
+        { homelab: stored.homelab },
+        {},
+    ].forEach(function (edited, i) {
+        eq('case ' + i + ' round trips', U.applyPending(stored, d(edited)), edited);
+    });
+
+    // A root-level edit subsumes narrower ones: it replaces the whole document, so a
+    // staged edit under a key it does not have would otherwise be re-applied on top.
+    const stub = { pending: [{ path: 'homelab.owner', op: 'set', value: 'x' }], docId: '1' };
+    ['stage'].forEach((m) => (stub[m] = P[m]));
+    stub.buildTree = () => {};
+    stub.syncButtons = () => {};
+    stub.stage('', 'set', { a: 1 });
+    eq('the document replaces everything under it', stub.pending, [{ path: '', op: 'set', value: { a: 1 } }]);
+}
+
+console.log('\n--- a staged value is linted like a stored one ---');
+{
+    // Findings are computed against the *planned* document, so a value that breaks
+    // the schema is marked the moment it is staged -- not after it is written.
+    const SCHEMA = { type: 'object', properties: { port: { type: 'integer', maximum: 65535 } } };
+    const panelS = Object.assign({}, panel, {
+        dc: false,
+        docId: '201',
+        docState: { 201: { digest: 'd', data: { docker: { port: 80 } } } },
+        prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
+        tags: [],
+        pending: [],
+    });
+    ['grammarSplit', 'grammarFor', 'findingsFor', 'docKind', 'dataOf', 'plannedData',
+     'applicablePrefixes', 'pendingUnder'].forEach((m) => (panelS[m] = P[m]));
+
+    eq('a stored value that fits is not marked', panelS.findingsFor()['docker.port'], undefined);
+    panelS.pending = [{ path: 'docker.port', op: 'set', value: 70000 }];
+    eq('a staged value that does not fit is', panelS.findingsFor()['docker.port'], 'must be at most 65535');
+    // ... and it is still allowed to be staged and applied: the marker is advisory,
+    // the server's lint is the authority (DESIGN §4).
+    eq('the planned document keeps it', panelS.plannedData().docker.port, 70000);
+
+    // Discarding one row drops that row's edits and nothing else.
+    panelS.pending = [
+        { path: 'docker.port', op: 'set', value: 70000 },
+        { path: 'docker.host', op: 'set', value: 'x' },
+    ];
+    eq('the row knows its own edits', panelS.pendingUnder('docker.port').length, 1);
+    eq('and a subtree knows all of them', panelS.pendingUnder('docker').length, 2);
+    eq('an untouched path has none', panelS.pendingUnder('netbird').length, 0);
+}
+
+console.log('\n--- acting on one member rewrites its list ---');
+{
+    // There is no path to `groups[1]`, so every action on a member is a write of the
+    // whole list. Staging is what makes that unremarkable: it is one more staged
+    // edit, applied with everything else.
+    const stub = {
+        docId: '201',
+        pending: [],
+        docState: { 201: { digest: 'd', data: { netbird: { groups: ['lan', 'wan', 'dmz'] } } } },
+    };
+    ['listAt', 'stageListMember', 'plannedData', 'dataOf'].forEach((m) => (stub[m] = P[m]));
+    stub.stage = function (path, op, value) {
+        this.pending.push({ path: path, op: op, value: value });
+    };
+
+    eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
+    stub.stageListMember('netbird.groups', 1, 'wlan');
+    eq('editing a member writes the list', stub.pending[0], {
+        path: 'netbird.groups',
+        op: 'set',
+        value: ['lan', 'wlan', 'dmz'],
+    });
+    // ... and it reads back through the staged edit, so a second action composes.
+    eq('and the next action sees it', stub.listAt('netbird.groups'), ['lan', 'wlan', 'dmz']);
+    stub.stageListMember('netbird.groups', 0, undefined);
+    eq('removing a member drops it', stub.pending[1].value, ['wlan', 'dmz']);
+    // An index that is not there changes nothing, rather than growing the list with
+    // a hole in it.
+    stub.pending = [];
+    stub.stageListMember('netbird.groups', 9, 'nope');
+    eq('an index that is not there is not an edit', stub.pending, []);
+    stub.stageListMember('netbird.groups', -1, 'nope');
+    eq('nor is a negative one', stub.pending, []);
+}
+
+console.log('\n--- a list is a container, like a map ---');
+{
+    // The tree existed to make a document something you can look at and act on one
+    // piece of. A list was the one shape that stayed a blob of JSON in a cell, for
+    // no reason other than that it came second.
+    const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    panel.addData.call(panel, root, {
+        netbird: { groups: ['lan', 'wan'] },
+        rules: [
+            { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
+            { prefix: 'netbird', mode: 'ro', selector: { all: true } },
+        ],
+        empty: [],
+    });
+
+    const groups = root.children.netbird.children.groups;
+    eq('a list of scalars has a row per member', Object.keys(groups.children).sort(), ['0', '1']);
+    eq('each member keeps its own value', groups.children['0'].value, 'lan');
+    eq('and knows which member it is', groups.children['1'].arrayIndex, 1);
+    // Not addressable: a view addresses through maps only, so nothing may try to
+    // write `groups.1` -- everything that acts on a member rewrites the list.
+    eq('a member is not addressable', groups.children['0'].addressable, false);
+    eq('the list itself still is', groups.addressable, undefined);
+
+    const rules = root.children.rules;
+    eq('a list of maps too', Object.keys(rules.children).sort(), ['0', '1']);
+    // A member with structure shows one readable line, and carries its real value.
+    eq('a rule reads as a rule', rules.children['0'].value, 'traefik (rw, tag: traefik)');
+    eq('and the real thing rides along', rules.children['0'].rawItem.selector, { tag: 'traefik' });
+    eq('an empty list has no members', Object.keys(root.children.empty.children), []);
+
+    // The summary is presentation only, and falls back to JSON for a shape it does
+    // not recognise -- it describes nothing and constrains nothing.
+    eq('an unknown shape is still legible', U.itemSummary({ a: 1 }), '{"a":1}');
+    eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
+}
+
+console.log('\n--- adding one rule to a permission file ---');
+{
+    const R = ctx.PVE.meta.AddRuleWindow.statics;
+    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
+        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
+    ]);
+    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
+        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
+    ]);
+    // Appending, not replacing: `rules` is written whole because a view addresses
+    // through maps only, so the existing entries have to come along.
+    eq(
+        'the ones already there come with it',
+        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
+            prefix: 'traefik', mode: 'rw', selector: 'all',
+        }).map((r) => r.prefix),
+        ['netbird', 'traefik'],
+    );
+    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
+    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
+}
+
+console.log('\n--- adding one rule to a permission file ---');
+{
+    const R = ctx.PVE.meta.AddRuleWindow.statics;
+    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
+        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
+    ]);
+    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
+        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
+    ]);
+    // Appending, not replacing: `rules` is written whole because a view addresses
+    // through maps only, so the existing entries have to come along.
+    eq(
+        'the ones already there come with it',
+        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
+            prefix: 'traefik', mode: 'rw', selector: 'all',
+        }).map((r) => r.prefix),
+        ['netbird', 'traefik'],
+    );
+    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
+    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
 }
 
 console.log('\n--- creating a registry file: the least that parses ---');
 {
-    const N = ctx.PVE.meta.NewRegistryWindow;
-    const make = (kind, v) => N.contentFrom.call({ kind: kind }, v);
-    eq('a prefix with an "all" selector', make('prefixes', { selector: 'all' }), { selector: { all: true } });
-    eq('a prefix with a tag selector', make('prefixes', { selector: 'tag', tag: 'web' }), { selector: { tag: 'web' } });
+    const plan = (kind, v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(kind, v);
+    eq('a prefix with an "all" selector', plan('prefixes', { name: 'x', selector: 'all' }).content, { selector: { all: true } });
+    eq('a prefix with a tag selector', plan('prefixes', { name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
-        make('prefixes', { selector: 'all', description: 'Home' }),
+        plan('prefixes', { name: 'x', selector: 'all', description: 'Home' }).content,
         { description: 'Home', selector: { all: true } },
     );
-    // A grant is created granting nothing: it names a principal, and an
+    // A permission file is created permitting nothing: it names a principal, and an
     // administrator says what it may touch afterwards.
-    eq('a grant starts empty', make('grants', { authid: 'a@pve!t1' }), { authid: 'a@pve!t1', grants: [] });
+    const existing = plan('permissions', { name: 'ops', principal: 'existing', authid: 'a@pve!t1' });
+    eq('a permission file starts empty', existing.content, { authid: 'a@pve!t1', rules: [] });
+    eq('an existing principal makes nothing', existing.user, undefined);
+    eq('the file is named separately from the principal', existing.file, 'ops');
+
+    // The other half of the same dialog: the principal does not exist yet. The file
+    // must name the TOKEN, not the user -- naming the user produces a file that
+    // parses, loads, and grants the token nothing.
+    const fresh = plan('permissions', {
+        name: 'traefik', principal: 'new', user: 'traefik@pve', tokenid: 'meta', role: 'none',
+    });
+    eq('the file names the token', fresh.content.authid, 'traefik@pve!meta');
+    eq('and the user is created too', fresh.user, 'traefik@pve');
+    eq('the none sentinel grants nothing', fresh.acl, undefined);
+    const withRole = plan('permissions', {
+        name: 'a', principal: 'new', user: 'a@pve', tokenid: 't', role: 'PVEAuditor', description: 'x',
+    });
+    // /vms, not per-guest (a guest created tomorrow would miss it) and not `/`
+    // (PVEAuditor there also grants Sys.Audit, the datacenter document's read).
+    eq('a role goes on /vms, propagating', withRole.acl, { path: '/vms', role: 'PVEAuditor', propagate: 1 });
+    eq('a description reaches the file', withRole.content.description, 'x');
+
+    // The generated token id is a name, not a secret: PVE generates the secret.
+    const T = ctx.PVE.meta.ServiceToken;
+    eq('a generated id is a legal token id', /^[A-Za-z0-9_-]+$/.test(T.randomTokenId()), true);
+    eq('and two of them differ', T.randomTokenId() === T.randomTokenId(), false);
 }
 
 console.log('\n--- reloading must not fold the tree up ---');
@@ -1021,12 +1280,12 @@ console.log('\n--- reloading must not fold the tree up ---');
     // reload because `Grants` had won the shared key.
     const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
     const prefixes = { data: { docId: null, path: '', key: 'Prefixes' } };
-    const grants = { data: { docId: null, path: '', key: 'Grants' } };
+    const permissions = { data: { docId: null, path: '', key: 'Permissions' } };
     const dcRoot = { data: { docId: 'datacenter', path: '', key: 'datacenter' } };
     const nsRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
     const same = { data: { docId: 'prefixes/homelab', path: 'selector', key: 'selector' } };
-    const other = { data: { docId: 'grants/scoped', path: 'selector', key: 'selector' } };
-    const keys = [prefixes, grants, dcRoot, nsRoot, same, other].map(key);
+    const other = { data: { docId: 'permissions/scoped', path: 'selector', key: 'selector' } };
+    const keys = [prefixes, permissions, dcRoot, nsRoot, same, other].map(key);
     eq('every row has a key of its own', new Set(keys).size, keys.length);
 }
 
@@ -1097,6 +1356,11 @@ eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'alwa
 // A range on a string, or a format on a number, would be a declaration nothing reads.
 eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
 eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
+// A KVComboBox whose key is the empty string hands back the store record's internal
+// id (`KeyValue-1`) instead of the key, so "no format" is the sentinel `none`. This
+// wrote `format: KeyValue-1` into a namespace schema until a browser check caught it.
+eq('the none sentinel is not a format', D.schemaFrom({ type: 'string', format: 'none' }), { type: 'string' });
+eq('a real format still lands', D.schemaFrom({ type: 'string', format: 'ip' }), { type: 'string', format: 'ip' });
 eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });
 // An empty field is left out entirely: a schema full of nulls describes nothing, and
 // the server's lint refuses null values anyway.

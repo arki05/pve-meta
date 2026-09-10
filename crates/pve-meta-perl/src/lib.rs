@@ -31,7 +31,7 @@
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
 //! `test/basic.pl`); the registration directories likewise with
-//! `PVE_META_PREFIX_DIRS`/`PVE_META_GRANT_DIRS`.
+//! `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`.
 
 use std::path::PathBuf;
 
@@ -63,7 +63,7 @@ mod pve_rs_meta {
     use anyhow::Error;
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
-    use pve_meta_core::registry::{self, Grant, PrefixDef};
+    use pve_meta_core::registry::{self, Permission, PrefixDef};
 
     use super::{open_store, RollbackOutcome};
 
@@ -71,12 +71,12 @@ mod pve_rs_meta {
     /// operator's `.deb` may ship a prefix but must never ship its own
     /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
     /// a stale grant is a wrong answer about who may write.
-    fn open_grants() -> Vec<Grant> {
-        registry::load_grants_default()
+    fn open_permissions() -> Vec<Permission> {
+        registry::load_permissions_default()
     }
 
     /// Every prefix, packaged then cluster-wide, most-specific prefix first
-    /// (`docs/DESIGN.md` §3.1). Read per request, like the grants: the
+    /// (`docs/DESIGN.md` §3.1). Read per request, like the permissions: the
     /// directories are tiny, pmxcfs caches them, and a stale prefix would be
     /// a stale schema.
     fn open_prefixes() -> Vec<PrefixDef> {
@@ -86,7 +86,7 @@ mod pve_rs_meta {
     // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
     //
     // Called from the patched `PVE/AbstractConfig.pm`. They run inside PVE's
-    // own guest locks and copy whole files; they do not consult grants.
+    // own guest locks and copy whole files; they do not consult permissions.
 
     /// Copies `$vmid`'s current document to its `$snapname` snapshot file.
     /// A no-op if the guest has no document.
@@ -230,10 +230,10 @@ mod pve_rs_meta {
         api::version(&open_store(), detail)
     }
 
-    /// `GET /meta/grants` -> every grant, as native hashes.
+    /// `GET /meta/permissions` -> every permission, as native hashes.
     #[export]
-    pub fn api_grants() -> Result<Vec<Grant>, Error> {
-        Ok(api::grants_list(&open_grants()))
+    pub fn api_permissions() -> Result<Vec<Permission>, Error> {
+        Ok(api::permissions_list(&open_permissions()))
     }
 
     /// `GET /meta/prefixes` -> every prefix, most-specific first.
@@ -256,7 +256,7 @@ mod pve_rs_meta {
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
-        Ok(api::access(&open_grants(), &doc_id, &acl))
+        Ok(api::access(&open_permissions(), &doc_id, &acl))
     }
 
     /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already
@@ -268,7 +268,7 @@ mod pve_rs_meta {
         guests: Vec<GuestInput>,
         has: Option<&str>,
     ) -> Result<Vec<api::GuestListEntry>, Error> {
-        api::list_guests(&open_store(), &open_grants(), authid, &guests, has)
+        api::list_guests(&open_store(), &open_permissions(), authid, &guests, has)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
@@ -280,7 +280,7 @@ mod pve_rs_meta {
         format: &str,
         acl: CallerAcl,
     ) -> Result<api::ApiViewDocument, Error> {
-        api::get_document(&open_store(), &open_grants(), id, view, format, &acl)
+        api::get_document(&open_store(), &open_permissions(), id, view, format, &acl)
     }
 
     /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
@@ -306,7 +306,7 @@ mod pve_rs_meta {
     ) -> Result<api::ApiPutResult, Error> {
         api::put_document(
             &open_store(),
-            &open_grants(),
+            &open_permissions(),
             id,
             view,
             format,
@@ -327,6 +327,6 @@ mod pve_rs_meta {
         digest: Option<&str>,
         acl: CallerAcl,
     ) -> Result<api::ApiPutResult, Error> {
-        api::delete_document(&open_store(), &open_grants(), id, view, digest, &acl)
+        api::delete_document(&open_store(), &open_permissions(), id, view, digest, &acl)
     }
 }

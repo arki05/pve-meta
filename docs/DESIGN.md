@@ -1,7 +1,7 @@
 # pve-meta — design (revision 6)
 
 Revision 6 splits revision 5's "operator registration" into a **prefix** and a
-**grant** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 (`DESIGN-rev4.md`, kept for the record) and the
+**permission** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 (`DESIGN-rev4.md`, kept for the record) and the
 review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
 deviations recorded in §11. It is the single authority for the code; where code and this
 document disagree, the code is wrong.
@@ -35,7 +35,7 @@ A caller reads or writes a document through a **view**: a key-path prefix (dotte
 depth, through maps only). A view of `traefik` is the subtree under `traefik`, returned
 with the prefix stripped. Views are also the unit of access.
 
-## 3. Prefixes and grants
+## 3. Prefixes and permissions
 
 Two concepts, in two drop directories. They were one — an "operator registration" —
 until revision 6; see §12 for why splitting them was the point.
@@ -86,15 +86,15 @@ parsed independently, and a cross-file check would trade that for nothing. It is
 The selector decides which guests a prefix reaches, and therefore where its
 declared-but-unset rows appear. Nowhere else.
 
-### 3.2 Grants — who may touch a prefix
+### 3.2 Permissions — who may touch a prefix
 
-`/etc/pve/meta.d/grants/<name>.yaml`. Cluster-only: **there is deliberately no packaged
-grants directory.**
+`/etc/pve/meta.d/permissions/<name>.yaml`. Cluster-only: **there is deliberately no packaged
+permissions directory.**
 
 ```yaml
-# /etc/pve/meta.d/grants/traefik.yaml
+# /etc/pve/meta.d/permissions/traefik.yaml
 authid: svc@pve!traefik
-grants:
+rules:
   - prefix: traefik
     mode: rw                 # ro | rw
     selector: { tag: traefik }
@@ -102,16 +102,16 @@ grants:
 
 That absence is a mechanism, not an omission. An operator's own `.deb` *should* be able
 to ship a prefix — a schema is a declaration. It must never be able to ship its own
-grant, because that is self-registration, which is privilege escalation. dpkg cannot
+permission file, because that is self-registration, which is privilege escalation. dpkg cannot
 write into pmxcfs, so "an operator declares what it expects; only an administrator
 grants it" is enforced by where the files live rather than by a rule someone has to
 remember. For the same reason **nothing registers itself over the API**: writing either
 directory requires `Sys.Modify` on `/`.
 
-**Grants nest by containment, additively** — the opposite of schemas, deliberately. A
-grant on `homelab` covers `homelab.docker`, because "you may write `homelab`" not
+**Permissions nest by containment, additively** — the opposite of schemas, deliberately. A
+rule on `homelab` covers `homelab.docker`, because "you may write `homelab`" not
 implying its subtree would be surprising. Schemas shadow because they describe shape and
-shape has one owner; grants accumulate because they describe permission and permission is
+shape has one owner; permissions accumulate because they describe access and access is
 a union. Those two rules cannot both live on one object, which is the concrete reason
 this is two concepts and not one.
 
@@ -126,21 +126,21 @@ this is two concepts and not one.
   a selector, not a permission boundary.
 * Grants apply to **guest documents only**. The datacenter document is governed by ACLs
   alone.
-* A grant on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
+* A rule on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
   is the only comment-key rule.
 
 ### 3.4 Effective access for one request
 
 * `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`
   (datacenter: `Sys.Audit` / `Sys.Modify` on `/`).
-* `scopes` = the union of grant entries whose `authid` is the caller and whose selector
+* `scopes` = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
 * Reading view `P` requires full read or a scope covering `P`; writing requires full
   write or a `rw` scope covering every touched path; a write to the root view requires
-  full write. A read by a caller with no grant at all is 403. Authorization is decided
+  full write. A read by a caller with no rule at all is 403. Authorization is decided
   from the request and a plan computed against a copy, never from a diff of stored data.
 
-**PVE ACLs cannot express this**, which is why grants are ours and not
+**PVE ACLs cannot express this**, which is why permissions are ours and not
 `pveum acl modify /meta/traefik`. `PVE::AccessControl::check_path` is a hardcoded
 whitelist (`/`, `/access/*`, `/nodes/*`, `/pool/*`, `/sdn/*`, `/storage/*`,
 `/vms/[1-9][0-9]{2,}`, `/mapping/*`); `/meta/*` is not in it and the API refuses it
@@ -152,9 +152,9 @@ breaking silently. Making it legitimate would mean patching a fourth package.
 
 ### 3.5 The registry files are documents too
 
-A prefix or grant file is addressed as a document: `prefixes/<name>` and
-`grants/<name>` are ids like `100` and `datacenter`, reachable at
-`/meta/prefixes/{name}` and `/meta/grants/{name}` with the same `view`, `format`,
+A prefix definition or permission file is addressed as a document: `prefixes/<name>` and
+`permissions/<name>` are ids like `100` and `datacenter`, reachable at
+`/meta/prefixes/{name}` and `/meta/permissions/{name}` with the same `view`, `format`,
 `mode`, `digest` and `dry_run` the other two take. That is not an aesthetic choice: the
 editor's tree, its markers, its diff, the digest compare-and-swap and the version poll
 are all written against *a document*, and the alternative was a second read/write path
@@ -170,7 +170,7 @@ Four things are specific to them:
   overriding a packaged file is an ordinary write and not a spurious 409.
 * **The result must parse as what it claims to be.** The loader deliberately skips a
   malformed file (§3.3), which is exactly why a write that produced one must not answer
-  200: the prefix would silently disappear. `parse_prefix`/`parse_grant` — the
+  200: the prefix would silently disappear. `parse_prefix`/`parse_permission` — the
   loader's own parsers, not a copy — gate every write, including a `dry_run` and a
   narrow `DELETE ?view=authid`. The ordinary document lint (§4) applies on top, to the
   `schema:` subtree as much as anywhere else — a property name the lint refuses is a
@@ -180,8 +180,8 @@ Four things are specific to them:
   `compose: { type: string, description: The compose file, as text }`, where the unquoted
   comma inside a flow mapping had silently made a second key `as text: null`. The loader
   never looked inside `schema`, so nothing had complained for weeks.)
-* **No grant ever reaches them.** These documents get no scopes at all, so an operator
-  holding `rw` on a prefix cannot edit the grant that gave it that prefix, nor the
+* **No permission ever reaches them.** These documents get no scopes at all, so an operator
+  holding `rw` on a prefix cannot edit the permission file that gave it that prefix, nor the
   prefix that declares it. Self-registration is refused by there being no way to
   express it. Read is open to every authenticated user, matching the two list endpoints,
   which return the same content; writing is `Sys.Modify` on `/`.
@@ -195,17 +195,17 @@ Four things are specific to them:
 
 The two registry formats are themselves described as schemas, in the same
 `PVE::JSONSchema` dialect a prefix uses for a guest's subtree, and served by
-`GET /meta/schemas` as `{ prefix, grant }`. The editor renders a prefix or grant
+`GET /meta/schemas` as `{ prefix, permission }`. The editor renders a prefix or permission
 document with these exactly the way it renders a guest document with the prefixes
 that reach it: declared rows, hovers, markers, the same code.
 
-It is **not** the validator. `parse_prefix`/`parse_grant` decide what is storable,
+It is **not** the validator. `parse_prefix`/`parse_permission` decide what is storable,
 on the way in, in one place (§3.5); this is the affordance that says what to type
 *before* you try. What keeps the two honest is a test rather than a convention: every
 property the meta-schema marks required is dropped from a valid file, and the parser
 has to refuse exactly the ones the schema said it would. That test already earned its
-place — it caught `grants:` being documented as required when the parser is happy
-without it (a grant file with no entries grants nothing, which is legal, if pointless).
+place — it caught the rule list being documented as required when the parser is happy
+without it (a permission file with no rules grants nothing, which is legal, if pointless).
 
 A prefix's own `schema:` is described as a **free-form object**: `type: object` with
 no `properties`. It is a schema in an open-ended dialect, and the honest offer for it is
@@ -252,10 +252,10 @@ covering only the keywords we happened to think of. The small form that *does* e
 | GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
 | GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
-| GET | `/meta/grants` | — | `[{ name, authid, grants: [{ prefix, mode, selector }] }]` — every grant, readable by every authenticated user |
+| GET | `/meta/permissions` | — | `[{ name, authid, rules: [{ prefix, mode, selector }] }]` — every permission file, readable by every authenticated user |
 | GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
-| GET/PUT/DELETE | `/meta/grants/{name}` | same | the grant file, `id: "grants/<name>"`, same rules |
-| GET | `/meta/schemas` | — | `{ prefix, grant }` — the two registry file formats as schemas (§3.6), so the editor can show one as a typed tree. An affordance, not the validator |
+| GET/PUT/DELETE | `/meta/permissions/{name}` | same | the permission file, `id: "permissions/<name>"`, same rules |
+| GET | `/meta/schemas` | — | `{ prefix, permission }` — the two registry file formats as schemas (§3.6), so the editor can show one as a typed tree. An affordance, not the validator |
 
 PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
 404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
@@ -327,7 +327,26 @@ leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays of scalars as one text leaf); opened by Edit, double-click or Enter.
+  enums); opened by Edit, double-click or Enter.
+
+**A list is a container, like a map.** Its members are rows — one per element, whatever
+the elements are — because the tree exists to make a document something you can look at
+and act on one piece of, and a list was the one shape that stayed a blob of JSON in a
+cell. A member with structure of its own shows one readable line (a permission rule reads
+as `traefik (rw, tag: traefik)`; anything else falls back to JSON) and carries its real
+value along for whatever edits it.
+
+A staged list edit is one write of the whole list, but almost never a change to the
+whole list — so the mark goes on the members that actually differ, and the list itself
+carries only the dot that says something below it changed. A member the edit dropped
+comes back as a ghost, struck through, the same as a deleted key.
+
+Member rows are **not addressable**: a view addresses through maps only, so there is no
+path to `groups[1]` (§2) and nothing may try to write one. They carry their index instead,
+and everything that acts on one — Edit, Remove, Add — rewrites the list it is in. That
+needs no new write path, because staging already turns any number of edits into one write
+(§8); a list rewrite is simply one more staged edit. Add on a list appends rather than
+adding a key beside it, since a list has no keys.
   **The editor follows the value's shape**: a value with structure inside it — a map,
   or an array of maps — is edited as *text*, in Monaco on that subtree, by the same
   three gestures. A string with newlines in it gets a text box rather than a one-line
@@ -362,7 +381,7 @@ is a legitimate state: an operator fills it in, or there is a reason it is not t
 A declared `default` is shown on the greyed row and written **only** by the explicit
 **Set to default** button (or by opening the editor, which pre-fills it) — never behind
 your back, and never by merely looking at the document. (`optional` survives in the
-meta-schema (§3.6), because those files really do have required fields: a grant with no
+meta-schema (§3.6), because those files really do have required fields: a permission file with no
 `authid` is refused on the way in.)
 
 **Edits are staged, and one Apply writes them.** A row edit used to be a write of
@@ -392,13 +411,18 @@ the text editors, which write immediately, are unavailable until the staged set 
 settled, since they would be showing the stored document while the tree shows the
 planned one.
 
-Apply asks the server **twice**: once with `dry_run=1`, whose refusal becomes the diff
-dialog's warning banner, and then for real. That is how a rule the client cannot know
-gets said before the write rather than after: "exactly one of `all`/`tag`" is not
-expressible in the schema dialect (§3.6), so the client never learns it — it asks. The
-banner and the diff are the same warned-apply dialog the text editor uses, with the same
-explicit tick, because a schema mismatch must stay possible: the server's lint decides
-what is storable (§4), not a schema that may have drifted.
+**Apply applies.** It stops to show the diff only when the planned document would not
+match the schema — the one case where seeing it changes what you decide — and the
+"Save anyway" tick keeps storing it anyway a deliberate act, because a mismatch must
+stay possible: the server's lint decides what is *storable* (§4), not a schema that may
+have drifted. Otherwise there is nothing to decide, and **Diff** is a button of its own
+in both text editors for whenever you want to look first.
+
+There is deliberately no `dry_run` pass before a write. It once existed to turn a server
+refusal into that same banner — but a refusal is not advisory: the server refuses the
+real write for the same reason, tick or no tick. Showing it as an error is honest;
+offering it as something you can override is not, and it cost every Apply a second
+request.
 
 A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
 colour, a triangle, and the message in the tooltip ahead of the schema's description.
@@ -415,9 +439,52 @@ one function (`grammarSplit`) what describes the document, so they cannot disagr
 Advisory like every other schema signal: the row is still editable and the value is
 still stored — the server's lint decides what is storable (§4).
 
-* **Access**: every grant whose prefix covers the row, `rw` ones by name, `ro` ones
+* **Access**: every rule whose prefix covers the row, `rw` ones by name, `ro` ones
   muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
   "access" is about who writes and who subscribes, not ownership.
+
+**One document, one edited document, two views of it.** Tree and Text are not two
+editors with two models kept apart by rules; they are two ways of looking at the same
+edited document. The buffer is rendered from the **planned** document, so staged row
+edits are visible in it; switching back parses the buffer and turns whatever was typed
+into staged edits *on rows*, so the tree shows which keys changed and to what, and a key
+you deleted shows struck through. Switching is therefore never a decision about your
+work — it used to ask you to discard it, and the Text card used to be refused outright
+while anything was staged.
+
+`Utils.diffDocuments` is what makes that true, and it checks itself: key order is data
+(§2), so a pure reordering produces no per-key entries, and rather than lose it the diff
+replays its own result and falls back to replacing the document whole when the replay
+does not match what was typed. The one thing that can refuse the switch is a buffer that
+does not parse — there is no document to draw as a tree, and guessing at one would lose
+what was typed, so it says so and stays put.
+
+Applying **from text** still sends the buffer rather than a dump of the model, and that
+is deliberate: a `#` comment is not part of the document model, so it survives only for
+as long as nothing rewrites the file from the model. Sending the buffer keeps what was
+typed. It is one apply that spends the staged edits too, since the buffer already
+contains them.
+
+**One buffer grammar, two editors.** "How do I read this buffer, and how do I render
+it back" is one rule, and it lived twice: the Text card preferred the server's own YAML
+whenever a round trip through JSON left the document unchanged — js-yaml and `serde_yaml`
+lay the same document out differently, so re-dumping made a *presentation* toggle report
+unsaved changes — and the subtree window, five hundred lines away, dumped unconditionally.
+Toggling to JSON and back there produced a whitespace-only diff with Apply enabled: the
+exact bug the sibling's comment describes preventing. Both now call
+`Utils.parseBuffer`/`renderBuffer`, and a test pins the round trip.
+
+**One footer, three editors.** There are three places you edit a document — the tree,
+the text card behind the Tree | Text toggle, and the text window over one subtree — and
+they had grown three different chromes: the subtree window put its view switch on *top*
+and had no Format button at all, the tree put Apply and Revert on top, and a document
+window's Close sat at the bottom while the Apply for the same document sat at the top of
+the panel inside it. So: **which view you are looking at goes bottom-left, what you can
+do about it goes bottom-right**, built from one place (`PVE.meta.Footer`). The top
+toolbar is left for acting on the document's *contents*, which is a different kind of
+thing from committing. In a window the secondary button is Close, and becomes **Discard**
+once there is something to lose — the way out and the way to abandon the edits are the
+same gesture; in a tab there is nothing to close, so it is Revert.
 
 Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
 parent of a selected leaf, or the root), **Set to default**, **Declare Key** (only on a
@@ -450,7 +517,7 @@ produces, leaving a confirm dialog that showed nothing while Apply was enabled. 
 or "Read-only" label appears next to the toggle only when the caller is restricted. No
 per-row action icons. Editability is per row from `/meta/access`; a row edit is
 `PUT ?view=<path>&mode=replace` with the scalar, delete is `DELETE ?view=<path>`, the
-digest is sent and a 409 reloads. The version poll refreshes the tree and the grants,
+digest is sent and a 409 reloads. The version poll refreshes the tree and the permission files,
 never while an editor is open.
 
 **Which ACL answers apply is a property of the document, not of the tab.** `GET
@@ -465,7 +532,7 @@ certainly read. Verified on the lab with a token holding only `Sys.Modify`.
 **The datacenter tab has three sub-tabs.** A guest tab is one document's editor, and
 looks as it always did. The datacenter tab is a tab panel: **Document** (the datacenter
 document, the same editor), **Prefixes** and **Grants** (two grids). They are three
-different kinds of thing — one document, a list of definitions, a list of grants — and
+different kinds of thing — one document, a list of definitions, a list of permissions — and
 an earlier revision drew them as branches of a single tree, which claimed a relationship
 they do not have and hid the only columns worth reading. A grid shows what a tree could
 not: which guests a prefix reaches, whether it carries a schema, and **where the file
@@ -498,15 +565,54 @@ like any other, so the server's one lint decides what a key may be and says so. 
 *dotted* key is refused, because it would silently declare a nested property rather than
 the one the form is asking about.
 
+**Add is hidden where nothing can be added.** A permission file has three keys and the
+parser refuses a fourth (`deny_unknown_fields`), so an arbitrary Add there could only
+ever produce a file the loader would skip — the one thing you add to one is a rule, and
+**Add Rule** is that. A prefix definition's root keys are fixed the same way, so Add is
+disabled at its root and available inside `schema`, where you may declare anything.
+
+**Two forms behind the two registry lists.** A prefix definition's schema gets
+**Declare Key** (§8, above); a permission file's `rules` gets **Add Rule** — the same
+shape one document over, because the rules *are* the file and leaving them to the text
+editor made the interesting part the one part with no affordance. Its prefix field is a
+combobox of the declared prefixes but stays editable: a rule may name a prefix nobody has
+declared, since the two are independent files and neither waits for the other. It appends
+by writing `rules` whole, because a view addresses through maps only and there is no path
+to `rules[1]` (§2); changing or removing one is still the text editor.
+
+**One "New" dialog, not two.** Adding a permission file and creating a service token
+were the same act — write a file for a principal — differing only in whether the principal
+exists yet, which is a question the dialog can just ask. It offers an existing user or
+token (a combobox filled from `/access/users?full=1`, which returns users *and* their
+tokens in one call, and stays typable because a permission file may name a principal that
+does not exist yet) or a new service token, which makes the principal an operator needs
+and nothing more: a `pve`-realm user with **no password** (verified: `/access/ticket`
+answers "authentication failure" for it, while its token works — the closest thing PVE has
+to a service principal, since there is no userless API key), one token on it, and a
+permission file naming **the token**, with no rules. Naming the *user* instead would
+produce a file that parses, loads, and grants the token nothing.
+
+The token is created with **privilege separation off**, which is not the PVE default and
+is deliberate: with it on, a token's rights are the intersection of its own ACLs and its
+user's, so a role added to the user later would silently do nothing (verified on the lab —
+an ACL on the token alone is denied, and so is one on the user alone). This user exists
+only to carry this token, so they are one principal in practice.
+
+The optional **guest access** role goes on `/vms`, propagating: per-guest silently misses
+guests created later, and `PVEAuditor` on `/` would also hand over `Sys.Audit`, which is
+the datacenter document's own read permission. The dialog says the part that is easy to
+miss — a role there lets the principal read *all* metadata on those guests, because
+`VM.Audit` is full read (§3.4); only writes stay inside its rules.
+
 **Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
 datacenter), and that is the whole audience: PVE's own resource tree lists a guest only
 to a caller holding `VM.Audit` on it (`PVE::API2::Cluster::resources`), so a principal
-holding nothing but grants has no guest to open the tab on, whatever the manifest says.
+holding nothing but permissions has no guest to open the tab on, whatever the manifest says.
 Tag selectors are therefore resolved against `GET /meta/guests`' `tags` (§5) and nothing
 else, and no server-resolved fallback is needed for a caller this page can have. Grants
 lose nothing by that: they bind server-side, on the API a scope-only principal actually
 uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
-exactly the rows its `rw` grants cover -- that is the "Scoped write access" label.
+exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.
 
 `ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
 mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
@@ -525,7 +631,7 @@ unit tests, is the thing `ui-extjs/testing/` has to keep earning.
 ## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, prefixes+grants+selectors, lint, api layer, store, gc
+crates/pve-meta-core     document model, views, prefixes+permissions+selectors, lint, api layer, store, gc
 crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
 perl/PVE/API2/Ext/Meta.pm
 prefixes/              packaged example prefixes (none required)
@@ -539,14 +645,14 @@ debian/, Makefile        packages: pve-ext, pve-meta, libpve-meta-rs-perl
 
 Reserved `scopes` key and every rule keyed on it (opaque-leaf addressing, touched-path
 collapsing, `check_scopes_write`, authid key lint); the strict/lenient scope parser
-split; the per-request datacenter read for grants; `WriteGate`, `lint_at`/`lint_relaxed*`,
+split; the per-request datacenter read for permissions; `WriteGate`, `lint_at`/`lint_relaxed*`,
 the lint-finding subset check; `may_name` and all message redaction; the `keys` wire
 field and the UI's YAML key scanner; the comment-key access machinery (`covers` aliasing
 beyond the one sibling rule, bare-`__` prefix rule, mid-path rejection, `filter`'s comment
 pass); orphan listing/deletion/access rules; the clone and backup hooks and their diffs
 (destroy came back as a hook in `AbstractConfig`, §6, together with a new create
-hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for grants, guest lists and results
-(`_grants_json`, `_inflate_view`, `parse_grants`, `data_json`); the "View as" selector.
+hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for permissions, guest lists and results
+(`_grants_json`, `_inflate_view`, `parse_permissions`, `data_json`); the "View as" selector.
 
 ## 12. Why revision 6 splits the registration
 
@@ -560,20 +666,20 @@ rather than in review:
 * **The lab config had already split it by hand.** One file carried the *grammar* with
   `selector: {all: true}`, another carried the *access* with `selector: {tag: traefik}` —
   same prefix, two files, because one object could not express both cleanly.
-* **A real bug came out of it.** Declared-but-unset rows were driven by a *grant's*
+* **A real bug came out of it.** Declared-but-unset rows were driven by a *permission's*
   grammar, so a broadly-scoped principal painted one operator's rows onto every guest in
   the cluster. With the schema on the prefix, the selector that governs rows is the
   prefix's and that bug is not expressible.
 * **Two files naming the same authid silently unioned their scopes.** Nobody decided
   that; it is what happens when identity is a field rather than the file.
 
-And the rule that settles it: **schemas shadow, grants accumulate** (§3.1, §3.2). Two
+And the rule that settles it: **schemas shadow, permissions accumulate** (§3.1, §3.2). Two
 opposite nesting semantics cannot live on one object. Revision 5's did — which is why
 overlapping grammars unioned their findings and why a path covered by two schemas got
 whichever the iteration reached last.
 
 What the split buys beyond correctness is that the store's vocabulary loses the word
-*operator* entirely. It knows prefixes and grants. An operator is an installer — a
+*operator* entirely. It knows prefixes and permissions. An operator is an installer — a
 package that drops a prefix, has an administrator issue a grant, and creates an LXC
 with credentials injected. Nothing at runtime needs the concept, so nothing in the core
 carries it.

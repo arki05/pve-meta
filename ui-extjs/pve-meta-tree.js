@@ -12,7 +12,7 @@
  *     carry a folder icon (open when expanded), value rows a document icon, both at the
  *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
  *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
- *     one text leaf. Access lists every grant whose prefix covers the row.
+ *     one text leaf. Access lists every permission whose prefix covers the row.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
  *     toggle), Apply through a diff dialog and Discard.
@@ -207,6 +207,14 @@ PVE.meta.Utils = {
         let U = PVE.meta.Utils;
         let out = JSON.parse(JSON.stringify(data || {}));
         (pending || []).forEach(function (p) {
+            // The empty path is the *document*, not a key called "". `setAtPath` walks
+            // segments and `''.split('.')` is `['']`, so without this a whole-document
+            // edit -- what `diffDocuments` falls back to when it cannot express a
+            // change as paths -- would land under a key nobody can address.
+            if (p.path === '') {
+                out = p.op === 'delete' ? {} : JSON.parse(JSON.stringify(p.value));
+                return;
+            }
             if (p.op === 'delete') {
                 U.deleteAtPath(out, p.path);
             } else {
@@ -236,6 +244,56 @@ PVE.meta.Utils = {
                 }
             }
         });
+        return out;
+    },
+
+    // What would have to be staged to turn `stored` into `edited`, as the same
+    // `{ path, op, value }` entries a row edit produces.
+    //
+    // This is what makes text an ordinary way to edit rather than a second editing
+    // model: whatever you type there comes back as edits *on rows*, so the tree shows
+    // which keys changed and to what, a key you deleted shows struck through, and one
+    // Apply writes the lot. Before this, text mode had its own buffer, its own apply
+    // and its own write, and the two models had to be kept apart by rules -- "you may
+    // not open text while edits are staged" and the rest.
+    //
+    // Lists are compared whole, because their members are not addressable (§2). Maps
+    // recurse, so a one-key change stays a one-key edit.
+    diffDocuments: function (stored, edited) {
+        let U = PVE.meta.Utils;
+        let out = [];
+        let isMap = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+        let same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+        let walk = function (was, now, path) {
+            Object.keys(now).forEach(function (k) {
+                let at = U.joinPath(path, k);
+                let before = Object.prototype.hasOwnProperty.call(was, k) ? was[k] : undefined;
+                if (before === undefined) {
+                    out.push({ path: at, op: 'set', value: now[k] });
+                } else if (isMap(before) && isMap(now[k])) {
+                    walk(before, now[k], at);
+                } else if (!same(before, now[k])) {
+                    out.push({ path: at, op: 'set', value: now[k] });
+                }
+            });
+            Object.keys(was).forEach(function (k) {
+                if (!Object.prototype.hasOwnProperty.call(now, k)) {
+                    out.push({ path: U.joinPath(path, k), op: 'delete' });
+                }
+            });
+        };
+        if (!isMap(stored) || !isMap(edited)) {
+            return same(stored, edited) ? [] : [{ path: '', op: 'set', value: edited }];
+        }
+        walk(stored, edited, '');
+
+        // A self-check, because a diff that quietly loses something is worse than no
+        // diff at all: key *order* is data in this model (§2) and a pure reordering
+        // produces no per-key entries, so replay the edits and fall back to replacing
+        // the document whole if the result is not what was typed.
+        if (!same(U.applyPending(stored, out), edited)) {
+            return [{ path: '', op: 'set', value: edited }];
+        }
         return out;
     },
 
@@ -270,6 +328,27 @@ PVE.meta.Utils = {
             view = segs.join('.');
         }
         return view;
+    },
+
+    // One element of a list, on one line. Presentation only -- like `format`, it
+    // describes nothing and constrains nothing; it is there so a list of maps reads
+    // as something other than JSON in a grid cell.
+    //
+    // A permission rule gets its own shape because that is the list people actually
+    // look at, and `{"prefix":"traefik","mode":"rw","selector":{"tag":"traefik"}}`
+    // is not a thing anyone reads twice.
+    itemSummary: function (v) {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) {
+            return PVE.meta.Utils.scalarText(v);
+        }
+        let has = (k) => Object.prototype.hasOwnProperty.call(v, k);
+        if (has('prefix') && has('mode')) {
+            return (
+                v.prefix + ' (' + v.mode +
+                (has('selector') ? ', ' + PVE.meta.Utils.selectorText(v.selector) : '') + ')'
+            );
+        }
+        return Ext.encode(v);
     },
 
     // A schema `type` as the kind `parseValue` speaks: both integers and numbers are
@@ -379,6 +458,56 @@ PVE.meta.Utils = {
         }
     },
 
+    // --- the two editor buffers (TextWindow, TreePanel's Text card) --------
+    //
+    // Both editors carry a Monaco buffer with a presentation-only YAML/JSON toggle
+    // and a Format button, and both used to parse and re-dump it inline -- six
+    // copies of "decode JSON or load YAML" and four of "stringify JSON or dump
+    // YAML" between them, one of which (TextWindow's own toggle) was missing the
+    // round-trip fix its sibling got. One set of functions now; see `renderBuffer`.
+
+    // How the buffer's own language reads it back. Used by Format, the JSON/YAML
+    // toggle and the live grammar squiggles -- everything that needs the parsed
+    // value rather than the text.
+    parseBuffer: function (text, lang) {
+        return lang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+    },
+
+    // The inverse: `value` as text in `lang`. Always re-dumps -- what Format wants,
+    // since a re-indent is the point of clicking it.
+    dumpBuffer: function (value, lang) {
+        return lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value);
+    },
+
+    // As `dumpBuffer`, but for a switch *into* YAML prefers `originalYaml` when it is
+    // the same document. js-yaml's dump lays a document out differently from
+    // serde_yaml_ng's (indentation of nested sequences, quoting), so unconditionally
+    // re-dumping on every toggle made a round trip through JSON look like an edit --
+    // a diff of pure whitespace, offered as something to Apply. That was fixed once,
+    // in the Text card's toggle; the subtree window's own toggle inlined the same
+    // ternary without it, so the identical no-op could open its diff with Apply
+    // enabled. Both call this now.
+    renderBuffer: function (value, lang, originalYaml) {
+        if (
+            lang !== 'json' &&
+            originalYaml !== undefined &&
+            PVE.meta.Utils.sameDocument(value, originalYaml)
+        ) {
+            return originalYaml;
+        }
+        return PVE.meta.Utils.dumpBuffer(value, lang);
+    },
+
+    // The document a buffer's own editor last loaded (its `original`/`textOriginal`),
+    // rendered in `lang`. Throws if it cannot be read as YAML -- callers fall back to
+    // 'yaml' rather than lose the comparison. TextWindow's diff used to inline this
+    // exact conversion rather than share TreePanel's `textRendered`.
+    originalInLang: function (originalYaml, lang) {
+        return lang === 'json'
+            ? JSON.stringify(PVE.meta.Utils.yamlLoad(originalYaml), null, 2)
+            : originalYaml;
+    },
+
     // The prefix governing `path`: the one whose prefix is the LONGEST that covers
     // it. Most-specific wins and schemas never merge (DESIGN section 3.1).
     //
@@ -400,7 +529,7 @@ PVE.meta.Utils = {
 
     // Plain containment: `p` itself, or anything under `p.`. Deliberately NOT
     // `covers`, which additionally aliases the sibling comment key `p__` -- that is a
-    // *grant* rule (a scope on `p` may write the note about `p`), and it does not
+    // *permission* rule (a scope on `p` may write the note about `p`), and it does not
     // belong here. With prefixes `a` and `a__` both declared, `covers` would have
     // said `a` governs the whole `a__` prefix; Rust's `registry::governing` uses
     // plain containment and would have said `a__`. Two predicates, two jobs.
@@ -568,7 +697,7 @@ PVE.meta.Yaml = {
 
 PVE.meta.Lint = {
     // The prefixes that carry a schema, longest prefix first. Shape comes from
-    // prefixes, never from grants (DESIGN section 3.1).
+    // prefixes, never from permissions (DESIGN section 3.1).
     applicable: function (prefixes) {
         return PVE.meta.Utils.bySpecificity(
             (prefixes || []).filter((ns) => ns && ns.schema && ns.prefix),
@@ -1002,16 +1131,20 @@ PVE.meta.Monaco = {
                     },
                 },
                 '->',
+                // Without an `apply` this window is just a look at the difference --
+                // the same view, without the decision. Being able to see the diff
+                // without committing to it is the point of offering it outside Apply.
                 {
                     text: gettext('Apply'),
                     itemId: 'diffApplyBtn',
+                    hidden: !cfg.apply,
                     disabled: !!warnings.length,
                     handler: function () {
                         win.close();
                         cfg.apply();
                     },
                 },
-                { text: gettext('Back'), handler: () => win.close() },
+                { text: cfg.apply ? gettext('Back') : gettext('Close'), handler: () => win.close() },
             ],
         });
         win.on('afterrender', function () {
@@ -1043,6 +1176,96 @@ PVE.meta.Monaco = {
 };
 
 // ---------------------------------------------------------------------------
+// The editor footer — one bar, three editors.
+//
+// There are three places you edit a document here: the tree, the text card behind
+// the Tree | Text toggle, and the text window over one subtree. They had grown
+// three different chromes — the subtree window put its view switch on *top* and had
+// no Format button at all, the tree put Apply and Revert on top, and a document
+// window's Close sat at the bottom while the Apply for the same document sat at the
+// top of the panel inside it. Nothing about the three is different enough to
+// justify that.
+//
+// So: **which view you are looking at goes bottom-left, what you can do about it
+// goes bottom-right**, and every editor builds both halves from here. The top
+// toolbar is left for acting on the document's *contents* (Add, Edit, Remove,
+// Declare Key, Add Rule), which is a different kind of thing from committing.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.Footer', {
+    singleton: true,
+
+    // cfg: { format: handler?, apply: handler, secondary: handler, secondaryText }
+    actions: function (cfg) {
+        let out = [];
+        if (cfg.format) {
+            out.push({
+                text: gettext('Format'),
+                itemId: 'metaFormat',
+                iconCls: 'fa fa-indent',
+                tooltip: gettext('Re-indent the buffer canonically'),
+                handler: cfg.format,
+            });
+        }
+        if (cfg.diff) {
+            out.push({
+                text: gettext('Diff'),
+                itemId: 'metaDiff',
+                iconCls: 'fa fa-exchange',
+                tooltip: gettext('Show this buffer against the stored document'),
+                handler: cfg.diff,
+            });
+        }
+        out.push('->');
+        out.push({
+            text: gettext('Apply'),
+            itemId: 'metaApply',
+            iconCls: 'fa fa-check',
+            // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
+            // a caller that never called `sync` got a button that looked ordinary and
+            // did nothing at all -- no click, no request, no message -- which is
+            // exactly what happened to the subtree window. A shared builder whose
+            // default only one of its callers undoes is a rule with two meanings,
+            // which is the thing extracting it was meant to stop.
+            disabled: !!cfg.applyDisabled,
+            handler: cfg.apply,
+        });
+        out.push({
+            text: cfg.secondaryText || gettext('Revert'),
+            itemId: 'metaSecondary',
+            iconCls: 'fa fa-undo',
+            handler: cfg.secondary,
+        });
+        return out;
+    },
+
+    // `count` on the button it acts on rather than in a label beside it: a label is
+    // the first thing clipped when an editor opens in a window, and a counter you
+    // cannot read is not one.
+    sync: function (owner, state) {
+        let apply = owner.down('#metaApply');
+        if (apply) {
+            apply.setDisabled(!state.canApply);
+            apply.setText(
+                state.count
+                    ? Ext.String.format(gettext('Apply ({0})'), state.count)
+                    : gettext('Apply'),
+            );
+        }
+        let second = owner.down('#metaSecondary');
+        if (second) {
+            // The icon has to agree with the word: an undo arrow on a button that says
+            // Close is a button that looks like it will throw your work away.
+            second.setIconCls(state.dirty ? 'fa fa-undo' : 'fa fa-times');
+            // A window's Close becomes Discard once there is something to lose, which
+            // is the one moment the difference matters.
+            second.setText(state.dirty ? state.dirtyText : state.cleanText);
+            second.setDisabled(!!state.secondaryOnlyWhenDirty && !state.dirty);
+        }
+    },
+});
+
+// ---------------------------------------------------------------------------
 // The row model.
 // ---------------------------------------------------------------------------
 
@@ -1057,6 +1280,9 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'belowText', type: 'string' }, // the first few of them, for the tooltip
         { name: 'stagedBelow', type: 'int' }, // staged edits somewhere beneath this row
         { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
+        { name: 'arrayIndex' }, // this row is member N of the list at `path`
+        { name: 'addressable', type: 'boolean' }, // false: no view path names this row
+        { name: 'rawItem' }, // a list member's real value, whatever it is
         { name: 'valueText', type: 'string' },
         { name: 'description', type: 'string' }, // the comment key `k__`, if present
         { name: 'grammarDescription', type: 'string' }, // the grammar's, shown as tooltip
@@ -1088,6 +1314,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
     width: 480,
     layout: 'fit',
     parentPath: '', // dotted path of the map the key goes into ('' = the document root)
+    list: false, // appending to a list instead: a member has no name to give it
 
     initComponent: function () {
         let me = this;
@@ -1102,13 +1329,14 @@ Ext.define('PVE.meta.AddKeyWindow', {
                     items: [
                         {
                             xtype: 'displayfield',
-                            fieldLabel: gettext('Under'),
+                            fieldLabel: me.list ? gettext('Append to') : gettext('Under'),
                             value: Ext.htmlEncode(me.parentPath || gettext('(document root)')),
                         },
                         {
                             xtype: 'textfield',
                             name: 'key',
-                            allowBlank: false,
+                            allowBlank: me.list,
+                            hidden: me.list,
                             fieldLabel: gettext('Key'),
                             emptyText: gettext('key, or a dotted path'),
                         },
@@ -1147,9 +1375,9 @@ Ext.define('PVE.meta.AddKeyWindow', {
             return;
         }
         let v = form.getValues();
-        let key = String(v.key).replace(/^\.+|\.+$/g, '');
+        let key = String(v.key || '').replace(/^\.+|\.+$/g, '');
         try {
-            if (!key) {
+            if (!key && !me.list) {
                 throw new Error(gettext('Key must not be empty'));
             }
             let value = v.kind === 'map' ? {} : PVE.meta.Utils.parseValue(v.value || '', v.kind);
@@ -1158,6 +1386,134 @@ Ext.define('PVE.meta.AddKeyWindow', {
         } catch (err) {
             Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
         }
+    },
+});
+
+// ---------------------------------------------------------------------------
+// "Add Rule" — one entry of a permission file, as a form.
+//
+// The same shape as Declare Key, one document over: a permission file's `rules`
+// is the whole point of the file, and leaving it to the text editor made the
+// interesting part of it the one part with no affordance.
+//
+// It appends rather than edits, and it stages like everything else. Appending
+// replaces the whole `rules` array, because a view addresses through maps only —
+// there is no path to `rules[1]` (DESIGN §2). Changing or removing a rule is
+// still the text editor; adding one is what you do a hundred times more often.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.AddRuleWindow', {
+    extend: 'Ext.window.Window',
+    xtype: 'pveMetaAddRuleWindow',
+
+    title: gettext('Add Rule'),
+    modal: true,
+    width: 520,
+    layout: 'fit',
+    prefixes: null, // the declared prefixes, for the combobox
+    existing: null, // the rules already in the file (appending)
+    rule: null, // the rule being edited, if this is an edit
+
+    initComponent: function () {
+        let me = this;
+        let declared = (me.prefixes || []).map((p) => [p.prefix, p.prefix]);
+        Ext.apply(me, {
+            items: [
+                {
+                    xtype: 'form',
+                    reference: 'form',
+                    bodyPadding: 10,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 120 },
+                    items: [
+                        {
+                            // Editable on purpose: a rule may name a prefix nobody has
+                            // declared yet. The list is a convenience, not a
+                            // constraint -- permissions and prefix definitions are
+                            // independent files and neither waits for the other.
+                            xtype: 'combobox',
+                            name: 'prefix',
+                            fieldLabel: gettext('Prefix'),
+                            allowBlank: false,
+                            store: declared,
+                            queryMode: 'local',
+                            editable: true,
+                            forceSelection: false,
+                            emptyText: gettext('a declared prefix, or any key path'),
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'mode',
+                            fieldLabel: gettext('Mode'),
+                            value: 'ro',
+                            comboItems: [
+                                ['ro', gettext('Read only')],
+                                ['rw', gettext('Read and write')],
+                            ],
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'selector',
+                            fieldLabel: gettext('Applies to'),
+                            value: 'all',
+                            comboItems: [
+                                ['all', gettext('Every guest')],
+                                ['tag', gettext('Guests with a tag')],
+                            ],
+                            listeners: {
+                                change: (f, v) => me.down('[name=tag]').setHidden(v !== 'tag'),
+                            },
+                        },
+                        { xtype: 'textfield', name: 'tag', fieldLabel: gettext('Tag'), hidden: true },
+                    ],
+                },
+            ],
+            buttons: [
+                { text: me.rule ? gettext('OK') : gettext('Add'), handler: () => me.submit() },
+                { text: gettext('Cancel'), handler: () => me.close() },
+            ],
+        });
+        me.callParent();
+        me.on('show', function () {
+            if (me.rule) {
+                let sel = me.rule.selector || {};
+                me.down('form').getForm().setValues({
+                    prefix: me.rule.prefix,
+                    mode: me.rule.mode,
+                    selector: sel.tag ? 'tag' : 'all',
+                    tag: sel.tag || '',
+                });
+            }
+            me.down('[name=prefix]').focus(true, 50);
+        });
+    },
+
+    statics: {
+        // The `rules` list this form would produce. Pure, so the offline suite can
+        // check the arithmetic without a DOM.
+        rulesWith: function (existing, v) {
+            let rule = {
+                prefix: String(v.prefix).trim(),
+                mode: v.mode === 'rw' ? 'rw' : 'ro',
+                selector: v.selector === 'tag' ? { tag: String(v.tag).trim() } : { all: true },
+            };
+            return (Array.isArray(existing) ? existing : []).concat([rule]);
+        },
+    },
+
+    submit: function () {
+        let me = this;
+        let form = me.down('form').getForm();
+        if (!form.isValid()) {
+            return;
+        }
+        let v = form.getValues();
+        if (v.selector === 'tag' && !String(v.tag).trim()) {
+            Ext.Msg.alert(gettext('Error'), gettext('A tag selector needs a tag'));
+            return;
+        }
+        me.fireEvent('addrule', PVE.meta.AddRuleWindow.rulesWith(me.existing, v));
+        me.close();
     },
 });
 
@@ -1182,7 +1538,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
 // operator fills it in, or there is a reason it is not there -- and a `default` is an
 // offer the row makes ("Set to default"), never something written behind your back.
 // (`optional` survives in the meta-schema, DESIGN §3.6, because *those* files really do
-// have required fields: a grant without an `authid` is refused on the way in.)
+// have required fields: a permission file without an `authid` is refused on the way in.)
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DeclareKeyWindow', {
@@ -1279,8 +1635,14 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                             xtype: 'proxmoxKVComboBox',
                             name: 'format',
                             fieldLabel: gettext('Format'),
-                            value: '',
-                            comboItems: [['', gettext('none')]].concat(
+                            // `none`, not `''`: a KVComboBox whose key is the empty
+                            // string hands back the store record's internal id
+                            // (`KeyValue-1`) instead of the key, and it renders blank
+                            // rather than showing its own default. Caught in a browser
+                            // -- this wrote `format: KeyValue-1` into a schema, and the
+                            // same shape broke Create Service Token outright.
+                            value: 'none',
+                            comboItems: [['none', gettext('none')]].concat(
                                 Object.keys(PVE.meta.Utils.FORMAT_VTYPES).map((f) => [f, f]),
                             ),
                         },
@@ -1329,7 +1691,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                 out[n] = Number(v[n]);
             }
         });
-        if (v.type === 'string' && v.format) {
+        if (v.type === 'string' && v.format && v.format !== 'none') {
             out.format = v.format;
         }
         if (v.type === 'string' && v.multiline) {
@@ -1495,7 +1857,7 @@ Ext.define('PVE.meta.TextWindow', {
 
         Ext.apply(me, {
             items: [{ xtype: 'component', reference: 'mount', style: 'height:100%;width:100%' }],
-            tbar: [
+            bbar: [
                 {
                     xtype: 'segmentedbutton',
                     reference: 'langbtn',
@@ -1510,11 +1872,15 @@ Ext.define('PVE.meta.TextWindow', {
                     ],
                     listeners: { change: (btn, value) => me.switchLang(value) },
                 },
-            ],
-            buttons: [
-                { text: gettext('Apply'), handler: () => me.showDiff() },
-                { text: gettext('Cancel'), handler: () => me.close() },
-            ],
+            ].concat(
+                PVE.meta.Footer.actions({
+                    diff: () => me.showBufferDiff(),
+                    format: () => me.formatBuffer(),
+                    apply: () => me.showDiff(),
+                    secondary: () => me.close(),
+                    secondaryText: gettext('Close'),
+                }),
+            ),
         });
         me.callParent();
 
@@ -1544,8 +1910,70 @@ Ext.define('PVE.meta.TextWindow', {
         });
     },
 
+    // The buffer against what was loaded, without committing to it -- the same view
+    // Apply ends with, offered on its own.
+    showBufferDiff: function () {
+        let me = this;
+        if (!me.editor) {
+            return;
+        }
+        let lang = me.lang;
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.original, lang);
+        } catch (_err) {
+            lang = 'yaml';
+            original = me.original;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: me.view || gettext('(whole document)'),
+            original: original,
+            modified: me.editor.getValue(),
+            lang: lang,
+        });
+    },
+
+    // Apply is live as soon as there is a buffer; the diff decides whether there is
+    // anything in it worth writing. Close becomes Discard once the buffer differs from
+    // what was loaded -- the same rule the panel's footer follows, and for the same
+    // reason: that is the moment there is something to lose.
+    syncFooter: function () {
+        let me = this;
+        PVE.meta.Footer.sync(me, {
+            canApply: !!me.editor,
+            count: 0,
+            dirty: !!me.editor && me.editor.getValue() !== me.original,
+            dirtyText: gettext('Discard'),
+            cleanText: gettext('Close'),
+        });
+    },
+
     // Presentation only: re-render the same value in the other syntax. If we cannot
     // parse the buffer we say so and stay put; the server remains the YAML authority.
+    // The same canonical re-dump the text card's Format does, on this window's own
+    // editor -- through `Utils.parseBuffer`/`dumpBuffer`, so the two Format buttons
+    // cannot drift. It refuses a buffer that does not parse rather than mangling it.
+    formatBuffer: function () {
+        let me = this;
+        let ed = me.editor;
+        if (!ed) {
+            return;
+        }
+        let text = ed.getValue();
+        try {
+            let U = PVE.meta.Utils;
+            let formatted = U.dumpBuffer(U.parseBuffer(text, me.lang), me.lang);
+            if (formatted !== text) {
+                ed.setValue(formatted);
+            }
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Cannot format'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+            );
+        }
+    },
+
     switchLang: function (lang) {
         let me = this;
         let btn = me.lookupReference('langbtn');
@@ -1554,10 +1982,7 @@ Ext.define('PVE.meta.TextWindow', {
         }
         let value;
         try {
-            value =
-                me.lang === 'json'
-                    ? Ext.decode(me.editor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.editor.getValue());
+            value = PVE.meta.Utils.parseBuffer(me.editor.getValue(), me.lang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -1574,37 +1999,32 @@ Ext.define('PVE.meta.TextWindow', {
         }
         me.lang = lang;
         window.monaco.editor.setModelLanguage(me.editor.getModel(), lang);
-        me.editor.setValue(
-            lang === 'json' ? JSON.stringify(value, null, 2) : PVE.meta.Utils.yamlDump(value),
-        );
+        // `renderBuffer`, not a bare dump: switching JSON -> YAML must not turn a
+        // no-op round trip into a whitespace diff (see the comment on that function).
+        // This editor used to dump unconditionally here, which the Text card's own
+        // toggle did not.
+        me.editor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.original));
     },
 
+    // Apply applies, and the window closes when the write lands. The diff is a button
+    // of its own now, so stopping to show it again was asking twice for one decision.
     showDiff: function () {
         let me = this;
         if (!me.editor) {
             return;
         }
-        let lang = me.lang;
         let edited = me.editor.getValue();
         let original = me.original;
-        if (lang === 'json') {
-            try {
-                original = JSON.stringify(PVE.meta.Utils.yamlLoad(me.original), null, 2);
-            } catch (_err) {
-                lang = 'yaml'; // cannot render the original as JSON; diff the YAML
-            }
+        try {
+            original = PVE.meta.Utils.originalInLang(me.original, me.lang);
+        } catch (_err) {
+            original = me.original;
         }
         if (edited === original) {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
-        PVE.meta.Monaco.confirmDiff({
-            title: me.view || gettext('(whole document)'),
-            original: original,
-            modified: edited,
-            lang: lang,
-            apply: () => me.apply(edited, me.lang),
-        });
+        me.apply(edited, me.lang);
     },
 
     apply: function (text, lang) {
@@ -1635,6 +2055,9 @@ Ext.define('PVE.meta.TreePanel', {
     // vmid/node/type/dc arrive as config properties from pve-ext's page loader;
     // pveSelNode is the fallback for anything that adds this panel the PVE way.
     pveSelNode: undefined,
+    // Set when this panel is inside a window: its footer then carries the way out,
+    // which is also the way to abandon staged edits.
+    onClose: undefined,
 
     initComponent: function () {
         let me = this;
@@ -1643,7 +2066,7 @@ Ext.define('PVE.meta.TreePanel', {
         me.vmid = me.vmid || sel.vmid;
         me.dc = !me.vmid;
         // This panel is ONE document's editor, named by `docId`: a guest's, the
-        // datacenter's, or a prefix/grant file's -- they are all documents (DESIGN
+        // datacenter's, or a prefix/permission file's -- they are all documents (DESIGN
         // §3.5), so the same tree, markers, text editor and diff serve all three, and
         // the registry grids open one of these in a window rather than reimplementing
         // any of it.
@@ -1660,7 +2083,7 @@ Ext.define('PVE.meta.TreePanel', {
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0, scopes: [] };
         me.prefixes = [];
-        me.grants = [];
+        me.permissions = [];
         me.tags = [];
         me.token = null;
         me.editing = false; // a row editor is open
@@ -1675,6 +2098,7 @@ Ext.define('PVE.meta.TreePanel', {
 
         Ext.apply(me, {
             tbar: me.buildToolbar(),
+            bbar: me.buildFooter(),
             items: [me.buildTreeCard(), me.buildTextCard()],
         });
         me.callParent();
@@ -1716,6 +2140,12 @@ Ext.define('PVE.meta.TreePanel', {
             columns: me.buildColumns(),
             listeners: {
                 selectionchange: () => me.syncButtons(),
+                cellclick: function (view, td, cellIndex, rec, tr, rowIndex, e) {
+                    if (e.getTarget('.pve-meta-undo')) {
+                        me.discardRow(rec);
+                        e.stopEvent();
+                    }
+                },
                 itemdblclick: (view, rec) => me.editRow(rec),
                 itemkeydown: function (view, rec, item, index, e) {
                     if (e.getKey() === e.ENTER && rec) {
@@ -1748,38 +2178,6 @@ Ext.define('PVE.meta.TreePanel', {
             layout: 'fit',
             border: false,
             items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
-            bbar: [
-                {
-                    xtype: 'segmentedbutton',
-                    itemId: 'textLangBtn',
-                    value: 'yaml',
-                    items: [
-                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
-                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
-                    ],
-                    listeners: { change: (btn, value) => me.switchTextLang(value) },
-                },
-                '->',
-                {
-                    text: gettext('Format'),
-                    itemId: 'textFormatBtn',
-                    iconCls: 'fa fa-indent',
-                    tooltip: gettext('Re-indent the buffer canonically'),
-                    handler: () => me.formatText(),
-                },
-                {
-                    text: gettext('Apply'),
-                    itemId: 'textApplyBtn',
-                    iconCls: 'fa fa-check',
-                    handler: () => me.applyText(),
-                },
-                {
-                    text: gettext('Discard'),
-                    itemId: 'textDiscardBtn',
-                    iconCls: 'fa fa-undo',
-                    handler: () => me.discardText(),
-                },
-            ],
         };
     },
 
@@ -1787,12 +2185,26 @@ Ext.define('PVE.meta.TreePanel', {
         let me = this;
         return [
             {
+                // The permission-document twin of Declare Key, and hidden by the same
+                // rule: a missing concept elsewhere, not a missing permission.
+                text: gettext('Add Rule'),
+                itemId: 'ruleBtn',
+                iconCls: 'fa fa-key',
+                hidden: true,
+                handler: () => me.addRule(),
+            },
+            {
                 text: gettext('Add'),
                 itemId: 'addBtn',
                 iconCls: 'fa fa-plus',
                 handler: function () {
                     let t = me.addTarget();
-                    if (t) {
+                    if (!t) {
+                        return;
+                    }
+                    if (t.list) {
+                        me.addListMember(t.path);
+                    } else {
                         me.addKey(t.docId, t.path);
                     }
                 },
@@ -1840,30 +2252,44 @@ Ext.define('PVE.meta.TreePanel', {
                 handler: () => me.editSelectionAsText(),
             },
             '-',
-            {
-                // The one write. Disabled until something is staged, so the tree has
-                // exactly the shape the text editor has always had: edit freely,
-                // then decide.
-                text: gettext('Apply'),
-                itemId: 'applyBtn',
-                iconCls: 'fa fa-check',
-                disabled: true,
-                handler: () => me.applyPending(),
-            },
-            {
-                text: gettext('Revert'),
-                itemId: 'revertBtn',
-                iconCls: 'fa fa-undo',
-                disabled: true,
-                handler: () => me.revertPending(),
-            },
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
-            // How many edits are waiting. Shown only when there are any -- it is the
-            // answer to "why is this row orange".
-            { xtype: 'tbtext', itemId: 'pendingText', cls: 'warning', hidden: true },
             // Only shown when the caller is restricted (DESIGN §8).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
+        ];
+    },
+
+    // The buffer against the file, without committing to anything. Text mode's Apply
+    // shows the same diff, but only as the last step before writing -- and wanting to
+    // see what you changed is not the same as wanting to write it.
+    showTextDiff: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let lang = me.textLang;
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+        } catch (_err) {
+            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
+            original = me.textOriginal;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
+            original: original,
+            modified: me.textEditor.getValue(),
+            lang: lang,
+            // No `apply`: this is the view, not the decision.
+        });
+    },
+
+    // The one bar at the bottom, for both cards. Which view you are looking at on
+    // the left, what you can do about it on the right; the top toolbar acts on the
+    // document's *contents*, which is a different kind of thing from committing.
+    buildFooter: function () {
+        let me = this;
+        return [
             {
                 xtype: 'segmentedbutton',
                 itemId: 'modeBtn',
@@ -1874,10 +2300,52 @@ Ext.define('PVE.meta.TreePanel', {
                 ],
                 listeners: { change: (btn, value) => me.onModeChange(value) },
             },
-        ];
+            {
+                xtype: 'segmentedbutton',
+                itemId: 'textLangBtn',
+                hidden: true,
+                value: 'yaml',
+                items: [
+                    { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                    { text: 'JSON', value: 'json', ui: 'default-toolbar' },
+                ],
+                listeners: { change: (btn, value) => me.switchTextLang(value) },
+            },
+        ].concat(
+            PVE.meta.Footer.actions({
+                applyDisabled: true, // nothing staged yet; `syncFooter` decides after
+                diff: () => me.showTextDiff(),
+                format: () => me.formatText(),
+                apply: () => (me.mode === 'text' ? me.applyText() : me.applyPending()),
+                secondary: () => me.footerSecondary(),
+                // In a window the exit *is* the discard, so there is one button for
+                // both; in a tab there is nothing to close, so it is Revert.
+                secondaryText: me.onClose ? gettext('Close') : gettext('Revert'),
+            }),
+        );
+    },
+
+    // Close, or Discard-and-close, or Revert — one button, because in a window the
+    // way out and the way to abandon the edits are the same gesture.
+    footerSecondary: function () {
+        let me = this;
+        if (me.mode === 'text') {
+            me.discardText();
+            return;
+        }
+        if (me.isDirty()) {
+            me.revertPending();
+            if (!me.onClose) {
+                return;
+            }
+        }
+        if (me.onClose) {
+            me.onClose();
+        }
     },
 
     buildColumns: function () {
+        let me = this;
         let U = PVE.meta.Utils;
         let fade = (rec, html) => (rec.data.present ? html : '<span class="faded">' + html + '</span>');
         // `html` is already content-encoded; this only escapes it for the attribute.
@@ -1999,13 +2467,25 @@ Ext.define('PVE.meta.TreePanel', {
                               (stored || '&nbsp;') +
                               '</div>'
                             : shown;
+                    // The discard sits on the row it acts on. It used to be a button
+                    // in the top toolbar, which meant reading the toolbar to find out
+                    // what it would apply to -- and on a list member it applied to the
+                    // whole list, which was worse than unclear.
+                    let undo =
+                        ' <i class="fa fa-undo pve-meta-undo" style="cursor:pointer" ' +
+                        'data-qtip="' + Ext.htmlEncode(gettext('Discard this change')) + '"></i>';
                     return (
                         (d.pending === 'delete' ? '' : stored) +
-                        '<div style="color:darkorange">' + after + '</div>'
+                        '<div style="color:darkorange">' + after + undo + '</div>'
                     );
                 },
             },
             {
+                // Guest documents only, structurally: a registry document's top-level
+                // keys are fixed and `deny_unknown_fields` refuses a fourth, so a
+                // comment key cannot exist there to describe one (DESIGN §3.5). An
+                // always-empty column is a column that teaches you to ignore columns.
+                hidden: me.docKind(me.docId) !== 'guest' && me.docKind(me.docId) !== 'datacenter',
                 // The row's own comment key (`k__`) if present, else nothing.
                 text: gettext('Description'),
                 dataIndex: 'description',
@@ -2019,6 +2499,9 @@ Ext.define('PVE.meta.TreePanel', {
                 },
             },
             {
+                // Permissions reach guest documents only (DESIGN §3.3), so on anything
+                // else this column can only ever be blank.
+                hidden: me.docKind(me.docId) !== 'guest',
                 text: gettext('Access'),
                 dataIndex: 'accessText',
                 flex: 2,
@@ -2070,8 +2553,8 @@ Ext.define('PVE.meta.TreePanel', {
         if (id.indexOf('prefixes/') === 0) {
             return 'prefix';
         }
-        if (id.indexOf('grants/') === 0) {
-            return 'grant';
+        if (id.indexOf('permissions/') === 0) {
+            return 'permission';
         }
         return 'guest';
     },
@@ -2136,13 +2619,37 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- staged edits --------------------------------------------------------
 
+    // The list at `path`, as it currently stands (staged edits included).
+    listAt: function (path) {
+        let v = PVE.meta.Lint.valueAt(this.plannedData(), path);
+        return Array.isArray(v) ? v.slice() : [];
+    },
+
+    // Stages the list at `path` with member `index` replaced, or dropped when
+    // `value` is undefined. One write of the whole list, because a view addresses
+    // through maps only -- the same reason the member rows are not addressable.
+    stageListMember: function (path, index, value) {
+        let list = this.listAt(path);
+        if (index < 0 || index >= list.length) {
+            return;
+        }
+        if (value === undefined) {
+            list.splice(index, 1);
+        } else {
+            list[index] = value;
+        }
+        this.stage(path, 'set', list);
+    },
+
     // Records one edit. A staged path replaces any earlier entry for itself *and*
     // for everything under it: staging `selector` after `selector.tag` means the
     // subtree was replaced wholesale, and keeping the older, narrower entry would
     // re-apply it on top of the new value.
     stage: function (path, op, value) {
         let me = this;
-        let under = (p) => p === path || p.indexOf(path + '.') === 0;
+        // The empty path is the document: it replaces everything, including edits
+        // staged under keys that no longer exist in it.
+        let under = (p) => path === '' || p === path || p.indexOf(path + '.') === 0;
         me.pending = me.pending.filter((e) => !under(e.path));
         me.pending.push({ path: path, op: op, value: value });
         me.buildTree();
@@ -2151,6 +2658,59 @@ Ext.define('PVE.meta.TreePanel', {
 
     isDirty: function () {
         return this.pending.length > 0;
+    },
+
+    // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
+    // so "what would Discard drop" and "what did staging replace" are one rule.
+    pendingUnder: function (path) {
+        return this.pending.filter((e) => e.path === path || e.path.indexOf(path + '.') === 0);
+    },
+
+    // Drops the staged edits on one row, leaving the rest alone.
+    //
+    // A list member needs more care than "drop what is staged at this path": the edit
+    // is staged on the *list*, so dropping it would throw away every other member's
+    // change too. Put that one member back to what the document says instead, and
+    // drop the whole staged edit only once the list matches again.
+    discardRow: function (rec) {
+        let me = this;
+        if (!rec || !rec.data.path) {
+            return;
+        }
+        let d = rec.data;
+        if (d.arrayIndex !== undefined && d.arrayIndex !== null) {
+            me.discardListMember(d.path, d.arrayIndex);
+            return;
+        }
+        let drop = me.pendingUnder(d.path);
+        if (!drop.length) {
+            return;
+        }
+        me.pending = me.pending.filter((e) => drop.indexOf(e) === -1);
+        me.buildTree();
+        me.syncButtons();
+    },
+
+    discardListMember: function (path, index) {
+        let me = this;
+        let stored = PVE.meta.Lint.valueAt(me.dataOf(me.docId), path);
+        let list = me.listAt(path);
+        if (!Array.isArray(stored)) {
+            return;
+        }
+        if (index < stored.length) {
+            list[index] = JSON.parse(JSON.stringify(stored[index]));
+        } else {
+            list.splice(index, 1); // it was appended; putting it back means removing it
+        }
+        if (JSON.stringify(list) === JSON.stringify(stored)) {
+            // Nothing of this list's edit is left to keep.
+            me.pending = me.pending.filter((e) => e.path !== path);
+            me.buildTree();
+            me.syncButtons();
+            return;
+        }
+        me.stage(path, 'set', list);
     },
 
     // The document as it would be. Everything the tree shows is computed from this,
@@ -2176,7 +2736,7 @@ Ext.define('PVE.meta.TreePanel', {
 
     // What describes this document's shape. A guest document is described by the
     // prefixes that reach it, most-specific first (they shadow); a prefix or
-    // grant file by the one meta-schema for its kind, rooted at the document itself;
+    // permission file by the one meta-schema for its kind, rooted at the document itself;
     // the datacenter document by nothing at all -- prefixes are guest-only
     // (DESIGN §3.3), which is what keeps a prefix from painting rows onto it.
     grammarFor: function (id) {
@@ -2185,10 +2745,10 @@ Ext.define('PVE.meta.TreePanel', {
         if (kind === 'guest') {
             return me.applicablePrefixes();
         }
-        if (kind !== 'prefix' && kind !== 'grant') {
+        if (kind !== 'prefix' && kind !== 'permission') {
             return []; // the datacenter document: nothing describes its shape
         }
-        let schema = kind === 'prefix' ? me.schemas.prefix : me.schemas.grant;
+        let schema = kind === 'prefix' ? me.schemas.prefix : me.schemas.permission;
         // A pseudo-prefix at the root. Its prefix is empty, so it governs the
         // whole document and there is nothing for it to shadow -- which is why it is
         // never passed as the shadowing list: `governing` answers about prefixes, and
@@ -2217,15 +2777,22 @@ Ext.define('PVE.meta.TreePanel', {
     // Add goes into the selected map, the parent of a selected leaf, or the root.
     // Where a new key goes: into the selected map, beside the selected leaf, or --
     // with nothing selected -- at the root of this panel's document.
+    //
+    // A list is the exception: `Add` on one, or on a member of one, appends to the
+    // list rather than adding a key beside it, because a list has no keys to add.
     addTarget: function () {
         let me = this;
         let rec = me.getSelection()[0];
         if (!rec) {
             return { docId: me.docId, path: '' };
         }
+        let d = rec.data;
+        if (d.kind === 'array' || d.arrayIndex !== undefined) {
+            return { docId: me.docOf(rec), path: d.path, list: true };
+        }
         return {
             docId: me.docOf(rec),
-            path: rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec),
+            path: d.kind === 'map' ? d.path : me.parentPath(rec),
         };
     },
 
@@ -2241,32 +2808,26 @@ Ext.define('PVE.meta.TreePanel', {
             }
         };
         let target = me.addTarget();
-        set('addBtn', text || !target || !me.editableFor(target.path));
+        // A permission file has three keys and the parser refuses a fourth
+        // (`deny_unknown_fields`), so an arbitrary Add can only ever produce a file
+        // the loader would skip: the one thing you add to one is a rule, and Add Rule
+        // is that. On a prefix definition Add stays, because `schema` holds whatever
+        // you declare -- but its *root* keys are fixed the same way, so Add there is
+        // disabled until you are somewhere it means something.
+        let kind = me.docKind(me.docId);
+        let addBtn = me.down('#addBtn');
+        if (addBtn) {
+            addBtn.setHidden(kind === 'permission');
+        }
+        let fixedRoot = kind === 'prefix' && target && target.path === '';
+        set('addBtn', text || !target || fixedRoot || !me.editableFor(target.path));
         let row = d;
         set('editBtn', text || !row || !row.editable);
         set('removeBtn', text || !row || !row.present || !row.editable);
         let dirty = me.isDirty();
-        // The text editors write immediately -- "edit as text" *is* an apply. With
-        // edits staged they would be showing the stored document while the tree
-        // shows the planned one, so they wait until this is settled either way.
-        set('textSelBtn', text || !row || dirty);
+        set('textSelBtn', text || !row);
         set('reloadBtn', text);
-        set('applyBtn', text || !dirty);
-        set('revertBtn', text || !dirty);
-        let count = me.down('#pendingText');
-        if (count) {
-            count.setHidden(!dirty);
-            count.setText(
-                dirty
-                    ? Ext.String.format(
-                          me.pending.length === 1
-                              ? gettext('{0} unapplied change')
-                              : gettext('{0} unapplied changes'),
-                          me.pending.length,
-                      )
-                    : '',
-            );
-        }
+        me.syncFooter();
         let dflt = me.down('#defaultBtn');
         if (dflt) {
             // Disabled, not hidden. What varies per *document* may hide (Declare Key
@@ -2274,12 +2835,23 @@ Ext.define('PVE.meta.TreePanel', {
             // per *row* must not, or the buttons beside it shift under the pointer
             // every time the selection changes -- which is how you click Remove and
             // hit something else.
+            // Hidden entirely when nothing in this document declares a default --
+            // a permission file never can, so the button was pure furniture there.
+            // Disabled, not hidden, when the document has defaults but this row is
+            // not one of them: that varies per row, and a button that moves under
+            // the pointer is how you aim for one thing and hit another.
             let offers = !!row && !row.present && row.defaultValue !== undefined;
+            dflt.setHidden(!me.hasDefaults);
             dflt.setDisabled(text || !offers || !row.editable);
         }
         // The Text toggle's enabled state depends on staged edits too, and this is
         // the function that runs whenever those change.
         me.syncAccessLabel();
+        let rule = me.down('#ruleBtn');
+        if (rule) {
+            rule.setHidden(me.docKind(me.docId) !== 'permission');
+            rule.setDisabled(text || !me.editableFor(''));
+        }
         let declare = me.down('#declareBtn');
         if (declare) {
             // Hidden by the *document*, disabled by the *row* -- the rule above. It
@@ -2289,6 +2861,28 @@ Ext.define('PVE.meta.TreePanel', {
             declare.setHidden(me.docKind(me.docId) !== 'prefix');
             declare.setDisabled(text || !row || !row.editable);
         }
+    },
+
+    // One place decides what the footer says, in either mode.
+    syncFooter: function () {
+        let me = this;
+        let textMode = me.mode === 'text';
+        ['textLangBtn', 'metaFormat', 'metaDiff'].forEach(function (id) {
+            let c = me.down('#' + id);
+            if (c) {
+                c.setHidden(!textMode);
+            }
+        });
+        PVE.meta.Footer.sync(me, {
+            // In text mode the buffer is the edit, and Apply is offered whenever the
+            // caller may write at all -- the diff is what decides if it is worth it.
+            canApply: textMode ? !!me.access.write : me.isDirty(),
+            count: textMode ? 0 : me.pending.length,
+            dirty: textMode ? true : me.isDirty(),
+            dirtyText: me.onClose ? gettext('Discard') : gettext('Revert'),
+            cleanText: me.onClose ? gettext('Close') : gettext('Revert'),
+            secondaryOnlyWhenDirty: !me.onClose,
+        });
     },
 
     setModeButton: function (value) {
@@ -2345,7 +2939,7 @@ Ext.define('PVE.meta.TreePanel', {
         }
         Proxmox.Utils.setErrorMask(me, true);
         me.loadPrefixes(() =>
-            me.loadGrants(() =>
+            me.loadPermissions(() =>
                 me.loadTags(() =>
                     me.loadAccess(() =>
                         me.loadSchemas(() =>
@@ -2357,7 +2951,7 @@ Ext.define('PVE.meta.TreePanel', {
         );
     },
 
-    // /meta/prefixes and /meta/grants are revision 6; against an older API they
+    // /meta/prefixes and /meta/permissions are revision 6; against an older API they
     // simply fail and the Access column and the schema-declared rows stay empty,
     // rather than the page.
     loadPrefixes: function (next) {
@@ -2378,16 +2972,16 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    loadGrants: function (next) {
+    loadPermissions: function (next) {
         let me = this;
         me.request({
-            url: '/meta/grants',
+            url: '/meta/permissions',
             success: function (response) {
-                me.grants = response.result.data || [];
+                me.permissions = response.result.data || [];
                 next();
             },
             failure: function () {
-                me.grants = [];
+                me.permissions = [];
                 next();
             },
         });
@@ -2401,7 +2995,7 @@ Ext.define('PVE.meta.TreePanel', {
             (list || []).some((e) => (e[key] || []).some((x) => x.selector && x.selector.tag));
         let needed =
             (me.prefixes || []).some((n) => n.selector && n.selector.tag) ||
-            hasTagSelector(me.grants, 'grants');
+            hasTagSelector(me.permissions, 'rules');
         if (me.dc || !needed) {
             next();
             return;
@@ -2423,7 +3017,7 @@ Ext.define('PVE.meta.TreePanel', {
             url: '/meta/access',
             // Ask about the document this panel is actually showing. `dc: 1` used to
             // stand in for "not a guest", which stopped being true the moment a
-            // prefix or grant file could be the document: those are readable by every
+            // prefix or permission file could be the document: those are readable by every
             // authenticated user, and asking about the datacenter document instead
             // answered with Sys.Audit -- disabling Text mode on a file the caller may
             // certainly read (DESIGN §3.5).
@@ -2443,19 +3037,17 @@ Ext.define('PVE.meta.TreePanel', {
         let modeBtn = me.down('#modeBtn');
         if (modeBtn && modeBtn.items.getAt(1)) {
             // The Text card is the whole document at the root view, and a scope-only
-            // principal may not read that at all (DESIGN §3): do not offer it. Nor
-            // while edits are staged, which the tree is showing and the text card
-            // would not be.
-            modeBtn.items.getAt(1).setDisabled(!me.access.read || me.isDirty());
+            // principal may not read that at all (DESIGN §3): do not offer it. Staged
+            // edits are no longer a reason to refuse -- the buffer is rendered from the
+            // planned document, so they are *in* it, and switching back turns whatever
+            // was typed into staged edits again.
+            modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
         // A Text-mode Apply is a root replace, which needs full write and nothing else
         // (DESIGN §3.4, `authorize_view_write`). Without this a read-only caller could
         // compose a whole document, open the diff, tick through the schema warning and
         // collect a 403 at the very end -- the server was right, the button was a lie.
-        let applyBtn = me.down('#textApplyBtn');
-        if (applyBtn) {
-            applyBtn.setDisabled(!me.access.write);
-        }
+        me.syncFooter();
         let label = me.down('#accessText');
         if (!label) {
             return;
@@ -2549,7 +3141,7 @@ Ext.define('PVE.meta.TreePanel', {
     // on `/vms/<vmid>` never sees the guest in the resource tree at all
     // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
     // panel has tags we cannot read. A scope-only principal is still bound by
-    // its grants -- they are enforced server-side, on the API it actually uses.
+    // its permissions -- they are enforced server-side, on the API it actually uses.
 
     // The prefixes that reach this guest, most-specific first. Prefixes decide
     // *shape*: which declared-but-unset rows appear and which schema governs a path.
@@ -2564,29 +3156,29 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    // The grant entries that reach this guest. Grants decide *access*, and unlike
-    // prefixes they accumulate by containment: a grant on `homelab` covers
+    // The permission rules that reach this guest. Permissions decide *access*, and
+    // unlike prefixes they accumulate by containment: a rule on `homelab` covers
     // `homelab.docker` (DESIGN section 3.2).
-    applicableGrants: function () {
+    applicablePermissions: function () {
         let me = this;
         let out = [];
         if (me.dc) {
-            return out; // grants apply to guest documents only
+            return out; // permissions apply to guest documents only
         }
-        (me.grants || []).forEach(function (grant) {
-            (grant.grants || []).forEach(function (entry) {
+        (me.permissions || []).forEach(function (file) {
+            (file.rules || []).forEach(function (entry) {
                 let sel = entry.selector || {};
                 let matches =
                     entry.prefix && (sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1));
                 if (matches) {
-                    out.push(Ext.apply({ grant: grant }, entry));
+                    out.push(Ext.apply({ file: file }, entry));
                 }
             });
         });
         return out;
     },
 
-    // Every grant whose prefix covers this row, `rw` first. Several principals
+    // Every rule whose prefix covers this row, `rw` first. Several principals
     // may read a subtree; this is about who writes and who subscribes, not ownership.
     accessFor: function (path, scopes) {
         let U = PVE.meta.Utils;
@@ -2597,7 +3189,7 @@ Ext.define('PVE.meta.TreePanel', {
             if (!U.covers(s.prefix, path)) {
                 return;
             }
-            let name = s.grant.name || s.grant.authid || '';
+            let name = s.file.name || s.file.authid || '';
             let mode = s.mode === 'ro' ? 'ro' : 'rw';
             let key = name + '\u0000' + mode;
             if (seen[key]) {
@@ -2662,10 +3254,38 @@ Ext.define('PVE.meta.TreePanel', {
             let child = me.entry(entry, key, U.joinPath(entry.path, key));
             if (U.kindOf(v) === 'map') {
                 me.addData(child, v);
-            } else {
-                child.present = true;
-                child.kind = U.kindOf(v);
-                child.value = v;
+                return;
+            }
+            child.present = true;
+            child.kind = U.kindOf(v);
+            child.value = v;
+            // **A list is a container, like a map.** Its members are rows, so you can
+            // see them, select one and act on it -- which is the whole reason a map
+            // is a tree and not a blob of JSON in a cell. A list was the one shape
+            // that stayed a blob, for no reason other than that it came second.
+            //
+            // The member rows are **not addressable**: a view addresses through maps
+            // only, so there is no path to `groups[1]` (DESIGN §2) and nothing may try
+            // to write one. They carry their index instead, and everything that acts
+            // on one rewrites the list it is in -- which is exactly what staging is
+            // for (§8), so this needs no new write path.
+            if (child.kind === 'array') {
+                v.forEach(function (item, i) {
+                    let row = me.entry(child, String(i), child.path);
+                    row.present = true;
+                    row.arrayIndex = i;
+                    row.addressable = false;
+                    row.rawItem = item;
+                    if (item !== null && typeof item === 'object') {
+                        // One line for a member with structure of its own; its real
+                        // value rides along in `rawItem` for whatever edits it.
+                        row.kind = 'string';
+                        row.value = U.itemSummary(item);
+                    } else {
+                        row.kind = U.kindOf(item);
+                        row.value = item;
+                    }
+                });
             }
         });
     },
@@ -2765,6 +3385,36 @@ Ext.define('PVE.meta.TreePanel', {
         // A row staged for deletion is gone from the planned document, but it should
         // not vanish off the screen before it is applied -- you would be looking at a
         // tree that already claims the write happened. It comes back as a ghost.
+        // A staged list edit is one write of the whole list, but it is almost never a
+        // change to the whole list: show it on the members that actually differ. Any
+        // member the edit dropped comes back as a ghost, the same as a deleted key.
+        let storedDoc = me.dataOf(me.docId);
+        me.pending.forEach(function (e) {
+            if (e.op !== 'set' || !Array.isArray(e.value)) {
+                return;
+            }
+            let before = PVE.meta.Lint.valueAt(storedDoc, e.path);
+            if (!Array.isArray(before) || before.length <= e.value.length) {
+                return;
+            }
+            let list = PVE.meta.Lint.valueAt(me.plannedData(), e.path);
+            let entry = root;
+            let path = '';
+            e.path.split('.').forEach(function (seg) {
+                path = PVE.meta.Utils.joinPath(path, seg);
+                entry = me.entry(entry, seg, path);
+            });
+            before.slice(Array.isArray(list) ? list.length : 0).forEach(function (item, i) {
+                let row = me.entry(entry, String((list || []).length + i), e.path);
+                row.present = false;
+                row.pendingDelete = true;
+                row.arrayIndex = null; // gone: there is no member to act on
+                row.addressable = false;
+                row.kind = 'string';
+                row.value = PVE.meta.Utils.itemSummary(item);
+            });
+        });
+
         me.pending
             .filter((e) => e.op === 'delete')
             .forEach(function (e) {
@@ -2799,15 +3449,36 @@ Ext.define('PVE.meta.TreePanel', {
     buildTree: function () {
         let me = this;
         let I = PVE.meta.Icons;
-        // Grants decide access, and they reach guest documents only, so the Access
+        // Permissions reach guest documents only, so the Access
         // column is empty on the datacenter tab by construction (DESIGN §3.3).
-        let scopes = me.applicableGrants();
+        let scopes = me.applicablePermissions();
 
         let findings = me.findingsFor();
         // What is staged, by path, so a changed row can show `stored -> pending`.
         let staged = Object.create(null);
         me.pending.forEach((e) => (staged[e.path] = e.op));
         let storedDoc = me.dataOf(me.docId);
+
+        // Which *member* of a staged list actually differs. The edit is one write of
+        // the whole list -- members are not addressable (§2) -- but wearing the mark on
+        // the list said "all of this changed" when one entry did.
+        let memberChanged = function (listPath, index, item) {
+            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            if (!Array.isArray(before) || index >= before.length) {
+                return true; // appended
+            }
+            return JSON.stringify(before[index]) !== JSON.stringify(item);
+        };
+        let storedMember = function (listPath, index) {
+            let before = PVE.meta.Lint.valueAt(storedDoc, listPath);
+            if (!Array.isArray(before) || index >= before.length) {
+                return '';
+            }
+            let v = before[index];
+            return v !== null && typeof v === 'object'
+                ? PVE.meta.Utils.itemSummary(v)
+                : PVE.meta.Utils.displayValue(v, PVE.meta.Utils.kindOf(v));
+        };
         // What each branch has to answer for: schema findings beneath it, and staged
         // edits beneath it. Both are invisible once the branch is collapsed.
         let below = PVE.meta.Utils.rollUp(findings);
@@ -2824,6 +3495,9 @@ Ext.define('PVE.meta.TreePanel', {
                 .map(function (key) {
                     let c = entry.children[key];
                     let kind = c.kind || 'string';
+                    if (c.defaultValue !== undefined) {
+                        me.hasDefaults = true;
+                    }
                     let access = me.accessFor(c.path, scopes);
                     let node = {
                         key: key,
@@ -2841,26 +3515,51 @@ Ext.define('PVE.meta.TreePanel', {
                         format: c.format,
                         multiline: c.multiline,
                         rawValue: c.value,
+                        arrayIndex: c.arrayIndex,
+                        addressable: c.addressable !== false,
+                        rawItem: c.rawItem,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         accessList: access,
                         accessText: me.accessSummary(access),
                         finding: findings[c.path] || '',
-                        pending: staged[c.path] || '',
+                        pending: (function () {
+                            if (c.pendingDelete) {
+                                return 'delete';
+                            }
+                            if (!staged[c.path]) {
+                                return '';
+                            }
+                            // A member carries the mark when it is the one that
+                            // changed; the list itself carries only the dot that says
+                            // something below it did.
+                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
+                                return memberChanged(c.path, c.arrayIndex, c.rawItem) ? 'set' : '';
+                            }
+                            return kind === 'array' ? '' : staged[c.path];
+                        })(),
                         belowCount: (below[c.path] || {}).count || 0,
                         belowText: ((below[c.path] || {}).messages || []).join('\n'),
-                        stagedBelow: (stagedBelow[c.path] || {}).count || 0,
+                        stagedBelow:
+                            (stagedBelow[c.path] || {}).count ||
+                            (kind === 'array' && staged[c.path] ? 1 : 0),
                         // Rendered with the row's own kind, not one inferred from the
                         // raw value: the API returns booleans as 1/0 (DESIGN §4), so
                         // inferring would print a struck-through "1" under a row whose
                         // stored value reads "Yes".
                         storedText: (function () {
+                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
+                                return storedMember(c.path, c.arrayIndex);
+                            }
+                            if (c.pendingDelete && c.value !== undefined) {
+                                return c.value; // a ghost carries what was there
+                            }
                             let v = PVE.meta.Lint.valueAt(storedDoc, c.path);
                             return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
                         })(),
                         editable: me.editableFor(c.path),
-                        leaf: kind !== 'map',
+                        leaf: kind !== 'map' && !Object.keys(c.children).length,
                     };
-                    if (kind === 'map') {
+                    if (kind === 'map' || Object.keys(c.children).length) {
                         node.children = toNodes(c, docId);
                         node.expanded = true;
                         node.iconCls = I.mapExpanded;
@@ -2872,6 +3571,9 @@ Ext.define('PVE.meta.TreePanel', {
                 });
         };
 
+        // Does anything in this document declare a default? If not, "Set to default"
+        // is furniture -- a permission file can never have one.
+        me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
         // Reloading (including from the version poll) must not fold the tree up.
@@ -2903,9 +3605,32 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- editing ------------------------------------------------------------
 
+    // Opens one of this panel's modal editor windows (Edit Value, Add Key, Add Rule,
+    // Declare Key) and wires the one thing all seven call sites did by hand: `editing`
+    // goes true so a reload or the version poll cannot pull the document out from
+    // under an open window, `on`/`handler` is the window's one result event, and
+    // `editing` goes false again on `destroy` -- whether the window committed or was
+    // cancelled. A copy of this that forgot the `destroy` listener would leave
+    // `editing` stuck true and quietly stop this panel from ever reloading again.
+    openEditor: function (xtype, cfg, on, handler) {
+        let me = this;
+        me.editing = true;
+        let win = Ext.create(xtype, cfg);
+        win.on(on, handler);
+        win.on('destroy', function () {
+            me.editing = false;
+        });
+        win.show();
+        return win;
+    },
+
     editRow: function (rec) {
         let me = this;
         if (!rec || !rec.data.editable) {
+            return;
+        }
+        if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
+            me.editListMember(rec);
             return;
         }
         // A value with structure inside it is edited as text, wherever the request came
@@ -2915,24 +3640,19 @@ Ext.define('PVE.meta.TreePanel', {
             me.editAsText(rec);
             return;
         }
-        me.editing = true;
-        let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
-        win.on('setvalue', (value) => me.stage(rec.data.path, 'set', value));
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
+            me.stage(rec.data.path, 'set', value),
+        );
     },
 
     addKey: function (docId, parentPath) {
         let me = this;
-        me.editing = true;
-        let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: parentPath || '' });
-        win.on('addkey', (path, value) => me.stage(path, 'set', value));
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
+        me.openEditor(
+            'PVE.meta.AddKeyWindow',
+            { parentPath: parentPath || '' },
+            'addkey',
+            (path, value) => me.stage(path, 'set', value),
+        );
     },
 
     // Applies everything staged, as ONE write.
@@ -2973,43 +3693,36 @@ Ext.define('PVE.meta.TreePanel', {
         };
         let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Lint.valueAt(me.dataOf(me.docId), view);
 
-        Proxmox.Utils.API2Request({
-            url: me.urlFor(me.docId),
-            method: 'PUT',
-            waitMsgTarget: me,
-            params: Ext.apply({ dry_run: 1 }, params),
-            // A refusal is not a failure to report and stop on: it is the banner. The
-            // administrator still gets the diff and an explicit "apply anyway", the
-            // same as a schema mismatch in the text editor -- and the server refuses
-            // it again for real if it really is unstorable.
-            callback: function (options, success, response) {
-                let warnings = me.textFindingsFor(planned);
-                if (!success) {
-                    // `htmlStatus` is already HTML -- PVE encodes it -- and the banner
-                    // encodes every warning again, so the server's own quotes and
-                    // angle brackets arrived as `&#39;` and `&lt;` on screen. Back to
-                    // plain text here; the banner does the one encoding.
-                    let msg = response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response);
-                    msg = Ext.util.Format.htmlDecode(Ext.util.Format.stripTags(String(msg)));
-                    warnings = [msg.replace(/\s+/g, ' ').trim()].concat(warnings);
-                }
-                PVE.meta.Monaco.confirmDiff({
-                    title: Ext.String.format(gettext('Apply: {0}'), me.docId),
-                    // Documents, not text: `confirmDiff` renders them once it has the
-                    // YAML codec, so this cannot run before it is loaded.
-                    originalValue: stored === undefined ? {} : stored,
-                    modifiedValue: subtree,
-                    warnings: warnings,
-                    apply: function () {
-                        me.submit(
-                            { url: me.urlFor(me.docId), method: 'PUT', params: params },
-                            function () {
-                                me.pending = [];
-                            },
-                        );
-                    },
-                });
-            },
+        let write = function () {
+            me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
+                me.pending = [];
+            });
+        };
+
+        // Apply applies. It stops to show the diff only when the document would not
+        // match the schema, which is the one case where seeing it changes what you
+        // decide -- and the tick is what makes storing it anyway a deliberate act
+        // rather than a dialog reflex. Otherwise there is nothing to decide: the diff
+        // is a button of its own now, for whenever you want to look first.
+        //
+        // There is deliberately no `dry_run` pass any more. It existed to turn a
+        // server refusal into a banner with a "Save anyway" tick -- but a refusal is
+        // not advisory: the server refuses the real write for the same reason, tick or
+        // no tick. Showing it as an error is honest; showing it as something you can
+        // override is not, and it cost every Apply a second request.
+        let warnings = me.textFindingsFor(planned);
+        if (!warnings.length) {
+            write();
+            return;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Apply: {0}'), me.docId),
+            // Documents, not text: `confirmDiff` renders them once it has the YAML
+            // codec, so this cannot run before it is loaded.
+            originalValue: stored === undefined ? {} : stored,
+            modifiedValue: subtree,
+            warnings: warnings,
+            apply: write,
         });
     },
 
@@ -3036,6 +3749,77 @@ Ext.define('PVE.meta.TreePanel', {
         me.stage(rec.data.path, 'set', rec.data.defaultValue);
     },
 
+    // Appending to a list. A rule list gets the rule form, because that is the list
+    // worth having a form for; anything else asks for a value, since a member of a
+    // list has no name to give it.
+    addListMember: function (path) {
+        let me = this;
+        let list = me.listAt(path);
+        if (path === 'rules' && me.docKind(me.docId) === 'permission') {
+            me.addRule();
+            return;
+        }
+        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
+            _path,
+            value,
+        ) {
+            me.stage(path, 'set', list.concat([value]));
+        });
+    },
+
+    // Editing one member of a list. Three cases, in the order they are worth having:
+    // a permission rule gets its own form (it is the list anyone actually edits), a
+    // scalar gets the ordinary value editor, and anything else with structure gets
+    // the text editor on the list it is in -- which is where it was before lists had
+    // rows at all, so nothing is lost.
+    editListMember: function (rec) {
+        let me = this;
+        let d = rec.data;
+        let item = d.rawItem;
+        let isRule =
+            item &&
+            typeof item === 'object' &&
+            Object.prototype.hasOwnProperty.call(item, 'prefix') &&
+            Object.prototype.hasOwnProperty.call(item, 'mode');
+        if (isRule) {
+            me.openEditor(
+                'PVE.meta.AddRuleWindow',
+                { title: gettext('Edit Rule'), prefixes: me.prefixes, rule: item },
+                'addrule',
+                function (rules) {
+                    // The form appends to what it was given; for an edit it was given
+                    // nothing, so the one rule it produced replaces this member.
+                    me.stageListMember(d.path, d.arrayIndex, rules[rules.length - 1]);
+                },
+            );
+            return;
+        }
+        if (item !== null && typeof item === 'object') {
+            me.editAsText(rec);
+            return;
+        }
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
+            me.stageListMember(d.path, d.arrayIndex, value),
+        );
+    },
+
+    // Append one rule to this permission file. The prefix combobox is filled from
+    // the declared prefixes, which is the list an administrator is choosing from
+    // nine times in ten -- but it stays editable, because a rule and a prefix
+    // definition are independent files and neither waits for the other.
+    addRule: function () {
+        let me = this;
+        if (me.docKind(me.docId) !== 'permission') {
+            return;
+        }
+        me.openEditor(
+            'PVE.meta.AddRuleWindow',
+            { prefixes: me.prefixes, existing: me.plannedData().rules },
+            'addrule',
+            (rules) => me.stage('rules', 'set', rules),
+        );
+    },
+
     // Declare one key of the selected prefix's schema: a view PUT into
     // `schema.properties.<key>` of that prefix document, with its digest. The
     // window builds the declaration; this only decides where it goes.
@@ -3045,15 +3829,12 @@ Ext.define('PVE.meta.TreePanel', {
             return;
         }
         let docId = rec.data.docId;
-        me.editing = true;
-        let win = Ext.create('PVE.meta.DeclareKeyWindow', { prefix: me.docTitle(docId) });
-        win.on('declarekey', (key, schema) =>
-            me.stage('schema.properties.' + key, 'set', schema),
+        me.openEditor(
+            'PVE.meta.DeclareKeyWindow',
+            { prefix: me.docTitle(docId) },
+            'declarekey',
+            (key, schema) => me.stage('schema.properties.' + key, 'set', schema),
         );
-        win.on('destroy', function () {
-            me.editing = false;
-        });
-        win.show();
     },
 
     // Staged like every other edit, so no confirm: nothing has happened yet, the row
@@ -3061,6 +3842,10 @@ Ext.define('PVE.meta.TreePanel', {
     removeKey: function (rec) {
         let me = this;
         if (!rec || !rec.data.path) {
+            return;
+        }
+        if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
+            me.stageListMember(rec.data.path, rec.data.arrayIndex, undefined);
             return;
         }
         me.stage(rec.data.path, 'delete');
@@ -3134,13 +3919,19 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // The loaded document rendered in `lang`; the diff's "original" side and the
-    // yardstick the dirty check uses.
+    // yardstick the dirty check uses. `Utils.originalInLang` -- the subtree
+    // window's own diff used to inline the same conversion rather than share this.
+    // What the buffer should show: the **planned** document -- stored plus whatever is
+    // staged -- in `lang`. With nothing staged this is the server's own text, comments
+    // and all, because `renderBuffer` prefers the original when the document is
+    // unchanged. That is what makes Tree and Text two views of one thing rather than
+    // two editors that have to be kept apart.
     textRendered: function (lang) {
         let me = this;
-        if (lang !== 'json') {
-            return me.textOriginal;
+        if (!me.isDirty()) {
+            return PVE.meta.Utils.originalInLang(me.textOriginal, lang);
         }
-        return JSON.stringify(PVE.meta.Utils.yamlLoad(me.textOriginal), null, 2);
+        return PVE.meta.Utils.renderBuffer(me.plannedData(), lang, me.textOriginal);
     },
 
     enterTextMode: function () {
@@ -3161,6 +3952,11 @@ Ext.define('PVE.meta.TreePanel', {
             success: function (response) {
                 let d = response.result.data || {};
                 me.setDigest(me.textDocId, d.digest);
+                // The server's own text, comments and all -- but what the buffer shows
+                // is the *planned* document, so staged edits are there too. With
+                // nothing staged the two are the same text (`renderBuffer` prefers the
+                // original when the document is unchanged), so opening text mode on an
+                // untouched document still shows the file as it was written.
                 me.textOriginal = d.text || '';
                 me.showTextEditor();
             },
@@ -3186,7 +3982,7 @@ Ext.define('PVE.meta.TreePanel', {
                     return;
                 }
                 me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
-                    value: me.textOriginal,
+                    value: me.textRendered(me.textLang),
                     language: 'yaml',
                     theme: PVE.meta.Monaco.theme(),
                     automaticLayout: true,
@@ -3217,27 +4013,37 @@ Ext.define('PVE.meta.TreePanel', {
         me.syncButtons();
     },
 
+    // Going back to the tree keeps whatever was typed: the buffer is turned into
+    // staged edits on rows, so the tree shows which keys changed and to what, and one
+    // Apply writes them. Switching views is not a decision about your work any more --
+    // it used to ask you to discard it, which is why it felt like a trap.
+    //
+    // The one thing that can stop it is a buffer that does not parse: there is no
+    // document to show as a tree, and guessing at one would lose what was typed. So it
+    // says so and stays put.
     leaveTextMode: function () {
         let me = this;
-        let finish = function () {
-            PVE.meta.Monaco.dispose(me.textEditor);
-            me.textEditor = null;
-            me.mode = 'tree';
-            me.setModeButton('tree');
-            me.getLayout().setActiveItem(me.down('#metaTree'));
-            me.syncButtons();
-            me.reload();
-        };
-        if (!me.textIsDirty()) {
-            finish();
+        let parsed;
+        try {
+            parsed = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+        } catch (err) {
+            me.setModeButton('text');
+            Ext.Msg.alert(
+                gettext('Cannot show this as a tree'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)) +
+                    '<br><br>' +
+                    Ext.htmlEncode(gettext('Fix the text, or Discard it, and try again.')),
+            );
             return;
         }
-        me.setModeButton('text'); // stay put until the question is answered
-        Ext.Msg.confirm(
-            gettext('Confirm'),
-            gettext('Discard the unapplied changes in the text editor?'),
-            (btn) => (btn === 'yes' ? finish() : undefined),
-        );
+        me.pending = PVE.meta.Utils.diffDocuments(me.dataOf(me.textDocId), parsed);
+        PVE.meta.Monaco.dispose(me.textEditor);
+        me.textEditor = null;
+        me.mode = 'tree';
+        me.setModeButton('tree');
+        me.getLayout().setActiveItem(me.down('#metaTree'));
+        me.buildTree();
+        me.syncButtons();
     },
 
     // Presentation only, exactly like the selection window's toggle.
@@ -3249,10 +4055,7 @@ Ext.define('PVE.meta.TreePanel', {
         }
         let value;
         try {
-            value =
-                me.textLang === 'json'
-                    ? Ext.decode(me.textEditor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
         } catch (err) {
             Ext.Msg.alert(
                 gettext('Error'),
@@ -3270,20 +4073,10 @@ Ext.define('PVE.meta.TreePanel', {
         me.textLang = lang;
         window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
 
-        let rendered;
-        if (lang === 'json') {
-            rendered = JSON.stringify(value, null, 2);
-        } else {
-            // Back to YAML: prefer the server's own text when the document is
-            // unchanged. js-yaml and serde_yaml lay the same document out
-            // differently (indentation of nested sequences, quoting), so re-dumping
-            // here made a *presentation* toggle report unsaved changes and offer an
-            // Apply whose only content was whitespace.
-            rendered = PVE.meta.Utils.sameDocument(value, me.textOriginal)
-                ? me.textOriginal
-                : PVE.meta.Utils.yamlDump(value);
-        }
-        me.textEditor.setValue(rendered);
+        // `renderBuffer`: switching back to YAML prefers the server's own text when
+        // the document is unchanged (see the comment on that function) rather than
+        // re-dumping unconditionally.
+        me.textEditor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.textOriginal));
         me.annotateText();
     },
 
@@ -3301,12 +4094,8 @@ Ext.define('PVE.meta.TreePanel', {
         }
         let text = me.textEditor.getValue();
         try {
-            let value =
-                me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
-            let formatted =
-                me.textLang === 'json'
-                    ? JSON.stringify(value, null, 2)
-                    : PVE.meta.Utils.yamlDump(value);
+            let U = PVE.meta.Utils;
+            let formatted = U.dumpBuffer(U.parseBuffer(text, me.textLang), me.textLang);
             if (formatted !== text) {
                 me.textEditor.setValue(formatted);
                 me.annotateText();
@@ -3337,40 +4126,62 @@ Ext.define('PVE.meta.TreePanel', {
             Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
             return;
         }
+        // The whole document, at the root view, as **text** -- not as a dump of the
+        // planned document. That is the one thing this path does that the tree's Apply
+        // cannot: a `#` comment is not part of the document model (DESIGN §2), so it
+        // survives only for as long as nothing rewrites the file from the model.
+        // Sending the buffer keeps what was typed, comments included.
+        //
+        // The buffer already contains whatever was staged in the tree -- it is rendered
+        // from the planned document -- so this applies all of it, and the staged edits
+        // are spent.
+        let write = function () {
+            let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
+            params[me.textLang === 'json' ? 'data' : 'text'] = edited;
+            me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
+                me.pending = [];
+                me.refreshText();
+            });
+        };
+
+        // Same rule as the tree's Apply: stop only when the document would not match
+        // the schema, because that is the one case where seeing the diff changes what
+        // you decide. The tick keeps storing it anyway a deliberate act -- the server's
+        // lint decides what is *storable* (DESIGN §4), and an operator whose schema has
+        // drifted must not be able to lock the administrator out of editing.
+        let warnings = me.textFindings();
+        if (!warnings.length) {
+            write();
+            return;
+        }
         PVE.meta.Monaco.confirmDiff({
             title: gettext('(whole document)'),
             original: original,
             modified: edited,
             lang: lang,
-            // Advisory: the banner and the tick make a schema mismatch a deliberate
-            // act, they do not forbid it. The server's lint decides what is storable
-            // (DESIGN section 4), and an operator whose grammar has drifted from what
-            // a document legitimately holds must not be able to lock the administrator
-            // out of editing it.
-            warnings: me.textFindings(),
-            apply: function () {
-                // The whole document, at the root view. JSON is a subset of YAML, but
-                // `data` is the parameter that says "this is the JSON data model".
-                let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
-                params[me.textLang === 'json' ? 'data' : 'text'] = edited;
-                me.submit(
-                    { url: me.urlFor(me.textDocId), method: 'PUT', params: params },
-                    () => me.refreshText(),
-                );
-            },
+            warnings: warnings,
+            apply: write,
         });
     },
 
+    // Drops everything unapplied -- the buffer's edits and the staged ones behind it,
+    // which are the same set: the buffer is rendered from the planned document.
     discardText: function () {
         let me = this;
-        if (!me.textIsDirty()) {
+        if (!me.textIsDirty() && !me.isDirty()) {
             me.refreshText();
             return;
         }
         Ext.Msg.confirm(
             gettext('Confirm'),
             gettext('Discard the unapplied changes in the text editor?'),
-            (btn) => (btn === 'yes' ? me.refreshText() : undefined),
+            function (btn) {
+                if (btn !== 'yes') {
+                    return;
+                }
+                me.pending = [];
+                me.refreshText();
+            },
         );
     },
 
@@ -3409,7 +4220,7 @@ Ext.define('PVE.meta.TreePanel', {
         let parsed = null;
         let parseError = null;
         try {
-            parsed = me.textLang === 'json' ? Ext.decode(text) : PVE.meta.Utils.yamlLoad(text);
+            parsed = PVE.meta.Utils.parseBuffer(text, me.textLang);
         } catch (err) {
             parseError = err;
         }
@@ -3483,10 +4294,7 @@ Ext.define('PVE.meta.TreePanel', {
             return [];
         }
         try {
-            let value =
-                me.textLang === 'json'
-                    ? Ext.decode(me.textEditor.getValue())
-                    : PVE.meta.Utils.yamlLoad(me.textEditor.getValue());
+            let value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
             return PVE.meta.Lint.findings(value, applicable, all).map((f) => f.path + ': ' + f.message);
         } catch (_err) {
             return [];
@@ -3583,7 +4391,7 @@ Ext.define('PVE.meta.TreePanel', {
 // One document in a window — what a registry grid opens.
 //
 // It is the ordinary editor panel, unchanged: tree, row editors, markers, the
-// Tree | Text toggle, the diff. A prefix definition or a grant file is a document
+// Tree | Text toggle, the diff. A prefix definition or a permission file is a document
 // (DESIGN §3.5), so "edit one" was never a thing that needed its own editor.
 // ---------------------------------------------------------------------------
 
@@ -3595,7 +4403,7 @@ Ext.define('PVE.meta.DocumentWindow', {
     width: 860,
     height: 560,
     layout: 'fit',
-    // configs: docId ('prefixes/<name>' or 'grants/<name>')
+    // configs: docId ('prefixes/<name>' or 'permissions/<name>')
 
     initComponent: function () {
         let me = this;
@@ -3605,14 +4413,17 @@ Ext.define('PVE.meta.DocumentWindow', {
                 {
                     xtype: 'pveMetaTreePanel',
                     // `dc: true` says "this is not a guest": no tags to resolve
-                    // and no grants to apply. Which ACL answers apply is decided by
+                    // and no permissions to apply. Which ACL answers apply is decided by
                     // `docId`, which `loadAccess` sends as-is.
                     dc: true,
                     docId: me.docId,
                     border: false,
+                    // The panel's footer is the only bar: a window with Close at the
+                    // bottom and the Apply for the same document at the top of the
+                    // panel inside it was the worst of the three chromes.
+                    onClose: () => me.close(),
                 },
             ],
-            buttons: [{ text: gettext('Close'), handler: () => me.close() }],
         });
         me.callParent();
     },
@@ -3631,14 +4442,14 @@ Ext.define('PVE.meta.NewRegistryWindow', {
     xtype: 'pveMetaNewRegistryWindow',
 
     modal: true,
-    width: 460,
+    width: 620,
     layout: 'fit',
     kind: 'prefixes',
 
     initComponent: function () {
         let me = this;
         let isPrefix = me.kind === 'prefixes';
-        me.title = isPrefix ? gettext('New Prefix') : gettext('New Grant');
+        me.title = isPrefix ? gettext('New Prefix') : gettext('New Permission');
         let items = [
             {
                 xtype: 'textfield',
@@ -3674,13 +4485,111 @@ Ext.define('PVE.meta.NewRegistryWindow', {
                 { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
             );
         } else {
+            // One dialog, not two. "Add" and "Create Service Token" were the same act
+            // -- write a permission file for a principal -- differing only in whether
+            // the principal exists yet, and a second button for that is a question the
+            // dialog can just ask.
+            let toggle = function () {
+                let fresh = me.down('[name=principal]').getValue() === 'new';
+                ['authid'].forEach((n) => me.down('[name=' + n + ']').setHidden(fresh));
+                ['user', 'tokenid', 'role'].forEach((n) =>
+                    me.down('[name=' + n + ']').setHidden(!fresh),
+                );
+                me.down('#tokenNote').setHidden(!fresh);
+                me.down('[name=authid]').allowBlank = fresh;
+                me.down('[name=user]').allowBlank = !fresh;
+                me.down('[name=tokenid]').allowBlank = !fresh;
+            };
             items.push(
                 {
-                    xtype: 'textfield',
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'principal',
+                    fieldLabel: gettext('For'),
+                    value: 'new',
+                    comboItems: [
+                        ['new', gettext('A new service token')],
+                        ['existing', gettext('An existing user or token')],
+                    ],
+                    listeners: { change: toggle },
+                },
+                {
+                    // Editable: a permission file may name a principal that does not
+                    // exist yet, and the parser only checks the *shape* of an authid.
+                    xtype: 'combobox',
                     name: 'authid',
-                    allowBlank: false,
                     fieldLabel: gettext('Auth ID'),
+                    hidden: true,
+                    allowBlank: true,
+                    store: [],
+                    queryMode: 'local',
+                    editable: true,
+                    forceSelection: false,
                     emptyText: gettext('user@realm, or user@realm!tokenid'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'user',
+                    fieldLabel: gettext('User'),
+                    value: '@pve',
+                    emptyText: 'traefik@pve',
+                    regex: /^[^\s@]+@[A-Za-z0-9-]+$/,
+                    regexText: gettext('A user id is user@realm'),
+                    listeners: {
+                        change: function (f, v) {
+                            let name = me.down('[name=name]');
+                            if (!name.isDirty()) {
+                                name.setValue(String(v).split('@')[0]);
+                            }
+                        },
+                    },
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    fieldLabel: gettext('Token ID'),
+                    layout: 'hbox',
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            name: 'tokenid',
+                            flex: 1,
+                            value: 'meta',
+                            regex: /^[A-Za-z0-9_-]+$/,
+                            regexText: gettext('Letters, digits, - and _'),
+                        },
+                        {
+                            xtype: 'button',
+                            text: gettext('Generate'),
+                            margin: '0 0 0 5',
+                            handler: () =>
+                                me.down('[name=tokenid]').setValue(PVE.meta.ServiceToken.randomTokenId()),
+                        },
+                    ],
+                },
+                {
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'role',
+                    fieldLabel: gettext('Guest access'),
+                    // `none`, not `''`: a KVComboBox whose key is the empty string
+                    // hands back the store record's internal id (`KeyValue-1`).
+                    value: 'none',
+                    comboItems: [
+                        ['none', gettext('None — metadata only')],
+                        ['PVEAuditor', gettext('Read guest configs (PVEAuditor on /vms)')],
+                        ['PVEVMAdmin', gettext('Manage guests (PVEVMAdmin on /vms)')],
+                    ],
+                },
+                {
+                    xtype: 'displayfield',
+                    itemId: 'tokenNote',
+                    userCls: 'faded',
+                    value: Ext.htmlEncode(
+                        gettext(
+                            'A new service token is a pve-realm user that cannot log in, with one token on ' +
+                                'it. Guest access is a PVE role on /vms, covering guests created later too — ' +
+                                'and it also lets this principal read ALL metadata on those guests, since ' +
+                                'VM.Audit is full read. Writes stay inside the rules you give it.',
+                        ),
+                    ),
                 },
                 { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
             );
@@ -3702,26 +4611,64 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             ],
         });
         me.callParent();
-        me.on('show', () => me.down('[name=name]').focus(true, 50));
+        me.on('show', function () {
+            me.down('[name=name]').focus(true, 50);
+            let box = me.down('[name=authid]');
+            if (!box) {
+                return;
+            }
+            // Users and their tokens in one call, so the picker costs one request.
+            Proxmox.Utils.API2Request({
+                url: '/access/users',
+                params: { full: 1 },
+                method: 'GET',
+                failure: Ext.emptyFn, // a picker that did not load is still typable
+                success: function (response) {
+                    let out = [];
+                    (response.result.data || []).forEach(function (u) {
+                        out.push(u.userid);
+                        (u.tokens || []).forEach((t) => out.push(u.userid + '!' + t.tokenid));
+                    });
+                    box.setStore(out);
+                },
+            });
+        });
     },
 
-    // The smallest file the loader will read back. A grant is created with no
-    // entries on purpose: it grants nothing until an administrator says what.
-    contentFrom: function (v) {
-        if (this.kind === 'grants') {
-            let out = { authid: v.authid };
-            if (v.description) {
-                out.description = v.description;
+    statics: {
+        // Everything the dialog will do, as data: the file to write, and -- when the
+        // principal does not exist yet -- the PVE objects to make first. Pure, so the
+        // offline suite can check the order and the shape without a browser.
+        //
+        // The permission file must name the **token**, not the user. Naming the user
+        // produces a file that parses, loads, and grants the token nothing.
+        planFrom: function (kind, v) {
+            let out = { file: String(v.name || '').trim(), content: {} };
+            if (kind !== 'permissions') {
+                if (v.description) {
+                    out.content.description = v.description;
+                }
+                out.content.selector = v.selector === 'tag' ? { tag: v.tag } : { all: true };
+                return out;
             }
-            out.grants = [];
+            if (v.principal === 'new') {
+                out.user = String(v.user || '').trim();
+                out.tokenid = String(v.tokenid || '').trim();
+                out.authid = out.user + '!' + out.tokenid;
+                if (v.role && v.role !== 'none') {
+                    out.acl = { path: '/vms', role: v.role, propagate: 1 };
+                }
+            } else {
+                out.authid = String(v.authid || '').trim();
+            }
+            out.content.authid = out.authid;
+            if (v.description) {
+                out.content.description = v.description;
+            }
+            // No rules on purpose: it permits nothing until an administrator says what.
+            out.content.rules = [];
             return out;
-        }
-        let out = {};
-        if (v.description) {
-            out.description = v.description;
-        }
-        out.selector = v.selector === 'tag' ? { tag: v.tag } : { all: true };
-        return out;
+        },
     },
 
     submit: function () {
@@ -3735,8 +4682,90 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             Ext.Msg.alert(gettext('Error'), gettext('A tag selector needs a tag'));
             return;
         }
-        me.fireEvent('create', String(v.name).trim(), me.contentFrom(v));
+        let plan = PVE.meta.NewRegistryWindow.planFrom(me.kind, v);
+        if (me.kind === 'permissions' && !plan.authid) {
+            Ext.Msg.alert(gettext('Error'), gettext('A permission needs an auth id'));
+            return;
+        }
+        me.fireEvent('create', plan);
         me.close();
+    },
+});
+
+// ---------------------------------------------------------------------------
+// Creating a service principal, for the "New" dialog's second half.
+//
+// Two things about PVE's model shape this, both verified on the lab:
+//
+// * **A `pve`-realm user with no password cannot log in at all** (`/access/ticket`
+//   answers "authentication failure"), while its token keeps working. That is the
+//   closest thing PVE has to a service principal: there is no userless API key, so
+//   every token hangs off a user, and this makes that user a dead end.
+// * **Privilege separation is an intersection.** With privsep on, a token's rights
+//   are its own ACLs *and* its user's, so granting the user a role later would
+//   silently do nothing. This user exists only to carry this token, so privsep off
+//   is what makes "add a role later" behave the way anyone would expect.
+//
+// The optional role goes on `/vms`, not per-guest and not `/`: per-guest silently
+// misses guests created later, and `PVEAuditor` on `/` would also hand over
+// `Sys.Audit`, which is the datacenter document's own read permission.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.ServiceToken', {
+    singleton: true,
+
+    // A token id with no meaning, for when you do not want to invent one. Not a
+    // secret -- PVE generates that itself and shows it once -- just a name.
+    randomTokenId: function () {
+        let out = '';
+        for (let i = 0; i < 6; i++) {
+            out += 'abcdefghijklmnopqrstuvwxyz0123456789'.charAt(Math.floor(Math.random() * 36));
+        }
+        return 't-' + out;
+    },
+
+    // The secret, once. PVE never shows it again and it cannot be recovered, so
+    // this is a copyable field rather than a message: the one moment it exists.
+    showSecret: function (plan, secret) {
+        Ext.create('Ext.window.Window', {
+            title: gettext('Service Token Created'),
+            modal: true,
+            width: 620,
+            bodyPadding: 10,
+            items: [
+                {
+                    xtype: 'form',
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 120 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            fieldLabel: gettext('Token ID'),
+                            value: Ext.htmlEncode(plan.authid),
+                        },
+                        {
+                            xtype: 'textfield',
+                            fieldLabel: gettext('Secret'),
+                            value: secret || '',
+                            editable: false,
+                            selectOnFocus: true,
+                        },
+                        {
+                            xtype: 'displayfield',
+                            userCls: 'faded',
+                            value: Ext.htmlEncode(
+                                gettext(
+                                    'Copy it now — PVE does not show it again. Use it as the header ' +
+                                        'Authorization: PVEAPIToken=<id>=<secret>. It can touch nothing ' +
+                                        'until you add rules to its permission file.',
+                                ),
+                            ),
+                        },
+                    ],
+                },
+            ],
+            buttons: [{ text: gettext('Close'), handler: function () { this.up('window').close(); } }],
+        }).show();
     },
 });
 
@@ -3754,7 +4783,7 @@ Ext.define('PVE.meta.RegistryGrid', {
     extend: 'Ext.grid.Panel',
     xtype: 'pveMetaRegistryGrid',
 
-    kind: 'prefixes', // or 'grants'
+    kind: 'prefixes', // or 'permissions'
     border: false,
     emptyText: gettext('No entries'),
 
@@ -3764,15 +4793,15 @@ Ext.define('PVE.meta.RegistryGrid', {
         rowsFrom: function (kind, list) {
             let U = PVE.meta.Utils;
             return (list || []).map(function (e) {
-                if (kind === 'grants') {
+                if (kind === 'permissions') {
                     return {
                         name: e.name,
-                        id: 'grants/' + e.name,
+                        id: 'permissions/' + e.name,
                         authid: e.authid || '',
                         description: e.description || '',
-                        // What it actually grants, in one line: prefix, mode and the
+                        // What it actually permits, in one line: prefix, mode and the
                         // selector that decides which guests it reaches.
-                        summary: (e.grants || [])
+                        summary: (e.rules || [])
                             .map((g) => g.prefix + ' (' + g.mode + ', ' + U.selectorText(g.selector) + ')')
                             .join(', '),
                         origin: e.origin || 'cluster',
@@ -3828,7 +4857,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         } else {
             columns.push(
                 { text: gettext('Auth ID'), dataIndex: 'authid', flex: 2, renderer: Ext.htmlEncode },
-                { text: gettext('Grants'), dataIndex: 'summary', flex: 3, renderer: Ext.htmlEncode },
+                { text: gettext('Rules'), dataIndex: 'summary', flex: 3, renderer: Ext.htmlEncode },
             );
         }
         columns.push(
@@ -3941,28 +4970,110 @@ Ext.define('PVE.meta.RegistryGrid', {
         win.show();
     },
 
+    // "New" for both lists, and for a permission file both of the things that used
+    // to be two buttons: name an existing principal, or make one.
+    //
+    // When it makes one, the order is chosen so a failure leaves the least behind: a
+    // user with no token is inert, a token with no permission file grants nothing at
+    // all, and only the last step makes anything true. Each failure says which step
+    // it was and what already exists, because "create failed" with three PVE objects
+    // half-made is not a message anyone can act on.
     createOne: function () {
         let me = this;
         let win = Ext.create('PVE.meta.NewRegistryWindow', { kind: me.kind });
-        win.on('create', function (name, content) {
-            Proxmox.Utils.API2Request({
-                url: '/meta/' + me.kind + '/' + encodeURIComponent(name),
-                method: 'PUT',
-                waitMsgTarget: me,
-                // `digest: ''` is "this file must not exist yet" (DESIGN §5), so two
-                // administrators creating the same name is a 409 rather than one
-                // silently overwriting the other.
-                params: { data: Ext.encode(content), mode: 'replace', digest: '' },
-                success: function () {
-                    me.reload();
-                    let win2 = Ext.create('PVE.meta.DocumentWindow', {
-                        docId: me.kind + '/' + name,
-                    });
-                    win2.on('destroy', () => me.reload());
-                    win2.show();
+        win.on('create', function (plan) {
+            let made = [];
+            let fail = (step) => (response) =>
+                Ext.Msg.alert(
+                    gettext('Error'),
+                    Ext.htmlEncode(step) + ': ' +
+                        (response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response)) +
+                        (made.length
+                            ? '<br><br>' +
+                              Ext.htmlEncode(
+                                  Ext.String.format(
+                                      gettext('Already created: {0}. Remove it from Datacenter → Permissions, or run this again to reuse it.'),
+                                      made.join(', '),
+                                  ),
+                              )
+                            : ''),
+                );
+            let req = (opts) => Proxmox.Utils.API2Request(Ext.apply({ waitMsgTarget: me }, opts));
+
+            let writeFile = function (secret) {
+                req({
+                    url: '/meta/' + me.kind + '/' + encodeURIComponent(plan.file),
+                    method: 'PUT',
+                    // `digest: ''` is "this file must not exist yet", so two
+                    // administrators creating the same name is a 409 rather than one
+                    // silently overwriting the other.
+                    params: { data: Ext.encode(plan.content), mode: 'replace', digest: '' },
+                    failure: fail(gettext('writing the file')),
+                    success: function () {
+                        me.reload();
+                        if (secret) {
+                            PVE.meta.ServiceToken.showSecret(plan, secret);
+                            return;
+                        }
+                        me.editOne({ data: { id: me.kind + '/' + plan.file } });
+                    },
+                });
+            };
+            if (!plan.user) {
+                writeFile(null);
+                return;
+            }
+            let addAcl = function (secret) {
+                if (!plan.acl) {
+                    writeFile(secret);
+                    return;
+                }
+                req({
+                    url: '/access/acl',
+                    method: 'PUT',
+                    params: {
+                        path: plan.acl.path,
+                        roles: plan.acl.role,
+                        propagate: plan.acl.propagate,
+                        users: plan.user,
+                    },
+                    failure: fail(gettext('granting guest access')),
+                    success: () => writeFile(secret),
+                });
+            };
+            let addToken = function () {
+                req({
+                    url: '/access/users/' + encodeURIComponent(plan.user) + '/token/' +
+                        encodeURIComponent(plan.tokenid),
+                    method: 'POST',
+                    // privsep off: this user exists only to carry this token, and with
+                    // it on, a role added to the user later would silently not apply.
+                    params: { privsep: 0 },
+                    failure: fail(gettext('creating the token')),
+                    success: function (response) {
+                        made.push(plan.authid);
+                        addAcl((response.result.data || {}).value);
+                    },
+                });
+            };
+            req({
+                url: '/access/users',
+                method: 'POST',
+                // No password: this user cannot log in, only its token can act.
+                params: { userid: plan.user, comment: 'pve-meta service principal' },
+                failure: function (response) {
+                    // An existing user is the normal case for a second token on the
+                    // same principal, not an error to stop on.
+                    if (String(response.htmlStatus || '').indexOf('already exists') !== -1) {
+                        addToken();
+                        return;
+                    }
+                    fail(gettext('creating the user'))(response);
                 },
-                failure: (response) =>
-                    Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error')),
+                success: function () {
+                    made.push(plan.user);
+                    addToken();
+                },
             });
         });
         win.show();
@@ -4001,7 +5112,7 @@ Ext.define('PVE.meta.RegistryGrid', {
 // The datacenter tab: the datacenter document, and the two registry lists.
 //
 // Three sub-tabs rather than one tree of everything. They are three different
-// kinds of thing -- one document, a list of prefix definitions, a list of grants --
+// kinds of thing -- one document, a list of prefix definitions, a list of permissions --
 // and drawing them as branches of a single tree claimed a relationship they do
 // not have, while hiding the columns that make a list worth reading.
 // ---------------------------------------------------------------------------
@@ -4030,10 +5141,10 @@ Ext.define('PVE.meta.DatacenterPanel', {
                     kind: 'prefixes',
                 },
                 {
-                    title: gettext('Grants'),
+                    title: gettext('Permissions'),
                     iconCls: 'fa fa-key',
                     xtype: 'pveMetaRegistryGrid',
-                    kind: 'grants',
+                    kind: 'permissions',
                 },
             ],
         });

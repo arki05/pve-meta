@@ -1,0 +1,145 @@
+#!/usr/bin/perl
+
+# pve-meta: read a metadata document from the node it runs on.
+#
+# Installed at /usr/sbin/pve-meta. **A local reader, not an API client**: it
+# calls PVE::RS::Meta directly against /etc/pve/meta, so it needs no ticket, no
+# token and no pveproxy, and it works in a hook script that runs before the API
+# is reachable (docs/DESIGN.md section 6). That is the whole reason it exists --
+# `pvesh get /meta/guests/<vmid>` already does this for anyone who has an API
+# session, and a hook script does not.
+#
+# It therefore enforces **nothing**. It is root reading a file root can already
+# `cat`, and it is refused to anyone else by the permissions on /etc/pve. The
+# access rules in docs/DESIGN.md section 3 are about the API, where a principal
+# other than root exists to be limited; there is no principal here.
+#
+# Output is shaped for the caller a hook script is:
+#
+#   pve-meta get 201 homelab.owner     -> arki          (a scalar, bare, no quotes)
+#   pve-meta get 201 homelab           -> YAML          (anything with structure)
+#   pve-meta get 201                   -> the whole document as YAML
+#   pve-meta get prefixes/traefik      -> a prefix definition, same as any document
+#   pve-meta ls                        -> every document id, one per line
+#
+# so `host=$(pve-meta get $vmid traefik.spec.host)` is the obvious thing and
+# gives the obvious answer. Exit status 2 means "not there" -- a missing
+# document, or a view the document does not have -- which is what lets a hook
+# script tell "nothing configured" from "something is broken" without parsing
+# the output:
+#
+#   if host=$(pve-meta get "$vmid" traefik.spec.host); then ... ; fi
+
+use strict;
+use warnings;
+
+use Getopt::Long qw(GetOptionsFromArray);
+use JSON::PP;
+
+use PVE::RS::Meta;
+
+my $SELF = 'pve-meta';
+
+sub usage {
+    my ($msg) = @_;
+    print STDERR "$SELF: $msg\n\n" if $msg;
+    print STDERR <<"EOF";
+usage: $SELF get <id> [<view>] [--format yaml|json]
+       $SELF ls [--format plain|json]
+
+  <id>    a vmid, 'datacenter', 'prefixes/<name>' or 'permissions/<name>'
+  <view>  a dotted key path inside the document; omit for all of it
+
+exit status: 0 found, 1 error, 2 no such document or view
+EOF
+    exit($msg ? 1 : 0);
+}
+
+# The one caller here is root on the node, reading files it already owns.
+my $ROOT_ACL = { authid => 'root@pam', read => 1, write => 1, tags => [] };
+
+# `PVE::RS::Meta` reports errors as "NNN: message" (the Rust->Perl contract).
+# A CLI wants the message and a status, not a stack trace.
+sub call {
+    my ($code) = @_;
+    my $res = eval { $code->() };
+    if (my $err = $@) {
+        my $msg = "$err";
+        $msg =~ s/\s+$//;
+        $msg =~ s/^\d{3}:\s*//;
+        print STDERR "$SELF: $msg\n";
+        exit 1;
+    }
+    return $res;
+}
+
+sub cmd_get {
+    my (@args) = @_;
+    my $format = 'yaml';
+    GetOptionsFromArray(\@args, 'format=s' => \$format) or usage('bad options');
+    usage("unknown format '$format'") if $format !~ /^(yaml|json)$/;
+
+    my ($id, $view) = @args;
+    usage('get needs an id') if !defined($id);
+    usage('too many arguments') if @args > 2;
+
+    # Read as JSON first: it is the form that says whether the value has
+    # structure, which decides how it should be printed.
+    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL) });
+    my $data = $doc->{data};
+
+    # A view the document does not have comes back as the empty document, which
+    # is also what an empty map looks like -- the API has one answer for both
+    # (docs/DESIGN.md section 4). For a *view*, treat it as absent: that is the
+    # question a hook script is asking, and an empty map is not an answer it can
+    # use either.
+    if (defined($view) && $view ne '' && ref($data) eq 'HASH' && !%$data) {
+        exit 2;
+    }
+    # The whole document being empty means there is no document.
+    if (!defined($view) && ref($data) eq 'HASH' && !%$data && $doc->{digest} eq '') {
+        exit 2;
+    }
+
+    if ($format eq 'json') {
+        print JSON::PP->new->canonical->encode($data), "\n";
+        return;
+    }
+    if (!ref($data)) {
+        # A scalar prints as itself: no quotes, no `--- ` document marker, so
+        # `$(pve-meta get ...)` is the value and nothing else.
+        print defined($data) ? "$data\n" : "\n";
+        return;
+    }
+    my $yaml = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL) });
+    print $yaml->{text};
+}
+
+sub cmd_ls {
+    my (@args) = @_;
+    my $format = 'plain';
+    GetOptionsFromArray(\@args, 'format=s' => \$format) or usage('bad options');
+    usage("unknown format '$format'") if $format !~ /^(plain|json)$/;
+    usage('too many arguments') if @args;
+
+    # The store's own walk (docs/DESIGN.md section 5), so this lists a document
+    # whether or not it parses -- the one an administrator most needs to find.
+    my $version = call(sub { PVE::RS::Meta::api_version(1) });
+    my @docs = @{ $version->{documents} || [] };
+    if ($format eq 'json') {
+        print JSON::PP->new->canonical->encode(\@docs), "\n";
+        return;
+    }
+    print "$_->{id}\n" for @docs;
+}
+
+my $cmd = shift @ARGV;
+usage() if !defined($cmd) || $cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h';
+if ($cmd eq 'get') {
+    cmd_get(@ARGV);
+} elsif ($cmd eq 'ls') {
+    cmd_ls(@ARGV);
+} else {
+    usage("unknown command '$cmd'");
+}
+exit 0;

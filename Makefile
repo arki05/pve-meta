@@ -107,14 +107,23 @@ install:
 	# out of band, or a destroy that never ran because its node was down --
 	# and an administrator runs it by hand.
 	install -D -m 0755 libexec/gc $(DESTDIR)$(PREFIX)/libexec/pve-meta/gc
+	# The local reader (bin/pve-meta, docs/DESIGN.md section 6). In sbin because
+	# it reads /etc/pve/meta directly and so is root's tool, not an API client's:
+	# a hook script runs as root on the node, often before pveproxy is reachable.
+	install -D -m 0755 bin/pve-meta $(DESTDIR)$(PREFIX)/sbin/pve-meta
+	# The example hook script: what this system is for with no operator anywhere
+	# near it. Not executable in place -- an administrator copies it into a
+	# storage's snippets directory, which is where PVE looks for hookscripts.
+	install -D -m 0644 examples/maintenance-hook.pl \
+		$(DESTDIR)$(PREFIX)/share/doc/pve-meta/examples/maintenance-hook.pl
 	# Packaged example prefixes (docs/DESIGN.md section 3.1); none are
 	# required for pve-meta to work, so this directory may be empty in a
 	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
 	# copy, never a hard failure.
 	#
-	# There is deliberately no packaged *grants* directory: an operator's
+	# There is deliberately no packaged *permissions* directory: an operator's
 	# package may ship a prefix (a declaration) but must never ship its
-	# own grant, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
+	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes
 	if [ -d prefixes ] && ls prefixes/*.yaml >/dev/null 2>&1; then \
 		cp prefixes/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/; \

@@ -92,7 +92,7 @@ accepts `yml`), `Display`, `FromStr`, `ALL`.
     strings (tested).
   * JSON: `serde_json::from_str`; comments and trailing commas not allowed.
 * `parse_raw(format, text)` is the same without the lint (crate-internal): the store's
-  tolerant read, the view payload parsers and the prefix/grant parsers all use it.
+  tolerant read, the view payload parsers and the prefix/permission parsers all use it.
 * `pub fn dump(format, doc: &Value) -> String` — canonical dump, always ends with a single
   `\n`, preserves key order:
   * YAML: block style, 2-space indent, no document markers (serde_yaml_ng defaults).
@@ -150,16 +150,16 @@ once the report names that subtree's path rather than every leaf under it, which
 makes the write check stricter (every reported path is an ancestor of what it stands
 for).
 
-## 7. Prefixes and grants (`registry.rs`)
+## 7. Prefixes and permissions (`registry.rs`)
 
 Two concepts in two drop directories, both **outside** the documents, one file each,
 parsed strictly and independently (`docs/DESIGN.md` §3). Revision 6 split revision 5's
 single "operator registration" in two; nothing here carries the *operator* concept any
-more — this crate knows prefixes and grants (`docs/DESIGN.md` §12).
+more — this crate knows prefixes and permissions (`docs/DESIGN.md` §12).
 
 `PrefixDef { prefix, description?, selector, schema? }`,
-`Grant { name, authid, description?, grants: Vec<GrantEntry> }`,
-`GrantEntry { prefix, mode, selector }`.
+`Permission { name, authid, description?, rules: Vec<Rule> }`,
+`Rule { prefix, mode, selector }`.
 
 **Prefixes — what a prefix is** (`docs/DESIGN.md` §3.1):
 
@@ -185,42 +185,42 @@ schema:                      # optional, PVE::JSONSchema dialect, passed through
 
 **Grants — who may touch a prefix** (`docs/DESIGN.md` §3.2):
 
-* `GRANT_CLUSTER_DIR = "/etc/pve/meta.d/grants"` — cluster only. **There is deliberately
-  no packaged grants directory**: an operator's `.deb` may ship a prefix (a
-  declaration) but must never ship its own grant, which would be self-registration, and
+* `PERMISSION_CLUSTER_DIR = "/etc/pve/meta.d/permissions"` — cluster only. **There is deliberately
+  no packaged permissions directory**: an operator's `.deb` may ship a prefix definition (what
+  it expects) but must never ship its own, which would be self-registration, and
   dpkg cannot write into pmxcfs;
-* `GRANT_DIRS_ENV = "PVE_META_GRANT_DIRS"` — the same colon-separated override.
+* `PERMISSION_DIRS_ENV = "PVE_META_PERMISSION_DIRS"` — the same colon-separated override.
 
 ```yaml
-# grants/traefik.yaml
+# permissions/traefik.yaml
 authid: svc@pve!traefik
 description: Traefik dynamic-configuration provider
-grants:
+rules:
   - prefix: traefik            # any dotted path, nested allowed
     mode: rw                   # ro | rw
     selector: { all: true }    # or { tag: traefik }
 ```
 
 * `parse_prefix(name, text) -> Result<PrefixDef>` and
-  `parse_grant(name, text) -> Result<Grant>` — **strict**: `deny_unknown_fields`
-  throughout, so neither file can express the other's job (a grant entry with a `schema`
+  `parse_permission(name, text) -> Result<Permission>` — **strict**: `deny_unknown_fields`
+  throughout, so neither file can express the other's job (a rule with a `schema`
   and a prefix with an `authid` are both errors). A prefix's `name` must be a valid
-  **non-root** prefix and must not contain a slash; a grant's `authid` must satisfy
+  **non-root** prefix and must not contain a slash; a permission file's `authid` must satisfy
   `is_authid` (`PVE::AccessControl`'s `$userid_or_token_regex` transliterated), each
-  grant prefix must parse and be **non-empty** (whole-document access comes from PVE
-  ACLs, never from a grant), `mode` is `ro`/`rw`, and `selector` is exactly one of
+  rule's prefix must parse and be **non-empty** (whole-document access comes from PVE
+  ACLs, never from a permission), `mode` is `ro`/`rw`, and `selector` is exactly one of
   `{all: true}` / `{tag: <name>}`. Room is left in the format for `{pool: <name>}`; it is
   deliberately not implemented, so it is currently an unknown field.
-* `load_prefixes(dirs) -> Vec<PrefixDef>` and `load_grants(dirs) -> Vec<Grant>` — read
+* `load_prefixes(dirs) -> Vec<PrefixDef>` and `load_permissions(dirs) -> Vec<Permission>` — read
   `*.yaml` from each directory in order, later directories overriding earlier ones **by
   file name**. A missing directory is not an error. **A malformed file is skipped with a
   `warn!` and contributes nothing** — files are independent, so one operator's typo can
-  never take another's grants or another's schema away. That independence is the whole
+  never take another's rules or another's schema away. That independence is the whole
   reason this data left `datacenter.yaml`.
 * `load_prefixes` returns them **sorted longest-prefix-first** (ties by name), which is
-  the order `governing` relies on; `load_grants` returns them sorted by file name.
-* `prefix_dirs()` / `grant_dirs()` — the constants above, or the env override.
-  `load_prefixes_default()` / `load_grants_default()` are those composed with the
+  the order `governing` relies on; `load_permissions` returns them sorted by file name.
+* `prefix_dirs()` / `permission_dirs()` — the constants above, or the env override.
+  `load_prefixes_default()` / `load_permissions_default()` are those composed with the
   matching loader.
 * `governing(prefixes, path, tags) -> Option<&PrefixDef>` — **most-specific wins;
   schemas never merge** (`docs/DESIGN.md` §3.1). The governing prefix is the one with
@@ -228,14 +228,14 @@ grants:
   contributes to that path. Given the load order it is the first match.
 * `applicable(prefixes, tags) -> Vec<&Prefix>` — the prefixes reaching a guest
   carrying `tags`, most-specific first.
-* `scopes_for(grants, authid, tags) -> Vec<Scope>` — the union of the entries of every
-  grant file for that authid whose selector matches the guest's tags. **Grants accumulate
-  by containment** (`docs/DESIGN.md` §3.2): a grant on `homelab` covers `homelab.docker`,
+* `scopes_for(files, authid, tags) -> Vec<Scope>` — the union of the rules of every
+  permission file for that authid whose selector matches the guest's tags. **Permissions accumulate
+  by containment** (`docs/DESIGN.md` §3.2): a rule on `homelab` covers `homelab.docker`,
   because `scopes::covers` is prefix containment. That is deliberately the opposite of
   `governing` — shape has one owner so it shadows, permission is a union so it adds, and
   the two rules cannot live on one object.
 * `Selector` serializes as it is written (`{all: true}` / `{tag: <name>}`), so
-  `GET /meta/prefixes` and `GET /meta/grants` hand the UI the same shape an
+  `GET /meta/prefixes` and `GET /meta/permissions` hand the UI the same shape an
   administrator edits.
 
 Tag membership is a **selector pve-meta implements itself** — PVE has no tag ACL. Adding
@@ -244,7 +244,7 @@ the tag is the deliberate act of including that guest.
 ## 8. Resolved access (`scopes.rs`)
 
 * `Grants { full_read, full_write, scopes: Vec<Scope> }`, `Scope { prefix: Path, mode: Ro|Rw }`
-  — one request's *resolved* answer, not the grant files of §7. Built by `api::grants`
+  — one request's *resolved* answer, not the permission files of §7. Built by `api::effective`
   from the ACL answers Perl passes plus `registry::scopes_for`; it is never deserialized
   from a wire string.
 * `can_read(path)` / `can_write(path)` / `readable_prefixes()` / `check_write(&[Touched])`
@@ -255,8 +255,8 @@ the tag is the deliberate act of including that guest.
   `view::filter` must give the same answer on the read side.
 * `check_write(&[])` is vacuously `Ok`, so it is **not** a security boundary on its own;
   the API layer's up-front `can_write(view)` is (§10).
-* Scopes apply to guest documents only. `api::grants` returns an empty scope list for
-  `DocId::Datacenter`, which is what keeps a grant from being able to reach it.
+* Scopes apply to guest documents only. `api::effective` returns an empty scope list for
+  `DocId::Datacenter`, which is what keeps a permission from being able to reach it.
 
 ## 9. Store (`store.rs`)
 
@@ -349,14 +349,14 @@ boundary and must be unit-testable without `libperl-dev` and without a cluster.
   converted by truthiness.
 * `pub struct GuestInput { vmid, node, type, name, tags, read, write }` — one vmlist row,
   likewise native.
-* `grants(grants, doc_id, acl) -> Grants` — the ACL answers plus, for a guest,
-  `registry::scopes_for(grants, acl.authid, acl.tags)`. Empty scopes for the datacenter.
-* `version(store, detail)`, `access(grants, doc_id, acl)`, `grants_list(grants)`,
+* `effective(files, doc_id, acl) -> Effective` — the ACL answers plus, for a guest,
+  `registry::scopes_for(files, acl.authid, acl.tags)`. Empty scopes for the datacenter.
+* `version(store, detail)`, `access(files, doc_id, acl)`, `permissions_list(files)`,
   `prefixes_list(prefixes)`,
-  `list_guests(store, grants, authid, guests, has)`,
-  `get_document(store, grants, id, view, format, acl)`,
-  `put_document(store, grants, id, view, format, payload, mode, digest, dry_run, acl)`,
-  `delete_document(store, grants, id, view, digest, acl)`,
+  `list_guests(store, files, authid, guests, has)`,
+  `get_document(store, files, id, view, format, acl)`,
+  `put_document(store, files, id, view, format, payload, mode, digest, dry_run, acl)`,
+  `delete_document(store, files, id, view, digest, acl)`,
   `gc_candidates(store, vmids) -> Vec<u32>`, `gc_purge(store, vmid, live) -> usize`,
   `gc(store, vmids) -> usize`.
 * Errors are `anyhow::Error`s whose `Display` is `"NNN: message"` (an HTTP status prefix);
@@ -367,7 +367,7 @@ boundary and must be unit-testable without `libperl-dev` and without a cluster.
 
 **Wire contract.** Everything crosses as native hashes and arrays. The single exception
 is the client-supplied `data` parameter, a JSON string because that is what the REST
-parameter is, decoded once here. `_grants_json`, `_inflate_view`, `parse_grants` and
+parameter is, decoded once here. `_permissions_json`, `_inflate_view`, `parse_permissions` and
 `data_json` are gone; so is the `keys` field, since key order is no longer a wire
 contract — the tree UI sorts.
 
@@ -475,7 +475,7 @@ scenarios:
   grant has no schema and a prefix has no authid; a cluster file overrides the
   packaged one of the same name wholesale while unrelated files survive; a malformed file
   is skipped and costs no other file anything; prefixes load most-specific first and
-  `governing` takes the first match, respecting the selector; grants accumulate by
+  `governing` takes the first match, respecting the selector; permissions accumulate by
   containment, which is the opposite of prefixes, with the selector still gating;
   `Selector` serializes as it is written; a missing directory is not an error for either
   kind; `is_authid` matches `PVE::AccessControl`'s shape;
@@ -509,7 +509,7 @@ scenarios:
   only as a whole — and cannot be used as an oracle through `?has=`; a write that changes
   nothing does not rewrite the file; a document that vanished mid-request is 404-shaped,
   never a 500; `list_guests` gates node/name/tags on `VM.Audit`; `access` reports
-  resolved scopes; a grant for another authid grants nothing; `grants_list` returns every
+  resolved scopes; a permission for another authid grants nothing; `permissions_list` returns every
   grant; `gc` removes documents and
   snapshot copies whose vmid is gone, is idempotent, and never touches the datacenter
   document; `gc_purge` keeps a vmid the re-read vmlist has and refuses an empty one.

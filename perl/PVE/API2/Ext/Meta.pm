@@ -18,7 +18,7 @@ use base qw(PVE::RESTHandler);
 # `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`, implemented in
 # `pve_meta_core::api`). This module does parameters, PVE ACL checks, the
 # vmlist, the guests' tags and the per-document write lock; everything else --
-# resolving the caller's scopes against the grant files, view
+# resolving the caller's scopes against the permission files, view
 # extraction, prefix stripping, merge/replace, write authorization, the lint,
 # touched-path computation, YAML/JSON rendering and digesting -- happens in
 # Rust.
@@ -44,7 +44,7 @@ sub ext_path { return 'meta' }
 #
 # `docs/DESIGN.md` §3: `full_read` = `VM.Audit` on `/vms/<vmid>`,
 # `full_write` = `VM.Config.Options` (datacenter: `Sys.Audit` / `Sys.Modify`
-# on `/`). Rust adds the scopes from the grant files whose authid
+# on `/`). Rust adds the scopes from the permission files whose authid
 # is the caller and whose selector matches the guest's tags -- which is why
 # the tags travel with the ACL.
 #
@@ -88,7 +88,7 @@ sub _datacenter_acl {
     };
 }
 
-# A registry document -- one prefix or grant file (docs/DESIGN.md §3) --
+# A registry document -- one prefix definition or permission file (docs/DESIGN.md §3) --
 # is an administrator's to edit and nobody else's.
 #
 # Read is open to every authenticated user, because it has to agree with the
@@ -97,9 +97,9 @@ sub _datacenter_acl {
 # thing would be a rule with two answers. Write is Sys.Modify on '/', the same
 # as the datacenter document.
 #
-# There is deliberately no scope path here at all: `api::grants` gives a
+# There is deliberately no scope path here at all: `api::effective` gives a
 # registry document no scopes, so an operator holding `rw` on some prefix
-# cannot edit the grant file that gave it that prefix, nor the prefix that
+# cannot edit the permission file that gave it that prefix, nor the prefix that
 # declares it. Self-registration is refused by there being no way to express it.
 sub _registry_acl {
     my ($rpcenv, $authuser) = @_;
@@ -233,7 +233,7 @@ my $TEXT_SCHEMA = {
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
-        . "grants (docs/DESIGN.md §3.2), with selectors already resolved.",
+        . "permission files (docs/DESIGN.md §3.2), with selectors already resolved.",
     items => {
         type => 'object',
         properties => {
@@ -332,11 +332,11 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests datacenter prefixes grants schemas)];
+        return [map { { subdir => $_ } } qw(version access guests datacenter prefixes permissions schemas)];
     },
 });
 
-# -- version / access / prefixes / grants ---------------------------------
+# -- version / access / prefixes / permissions -----------------------------
 
 __PACKAGE__->register_method({
     name => 'version',
@@ -389,10 +389,10 @@ __PACKAGE__->register_method({
     path => 'access',
     method => 'GET',
     permissions => { user => 'all' },
-    description => "The caller's effective grants for one document (docs/DESIGN.md §3): "
+    description => "The caller's effective access for one document (docs/DESIGN.md §3): "
         . "'read'/'write' are the ACL answers for that document (VM.Audit / "
         . "VM.Config.Options with 'vmid'; Sys.Audit / Sys.Modify with 'dc'), and "
-        . "'scopes' lists the prefix scopes the grant files give the caller "
+        . "'scopes' lists the prefix scopes the permission files give the caller "
         . "on it, with selectors already resolved against the guest's tags. Scopes "
         . "apply to guest documents only, never to the datacenter document. "
         . "With no parameter at all, 'read'/'write' describe the datacenter document. "
@@ -404,7 +404,7 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "The document to ask about, as an id: a vmid, "
-                    . "'datacenter', 'prefixes/<name>' or 'grants/<name>'. Prefer this "
+                    . "'datacenter', 'prefixes/<name>' or 'permissions/<name>'. Prefer this "
                     . "over 'vmid'/'dc', which predate registry documents and cannot "
                     . "name one.",
             },
@@ -444,7 +444,7 @@ __PACKAGE__->register_method({
             $id = defined($param->{vmid}) ? "$param->{vmid}" : 'datacenter';
         }
 
-        if ($id =~ m{^(prefixes|grants)/}) {
+        if ($id =~ m{^(prefixes|permissions)/}) {
             return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
         }
         if ($id =~ m{^\d+$}) {
@@ -493,19 +493,19 @@ __PACKAGE__->register_method({
 });
 
 __PACKAGE__->register_method({
-    name => 'grants',
-    path => 'grants',
+    name => 'permissions',
+    path => 'permissions',
     method => 'GET',
     permissions => {
-        description => "Readable by every authenticated user: a grant says who may "
+        description => "Readable by every authenticated user: a permission file says who may "
             . "touch which prefix, which is exactly what the editor's Access column "
             . "shows for every row, and listings are out of scope (docs/DESIGN.md §1).",
         user => 'all',
     },
-    description => "Every grant (docs/DESIGN.md §3.2): the files in "
-        . "/etc/pve/meta.d/grants. Cluster-only on purpose -- there is deliberately no "
-        . "packaged grants directory, because an operator's own package may ship a "
-        . "prefix (a declaration) but must never ship its own grant. A malformed "
+    description => "Every permission file (docs/DESIGN.md §3.2): the files in "
+        . "/etc/pve/meta.d/permissions. Cluster-only on purpose -- there is deliberately no "
+        . "packaged permissions directory, because an operator's own package may ship a "
+        . "prefix definition (what it expects) but must never ship its own. A malformed "
         . "file is skipped with a warning and does not appear here.",
     parameters => {
         additionalProperties => 0,
@@ -513,11 +513,11 @@ __PACKAGE__->register_method({
     },
     returns => {
         type => 'array',
-        # `{ name, authid, description?, grants: [{ prefix, mode, selector }] }`
+        # `{ name, authid, description?, rules: [{ prefix, mode, selector }] }`
         items => { type => 'object', additionalProperties => 1 },
     },
     code => sub {
-        return _call(\&PVE::RS::Meta::api_grants);
+        return _call(\&PVE::RS::Meta::api_permissions);
     },
 });
 
@@ -531,9 +531,9 @@ __PACKAGE__->register_method({
         user => 'all',
     },
     description => "The two registry file formats as schemas (docs/DESIGN.md §3.6), "
-        . "keyed 'prefix' and 'grant', in the same PVE::JSONSchema dialect a "
+        . "keyed 'prefix' and 'permission', in the same PVE::JSONSchema dialect a "
         . "prefix uses to describe a guest's subtree. The editor renders a "
-        . "prefix or grant document with these the way it renders a guest document "
+        . "prefix or permission document with these the way it renders a guest document "
         . "with the prefixes that reach it. This is an affordance, not the "
         . "validator: what is storable is decided by the parser on the way in.",
     parameters => {
@@ -565,15 +565,15 @@ my $REGISTRY_NAME_SCHEMA = {
 };
 
 # The six endpoints below are generated rather than written twice: a prefix
-# and a grant are the same document to everything but the parser that validates
+# and a permission file are the same document to everything but the parser that validates
 # what is written (`api::check_registry_shape`), and two copies of a read/write
 # pair is how this project has produced every wrong-result bug it has had.
-for my $kind (['prefixes', 'prefix'], ['grants', 'grant']) {
+for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
     my ($dir, $one) = @$kind;
     my $where = $one eq 'prefix'
         ? "/etc/pve/meta.d/prefixes, overriding the packaged file of the same name in "
           . "/usr/share/pve-meta/prefixes if there is one"
-        : "/etc/pve/meta.d/grants";
+        : "/etc/pve/meta.d/permissions";
 
     __PACKAGE__->register_method({
         name => "get_$one",
@@ -669,7 +669,7 @@ for my $kind (['prefixes', 'prefix'], ['grants', 'grant']) {
                 ? "A packaged prefix is never removed: deleting the cluster file "
                   . "that overrode it reverts to the packaged one, which is then what "
                   . "a following GET returns."
-                : "Grants are cluster-only, so this removes the file."),
+                : "Permission files are cluster-only, so this removes the file."),
         parameters => {
             additionalProperties => 0,
             properties => {
@@ -737,7 +737,7 @@ __PACKAGE__->register_method({
         # opens `/etc/pve/.vmlist` or a guest config, so the two can no longer
         # disagree and guest-config parsing is not re-implemented in a second
         # language. `hostname` is the LXC name field, `name` the qemu one;
-        # `tags` resolves the grants' and prefixes' selectors (docs/DESIGN.md §3).
+        # `tags` resolves the permission files' and prefix definitions' selectors (docs/DESIGN.md §3).
         my $props = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname tags)]) } || {};
         warn "pve-meta: could not read guest properties: $@" if $@;
 
