@@ -688,6 +688,17 @@ lose nothing by that: they bind server-side, on the API a scope-only principal a
 uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
 exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.
 
+**The editor reads the document as YAML, never as JSON**, and that is a correctness
+requirement. perlmod renders a document as a native Perl hash on the way out, and a Perl
+hash has no key order: the same document comes back with its keys in different orders
+from different pvedaemon workers (verified on the lab). Key order is data (§2), and the
+planned document is exactly what an Apply at the root view writes back — so reading JSON
+meant writing the document back in an order nobody chose. Nothing looked wrong, because
+the tree sorts its rows; the file changed anyway. The canonical YAML text is the one
+representation on this wire that carries the order the store holds. This applies to every
+JSON consumer, not just the editor: `format=json` is a convenient view of a document's
+*content* and is not order-preserving.
+
 `ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
 mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
 theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe,

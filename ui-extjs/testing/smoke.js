@@ -492,6 +492,24 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
     staged.pop();
 }
 
+console.log('\n--- the document is read as YAML because key order is data ---');
+{
+    // `GET ...?format=json` renders the document as a native Perl hash on the way
+    // out, and a Perl hash has no order: the same document comes back with its keys
+    // in different orders from different workers. The editor reads the canonical
+    // YAML text instead, because `plannedData()` is what an Apply at the root view
+    // writes back, and writing back an order nobody chose rewrites the file.
+    const text = 'zebra: 1\nalpha: 2\nmiddle:\n  z: 1\n  a: 2\n';
+    eq('yamlLoad keeps the document order', Object.keys(U.yamlLoad(text)), ['zebra', 'alpha', 'middle']);
+    eq('... at every level', Object.keys(U.yamlLoad(text).middle), ['z', 'a']);
+
+    // And the order survives the trip the editor actually makes: parse, stage an
+    // edit, dump. This is the property that keeps an Apply from churning the file.
+    const planned = U.applyPending(U.yamlLoad(text), [{ path: 'alpha', op: 'set', value: 9 }]);
+    eq('order survives a staged edit', Object.keys(planned), ['zebra', 'alpha', 'middle']);
+    eq('... and the dump preserves it', U.yamlDump(planned).indexOf('zebra') === 0, true);
+}
+
 console.log('\n--- Apply is offered wherever a write could succeed ---');
 {
     // Mirrors `Effective::has_any_write`. The server decides what a write may

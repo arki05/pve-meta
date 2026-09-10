@@ -3253,18 +3253,72 @@ Ext.define('PVE.meta.TreePanel', {
     },
 
     // This panel's one document.
+    // Reads the document as YAML, and that is a correctness requirement, not a
+    // formatting preference.
+    //
+    // perlmod renders a document as a **native Perl hash**, and a Perl hash has no
+    // key order at all: two `GET`s of the same document come back with their keys
+    // in different orders, depending on which pvedaemon worker answered (verified
+    // on the lab -- three requests, two different orders). Key order is data in
+    // this model (DESIGN section 2), and `plannedData()` is exactly what an Apply
+    // at the root view sends back, so reading JSON meant writing the document back
+    // in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
+    // its rows; the file changed anyway. The canonical YAML text is the one
+    // representation on this wire that carries the order the store actually holds.
+    //
+    // js-yaml is loaded first rather than assumed: it is lazy, and calling into it
+    // before it is there is a bug this editor has already had once.
+    //
+    // One narrower loss remains and cannot be fixed here: JavaScript objects order
+    // integer-like keys first, so a document with keys `2` and `1` cannot round
+    // trip through any client built on plain objects. That is a property of the
+    // language, and it is a far smaller hole than the one it replaces.
     loadDocument: function (next) {
         let me = this;
-        me.request({
-            url: me.urlFor(me.docId),
-            success: function (response) {
-                let d = response.result.data || {};
-                me.docState[me.docId] = { digest: d.digest || '', data: d.data || {} };
-                me.buildTree();
-                me.syncButtons();
-                next();
+        PVE.meta.Yaml.load().then(
+            function () {
+                me.request({
+                    url: me.urlFor(me.docId),
+                    params: { format: 'yaml' },
+                    success: function (response) {
+                        let d = response.result.data || {};
+                        // The server could read the bytes but they are not a
+                        // document. Do *not* fall back to the empty document: the
+                        // tree would look empty and an Apply would replace the file
+                        // with whatever was staged on top of nothing. Report it, the
+                        // way the JSON view's 422 used to.
+                        if (d.parse_error) {
+                            Proxmox.Utils.setErrorMask(
+                                me,
+                                Ext.htmlEncode(
+                                    Ext.String.format(
+                                        gettext('The stored document cannot be read: {0}'),
+                                        d.parse_error,
+                                    ),
+                                ),
+                            );
+                            return;
+                        }
+                        let data;
+                        try {
+                            data = PVE.meta.Utils.yamlLoad(d.text || '');
+                        } catch (err) {
+                            Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                            return;
+                        }
+                        me.docState[me.docId] = { digest: d.digest || '', data: data };
+                        me.buildTree();
+                        me.syncButtons();
+                        next();
+                    },
+                });
             },
-        });
+            function (err) {
+                // Without YAML this panel cannot read a document faithfully, and
+                // reading it unfaithfully is what this whole path exists to stop.
+                Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            },
+        );
     },
 
     poll: function () {
