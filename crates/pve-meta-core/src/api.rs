@@ -174,7 +174,8 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
             "permissions" => RegistryKind::Permission,
             other => {
                 return Err(bad_request(format!(
-                    "invalid id '{id}': unknown registry kind '{other}'                      (expected 'prefixes' or 'permissions')"
+                    "invalid id '{id}': unknown registry kind '{other}' \
+                     (expected 'prefixes' or 'permissions')"
                 )))
             }
         };
@@ -187,7 +188,8 @@ pub fn parse_id(id: &str) -> Result<DocId, anyhow::Error> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'datacenter',              'prefixes/<name>' or 'permissions/<name>'"
+            "invalid id '{id}': must be a vmid, 'datacenter', \
+             'prefixes/<name>' or 'permissions/<name>'"
         ))
     })
 }
@@ -743,10 +745,11 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), anyhow::Error>
     parsed.map_err(|e| {
         let kind = match kind {
             RegistryKind::PrefixDef => "prefix",
-            RegistryKind::Permission => "grant",
+            RegistryKind::Permission => "permission file",
         };
         bad_request(format!(
-            "the result would not be a valid {kind}: {e}              (the loader would skip the file, so the write is refused instead)"
+            "the result would not be a valid {kind}: {e} \
+             (the loader would skip the file, so the write is refused instead)"
         ))
     })
 }
@@ -1958,7 +1961,7 @@ fn version_detail_names_the_documents_that_changed() {
         )
         .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
-        assert!(format!("{err}").contains("not be a valid grant"), "{err}");
+        assert!(format!("{err}").contains("not be a valid permission file"), "{err}");
     }
 
     #[test]

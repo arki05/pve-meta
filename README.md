@@ -157,7 +157,17 @@ datacenter document), **Prefixes** and **Grants** — two grids over `/meta/pref
 `/meta/permissions`, with columns a tree could not show (which guests a prefix reaches,
 whether it carries a schema, and whether the file is a package's or yours on top of one).
 Editing a row opens that file in the same document editor, because a prefix definition is
-a document like any other.
+a document like any other. **Create Service Token** on the Permissions list makes the
+principal an operator needs — a `pve` user that cannot log in, one token on it, and a
+permission file naming that token with no rules — and nothing else; **Add Rule** fills in
+what it may touch.
+
+A **local CLI** for hook scripts, `pve-meta get <vmid> [<view>]`, reads `/etc/pve/meta`
+directly: no ticket, no token, no pveproxy, so it works during boot. A scalar prints bare,
+anything with structure prints YAML, and exit status 2 means "not there" — which is what
+lets a hook script tell "nothing configured" from "something is broken". See
+`examples/maintenance-hook.pl`, which refuses to start a guest its metadata says is under
+maintenance: no operator, no token, no daemon.
 
 The tab is `ui-extjs/`: plain JavaScript, a native `Ext.tree.Panel` mounted through
 pve-ext's `script`+`xtype` manifest form, so session, CSRF, theme and i18n all come from

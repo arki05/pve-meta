@@ -88,12 +88,14 @@ console.log('--- classes defined ---');
 eq('defined', ctx.__defined, [
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
+    'PVE.meta.AddRuleWindow',
     'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
     'PVE.meta.DocumentWindow',
     'PVE.meta.NewRegistryWindow',
+    'PVE.meta.ServiceToken',
     'PVE.meta.RegistryGrid',
     'PVE.meta.DatacenterPanel',
 ]);
@@ -997,20 +999,160 @@ console.log('\n--- the registry lists ---');
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
 }
 
+console.log('\n--- acting on one member rewrites its list ---');
+{
+    // There is no path to `groups[1]`, so every action on a member is a write of the
+    // whole list. Staging is what makes that unremarkable: it is one more staged
+    // edit, applied with everything else.
+    const stub = {
+        docId: '201',
+        pending: [],
+        docState: { 201: { digest: 'd', data: { netbird: { groups: ['lan', 'wan', 'dmz'] } } } },
+    };
+    ['listAt', 'stageListMember', 'plannedData', 'dataOf'].forEach((m) => (stub[m] = P[m]));
+    stub.stage = function (path, op, value) {
+        this.pending.push({ path: path, op: op, value: value });
+    };
+
+    eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
+    stub.stageListMember('netbird.groups', 1, 'wlan');
+    eq('editing a member writes the list', stub.pending[0], {
+        path: 'netbird.groups',
+        op: 'set',
+        value: ['lan', 'wlan', 'dmz'],
+    });
+    // ... and it reads back through the staged edit, so a second action composes.
+    eq('and the next action sees it', stub.listAt('netbird.groups'), ['lan', 'wlan', 'dmz']);
+    stub.stageListMember('netbird.groups', 0, undefined);
+    eq('removing a member drops it', stub.pending[1].value, ['wlan', 'dmz']);
+    // An index that is not there changes nothing, rather than growing the list with
+    // a hole in it.
+    stub.pending = [];
+    stub.stageListMember('netbird.groups', 9, 'nope');
+    eq('an index that is not there is not an edit', stub.pending, []);
+    stub.stageListMember('netbird.groups', -1, 'nope');
+    eq('nor is a negative one', stub.pending, []);
+}
+
+console.log('\n--- a list is a container, like a map ---');
+{
+    // The tree existed to make a document something you can look at and act on one
+    // piece of. A list was the one shape that stayed a blob of JSON in a cell, for
+    // no reason other than that it came second.
+    const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
+    panel.addData.call(panel, root, {
+        netbird: { groups: ['lan', 'wan'] },
+        rules: [
+            { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
+            { prefix: 'netbird', mode: 'ro', selector: { all: true } },
+        ],
+        empty: [],
+    });
+
+    const groups = root.children.netbird.children.groups;
+    eq('a list of scalars has a row per member', Object.keys(groups.children).sort(), ['0', '1']);
+    eq('each member keeps its own value', groups.children['0'].value, 'lan');
+    eq('and knows which member it is', groups.children['1'].arrayIndex, 1);
+    // Not addressable: a view addresses through maps only, so nothing may try to
+    // write `groups.1` -- everything that acts on a member rewrites the list.
+    eq('a member is not addressable', groups.children['0'].addressable, false);
+    eq('the list itself still is', groups.addressable, undefined);
+
+    const rules = root.children.rules;
+    eq('a list of maps too', Object.keys(rules.children).sort(), ['0', '1']);
+    // A member with structure shows one readable line, and carries its real value.
+    eq('a rule reads as a rule', rules.children['0'].value, 'traefik (rw, tag: traefik)');
+    eq('and the real thing rides along', rules.children['0'].rawItem.selector, { tag: 'traefik' });
+    eq('an empty list has no members', Object.keys(root.children.empty.children), []);
+
+    // The summary is presentation only, and falls back to JSON for a shape it does
+    // not recognise -- it describes nothing and constrains nothing.
+    eq('an unknown shape is still legible', U.itemSummary({ a: 1 }), '{"a":1}');
+    eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
+}
+
+console.log('\n--- adding one rule to a permission file ---');
+{
+    const R = ctx.PVE.meta.AddRuleWindow.statics;
+    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
+        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
+    ]);
+    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
+        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
+    ]);
+    // Appending, not replacing: `rules` is written whole because a view addresses
+    // through maps only, so the existing entries have to come along.
+    eq(
+        'the ones already there come with it',
+        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
+            prefix: 'traefik', mode: 'rw', selector: 'all',
+        }).map((r) => r.prefix),
+        ['netbird', 'traefik'],
+    );
+    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
+    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
+}
+
+console.log('\n--- adding one rule to a permission file ---');
+{
+    const R = ctx.PVE.meta.AddRuleWindow.statics;
+    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
+        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
+    ]);
+    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
+        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
+    ]);
+    // Appending, not replacing: `rules` is written whole because a view addresses
+    // through maps only, so the existing entries have to come along.
+    eq(
+        'the ones already there come with it',
+        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
+            prefix: 'traefik', mode: 'rw', selector: 'all',
+        }).map((r) => r.prefix),
+        ['netbird', 'traefik'],
+    );
+    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
+    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
+}
+
 console.log('\n--- creating a registry file: the least that parses ---');
 {
-    const N = ctx.PVE.meta.NewRegistryWindow;
-    const make = (kind, v) => N.contentFrom.call({ kind: kind }, v);
-    eq('a prefix with an "all" selector', make('prefixes', { selector: 'all' }), { selector: { all: true } });
-    eq('a prefix with a tag selector', make('prefixes', { selector: 'tag', tag: 'web' }), { selector: { tag: 'web' } });
+    const plan = (kind, v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(kind, v);
+    eq('a prefix with an "all" selector', plan('prefixes', { name: 'x', selector: 'all' }).content, { selector: { all: true } });
+    eq('a prefix with a tag selector', plan('prefixes', { name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
-        make('prefixes', { selector: 'all', description: 'Home' }),
+        plan('prefixes', { name: 'x', selector: 'all', description: 'Home' }).content,
         { description: 'Home', selector: { all: true } },
     );
-    // A grant is created granting nothing: it names a principal, and an
+    // A permission file is created permitting nothing: it names a principal, and an
     // administrator says what it may touch afterwards.
-    eq('a permission file starts empty', make('permissions', { authid: 'a@pve!t1' }), { authid: 'a@pve!t1', rules: [] });
+    const existing = plan('permissions', { name: 'ops', principal: 'existing', authid: 'a@pve!t1' });
+    eq('a permission file starts empty', existing.content, { authid: 'a@pve!t1', rules: [] });
+    eq('an existing principal makes nothing', existing.user, undefined);
+    eq('the file is named separately from the principal', existing.file, 'ops');
+
+    // The other half of the same dialog: the principal does not exist yet. The file
+    // must name the TOKEN, not the user -- naming the user produces a file that
+    // parses, loads, and grants the token nothing.
+    const fresh = plan('permissions', {
+        name: 'traefik', principal: 'new', user: 'traefik@pve', tokenid: 'meta', role: 'none',
+    });
+    eq('the file names the token', fresh.content.authid, 'traefik@pve!meta');
+    eq('and the user is created too', fresh.user, 'traefik@pve');
+    eq('the none sentinel grants nothing', fresh.acl, undefined);
+    const withRole = plan('permissions', {
+        name: 'a', principal: 'new', user: 'a@pve', tokenid: 't', role: 'PVEAuditor', description: 'x',
+    });
+    // /vms, not per-guest (a guest created tomorrow would miss it) and not `/`
+    // (PVEAuditor there also grants Sys.Audit, the datacenter document's read).
+    eq('a role goes on /vms, propagating', withRole.acl, { path: '/vms', role: 'PVEAuditor', propagate: 1 });
+    eq('a description reaches the file', withRole.content.description, 'x');
+
+    // The generated token id is a name, not a secret: PVE generates the secret.
+    const T = ctx.PVE.meta.ServiceToken;
+    eq('a generated id is a legal token id', /^[A-Za-z0-9_-]+$/.test(T.randomTokenId()), true);
+    eq('and two of them differ', T.randomTokenId() === T.randomTokenId(), false);
 }
 
 console.log('\n--- reloading must not fold the tree up ---');
@@ -1097,6 +1239,11 @@ eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'alwa
 // A range on a string, or a format on a number, would be a declaration nothing reads.
 eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
 eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
+// A KVComboBox whose key is the empty string hands back the store record's internal
+// id (`KeyValue-1`) instead of the key, so "no format" is the sentinel `none`. This
+// wrote `format: KeyValue-1` into a namespace schema until a browser check caught it.
+eq('the none sentinel is not a format', D.schemaFrom({ type: 'string', format: 'none' }), { type: 'string' });
+eq('a real format still lands', D.schemaFrom({ type: 'string', format: 'ip' }), { type: 'string', format: 'ip' });
 eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });
 // An empty field is left out entirely: a schema full of nulls describes nothing, and
 // the server's lint refuses null values anyway.

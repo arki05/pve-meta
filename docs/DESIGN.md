@@ -327,7 +327,21 @@ leaf icon for values, next to the expander. Columns:
 
 * **Key**.
 * **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums, arrays of scalars as one text leaf); opened by Edit, double-click or Enter.
+  enums); opened by Edit, double-click or Enter.
+
+**A list is a container, like a map.** Its members are rows — one per element, whatever
+the elements are — because the tree exists to make a document something you can look at
+and act on one piece of, and a list was the one shape that stayed a blob of JSON in a
+cell. A member with structure of its own shows one readable line (a permission rule reads
+as `traefik (rw, tag: traefik)`; anything else falls back to JSON) and carries its real
+value along for whatever edits it.
+
+Member rows are **not addressable**: a view addresses through maps only, so there is no
+path to `groups[1]` (§2) and nothing may try to write one. They carry their index instead,
+and everything that acts on one — Edit, Remove, Add — rewrites the list it is in. That
+needs no new write path, because staging already turns any number of edits into one write
+(§8); a list rewrite is simply one more staged edit. Add on a list appends rather than
+adding a key beside it, since a list has no keys.
   **The editor follows the value's shape**: a value with structure inside it — a map,
   or an array of maps — is edited as *text*, in Monaco on that subtree, by the same
   three gestures. A string with newlines in it gets a text box rather than a one-line
@@ -497,6 +511,39 @@ itself is not validated in the browser: `schema.properties.<key>` is a document 
 like any other, so the server's one lint decides what a key may be and says so. A
 *dotted* key is refused, because it would silently declare a nested property rather than
 the one the form is asking about.
+
+**Two forms behind the two registry lists.** A prefix definition's schema gets
+**Declare Key** (§8, above); a permission file's `rules` gets **Add Rule** — the same
+shape one document over, because the rules *are* the file and leaving them to the text
+editor made the interesting part the one part with no affordance. Its prefix field is a
+combobox of the declared prefixes but stays editable: a rule may name a prefix nobody has
+declared, since the two are independent files and neither waits for the other. It appends
+by writing `rules` whole, because a view addresses through maps only and there is no path
+to `rules[1]` (§2); changing or removing one is still the text editor.
+
+**One "New" dialog, not two.** Adding a permission file and creating a service token
+were the same act — write a file for a principal — differing only in whether the principal
+exists yet, which is a question the dialog can just ask. It offers an existing user or
+token (a combobox filled from `/access/users?full=1`, which returns users *and* their
+tokens in one call, and stays typable because a permission file may name a principal that
+does not exist yet) or a new service token, which makes the principal an operator needs
+and nothing more: a `pve`-realm user with **no password** (verified: `/access/ticket`
+answers "authentication failure" for it, while its token works — the closest thing PVE has
+to a service principal, since there is no userless API key), one token on it, and a
+permission file naming **the token**, with no rules. Naming the *user* instead would
+produce a file that parses, loads, and grants the token nothing.
+
+The token is created with **privilege separation off**, which is not the PVE default and
+is deliberate: with it on, a token's rights are the intersection of its own ACLs and its
+user's, so a role added to the user later would silently do nothing (verified on the lab —
+an ACL on the token alone is denied, and so is one on the user alone). This user exists
+only to carry this token, so they are one principal in practice.
+
+The optional **guest access** role goes on `/vms`, propagating: per-guest silently misses
+guests created later, and `PVEAuditor` on `/` would also hand over `Sys.Audit`, which is
+the datacenter document's own read permission. The dialog says the part that is easy to
+miss — a role there lets the principal read *all* metadata on those guests, because
+`VM.Audit` is full read (§3.4); only writes stay inside its rules.
 
 **Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
 datacenter), and that is the whole audience: PVE's own resource tree lists a guest only

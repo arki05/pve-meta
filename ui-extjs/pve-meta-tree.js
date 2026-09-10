@@ -272,6 +272,27 @@ PVE.meta.Utils = {
         return view;
     },
 
+    // One element of a list, on one line. Presentation only -- like `format`, it
+    // describes nothing and constrains nothing; it is there so a list of maps reads
+    // as something other than JSON in a grid cell.
+    //
+    // A permission rule gets its own shape because that is the list people actually
+    // look at, and `{"prefix":"traefik","mode":"rw","selector":{"tag":"traefik"}}`
+    // is not a thing anyone reads twice.
+    itemSummary: function (v) {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) {
+            return PVE.meta.Utils.scalarText(v);
+        }
+        let has = (k) => Object.prototype.hasOwnProperty.call(v, k);
+        if (has('prefix') && has('mode')) {
+            return (
+                v.prefix + ' (' + v.mode +
+                (has('selector') ? ', ' + PVE.meta.Utils.selectorText(v.selector) : '') + ')'
+            );
+        }
+        return Ext.encode(v);
+    },
+
     // A schema `type` as the kind `parseValue` speaks: both integers and numbers are
     // parsed as numbers, and a map or a list of one is not a scalar to parse at all.
     schemaValueKind: function (type) {
@@ -1057,6 +1078,9 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'belowText', type: 'string' }, // the first few of them, for the tooltip
         { name: 'stagedBelow', type: 'int' }, // staged edits somewhere beneath this row
         { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
+        { name: 'arrayIndex' }, // this row is member N of the list at `path`
+        { name: 'addressable', type: 'boolean' }, // false: no view path names this row
+        { name: 'rawItem' }, // a list member's real value, whatever it is
         { name: 'valueText', type: 'string' },
         { name: 'description', type: 'string' }, // the comment key `k__`, if present
         { name: 'grammarDescription', type: 'string' }, // the grammar's, shown as tooltip
@@ -1088,6 +1112,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
     width: 480,
     layout: 'fit',
     parentPath: '', // dotted path of the map the key goes into ('' = the document root)
+    list: false, // appending to a list instead: a member has no name to give it
 
     initComponent: function () {
         let me = this;
@@ -1102,13 +1127,14 @@ Ext.define('PVE.meta.AddKeyWindow', {
                     items: [
                         {
                             xtype: 'displayfield',
-                            fieldLabel: gettext('Under'),
+                            fieldLabel: me.list ? gettext('Append to') : gettext('Under'),
                             value: Ext.htmlEncode(me.parentPath || gettext('(document root)')),
                         },
                         {
                             xtype: 'textfield',
                             name: 'key',
-                            allowBlank: false,
+                            allowBlank: me.list,
+                            hidden: me.list,
                             fieldLabel: gettext('Key'),
                             emptyText: gettext('key, or a dotted path'),
                         },
@@ -1147,9 +1173,9 @@ Ext.define('PVE.meta.AddKeyWindow', {
             return;
         }
         let v = form.getValues();
-        let key = String(v.key).replace(/^\.+|\.+$/g, '');
+        let key = String(v.key || '').replace(/^\.+|\.+$/g, '');
         try {
-            if (!key) {
+            if (!key && !me.list) {
                 throw new Error(gettext('Key must not be empty'));
             }
             let value = v.kind === 'map' ? {} : PVE.meta.Utils.parseValue(v.value || '', v.kind);
@@ -1158,6 +1184,134 @@ Ext.define('PVE.meta.AddKeyWindow', {
         } catch (err) {
             Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
         }
+    },
+});
+
+// ---------------------------------------------------------------------------
+// "Add Rule" — one entry of a permission file, as a form.
+//
+// The same shape as Declare Key, one document over: a permission file's `rules`
+// is the whole point of the file, and leaving it to the text editor made the
+// interesting part of it the one part with no affordance.
+//
+// It appends rather than edits, and it stages like everything else. Appending
+// replaces the whole `rules` array, because a view addresses through maps only —
+// there is no path to `rules[1]` (DESIGN §2). Changing or removing a rule is
+// still the text editor; adding one is what you do a hundred times more often.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.AddRuleWindow', {
+    extend: 'Ext.window.Window',
+    xtype: 'pveMetaAddRuleWindow',
+
+    title: gettext('Add Rule'),
+    modal: true,
+    width: 520,
+    layout: 'fit',
+    prefixes: null, // the declared prefixes, for the combobox
+    existing: null, // the rules already in the file (appending)
+    rule: null, // the rule being edited, if this is an edit
+
+    initComponent: function () {
+        let me = this;
+        let declared = (me.prefixes || []).map((p) => [p.prefix, p.prefix]);
+        Ext.apply(me, {
+            items: [
+                {
+                    xtype: 'form',
+                    reference: 'form',
+                    bodyPadding: 10,
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 120 },
+                    items: [
+                        {
+                            // Editable on purpose: a rule may name a prefix nobody has
+                            // declared yet. The list is a convenience, not a
+                            // constraint -- permissions and prefix definitions are
+                            // independent files and neither waits for the other.
+                            xtype: 'combobox',
+                            name: 'prefix',
+                            fieldLabel: gettext('Prefix'),
+                            allowBlank: false,
+                            store: declared,
+                            queryMode: 'local',
+                            editable: true,
+                            forceSelection: false,
+                            emptyText: gettext('a declared prefix, or any key path'),
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'mode',
+                            fieldLabel: gettext('Mode'),
+                            value: 'ro',
+                            comboItems: [
+                                ['ro', gettext('Read only')],
+                                ['rw', gettext('Read and write')],
+                            ],
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'selector',
+                            fieldLabel: gettext('Applies to'),
+                            value: 'all',
+                            comboItems: [
+                                ['all', gettext('Every guest')],
+                                ['tag', gettext('Guests with a tag')],
+                            ],
+                            listeners: {
+                                change: (f, v) => me.down('[name=tag]').setHidden(v !== 'tag'),
+                            },
+                        },
+                        { xtype: 'textfield', name: 'tag', fieldLabel: gettext('Tag'), hidden: true },
+                    ],
+                },
+            ],
+            buttons: [
+                { text: me.rule ? gettext('OK') : gettext('Add'), handler: () => me.submit() },
+                { text: gettext('Cancel'), handler: () => me.close() },
+            ],
+        });
+        me.callParent();
+        me.on('show', function () {
+            if (me.rule) {
+                let sel = me.rule.selector || {};
+                me.down('form').getForm().setValues({
+                    prefix: me.rule.prefix,
+                    mode: me.rule.mode,
+                    selector: sel.tag ? 'tag' : 'all',
+                    tag: sel.tag || '',
+                });
+            }
+            me.down('[name=prefix]').focus(true, 50);
+        });
+    },
+
+    statics: {
+        // The `rules` list this form would produce. Pure, so the offline suite can
+        // check the arithmetic without a DOM.
+        rulesWith: function (existing, v) {
+            let rule = {
+                prefix: String(v.prefix).trim(),
+                mode: v.mode === 'rw' ? 'rw' : 'ro',
+                selector: v.selector === 'tag' ? { tag: String(v.tag).trim() } : { all: true },
+            };
+            return (Array.isArray(existing) ? existing : []).concat([rule]);
+        },
+    },
+
+    submit: function () {
+        let me = this;
+        let form = me.down('form').getForm();
+        if (!form.isValid()) {
+            return;
+        }
+        let v = form.getValues();
+        if (v.selector === 'tag' && !String(v.tag).trim()) {
+            Ext.Msg.alert(gettext('Error'), gettext('A tag selector needs a tag'));
+            return;
+        }
+        me.fireEvent('addrule', PVE.meta.AddRuleWindow.rulesWith(me.existing, v));
+        me.close();
     },
 });
 
@@ -1279,8 +1433,14 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                             xtype: 'proxmoxKVComboBox',
                             name: 'format',
                             fieldLabel: gettext('Format'),
-                            value: '',
-                            comboItems: [['', gettext('none')]].concat(
+                            // `none`, not `''`: a KVComboBox whose key is the empty
+                            // string hands back the store record's internal id
+                            // (`KeyValue-1`) instead of the key, and it renders blank
+                            // rather than showing its own default. Caught in a browser
+                            // -- this wrote `format: KeyValue-1` into a schema, and the
+                            // same shape broke Create Service Token outright.
+                            value: 'none',
+                            comboItems: [['none', gettext('none')]].concat(
                                 Object.keys(PVE.meta.Utils.FORMAT_VTYPES).map((f) => [f, f]),
                             ),
                         },
@@ -1329,7 +1489,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                 out[n] = Number(v[n]);
             }
         });
-        if (v.type === 'string' && v.format) {
+        if (v.type === 'string' && v.format && v.format !== 'none') {
             out.format = v.format;
         }
         if (v.type === 'string' && v.multiline) {
@@ -1792,7 +1952,12 @@ Ext.define('PVE.meta.TreePanel', {
                 iconCls: 'fa fa-plus',
                 handler: function () {
                     let t = me.addTarget();
-                    if (t) {
+                    if (!t) {
+                        return;
+                    }
+                    if (t.list) {
+                        me.addListMember(t.path);
+                    } else {
                         me.addKey(t.docId, t.path);
                     }
                 },
@@ -1813,6 +1978,15 @@ Ext.define('PVE.meta.TreePanel', {
                 iconCls: 'fa fa-reply',
                 disabled: true,
                 handler: () => me.setToDefault(me.getSelection()[0]),
+            },
+            {
+                // The permission-document twin of Declare Key, and hidden by the same
+                // rule: a missing concept elsewhere, not a missing permission.
+                text: gettext('Add Rule'),
+                itemId: 'ruleBtn',
+                iconCls: 'fa fa-key',
+                hidden: true,
+                handler: () => me.addRule(),
             },
             {
                 // Only ever shown on a prefix document, where declaring a key is a
@@ -1846,6 +2020,9 @@ Ext.define('PVE.meta.TreePanel', {
                 // then decide.
                 text: gettext('Apply'),
                 itemId: 'applyBtn',
+                // The count lives on this button (`Apply (2)`) rather than in a
+                // toolbar label: the label was the first thing to be clipped when the
+                // editor opens in a window, and a counter you cannot read is not one.
                 iconCls: 'fa fa-check',
                 disabled: true,
                 handler: () => me.applyPending(),
@@ -1859,9 +2036,6 @@ Ext.define('PVE.meta.TreePanel', {
             },
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
-            // How many edits are waiting. Shown only when there are any -- it is the
-            // answer to "why is this row orange".
-            { xtype: 'tbtext', itemId: 'pendingText', cls: 'warning', hidden: true },
             // Only shown when the caller is restricted (DESIGN §8).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
             {
@@ -2136,6 +2310,28 @@ Ext.define('PVE.meta.TreePanel', {
 
     // --- staged edits --------------------------------------------------------
 
+    // The list at `path`, as it currently stands (staged edits included).
+    listAt: function (path) {
+        let v = PVE.meta.Lint.valueAt(this.plannedData(), path);
+        return Array.isArray(v) ? v.slice() : [];
+    },
+
+    // Stages the list at `path` with member `index` replaced, or dropped when
+    // `value` is undefined. One write of the whole list, because a view addresses
+    // through maps only -- the same reason the member rows are not addressable.
+    stageListMember: function (path, index, value) {
+        let list = this.listAt(path);
+        if (index < 0 || index >= list.length) {
+            return;
+        }
+        if (value === undefined) {
+            list.splice(index, 1);
+        } else {
+            list[index] = value;
+        }
+        this.stage(path, 'set', list);
+    },
+
     // Records one edit. A staged path replaces any earlier entry for itself *and*
     // for everything under it: staging `selector` after `selector.tag` means the
     // subtree was replaced wholesale, and keeping the older, narrower entry would
@@ -2217,15 +2413,22 @@ Ext.define('PVE.meta.TreePanel', {
     // Add goes into the selected map, the parent of a selected leaf, or the root.
     // Where a new key goes: into the selected map, beside the selected leaf, or --
     // with nothing selected -- at the root of this panel's document.
+    //
+    // A list is the exception: `Add` on one, or on a member of one, appends to the
+    // list rather than adding a key beside it, because a list has no keys to add.
     addTarget: function () {
         let me = this;
         let rec = me.getSelection()[0];
         if (!rec) {
             return { docId: me.docId, path: '' };
         }
+        let d = rec.data;
+        if (d.kind === 'array' || d.arrayIndex !== undefined) {
+            return { docId: me.docOf(rec), path: d.path, list: true };
+        }
         return {
             docId: me.docOf(rec),
-            path: rec.data.kind === 'map' ? rec.data.path : me.parentPath(rec),
+            path: d.kind === 'map' ? d.path : me.parentPath(rec),
         };
     },
 
@@ -2253,18 +2456,12 @@ Ext.define('PVE.meta.TreePanel', {
         set('reloadBtn', text);
         set('applyBtn', text || !dirty);
         set('revertBtn', text || !dirty);
-        let count = me.down('#pendingText');
-        if (count) {
-            count.setHidden(!dirty);
-            count.setText(
+        let applyBtn = me.down('#applyBtn');
+        if (applyBtn) {
+            applyBtn.setText(
                 dirty
-                    ? Ext.String.format(
-                          me.pending.length === 1
-                              ? gettext('{0} unapplied change')
-                              : gettext('{0} unapplied changes'),
-                          me.pending.length,
-                      )
-                    : '',
+                    ? Ext.String.format(gettext('Apply ({0})'), me.pending.length)
+                    : gettext('Apply'),
             );
         }
         let dflt = me.down('#defaultBtn');
@@ -2280,6 +2477,11 @@ Ext.define('PVE.meta.TreePanel', {
         // The Text toggle's enabled state depends on staged edits too, and this is
         // the function that runs whenever those change.
         me.syncAccessLabel();
+        let rule = me.down('#ruleBtn');
+        if (rule) {
+            rule.setHidden(me.docKind(me.docId) !== 'permission');
+            rule.setDisabled(text || !me.editableFor(''));
+        }
         let declare = me.down('#declareBtn');
         if (declare) {
             // Hidden by the *document*, disabled by the *row* -- the rule above. It
@@ -2662,10 +2864,38 @@ Ext.define('PVE.meta.TreePanel', {
             let child = me.entry(entry, key, U.joinPath(entry.path, key));
             if (U.kindOf(v) === 'map') {
                 me.addData(child, v);
-            } else {
-                child.present = true;
-                child.kind = U.kindOf(v);
-                child.value = v;
+                return;
+            }
+            child.present = true;
+            child.kind = U.kindOf(v);
+            child.value = v;
+            // **A list is a container, like a map.** Its members are rows, so you can
+            // see them, select one and act on it -- which is the whole reason a map
+            // is a tree and not a blob of JSON in a cell. A list was the one shape
+            // that stayed a blob, for no reason other than that it came second.
+            //
+            // The member rows are **not addressable**: a view addresses through maps
+            // only, so there is no path to `groups[1]` (DESIGN §2) and nothing may try
+            // to write one. They carry their index instead, and everything that acts
+            // on one rewrites the list it is in -- which is exactly what staging is
+            // for (§8), so this needs no new write path.
+            if (child.kind === 'array') {
+                v.forEach(function (item, i) {
+                    let row = me.entry(child, String(i), child.path);
+                    row.present = true;
+                    row.arrayIndex = i;
+                    row.addressable = false;
+                    row.rawItem = item;
+                    if (item !== null && typeof item === 'object') {
+                        // One line for a member with structure of its own; its real
+                        // value rides along in `rawItem` for whatever edits it.
+                        row.kind = 'string';
+                        row.value = U.itemSummary(item);
+                    } else {
+                        row.kind = U.kindOf(item);
+                        row.value = item;
+                    }
+                });
             }
         });
     },
@@ -2841,6 +3071,9 @@ Ext.define('PVE.meta.TreePanel', {
                         format: c.format,
                         multiline: c.multiline,
                         rawValue: c.value,
+                        arrayIndex: c.arrayIndex,
+                        addressable: c.addressable !== false,
+                        rawItem: c.rawItem,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         accessList: access,
                         accessText: me.accessSummary(access),
@@ -2858,9 +3091,9 @@ Ext.define('PVE.meta.TreePanel', {
                             return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
                         })(),
                         editable: me.editableFor(c.path),
-                        leaf: kind !== 'map',
+                        leaf: kind !== 'map' && !Object.keys(c.children).length,
                     };
-                    if (kind === 'map') {
+                    if (kind === 'map' || Object.keys(c.children).length) {
                         node.children = toNodes(c, docId);
                         node.expanded = true;
                         node.iconCls = I.mapExpanded;
@@ -2906,6 +3139,10 @@ Ext.define('PVE.meta.TreePanel', {
     editRow: function (rec) {
         let me = this;
         if (!rec || !rec.data.editable) {
+            return;
+        }
+        if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
+            me.editListMember(rec);
             return;
         }
         // A value with structure inside it is edited as text, wherever the request came
@@ -3036,6 +3273,87 @@ Ext.define('PVE.meta.TreePanel', {
         me.stage(rec.data.path, 'set', rec.data.defaultValue);
     },
 
+    // Appending to a list. A rule list gets the rule form, because that is the list
+    // worth having a form for; anything else asks for a value, since a member of a
+    // list has no name to give it.
+    addListMember: function (path) {
+        let me = this;
+        let list = me.listAt(path);
+        if (path === 'rules' && me.docKind(me.docId) === 'permission') {
+            me.addRule();
+            return;
+        }
+        me.editing = true;
+        let win = Ext.create('PVE.meta.AddKeyWindow', { parentPath: path, list: true });
+        win.on('addkey', function (_path, value) {
+            me.stage(path, 'set', list.concat([value]));
+        });
+        win.on('destroy', () => (me.editing = false));
+        win.show();
+    },
+
+    // Editing one member of a list. Three cases, in the order they are worth having:
+    // a permission rule gets its own form (it is the list anyone actually edits), a
+    // scalar gets the ordinary value editor, and anything else with structure gets
+    // the text editor on the list it is in -- which is where it was before lists had
+    // rows at all, so nothing is lost.
+    editListMember: function (rec) {
+        let me = this;
+        let d = rec.data;
+        let item = d.rawItem;
+        let isRule =
+            item &&
+            typeof item === 'object' &&
+            Object.prototype.hasOwnProperty.call(item, 'prefix') &&
+            Object.prototype.hasOwnProperty.call(item, 'mode');
+        if (isRule) {
+            me.editing = true;
+            let win = Ext.create('PVE.meta.AddRuleWindow', {
+                title: gettext('Edit Rule'),
+                prefixes: me.prefixes,
+                rule: item,
+            });
+            win.on('addrule', function (rules) {
+                // The form appends to what it was given; for an edit it was given
+                // nothing, so the one rule it produced replaces this member.
+                me.stageListMember(d.path, d.arrayIndex, rules[rules.length - 1]);
+            });
+            win.on('destroy', () => (me.editing = false));
+            win.show();
+            return;
+        }
+        if (item !== null && typeof item === 'object') {
+            me.editAsText(rec);
+            return;
+        }
+        me.editing = true;
+        let win = Ext.create('PVE.meta.EditValueWindow', { rec: rec });
+        win.on('setvalue', (value) => me.stageListMember(d.path, d.arrayIndex, value));
+        win.on('destroy', () => (me.editing = false));
+        win.show();
+    },
+
+    // Append one rule to this permission file. The prefix combobox is filled from
+    // the declared prefixes, which is the list an administrator is choosing from
+    // nine times in ten -- but it stays editable, because a rule and a prefix
+    // definition are independent files and neither waits for the other.
+    addRule: function () {
+        let me = this;
+        if (me.docKind(me.docId) !== 'permission') {
+            return;
+        }
+        me.editing = true;
+        let win = Ext.create('PVE.meta.AddRuleWindow', {
+            prefixes: me.prefixes,
+            existing: me.plannedData().rules,
+        });
+        win.on('addrule', (rules) => me.stage('rules', 'set', rules));
+        win.on('destroy', function () {
+            me.editing = false;
+        });
+        win.show();
+    },
+
     // Declare one key of the selected prefix's schema: a view PUT into
     // `schema.properties.<key>` of that prefix document, with its digest. The
     // window builds the declaration; this only decides where it goes.
@@ -3061,6 +3379,10 @@ Ext.define('PVE.meta.TreePanel', {
     removeKey: function (rec) {
         let me = this;
         if (!rec || !rec.data.path) {
+            return;
+        }
+        if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
+            me.stageListMember(rec.data.path, rec.data.arrayIndex, undefined);
             return;
         }
         me.stage(rec.data.path, 'delete');
@@ -3631,7 +3953,7 @@ Ext.define('PVE.meta.NewRegistryWindow', {
     xtype: 'pveMetaNewRegistryWindow',
 
     modal: true,
-    width: 460,
+    width: 620,
     layout: 'fit',
     kind: 'prefixes',
 
@@ -3674,13 +3996,111 @@ Ext.define('PVE.meta.NewRegistryWindow', {
                 { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
             );
         } else {
+            // One dialog, not two. "Add" and "Create Service Token" were the same act
+            // -- write a permission file for a principal -- differing only in whether
+            // the principal exists yet, and a second button for that is a question the
+            // dialog can just ask.
+            let toggle = function () {
+                let fresh = me.down('[name=principal]').getValue() === 'new';
+                ['authid'].forEach((n) => me.down('[name=' + n + ']').setHidden(fresh));
+                ['user', 'tokenid', 'role'].forEach((n) =>
+                    me.down('[name=' + n + ']').setHidden(!fresh),
+                );
+                me.down('#tokenNote').setHidden(!fresh);
+                me.down('[name=authid]').allowBlank = fresh;
+                me.down('[name=user]').allowBlank = !fresh;
+                me.down('[name=tokenid]').allowBlank = !fresh;
+            };
             items.push(
                 {
-                    xtype: 'textfield',
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'principal',
+                    fieldLabel: gettext('For'),
+                    value: 'new',
+                    comboItems: [
+                        ['new', gettext('A new service token')],
+                        ['existing', gettext('An existing user or token')],
+                    ],
+                    listeners: { change: toggle },
+                },
+                {
+                    // Editable: a permission file may name a principal that does not
+                    // exist yet, and the parser only checks the *shape* of an authid.
+                    xtype: 'combobox',
                     name: 'authid',
-                    allowBlank: false,
                     fieldLabel: gettext('Auth ID'),
+                    hidden: true,
+                    allowBlank: true,
+                    store: [],
+                    queryMode: 'local',
+                    editable: true,
+                    forceSelection: false,
                     emptyText: gettext('user@realm, or user@realm!tokenid'),
+                },
+                {
+                    xtype: 'textfield',
+                    name: 'user',
+                    fieldLabel: gettext('User'),
+                    value: '@pve',
+                    emptyText: 'traefik@pve',
+                    regex: /^[^\s@]+@[A-Za-z0-9-]+$/,
+                    regexText: gettext('A user id is user@realm'),
+                    listeners: {
+                        change: function (f, v) {
+                            let name = me.down('[name=name]');
+                            if (!name.isDirty()) {
+                                name.setValue(String(v).split('@')[0]);
+                            }
+                        },
+                    },
+                },
+                {
+                    xtype: 'fieldcontainer',
+                    fieldLabel: gettext('Token ID'),
+                    layout: 'hbox',
+                    items: [
+                        {
+                            xtype: 'textfield',
+                            name: 'tokenid',
+                            flex: 1,
+                            value: 'meta',
+                            regex: /^[A-Za-z0-9_-]+$/,
+                            regexText: gettext('Letters, digits, - and _'),
+                        },
+                        {
+                            xtype: 'button',
+                            text: gettext('Generate'),
+                            margin: '0 0 0 5',
+                            handler: () =>
+                                me.down('[name=tokenid]').setValue(PVE.meta.ServiceToken.randomTokenId()),
+                        },
+                    ],
+                },
+                {
+                    xtype: 'proxmoxKVComboBox',
+                    name: 'role',
+                    fieldLabel: gettext('Guest access'),
+                    // `none`, not `''`: a KVComboBox whose key is the empty string
+                    // hands back the store record's internal id (`KeyValue-1`).
+                    value: 'none',
+                    comboItems: [
+                        ['none', gettext('None — metadata only')],
+                        ['PVEAuditor', gettext('Read guest configs (PVEAuditor on /vms)')],
+                        ['PVEVMAdmin', gettext('Manage guests (PVEVMAdmin on /vms)')],
+                    ],
+                },
+                {
+                    xtype: 'displayfield',
+                    itemId: 'tokenNote',
+                    userCls: 'faded',
+                    value: Ext.htmlEncode(
+                        gettext(
+                            'A new service token is a pve-realm user that cannot log in, with one token on ' +
+                                'it. Guest access is a PVE role on /vms, covering guests created later too — ' +
+                                'and it also lets this principal read ALL metadata on those guests, since ' +
+                                'VM.Audit is full read. Writes stay inside the rules you give it.',
+                        ),
+                    ),
                 },
                 { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
             );
@@ -3702,26 +4122,64 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             ],
         });
         me.callParent();
-        me.on('show', () => me.down('[name=name]').focus(true, 50));
+        me.on('show', function () {
+            me.down('[name=name]').focus(true, 50);
+            let box = me.down('[name=authid]');
+            if (!box) {
+                return;
+            }
+            // Users and their tokens in one call, so the picker costs one request.
+            Proxmox.Utils.API2Request({
+                url: '/access/users',
+                params: { full: 1 },
+                method: 'GET',
+                failure: Ext.emptyFn, // a picker that did not load is still typable
+                success: function (response) {
+                    let out = [];
+                    (response.result.data || []).forEach(function (u) {
+                        out.push(u.userid);
+                        (u.tokens || []).forEach((t) => out.push(u.userid + '!' + t.tokenid));
+                    });
+                    box.setStore(out);
+                },
+            });
+        });
     },
 
-    // The smallest file the loader will read back. A permission file is created with
-    // no rules on purpose: it permits nothing until an administrator says what.
-    contentFrom: function (v) {
-        if (this.kind === 'permissions') {
-            let out = { authid: v.authid };
-            if (v.description) {
-                out.description = v.description;
+    statics: {
+        // Everything the dialog will do, as data: the file to write, and -- when the
+        // principal does not exist yet -- the PVE objects to make first. Pure, so the
+        // offline suite can check the order and the shape without a browser.
+        //
+        // The permission file must name the **token**, not the user. Naming the user
+        // produces a file that parses, loads, and grants the token nothing.
+        planFrom: function (kind, v) {
+            let out = { file: String(v.name || '').trim(), content: {} };
+            if (kind !== 'permissions') {
+                if (v.description) {
+                    out.content.description = v.description;
+                }
+                out.content.selector = v.selector === 'tag' ? { tag: v.tag } : { all: true };
+                return out;
             }
-            out.rules = [];
+            if (v.principal === 'new') {
+                out.user = String(v.user || '').trim();
+                out.tokenid = String(v.tokenid || '').trim();
+                out.authid = out.user + '!' + out.tokenid;
+                if (v.role && v.role !== 'none') {
+                    out.acl = { path: '/vms', role: v.role, propagate: 1 };
+                }
+            } else {
+                out.authid = String(v.authid || '').trim();
+            }
+            out.content.authid = out.authid;
+            if (v.description) {
+                out.content.description = v.description;
+            }
+            // No rules on purpose: it permits nothing until an administrator says what.
+            out.content.rules = [];
             return out;
-        }
-        let out = {};
-        if (v.description) {
-            out.description = v.description;
-        }
-        out.selector = v.selector === 'tag' ? { tag: v.tag } : { all: true };
-        return out;
+        },
     },
 
     submit: function () {
@@ -3735,8 +4193,90 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             Ext.Msg.alert(gettext('Error'), gettext('A tag selector needs a tag'));
             return;
         }
-        me.fireEvent('create', String(v.name).trim(), me.contentFrom(v));
+        let plan = PVE.meta.NewRegistryWindow.planFrom(me.kind, v);
+        if (me.kind === 'permissions' && !plan.authid) {
+            Ext.Msg.alert(gettext('Error'), gettext('A permission needs an auth id'));
+            return;
+        }
+        me.fireEvent('create', plan);
         me.close();
+    },
+});
+
+// ---------------------------------------------------------------------------
+// Creating a service principal, for the "New" dialog's second half.
+//
+// Two things about PVE's model shape this, both verified on the lab:
+//
+// * **A `pve`-realm user with no password cannot log in at all** (`/access/ticket`
+//   answers "authentication failure"), while its token keeps working. That is the
+//   closest thing PVE has to a service principal: there is no userless API key, so
+//   every token hangs off a user, and this makes that user a dead end.
+// * **Privilege separation is an intersection.** With privsep on, a token's rights
+//   are its own ACLs *and* its user's, so granting the user a role later would
+//   silently do nothing. This user exists only to carry this token, so privsep off
+//   is what makes "add a role later" behave the way anyone would expect.
+//
+// The optional role goes on `/vms`, not per-guest and not `/`: per-guest silently
+// misses guests created later, and `PVEAuditor` on `/` would also hand over
+// `Sys.Audit`, which is the datacenter document's own read permission.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.meta.ServiceToken', {
+    singleton: true,
+
+    // A token id with no meaning, for when you do not want to invent one. Not a
+    // secret -- PVE generates that itself and shows it once -- just a name.
+    randomTokenId: function () {
+        let out = '';
+        for (let i = 0; i < 6; i++) {
+            out += 'abcdefghijklmnopqrstuvwxyz0123456789'.charAt(Math.floor(Math.random() * 36));
+        }
+        return 't-' + out;
+    },
+
+    // The secret, once. PVE never shows it again and it cannot be recovered, so
+    // this is a copyable field rather than a message: the one moment it exists.
+    showSecret: function (plan, secret) {
+        Ext.create('Ext.window.Window', {
+            title: gettext('Service Token Created'),
+            modal: true,
+            width: 620,
+            bodyPadding: 10,
+            items: [
+                {
+                    xtype: 'form',
+                    border: false,
+                    defaults: { anchor: '100%', labelWidth: 120 },
+                    items: [
+                        {
+                            xtype: 'displayfield',
+                            fieldLabel: gettext('Token ID'),
+                            value: Ext.htmlEncode(plan.authid),
+                        },
+                        {
+                            xtype: 'textfield',
+                            fieldLabel: gettext('Secret'),
+                            value: secret || '',
+                            editable: false,
+                            selectOnFocus: true,
+                        },
+                        {
+                            xtype: 'displayfield',
+                            userCls: 'faded',
+                            value: Ext.htmlEncode(
+                                gettext(
+                                    'Copy it now — PVE does not show it again. Use it as the header ' +
+                                        'Authorization: PVEAPIToken=<id>=<secret>. It can touch nothing ' +
+                                        'until you add rules to its permission file.',
+                                ),
+                            ),
+                        },
+                    ],
+                },
+            ],
+            buttons: [{ text: gettext('Close'), handler: function () { this.up('window').close(); } }],
+        }).show();
     },
 });
 
@@ -3941,28 +4481,110 @@ Ext.define('PVE.meta.RegistryGrid', {
         win.show();
     },
 
+    // "New" for both lists, and for a permission file both of the things that used
+    // to be two buttons: name an existing principal, or make one.
+    //
+    // When it makes one, the order is chosen so a failure leaves the least behind: a
+    // user with no token is inert, a token with no permission file grants nothing at
+    // all, and only the last step makes anything true. Each failure says which step
+    // it was and what already exists, because "create failed" with three PVE objects
+    // half-made is not a message anyone can act on.
     createOne: function () {
         let me = this;
         let win = Ext.create('PVE.meta.NewRegistryWindow', { kind: me.kind });
-        win.on('create', function (name, content) {
-            Proxmox.Utils.API2Request({
-                url: '/meta/' + me.kind + '/' + encodeURIComponent(name),
-                method: 'PUT',
-                waitMsgTarget: me,
-                // `digest: ''` is "this file must not exist yet" (DESIGN §5), so two
-                // administrators creating the same name is a 409 rather than one
-                // silently overwriting the other.
-                params: { data: Ext.encode(content), mode: 'replace', digest: '' },
-                success: function () {
-                    me.reload();
-                    let win2 = Ext.create('PVE.meta.DocumentWindow', {
-                        docId: me.kind + '/' + name,
-                    });
-                    win2.on('destroy', () => me.reload());
-                    win2.show();
+        win.on('create', function (plan) {
+            let made = [];
+            let fail = (step) => (response) =>
+                Ext.Msg.alert(
+                    gettext('Error'),
+                    Ext.htmlEncode(step) + ': ' +
+                        (response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response)) +
+                        (made.length
+                            ? '<br><br>' +
+                              Ext.htmlEncode(
+                                  Ext.String.format(
+                                      gettext('Already created: {0}. Remove it from Datacenter → Permissions, or run this again to reuse it.'),
+                                      made.join(', '),
+                                  ),
+                              )
+                            : ''),
+                );
+            let req = (opts) => Proxmox.Utils.API2Request(Ext.apply({ waitMsgTarget: me }, opts));
+
+            let writeFile = function (secret) {
+                req({
+                    url: '/meta/' + me.kind + '/' + encodeURIComponent(plan.file),
+                    method: 'PUT',
+                    // `digest: ''` is "this file must not exist yet", so two
+                    // administrators creating the same name is a 409 rather than one
+                    // silently overwriting the other.
+                    params: { data: Ext.encode(plan.content), mode: 'replace', digest: '' },
+                    failure: fail(gettext('writing the file')),
+                    success: function () {
+                        me.reload();
+                        if (secret) {
+                            PVE.meta.ServiceToken.showSecret(plan, secret);
+                            return;
+                        }
+                        me.editOne({ data: { id: me.kind + '/' + plan.file } });
+                    },
+                });
+            };
+            if (!plan.user) {
+                writeFile(null);
+                return;
+            }
+            let addAcl = function (secret) {
+                if (!plan.acl) {
+                    writeFile(secret);
+                    return;
+                }
+                req({
+                    url: '/access/acl',
+                    method: 'PUT',
+                    params: {
+                        path: plan.acl.path,
+                        roles: plan.acl.role,
+                        propagate: plan.acl.propagate,
+                        users: plan.user,
+                    },
+                    failure: fail(gettext('granting guest access')),
+                    success: () => writeFile(secret),
+                });
+            };
+            let addToken = function () {
+                req({
+                    url: '/access/users/' + encodeURIComponent(plan.user) + '/token/' +
+                        encodeURIComponent(plan.tokenid),
+                    method: 'POST',
+                    // privsep off: this user exists only to carry this token, and with
+                    // it on, a role added to the user later would silently not apply.
+                    params: { privsep: 0 },
+                    failure: fail(gettext('creating the token')),
+                    success: function (response) {
+                        made.push(plan.authid);
+                        addAcl((response.result.data || {}).value);
+                    },
+                });
+            };
+            req({
+                url: '/access/users',
+                method: 'POST',
+                // No password: this user cannot log in, only its token can act.
+                params: { userid: plan.user, comment: 'pve-meta service principal' },
+                failure: function (response) {
+                    // An existing user is the normal case for a second token on the
+                    // same principal, not an error to stop on.
+                    if (String(response.htmlStatus || '').indexOf('already exists') !== -1) {
+                        addToken();
+                        return;
+                    }
+                    fail(gettext('creating the user'))(response);
                 },
-                failure: (response) =>
-                    Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error')),
+                success: function () {
+                    made.push(plan.user);
+                    addToken();
+                },
             });
         });
         win.show();
