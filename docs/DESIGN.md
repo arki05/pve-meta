@@ -1,7 +1,7 @@
 # pve-meta — design (revision 6)
 
 Revision 6 splits revision 5's "operator registration" into a **prefix** and a
-**permission** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 (`DESIGN-rev4.md`, kept for the record) and the
+**permission** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 and the
 review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
 deviations recorded in §11. It is the single authority for the code; where code and this
 document disagree, the code is wrong.

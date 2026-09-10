@@ -99,9 +99,9 @@ install:
 	# pve-ext/bin/pve-ext-patch's header comment, "manifest_id"). Resolved
 	# via pve-ext-patch's own "manifest-id" subcommand rather than a second,
 	# independently-drifting awk parser of the same TOML rule (this
-	# Makefile's own copy used to lack the diff tool's trailing-comment
-	# strip and single-quote support -- see docs/REVIEW-2026-09-08-pass3.md,
-	# Makefile:79 finding).
+	# Makefile's own copy had already drifted: it lacked the diff tool's
+	# trailing-comment strip and single-quote support when a review compared
+	# the two).
 	lifecycle_id="$$(pve-ext/bin/pve-ext-patch manifest-id patches/lifecycle.toml)" || exit 1; \
 	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
