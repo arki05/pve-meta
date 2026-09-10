@@ -164,7 +164,7 @@ mod pve_rs_meta {
     /// window in which a `PUT` that landed after the vmlist was read had its
     /// fresh document purged.
     #[export]
-    pub fn gc_candidates(vmids: Vec<u32>) -> Result<Vec<u32>, Error> {
+    pub fn gc_candidates(vmids: Vec<u32>) -> Result<Vec<u32>, api::ApiError> {
         api::gc_candidates(&open_store(), &vmids)
     }
 
@@ -177,7 +177,7 @@ mod pve_rs_meta {
     /// which is also what a process that has not called
     /// `PVE::Cluster::cfs_update()` sees.
     #[export]
-    pub fn gc_purge(vmid: u32, live: Vec<u32>) -> Result<usize, Error> {
+    pub fn gc_purge(vmid: u32, live: Vec<u32>) -> Result<usize, api::ApiError> {
         api::gc_purge(&open_store(), vmid, &live)
     }
 
@@ -200,7 +200,7 @@ mod pve_rs_meta {
     /// Dies on an empty `$vmids`, like `gc_purge`: it is indistinguishable
     /// from a caller that has not run `PVE::Cluster::cfs_update()`.
     #[export]
-    pub fn gc(vmids: Vec<u32>) -> Result<usize, Error> {
+    pub fn gc(vmids: Vec<u32>) -> Result<usize, api::ApiError> {
         api::gc(&open_store(), &vmids)
     }
 
@@ -216,9 +216,11 @@ mod pve_rs_meta {
     //
     // Thin wrappers over `pve_meta_core::api` (see that module's docs for the
     // wire contract and the authorization rules). All of these die with a
-    // Rust `anyhow::Error` whose `Display` is `"NNN: message"` (an HTTP
-    // status prefix); the Perl layer parses that prefix and re-raises via
-    // `PVE::Exception::raise`.
+    // Rust `pve_meta_core::api::ApiError` whose `Display` is `"NNN: message"`
+    // (an HTTP status prefix); the Perl layer parses that prefix and
+    // re-raises via `PVE::Exception::raise`. `perlmod`'s `#[export]` only
+    // needs the error type to be `Display`, so this needs no conversion back
+    // to `anyhow::Error`.
     //
     // `$acl` is a native hash: `{ authid, read, write, tags => [...] }`,
     // where `read`/`write` are the PVE ACL answers for the document being
@@ -232,7 +234,7 @@ mod pve_rs_meta {
     /// directories instead of the whole store — the cheap poll an open editor
     /// wants, and the only form whose cost does not grow with the cluster.
     #[export]
-    pub fn api_version(detail: bool, id: Option<&str>) -> Result<api::ApiVersion, Error> {
+    pub fn api_version(detail: bool, id: Option<&str>) -> Result<api::ApiVersion, api::ApiError> {
         api::version(&open_store(), detail, id)
     }
 
@@ -273,7 +275,7 @@ mod pve_rs_meta {
         authid: &str,
         guests: Vec<GuestInput>,
         has: Option<&str>,
-    ) -> Result<Vec<api::GuestListEntry>, Error> {
+    ) -> Result<Vec<api::GuestListEntry>, api::ApiError> {
         api::list_guests(&open_store(), &open_permissions(), authid, &guests, has)
     }
 
@@ -285,7 +287,7 @@ mod pve_rs_meta {
         view: Option<&str>,
         format: &str,
         acl: CallerAcl,
-    ) -> Result<api::ApiViewDocument, Error> {
+    ) -> Result<api::ApiViewDocument, api::ApiError> {
         api::get_document(&open_store(), &open_permissions(), id, view, format, &acl)
     }
 
@@ -309,7 +311,7 @@ mod pve_rs_meta {
         digest: Option<&str>,
         dry_run: bool,
         acl: CallerAcl,
-    ) -> Result<api::ApiPutResult, Error> {
+    ) -> Result<api::ApiPutResult, api::ApiError> {
         api::put_document(
             &open_store(),
             &open_permissions(),
@@ -332,7 +334,7 @@ mod pve_rs_meta {
         view: Option<&str>,
         digest: Option<&str>,
         acl: CallerAcl,
-    ) -> Result<api::ApiPutResult, Error> {
+    ) -> Result<api::ApiPutResult, api::ApiError> {
         api::delete_document(&open_store(), &open_permissions(), id, view, digest, &acl)
     }
 }
