@@ -84,11 +84,6 @@ install:
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
-	# pve-ext UI-page manifests (see pages/, pve-ext/README.md). Two of them, one
-	# per target shape: a guest tab is one document's editor, the datacenter tab is
-	# that plus the two registry lists, and a manifest carries a single `xtype`.
-	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
-	install -D -m 0644 pages/pve-meta-dc.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-dc.json
 	# pve-ext managed-patch manifest for the guest-lifecycle hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
 	# the whole lifecycle is one patched file, see docs/LIFECYCLE-PATCHES.md).
@@ -213,4 +208,3 @@ test:
 
 clean:
 	$(CARGO) clean
-	rm -rf $(UI_DIST)
