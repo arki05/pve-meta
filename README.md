@@ -126,8 +126,8 @@ are `protected` and run in pvedaemon.
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
 | GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes, tags }` for that document, selectors already resolved; `tags` are the guest's PVE tags (`VM.Audit` only, empty otherwise); without either, the caller's own datacenter read/write |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
-| GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies. A file that did not parse is listed too, as `{ prefix, origin, error }` and nothing else, so it can be found and repaired instead of silently ceasing to exist |
+| GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column. A file that did not parse is listed as `{ name, origin, error }`; it grants nothing |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/permissions/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix definition/permission file. `Sys.Modify` on `/` to write |
 | GET | `/meta/schemas` | — | `{ prefix, permission }` — the two registry file formats described as schemas, which is what lets the editor show a prefix file as a typed tree |
 
