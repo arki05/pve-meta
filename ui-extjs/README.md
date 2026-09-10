@@ -41,8 +41,8 @@ segmented button at the right end of the toolbar.
   cell tooltip spells each one out with its selector (`example-traefik (rw, all
   guests)`). Several principals may read a subtree; this column is about who writes and
   who subscribes, not ownership. Scopes apply to guest documents only, so the datacenter
-  tree has no entries. `selector: { tag: … }` is resolved against the guest's `tags` from
-  `GET /meta/guests`, fetched only when some grant actually uses a tag selector.
+  tree has no entries. `selector: { tag: … }` is resolved against the guest's `tags`, which
+  `GET /meta/access` returns alongside the access answer.
 * **No per-row action icons.** The toolbar is **Add | Edit | Remove | Edit selection as
   text | Reload**, all targeting the selection: Add goes into the selected map, the
   parent of a selected leaf, or the document root; Edit and Remove need a row; *Edit

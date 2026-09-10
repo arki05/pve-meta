@@ -124,7 +124,7 @@ sub cmd_ls {
 
     # The store's own walk (docs/DESIGN.md section 5), so this lists a document
     # whether or not it parses -- the one an administrator most needs to find.
-    my $version = call(sub { PVE::RS::Meta::api_version(1) });
+    my $version = call(sub { PVE::RS::Meta::api_version(1, undef) });
     my @docs = @{ $version->{documents} || [] };
     if ($format eq 'json') {
         print JSON::PP->new->canonical->encode(\@docs), "\n";

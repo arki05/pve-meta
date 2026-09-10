@@ -68,6 +68,27 @@
 // `make doc` still fails on a link that resolves to nothing at all.
 #![allow(rustdoc::private_intra_doc_links)]
 
+/// Warns to stderr, with a `pve-meta:` tag so the line is greppable in the
+/// journal.
+///
+/// `libpve_meta_rs.so` is loaded into pvedaemon and pveproxy, and **nothing
+/// anywhere initialises a `tracing` subscriber** -- so every `tracing::warn!`
+/// this crate used to emit was discarded, and `docs/DESIGN.md` §3.3's "a
+/// malformed file is skipped with a warning" was simply not true in
+/// production. stderr is the one sink already wired up in every caller: the
+/// daemons capture their workers' stderr into the journal, the `pve-meta` CLI
+/// writes it to the terminal, and the test binaries show it on failure.
+///
+/// The structure a subscriber would have added is not worth a dependency
+/// inside a `.so` that lives in pvedaemon, for four call sites nobody
+/// machine-reads.
+#[macro_export]
+macro_rules! warn_line {
+    ($($arg:tt)*) => {
+        eprintln!("pve-meta: {}", format_args!($($arg)*))
+    };
+}
+
 pub mod api;
 pub mod digest;
 pub mod error;

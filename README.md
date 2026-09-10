@@ -112,13 +112,13 @@ are `protected` and run in pvedaemon.
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | `detail` | `{ token, changed }` — content hash over the store; poll it |
+| GET | `/meta/version` | `detail`, `id` | `{ token, changed }` — content hash over the store; poll it. With `id`, over that one document plus the registry directories instead |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags, digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's permissions, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes }` for that document, selectors already resolved; without either, the caller's own datacenter read/write |
+| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes, tags }` for that document, selectors already resolved; `tags` are the guest's PVE tags (`VM.Audit` only, empty otherwise); without either, the caller's own datacenter read/write |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/permissions/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix definition/permission file. `Sys.Modify` on `/` to write |

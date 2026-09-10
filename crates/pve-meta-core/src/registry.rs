@@ -441,7 +441,10 @@ fn load_dirs<T>(
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, kind, "skipping unreadable file");
+                    crate::warn_line!(
+                        "skipping unreadable {kind} file {}: {e}",
+                        path.display()
+                    );
                     continue;
                 }
             };
@@ -454,7 +457,10 @@ fn load_dirs<T>(
                     by_name.insert(name, parsed);
                 }
                 Err(e) => {
-                    tracing::warn!(file = %path.display(), error = %e, kind, "skipping malformed file");
+                    crate::warn_line!(
+                        "skipping malformed {kind} file {}: {e}",
+                        path.display()
+                    );
                 }
             }
         }

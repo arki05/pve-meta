@@ -356,6 +356,18 @@ __PACKAGE__->register_method({
                 default => 0,
                 description => "Also return each document's digest.",
             },
+            id => {
+                type => 'string',
+                optional => 1,
+                description => "Watch just this document: a vmid, 'datacenter', "
+                    . "'prefixes/<name>' or 'permissions/<name>'. The token then covers "
+                    . "that document plus the prefix and permission directories, and "
+                    . "nothing else -- which is what an open editor watches, at a cost "
+                    . "that does not grow with the number of guests. Tokens from "
+                    . "different 'id' are not comparable with each other or with the "
+                    . "unscoped one; poll with a fixed 'id' and compare against your own "
+                    . "previous answer.",
+            },
         },
     },
     returns => {
@@ -380,7 +392,11 @@ __PACKAGE__->register_method({
     },
     code => sub {
         my ($param) = @_;
-        return _call(\&PVE::RS::Meta::api_version, $param->{detail} ? 1 : 0);
+        # No ACL check, and none is needed: a token is a hash over content the
+        # 'detail' listing already hands to every authenticated user unfiltered
+        # (docs/DESIGN.md §1), and a bad id is refused by the one id parser
+        # rather than falling back to the whole store.
+        return _call(\&PVE::RS::Meta::api_version, $param->{detail} ? 1 : 0, $param->{id});
     },
 });
 
@@ -422,6 +438,16 @@ __PACKAGE__->register_method({
             read => { type => 'boolean', description => "May read the whole document (ACL)." },
             write => { type => 'boolean', description => "May write the whole document (ACL)." },
             scopes => $SCOPES_RETURNS,
+            tags => {
+                type => 'array',
+                description => "The guest's PVE tags, which is what a permission's or "
+                    . "prefix's 'selector: {tag: t}' matches against. Empty for any other "
+                    . "document, and for a caller without VM.Audit on the guest -- the "
+                    . "same filter GET /meta/guests applies to the same field. Here so "
+                    . "the editor does not have to read every document in the cluster "
+                    . "(GET /meta/guests) to learn one guest's tags.",
+                items => { type => 'string' },
+            },
         },
     },
     code => sub {

@@ -227,9 +227,13 @@ mod pve_rs_meta {
 
     /// `GET /meta/version` -> `{ token, changed }`, plus `documents`
     /// (`[{ id, digest }]`, sorted) when `$detail` is true.
+    ///
+    /// With `$id`, the token covers that one document plus the registry
+    /// directories instead of the whole store — the cheap poll an open editor
+    /// wants, and the only form whose cost does not grow with the cluster.
     #[export]
-    pub fn api_version(detail: bool) -> Result<api::ApiVersion, Error> {
-        api::version(&open_store(), detail)
+    pub fn api_version(detail: bool, id: Option<&str>) -> Result<api::ApiVersion, Error> {
+        api::version(&open_store(), detail, id)
     }
 
     /// `GET /meta/permissions` -> every permission, as native hashes.

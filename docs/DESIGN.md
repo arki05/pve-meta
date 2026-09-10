@@ -244,13 +244,13 @@ covering only the keywords we happened to think of. The small form that *does* e
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | `detail` | `{ token, changed }` — content hash over the store; poll it. With `detail`, also `documents: [{ id, digest }]` (sorted) so a caller that saw the token move knows which documents to re-read instead of re-listing. Snapshot copies move `token` but are not documents and are not listed. Digests are unfiltered (§1). |
+| GET | `/meta/version` | `detail`, `id` | `{ token, changed }` — content hash over the store; poll it. With `detail`, also `documents: [{ id, digest }]` (sorted) so a caller that saw the token move knows which documents to re-read instead of re-listing. Snapshot copies move `token` but are not documents and are not listed. Digests are unfiltered (§1). With `id`, the token covers that one document plus the prefix and permission directories and nothing else — what an open editor watches, at a cost that does not grow with the number of guests. Tokens of different scope are not comparable; poll with a fixed `id`. |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags: [..], digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
-| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes: [{ prefix, mode }] }` for that document (selectors already resolved); without either, the caller's datacenter read/write |
+| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document (selectors already resolved); `tags` are the guest's PVE tags, filtered exactly as `/meta/guests` filters them (`VM.Audit` only) and empty for any other document; without either parameter, the caller's datacenter read/write |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
 | GET | `/meta/permissions` | — | `[{ name, authid, rules: [{ prefix, mode, selector }] }]` — every permission file, readable by every authenticated user |
 | GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
@@ -608,8 +608,12 @@ miss — a role there lets the principal read *all* metadata on those guests, be
 datacenter), and that is the whole audience: PVE's own resource tree lists a guest only
 to a caller holding `VM.Audit` on it (`PVE::API2::Cluster::resources`), so a principal
 holding nothing but permissions has no guest to open the tab on, whatever the manifest says.
-Tag selectors are therefore resolved against `GET /meta/guests`' `tags` (§5) and nothing
-else, and no server-resolved fallback is needed for a caller this page can have. Grants
+Tag selectors are therefore resolved against the server-supplied `tags` on
+`GET /meta/access` (§5) and nothing else, and no server-resolved fallback is needed for a
+caller this page can have. Those tags used to come from `GET /meta/guests`, which reads
+every document in the cluster to answer a question about one guest; they are the same
+tags, computed by the same ACL check, under the same `VM.Audit` filter -- the client
+still only *matches* tags it was given, and never learns one it could not have read. Grants
 lose nothing by that: they bind server-side, on the API a scope-only principal actually
 uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
 exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.

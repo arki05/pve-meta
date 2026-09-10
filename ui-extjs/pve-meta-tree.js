@@ -25,8 +25,9 @@
  * `GET /meta/access`. A commit is one minimal write:
  *   PUT /meta/guests/{vmid}?view=<dotted.path>&mode=replace&data=<json>&digest=<d>
  * 409 (digest mismatch) reloads and reports the API's message verbatim. A 5 s poll of
- * `GET /meta/version` refreshes the tree when the content token changed — never while a
- * row editor, the text window or the Text card is open.
+ * `GET /meta/version?id=<docid>` — this document plus the registry, never the whole
+ * store — refreshes the tree when the content token changed, and never while a row
+ * editor, the text window or the Text card is open.
  *
  * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
  * card on the whole document, and the diff that confirms either one's Apply. Its AMD
@@ -2958,11 +2959,9 @@ Ext.define('PVE.meta.TreePanel', {
         Proxmox.Utils.setErrorMask(me, true);
         me.loadPrefixes(() =>
             me.loadPermissions(() =>
-                me.loadTags(() =>
-                    me.loadAccess(() =>
-                        me.loadSchemas(() =>
-                            me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
-                        ),
+                me.loadAccess(() =>
+                    me.loadSchemas(() =>
+                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
                     ),
                 ),
             ),
@@ -3005,29 +3004,12 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    // Only needed to resolve `selector: { tag: t }`, so only fetched when one exists.
-    loadTags: function (next) {
-        let me = this;
-        me.tags = [];
-        let hasTagSelector = (list, key) =>
-            (list || []).some((e) => (e[key] || []).some((x) => x.selector && x.selector.tag));
-        let needed =
-            (me.prefixes || []).some((n) => n.selector && n.selector.tag) ||
-            hasTagSelector(me.permissions, 'rules');
-        if (me.dc || !needed) {
-            next();
-            return;
-        }
-        me.request({
-            url: '/meta/guests',
-            success: function (response) {
-                let row = (response.result.data || []).find((g) => String(g.vmid) === String(me.vmid));
-                me.tags = (row && row.tags) || [];
-                next();
-            },
-            failure: () => next(),
-        });
-    },
+    // There is no separate tag request: `GET /meta/access` returns the guest's
+    // tags with the access answer (see `loadAccess`). It used to be
+    // `GET /meta/guests`, which reads, parses and digests every document in the
+    // cluster -- to learn one guest's tags, on every open of every guest tab
+    // that has a `tag:` selector anywhere in the registry, which the shipped
+    // traefik prefix has.
 
     loadAccess: function (next) {
         let me = this;
@@ -3041,7 +3023,12 @@ Ext.define('PVE.meta.TreePanel', {
             // certainly read (DESIGN §3.5).
             params: { id: me.docId },
             success: function (response) {
-                me.access = response.result.data || { read: 0, write: 0, scopes: [] };
+                me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
+                // The server resolved the selectors it enforces; these tags are
+                // for the *rendering* decisions the client makes on top -- which
+                // prefixes apply to this guest. Same tags, same authority, one
+                // request instead of two.
+                me.tags = me.access.tags || [];
                 me.syncAccessLabel();
                 next();
             },
@@ -3131,6 +3118,13 @@ Ext.define('PVE.meta.TreePanel', {
         Proxmox.Utils.API2Request({
             url: '/meta/version',
             method: 'GET',
+            // Scoped to the document this panel shows. Unscoped, every tick of
+            // every open tab read and hashed every document *and every snapshot
+            // copy* in the cluster to answer a question about one guest, and any
+            // guest changing anywhere reloaded every open editor. The scoped
+            // token still covers the prefix and permission directories, so a
+            // registry change reloads this panel the way it always did.
+            params: { id: me.docId },
             failure: Ext.emptyFn, // transient; the next tick tries again
             success: function (response) {
                 let token = (response.result.data || {}).token;
@@ -3154,7 +3148,7 @@ Ext.define('PVE.meta.TreePanel', {
     // --- rows ---------------------------------------------------------------
 
     // Both lists below resolve `selector: { tag: t }` against `me.tags`, which
-    // `GET /meta/guests` fills in only for a caller with VM.Audit (DESIGN §5).
+    // `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §5).
     // That is not a gap here: this is a guest tab, and a caller without VM.Audit
     // on `/vms/<vmid>` never sees the guest in the resource tree at all
     // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this

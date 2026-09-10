@@ -341,7 +341,7 @@ pub struct ApiVersion {
     pub changed: u64,
     /// With `detail`: every document's own digest, sorted by id, so a caller
     /// that saw the token move can tell **which** documents to re-read instead
-    /// of re-listing the store.
+    /// of re-listing the store. With an `id` as well, just that one document.
     ///
     /// Unfiltered by design. A digest is not sensitive (`docs/DESIGN.md` §1
     /// puts digests and listings out of scope), and filtering would cost a
@@ -420,6 +420,19 @@ pub struct ApiAccess {
     pub read: bool,
     pub write: bool,
     pub scopes: Vec<Scope>,
+    /// The guest's PVE tags — empty for any other document.
+    ///
+    /// Here so an editor can resolve `selector: {tag: …}` without a second
+    /// request: the alternative was `GET /meta/guests`, which reads, parses
+    /// and digests **every** document in the cluster to answer a question
+    /// about one guest. The tags come from the same place either way — Perl
+    /// computed them for this request's ACL check — so the rule that the
+    /// server supplies tags and the client only matches them is unchanged.
+    ///
+    /// Filtered exactly as `GET /meta/guests` filters the same field: a
+    /// caller without `VM.Audit` on the guest gets an empty list, not the
+    /// tags (`docs/DESIGN.md` §5).
+    pub tags: Vec<String>,
 }
 
 /// One row of `GET /meta/guests`' input: the vmlist row Perl already has,
@@ -447,8 +460,20 @@ pub struct GuestInput {
 }
 
 /// `api_version()` -> `{ token, changed }`.
-pub fn version(store: &MetaStore, detail: bool) -> Result<ApiVersion, anyhow::Error> {
-    let v = store.version().map_err(api_err)?;
+///
+/// With `id`, the token covers that document plus the registry directories and
+/// nothing else ([`MetaStore::version_of`]) — what an open editor is actually
+/// watching, at a cost that does not grow with the number of guests in the
+/// cluster. A scoped and an unscoped token are not comparable, which is a
+/// caller's business: each poller compares a token against its own previous
+/// one.
+pub fn version(
+    store: &MetaStore,
+    detail: bool,
+    id: Option<&str>,
+) -> Result<ApiVersion, anyhow::Error> {
+    let doc_id = id.map(parse_id).transpose()?;
+    let v = store.version_of(doc_id.as_ref()).map_err(api_err)?;
     Ok(ApiVersion {
         token: v.token,
         changed: unix_secs(v.changed),
@@ -471,13 +496,14 @@ pub fn schemas() -> Value {
     crate::metaschema::schemas()
 }
 
-/// `GET /meta/access`: `{ read, write, scopes }` for one document.
+/// `GET /meta/access`: `{ read, write, scopes, tags }` for one document.
 pub fn access(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
     let g = effective(permission_files, doc_id, acl);
     ApiAccess {
         read: g.full_read,
         write: g.full_write,
         scopes: g.scopes,
+        tags: if acl.read { acl.tags.clone() } else { Vec::new() },
     }
 }
 
@@ -1127,15 +1153,83 @@ fn version_detail_names_the_documents_that_changed() {
         store.put_raw(&DocId::Datacenter, "b: 2\n", None).unwrap();
 
         // Without `detail` the shape is unchanged: no `documents` on the wire.
-        let plain = version(&store, false).unwrap();
+        let plain = version(&store, false, None).unwrap();
         assert!(plain.documents.is_none());
 
-        let detailed = version(&store, true).unwrap();
+        let detailed = version(&store, true, None).unwrap();
         let docs = detailed.documents.expect("detail asked for");
         let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(ids, vec!["100", "datacenter"]);
         assert_eq!(docs[0].digest, store.read(&DocId::Guest(100)).unwrap().digest);
         assert_eq!(detailed.token, plain.token, "detail does not change the token");
+    }
+
+    #[test]
+    fn a_scoped_version_ignores_other_documents_and_snapshots() {
+        let (dir, store) = store();
+        store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+        store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
+
+        let mine = || version(&store, false, Some("100")).unwrap().token;
+        let before = mine();
+
+        // Another guest's document: the unscoped token moves, mine does not.
+        let whole_before = version(&store, false, None).unwrap().token;
+        store.put_raw(&DocId::Guest(101), "b: 2\n", None).unwrap();
+        assert_ne!(version(&store, false, None).unwrap().token, whole_before);
+        assert_eq!(mine(), before, "another guest is not my document");
+
+        // My own snapshot copy is not my document either -- it is exactly the
+        // per-guest fan-out this scoping exists to avoid.
+        std::fs::write(dir.path().join("100.snap.yaml"), "a: 9\n").unwrap();
+        assert_eq!(mine(), before, "a snapshot copy is not the document");
+
+        // My own document, and only when its content actually changed.
+        store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+        assert_eq!(mine(), before, "a rewrite with the same bytes is not a change");
+        store.put_raw(&DocId::Guest(100), "a: 2\n", None).unwrap();
+        assert_ne!(mine(), before);
+    }
+
+    #[test]
+    fn a_scoped_version_still_watches_the_registry() {
+        // The registry decides what the document *looks like* and who may
+        // write it, so a scoped poll that missed it would leave an open editor
+        // rendering against a schema that no longer exists.
+        let (dir, store) = store();
+        store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+        let prefixes = dir.path().join("registry/prefixes");
+        std::fs::create_dir_all(&prefixes).unwrap();
+
+        for (id, body) in [("100", "selector: {all: true}\n"), ("prefixes/homelab", "selector: {tag: web}\n")] {
+            let before = version(&store, false, Some(id)).unwrap().token;
+            std::fs::write(prefixes.join("homelab.yaml"), body).unwrap();
+            assert_ne!(
+                version(&store, false, Some(id)).unwrap().token,
+                before,
+                "a prefix appearing must move the token for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scoped_version_names_only_its_own_document() {
+        let (_dir, store) = store();
+        store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+        store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
+
+        let docs = version(&store, true, Some("100")).unwrap().documents.unwrap();
+        let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["100"]);
+    }
+
+    #[test]
+    fn a_scoped_version_refuses_a_garbage_id() {
+        // The same parser every other endpoint uses: a 400, not a 500 and not
+        // a silent fall back to the whole store.
+        let (_dir, store) = store();
+        let err = version(&store, false, Some("nope")).unwrap_err().to_string();
+        assert!(err.starts_with("400: "), "{err}");
     }
 
     #[test]
@@ -1707,6 +1801,29 @@ fn version_detail_names_the_documents_that_changed() {
     }
 
     #[test]
+    fn access_returns_the_tags_only_to_a_caller_who_may_read_the_guest() {
+        // This field exists so the editor stops calling `GET /meta/guests`
+        // just to learn one guest's tags. It must therefore be filtered the
+        // way that endpoint filters the same field, or moving it would have
+        // widened who can see a guest's tags.
+        let permission_files = regs();
+
+        let mut auditor = full();
+        auditor.tags = vec!["traefik".to_string()];
+        let seen = access(&permission_files, &DocId::Guest(100), &auditor);
+        assert_eq!(seen.tags, vec!["traefik".to_string()]);
+
+        // A scope-only principal has no VM.Audit: it gets the scopes its
+        // permission file grants -- resolved against those very tags -- but
+        // not the tags themselves.
+        let hidden = access(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
+        assert!(hidden.tags.is_empty(), "no VM.Audit, no tags");
+        assert_eq!(hidden.scopes.len(), 2, "the selector still resolved server-side");
+
+        assert!(access(&permission_files, &DocId::Datacenter, &full()).tags.is_empty());
+    }
+
+    #[test]
     fn permissions_list_returns_every_permission() {
         let gs = permissions_list(&regs());
         assert_eq!(gs.len(), 1);
@@ -1819,8 +1936,8 @@ fn version_detail_names_the_documents_that_changed() {
         assert_eq!(listed[0].digest, "");
 
         // The version poll skips it rather than failing.
-        assert!(version(&store, false).is_ok());
-        assert!(version(&store, true).is_ok());
+        assert!(version(&store, false, None).is_ok());
+        assert!(version(&store, true, None).is_ok());
 
         // A DELETE of a document another caller already removed is that
         // caller's request satisfied.

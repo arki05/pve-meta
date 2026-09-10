@@ -238,16 +238,39 @@ write_file('datacenter.yaml', "note: keep me\n");
 write_file('9100.yaml', "a: 1\n");
 write_file('9100.keep.yaml', "a: 1\n");
 
-my $v = PVE::RS::Meta::api_version(0);
+my $v = PVE::RS::Meta::api_version(0, undef);
 like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
 ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
 ok(!defined($v->{documents}), 'no `documents` without detail');
 
-my $vd = PVE::RS::Meta::api_version(1);
+my $vd = PVE::RS::Meta::api_version(1, undef);
 is($vd->{token}, $v->{token}, 'detail does not change the token');
 ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
 is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200', 'datacenter'],
     'every guest and the datacenter document are listed by id, and the snapshot copy is not');
+
+# Scoped to one document: its own file plus the registry directories, and
+# nothing else. This is the form the editor polls, so the arity has to work
+# across the perlmod boundary as well as the semantics.
+my $scoped_v = PVE::RS::Meta::api_version(0, '9100');
+like($scoped_v->{token}, qr/^[0-9a-f]{64}$/, 'api_version takes an id');
+isnt($scoped_v->{token}, $v->{token}, 'a scoped token is its own token, not the store-wide one');
+is_deeply(
+    [map { $_->{id} } @{ PVE::RS::Meta::api_version(1, '9100')->{documents} }],
+    ['9100'],
+    'detail with an id names only that document',
+);
+write_file('9200.yaml', "moved: yes\n");
+is(PVE::RS::Meta::api_version(0, '9100')->{token}, $scoped_v->{token},
+    'another guest changing does not move a scoped token');
+isnt(PVE::RS::Meta::api_version(0, undef)->{token}, $v->{token},
+    '... though it does move the store-wide one');
+write_file('9100.yaml', "a: 2\n");
+isnt(PVE::RS::Meta::api_version(0, '9100')->{token}, $scoped_v->{token},
+    'and the document itself changing does move it');
+
+eval { PVE::RS::Meta::api_version(0, 'not-an-id') };
+like($@, api_error_status(400), 'a garbage id is a 400, not a silent whole-store poll');
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
@@ -434,6 +457,19 @@ my $tagged = PVE::RS::Meta::api_access('9400', scoped_acl('traefik'));
 is_deeply([map { $_->{prefix} } @{ $tagged->{scopes} }], ['traefik', 'netbird'],
     'with the tag, both scopes apply');
 is_deeply([map { $_->{mode} } @{ $tagged->{scopes} }], ['rw', 'ro'], '... with their modes');
+
+# The tags come back with the access answer, so an editor never has to read
+# every document in the cluster (GET /meta/guests) to learn one guest's. They
+# are filtered exactly as that endpoint filters them: no VM.Audit, no tags.
+is_deeply($tagged->{tags}, [], 'a caller without VM.Audit is told its scopes but not the tags');
+is_deeply(
+    PVE::RS::Meta::api_access('9400',
+        { authid => 'root@pam', read => 1, write => 1, tags => ['traefik', 'web'] })->{tags},
+    ['traefik', 'web'],
+    'a caller with VM.Audit gets the guest tags back',
+);
+is_deeply(PVE::RS::Meta::api_access('datacenter', $FULL)->{tags}, [],
+    'the datacenter document has no tags');
 is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', scoped_acl('traefik'))->{data},
     { traefik => { spec => { host => 'ct.example' } }, netbird => { groups => ['lan'] } },
     'and the read now carries both subtrees, but never `other`');
@@ -664,7 +700,7 @@ my ($listed_big) = grep { $_->{vmid} == 9504 }
     @{ PVE::RS::Meta::api_list_guests('root@pam', [guest_row(9504, read => 1)], undef) };
 ok(defined($listed_big), 'one oversized document does not take the listing down');
 isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
-ok(defined(PVE::RS::Meta::api_version(0)->{token}), '... nor the version poll');
+ok(defined(PVE::RS::Meta::api_version(0, undef)->{token}), '... nor the version poll');
 
 $res = eval { PVE::RS::Meta::api_put('9504', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
 ok(!defined($res), 'a view write against an oversized document is refused');
@@ -679,10 +715,10 @@ PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
 # is skipped: `version()`'s token does not move for it, so `changed` must not
 # either.
 write_file('9506.yaml', "traefik:\n  spec:\n    host: x\n");
-my $noop_before = PVE::RS::Meta::api_version(0);
+my $noop_before = PVE::RS::Meta::api_version(0, undef);
 my $noop = PVE::RS::Meta::api_put('9506', 'traefik.spec', 'json', '{}', 'merge', undef, 0, $FULL);
 is_deeply($noop->{touched}, [], 'a no-op merge touches nothing');
-is_deeply(PVE::RS::Meta::api_version(0), $noop_before, '... and moves neither token nor changed');
+is_deeply(PVE::RS::Meta::api_version(0, undef), $noop_before, '... and moves neither token nor changed');
 is(read_file('9506.yaml'), "traefik:\n  spec:\n    host: x\n", '... and rewrites nothing');
 unlink("$root/9506.yaml");
 

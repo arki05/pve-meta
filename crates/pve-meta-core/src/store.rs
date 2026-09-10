@@ -44,8 +44,8 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
 
-/// Warn threshold for document size (informational only; logged via
-/// `tracing`).
+/// Warn threshold for document size (informational only; warned to stderr via
+/// [`crate::warn_line`]).
 pub const WARN_BYTES: u64 = 256 * 1024;
 /// Hard limit for document size; exceeding it is [`Error::TooLarge`].
 ///
@@ -443,7 +443,7 @@ impl MetaStore {
             });
         }
         if size > WARN_BYTES {
-            tracing::warn!(size, warn_bytes = WARN_BYTES, "document approaching size limit");
+            crate::warn_line!("document approaching size limit: {size} bytes (warn at {WARN_BYTES})");
         }
         Ok(())
     }
@@ -535,7 +535,9 @@ impl MetaStore {
         let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
             Ok(value) => (value, None),
             Err(e) => {
-                tracing::warn!(document = %id, error = %e, "stored document is not valid YAML; reading it as empty");
+                crate::warn_line!(
+                    "stored document is not valid YAML; reading it as empty: {id}: {e}"
+                );
                 (Value::Object(serde_json::Map::new()), Some(e.to_string()))
             }
         };
@@ -881,6 +883,35 @@ impl MetaStore {
     /// against a concurrent `DELETE` or GC pass, and a poll must not 500
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
+        self.version_of(None)
+    }
+
+    /// [`MetaStore::version`], restricted to the one document a caller is
+    /// actually watching.
+    ///
+    /// `None` is the whole store. `Some(id)` covers `id`'s own file plus both
+    /// registry directories and nothing else, which is exactly what an open
+    /// editor needs: its document's content, and the prefixes and permissions
+    /// that decide how that content is rendered and who may write it.
+    ///
+    /// The registry directories are still walked whole, because they are the
+    /// unit of *shadowing*: a prefix appearing in the cluster directory
+    /// changes the governing schema without any document changing, and the
+    /// token has to move for that. They hold tens of files for a cluster, not
+    /// one per guest, which is the whole reason this scoping is worth having.
+    ///
+    /// What a scoped token deliberately does **not** see: other documents, and
+    /// `id`'s own snapshot copies. The unscoped token moves for both — every
+    /// file in the store root is an entry — so the two tokens are not
+    /// comparable, and a caller that changes scope sees its token move once
+    /// and reloads once. That is the only cost.
+    ///
+    /// The cost it removes is per open tab, per tick: the unscoped poll reads
+    /// and hashes every document *and every snapshot copy* in the cluster to
+    /// answer a question about one guest. At four guests that is invisible; at
+    /// three hundred with snapshots it is a thousand pmxcfs round-trips every
+    /// five seconds, per open editor.
+    pub fn version_of(&self, only: Option<&DocId>) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
         // A map, not a list: a prefix present in both the packaged and the
         // cluster directory is *one* document, and the effective one is the
@@ -892,14 +923,32 @@ impl MetaStore {
         let mut documents: BTreeMap<DocId, String> = BTreeMap::new();
         let mut latest: Option<SystemTime> = None;
 
-        self.scan_for_version(
-            &self.root.clone(),
-            "",
-            &mut entries,
-            &mut documents,
-            &mut latest,
-            &document_id,
-        )?;
+        match only {
+            // A registry document's own file is one the registry walk below
+            // already covers, and no guest document can affect it: the store
+            // root is not read at all.
+            Some(DocId::Registry(..)) => {}
+            Some(id) => {
+                let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
+                self.add_version_entry(
+                    &self.root.join(&file),
+                    &file,
+                    "",
+                    &mut entries,
+                    &mut documents,
+                    &mut latest,
+                    &document_id,
+                )?;
+            }
+            None => self.scan_for_version(
+                &self.root.clone(),
+                "",
+                &mut entries,
+                &mut documents,
+                &mut latest,
+                &document_id,
+            )?,
+        }
         for (kind, dirs) in [
             (RegistryKind::PrefixDef, &self.prefix_dirs),
             (RegistryKind::Permission, &self.permission_dirs),
@@ -958,28 +1007,60 @@ impl MetaStore {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(file_type) = gone_is_none(entry.file_type())? else {
-                continue;
-            };
-            if name.starts_with('.') || !file_type.is_file() {
+            if name.starts_with('.') {
                 continue;
             }
-            let Some(meta) = gone_is_none(entry.metadata())? else {
-                continue;
-            };
-            let mtime = meta.modified()?;
-            let Some(dig) = identify(&entry.path())? else {
-                continue;
-            };
-            if let Some(id) = id_of(&name) {
-                documents.insert(id, dig.clone());
-            }
-            entries.push((format!("{prefix}{name}"), dig));
-            *latest = Some(match *latest {
-                Some(t) if t >= mtime => t,
-                _ => mtime,
-            });
+            self.add_version_entry(
+                &entry.path(),
+                &name,
+                prefix,
+                entries,
+                documents,
+                latest,
+                id_of,
+            )?;
         }
+        Ok(())
+    }
+
+    /// One file's contribution to a version token: a `(prefix + name,
+    /// identity)` entry, plus a `documents` row when the name addresses a
+    /// document.
+    ///
+    /// A path that is not there, is not a regular file, or disappears between
+    /// two of the syscalls here contributes nothing rather than failing: a
+    /// poll must not 500 because a document was deleted between two ticks.
+    /// `symlink_metadata`, not `metadata`, so a symlink is skipped the same
+    /// way the directory walk's `file_type()` check skipped it.
+    #[allow(clippy::too_many_arguments)]
+    fn add_version_entry(
+        &self,
+        path: &std::path::Path,
+        name: &str,
+        prefix: &str,
+        entries: &mut Vec<(String, String)>,
+        documents: &mut BTreeMap<DocId, String>,
+        latest: &mut Option<SystemTime>,
+        id_of: &dyn Fn(&str) -> Option<DocId>,
+    ) -> Result<()> {
+        let Some(meta) = gone_is_none(fs::symlink_metadata(path))? else {
+            return Ok(());
+        };
+        if !meta.is_file() {
+            return Ok(());
+        }
+        let mtime = meta.modified()?;
+        let Some(dig) = identify(path)? else {
+            return Ok(());
+        };
+        if let Some(id) = id_of(name) {
+            documents.insert(id, dig.clone());
+        }
+        entries.push((format!("{prefix}{name}"), dig));
+        *latest = Some(match *latest {
+            Some(t) if t >= mtime => t,
+            _ => mtime,
+        });
         Ok(())
     }
 }
