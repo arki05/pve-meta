@@ -1411,15 +1411,18 @@ fn version_detail_names_the_documents_that_changed() {
         }
     }
 
+    /// Still true after the gate moved to the content, but for two different
+    /// reasons: a token with nothing has no write permission at all, and a
+    /// scope-only one cannot read the whole document it would be replacing.
     #[test]
-    fn zero_permission_token_cannot_write_the_root_view() {
+    fn a_token_without_full_read_cannot_write_the_root_view() {
         let (_dir, store) = store();
         seed(&store, "100", "traefik:\n  host: x\n");
         let before = read_raw(&store, "100").unwrap();
         for acl in [none(), scoped(&["traefik"])] {
             for (mode, payload) in [("merge", "{}"), ("replace", "{\"a\": 1}")] {
                 let err = put(&store, "100", None, "json", payload, mode, None, false, &acl)
-                    .expect_err("root writes need full write access");
+                    .expect_err("neither principal can name the root view");
                 assert_eq!(status(&err), 403, "{mode}: {err}");
             }
             let err = del(&store, "100", None, None, &acl).expect_err("root delete");
