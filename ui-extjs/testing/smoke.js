@@ -127,6 +127,33 @@ coversCases.forEach((c) => {
     eq(`covers(${JSON.stringify(c.prefix)}, ${JSON.stringify(c.path)}) -- ${c.why}`,
         U.covers(c.prefix, c.path), c.covered);
 });
+
+console.log('\n--- governing (shared fixture, mirrored in Rust) ---');
+// The other mirrored rule, and the one that had no shared table until now:
+// `crates/pve-meta-core/src/registry.rs`'s `governing` says the same thing this
+// does, and only one of the two runs in production. Testing each side against its
+// own hand-written cases is how a mirror drifts.
+//
+// The fixture hands over the declared prefixes UNSORTED and WITH their selectors,
+// because that is what a caller really has. The two sides factor the rest
+// differently -- Rust's `governing` filters by selector itself, while this side
+// filters first (`applicablePrefixes`) and then asks -- and both must sort
+// most-specific-first before asking. Running each side's whole chain is what makes
+// the table mean the same thing on both.
+const governingCases = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'governing-cases.json'), 'utf8'),
+).cases;
+eq('the shared governing fixture is present', governingCases.length >= 12, true);
+governingCases.forEach((c) => {
+    // What `TreePanel.applicablePrefixes` does, then what `grammarFor` hands to
+    // `governing`: the selector filter, then the specificity sort.
+    const applicable = c.prefixes.filter(
+        (p) => p.selector.all || (p.selector.tag && c.tags.indexOf(p.selector.tag) !== -1),
+    );
+    const got = U.governing(c.path, U.bySpecificity(applicable));
+    eq(`governing(${JSON.stringify(c.path)}) -- ${c.why}`, got && got.prefix, c.governing);
+});
+
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
 eq('isComment', [U.isComment('k__'), U.isComment('__'), U.isComment('k')], [true, true, false]);

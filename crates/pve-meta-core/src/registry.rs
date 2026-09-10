@@ -689,6 +689,75 @@ rules:
         assert!(only.iter().all(|p| p.origin == Origin::Cluster));
     }
 
+    /// The schema-shadowing rule against the fixture the JavaScript editor's
+    /// suite reads too (`testdata/governing-cases.json`).
+    ///
+    /// `governing` is mirrored in `ui-extjs`'s `PVE.meta.Utils.governing`, and
+    /// unlike `covers` only *one* of the two runs in production -- this one has
+    /// no caller in the crate at all (see its own doc comment). That makes the
+    /// shared table the entire point of keeping it: the dead twin is what holds
+    /// the live one honest, and a twin tested against its own hand-written
+    /// cases would drift without either side noticing.
+    ///
+    /// The fixture gives the prefixes unsorted and with their selectors, so
+    /// both sides run their whole chain -- here that is `load_prefixes` (parse,
+    /// then sort most-specific-first) followed by `governing` (which applies
+    /// the selector itself); over there it is the selector filter, then
+    /// `bySpecificity`, then `governing`. Factored differently, same answer, or
+    /// the editor paints a row against a schema the server never chose.
+    #[test]
+    fn governing_matches_the_shared_cases() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/governing-cases.json"
+        ))
+        .expect("the shared fixture is part of the repository");
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cases = doc["cases"].as_array().expect("cases array");
+        assert!(cases.len() >= 12, "the fixture should not have been emptied");
+
+        for case in cases {
+            // Through real files, because the file name *is* the prefix and the
+            // sort that `governing` relies on lives in `load_prefixes`. A test
+            // that built the list by hand would be testing neither.
+            let dir = tempfile::tempdir().unwrap();
+            for def in case["prefixes"].as_array().unwrap() {
+                let name = def["prefix"].as_str().unwrap();
+                let sel = &def["selector"];
+                let body = if sel["all"].as_bool() == Some(true) {
+                    "selector: {all: true}\n".to_string()
+                } else {
+                    format!("selector: {{tag: {}}}\n", sel["tag"].as_str().unwrap())
+                };
+                std::fs::write(dir.path().join(format!("{name}.yaml")), body).unwrap();
+            }
+            let prefixes = load_prefixes(&[dir.path().to_path_buf()]);
+            assert_eq!(
+                prefixes.len(),
+                case["prefixes"].as_array().unwrap().len(),
+                "every fixture prefix should have loaded"
+            );
+
+            let tags: Vec<String> = case["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_str().unwrap().to_string())
+                .collect();
+            let path = Path::parse(case["path"].as_str().unwrap()).unwrap();
+            let got = governing(&prefixes, &path, &tags).map(|n| n.prefix.to_string());
+            let want = case["governing"].as_str().map(str::to_string);
+            assert_eq!(
+                got,
+                want,
+                "governing({:?}) with tags {:?}: {}",
+                case["path"].as_str().unwrap(),
+                tags,
+                case["why"].as_str().unwrap(),
+            );
+        }
+    }
+
     #[test]
     fn a_registry_file_name_is_a_dotted_prefix_and_never_a_path() {
         for good in ["traefik", "homelab.docker", "a-b_c", "svc@pve!t1"] {
@@ -810,21 +879,6 @@ rules:
             "homelab.docker",
         );
         assert!(governing(&all, &p("unrelated"), &[]).is_none());
-    }
-
-    #[test]
-    fn governing_respects_the_selector() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "a.b.yaml", "selector: {tag: deep}\n");
-        write(dir.path(), "a.yaml", "selector: {all: true}\n");
-        let all = load_prefixes(&[dir.path().into()]);
-        let p = Path::parse("a.b.c").unwrap();
-        // Without the tag the specific prefix does not apply, so the broad one governs.
-        assert_eq!(governing(&all, &p, &[]).unwrap().prefix.to_string(), "a");
-        assert_eq!(
-            governing(&all, &p, &["deep".to_string()]).unwrap().prefix.to_string(),
-            "a.b",
-        );
     }
 
     #[test]
