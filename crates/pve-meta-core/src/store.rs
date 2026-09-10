@@ -15,9 +15,9 @@
 //!
 //! ## A file that is not there is never a 500
 //!
-//! Reads run unlocked, writes hold `pve-meta-<id>` and the GC holds
-//! `pve-meta-gc` — three disjoint lock domains, so no reader is ever excluded
-//! from a directory a `DELETE` or the GC is working on. Every operation here
+//! Reads run unlocked and writes hold `pve-meta-<id>` (the API's handlers and
+//! `pve-meta rm` alike), so no reader is ever excluded from a directory a
+//! `DELETE` or a removal is working on. Every operation here
 //! is therefore written so that a file disappearing between two syscalls is
 //! an ordinary outcome, never an `io::ErrorKind::NotFound` propagated as
 //! [`Error::Io`] (which the API layer maps to HTTP 500): a read reports

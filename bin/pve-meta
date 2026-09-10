@@ -14,6 +14,13 @@
 # access rules in docs/DESIGN.md section 3 are about the API, where a principal
 # other than root exists to be limited; there is no principal here.
 #
+# `ls --orphans` and `rm` are the manual cleanup for the one case the create and
+# destroy hooks cannot see (docs/DESIGN.md section 6): a guest config deleted out
+# of band, so destroy_config never ran and the document stayed. `rm` takes the
+# document's own write lock and re-reads the vmlist inside it, so it can never
+# race a PUT for a guest that came back, and it refuses a live guest outright --
+# that one is removed through the API or the UI, where permissions apply.
+#
 # Output is shaped for the caller a hook script is:
 #
 #   pve-meta get 201 homelab.owner     -> arki          (a scalar, bare, no quotes)
@@ -21,6 +28,8 @@
 #   pve-meta get 201                   -> the whole document as YAML
 #   pve-meta get prefixes/traefik      -> a prefix definition, same as any document
 #   pve-meta ls                        -> every document id, one per line
+#   pve-meta ls --orphans              -> vmids with files but no guest in the vmlist
+#   pve-meta rm 999500                 -> remove an orphan's document and snapshot copies
 #
 # so `host=$(pve-meta get $vmid traefik.spec.host)` is the obvious thing and
 # gives the obvious answer. Exit status 2 means "not there" -- a missing
@@ -38,6 +47,8 @@ use JSON::PP;
 
 use PVE::RS::Meta;
 
+my $LOCK_TIMEOUT = 30;
+
 my $SELF = 'pve-meta';
 
 sub usage {
@@ -45,12 +56,16 @@ sub usage {
     print STDERR "$SELF: $msg\n\n" if $msg;
     print STDERR <<"EOF";
 usage: $SELF get <id> [<view>] [--format yaml|json]
-       $SELF ls [--format plain|json]
+       $SELF ls [--orphans] [--format plain|json]
+       $SELF rm <vmid>
 
   <id>    a vmid, 'datacenter', 'prefixes/<name>' or 'permissions/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
-exit status: 0 found, 1 error, 2 no such document or view
+  ls --orphans  only vmids the store holds files for that are not in the vmlist
+  rm <vmid>     remove an orphan's document and snapshot copies; refuses a live guest
+
+exit status: 0 found, 1 error, 2 no such document, view or orphan
 EOF
     exit($msg ? 1 : 0);
 }
@@ -122,12 +137,48 @@ sub cmd_get {
     print $yaml->{text};
 }
 
+# The vmlist as a set, freshly refreshed. cfs_update() is not optional: a process
+# that has not refreshed the cached cluster filesystem state -- and this one was
+# just spawned -- sees an empty list, and an empty vmlist reads as "every guest
+# is gone" to anything that subtracts it.
+sub live_vmids {
+    require PVE::Cluster;
+    PVE::Cluster::cfs_update();
+    my $vmlist = PVE::Cluster::get_vmlist() || {};
+    return { map { int($_) => 1 } keys %{ $vmlist->{ids} // {} } };
+}
+
+sub orphan_vmids {
+    my $live = live_vmids();
+    die "the vmlist is empty; refusing to call every document an orphan\n" if !%$live;
+    my $stored = call(sub { PVE::RS::Meta::stored_vmids() });
+    return grep { !$live->{$_} } @$stored;
+}
+
 sub cmd_ls {
     my (@args) = @_;
     my $format = 'plain';
-    GetOptionsFromArray(\@args, 'format=s' => \$format) or usage('bad options');
+    my $orphans = 0;
+    GetOptionsFromArray(\@args, 'format=s' => \$format, 'orphans' => \$orphans)
+        or usage('bad options');
     usage("unknown format '$format'") if $format !~ /^(plain|json)$/;
     usage('too many arguments') if @args;
+
+    if ($orphans) {
+        my @vmids = eval { orphan_vmids() };
+        if (my $err = $@) {
+            chomp $err;
+            print STDERR "$SELF: $err\n";
+            exit 1;
+        }
+        if ($format eq 'json') {
+            print JSON::PP->new->canonical->encode(\@vmids), "\n";
+        } else {
+            print "$_\n" for @vmids;
+        }
+        exit 2 if !@vmids;
+        return;
+    }
 
     # The store's own walk (docs/DESIGN.md section 5), so this lists a document
     # whether or not it parses -- the one an administrator most needs to find.
@@ -140,12 +191,57 @@ sub cmd_ls {
     print "$_->{id}\n" for @docs;
 }
 
+sub cmd_rm {
+    my (@args) = @_;
+    usage('rm needs a vmid') if !@args;
+    usage('too many arguments') if @args > 1;
+    my ($vmid) = @args;
+    usage("'$vmid' is not a vmid") if $vmid !~ /^[1-9][0-9]*$/;
+    $vmid = int($vmid);
+
+    require PVE::Cluster;
+    my $removed;
+    # The document's own write lock -- the one PVE::API2::Ext::Meta holds around
+    # every read-modify-write -- with the vmlist re-read inside it. A guest
+    # created at this vmid after the check outside the lock would have its
+    # fresh document deleted otherwise, with its PUT long since answered 200.
+    #
+    # cfs_lock_domain() catches the callback's die and re-raises it through $@,
+    # so the call is followed by an explicit check rather than wrapped in eval.
+    PVE::Cluster::cfs_lock_domain(
+        "pve-meta-$vmid",
+        $LOCK_TIMEOUT,
+        sub {
+            my $live = live_vmids();
+            die "the vmlist is empty; refusing to remove anything\n" if !%$live;
+            die "$vmid is a live guest; remove its metadata through the API or the UI\n"
+                if $live->{$vmid};
+            # "This guest is gone, remove everything it had" is exactly what the
+            # destroy hook does on every destroy path PVE has.
+            $removed = PVE::RS::Meta::on_destroy($vmid);
+        },
+    );
+    if (my $err = $@) {
+        chomp $err;
+        $err =~ s/^\d{3}:\s*//;
+        print STDERR "$SELF: $err\n";
+        exit 1;
+    }
+    if (!$removed) {
+        print STDERR "$SELF: nothing stored for $vmid\n";
+        exit 2;
+    }
+    print "removed $removed file(s) for $vmid\n";
+}
+
 my $cmd = shift @ARGV;
 usage() if !defined($cmd) || $cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h';
 if ($cmd eq 'get') {
     cmd_get(@ARGV);
 } elsif ($cmd eq 'ls') {
     cmd_ls(@ARGV);
+} elsif ($cmd eq 'rm') {
+    cmd_rm(@ARGV);
 } else {
     usage("unknown command '$cmd'");
 }

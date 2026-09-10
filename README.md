@@ -170,7 +170,9 @@ permission file naming that token with no rules — and nothing else; **Add Rule
 what it may touch.
 
 A **local CLI** for hook scripts, `pve-meta get <vmid> [<view>]`, reads `/etc/pve/meta`
-directly: no ticket, no token, no pveproxy, so it works during boot. A scalar prints bare,
+directly: no ticket, no token, no pveproxy, so it works during boot. `pve-meta ls`
+lists documents (`--orphans`: only those whose guest is gone), and `pve-meta rm <vmid>`
+removes an orphan's files under the document's write lock. A scalar prints bare,
 anything with structure prints YAML, and exit status 2 means "not there" — which is what
 lets a hook script tell "nothing configured" from "something is broken". See
 `examples/maintenance-hook.pl`, which refuses to start a guest its metadata says is under
@@ -198,9 +200,9 @@ flat and cluster-wide, so it does not move. Clone and backup are not carried:
   clears any metadata left at a vmid when PVE has just asserted it was unused (so a
   recreated vmid never inherits the old guest's document), and `destroy_config` removes
   the document and its snapshot copies once the guest config itself is gone. Both are
-  best-effort and warn; metadata never breaks a guest operation. `/usr/libexec/pve-meta/gc`
-  stays as a **manual** broom for a config removed out of band — nothing runs it on a
-  timer.
+  best-effort and warn; metadata never breaks a guest operation. The one case the hooks
+  cannot see is a guest config deleted out of band: `pve-meta ls --orphans` lists what
+  that left behind and `pve-meta rm <vmid>` removes it. Nothing sweeps on a timer.
 * **Clone and backup are not carried.** Documented instead: metadata lives in
   `/etc/pve`, so back up `/etc/pve`. See `docs/LIFECYCLE-PATCHES.md` for the reasoning
   (a disk-having QEMU VM's backup path has no room for a third blob, so a partial
@@ -288,8 +290,8 @@ live node.
 
 | Path | What |
 |---|---|
-| `crates/pve-meta-core` | Document model, views, prefixes/permissions/selectors, lint, api layer, store, gc — pure Rust |
-| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, gc, the `api_*` functions |
+| `crates/pve-meta-core` | Document model, views, prefixes/permissions/selectors, lint, api layer, store — pure Rust |
+| `crates/pve-meta-perl` | `PVE::RS::Meta` — perlmod bindings: lifecycle hooks, the `api_*` functions |
 | `crates/pve-meta-wasm` | The same core for the browser: a JSON-string ABI over `wasm32-unknown-unknown`, loaded by the editor |
 | `perl/PVE/API2/Ext/Meta.pm` | The native API module, thin over `PVE::RS::Meta` |
 | `prefixes/` | Packaged example prefixes (none required) |
@@ -297,7 +299,6 @@ live node.
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/` | `lifecycle.toml`, the managed-patch manifest, and `lifecycle/` holding the one guest-lifecycle diff it names |
 | `pages/` | The "Metadata" tab's two page manifests (guest, datacenter) |
-| `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
 | `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |
 | `scripts/apt-repo/` | Signed apt repo build/publish scripts (Cloudflare R2) |

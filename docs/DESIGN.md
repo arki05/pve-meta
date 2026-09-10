@@ -394,13 +394,15 @@ who may write.
   `/etc/pve/firewall/<vmid>.fw`; only the guest config is node-scoped and gets
   `move_config_to_node`'d.
 
-  A **manual broom** remains at `/usr/libexec/pve-meta/gc` (`PVE::RS::Meta::gc_candidates`
-  + `gc_purge` — two-phase because a write and a sweep lock disjoint domains, so a
-  one-pass sweep could purge a document written after its vmlist snapshot; the sweep
-  only nominates, and each vmid is purged under its own write lock against a vmlist
-  re-read inside it) for the one case the hooks cannot see:
-  a config removed out of band. **Nothing runs it on a timer.** There is no orphan concept
-  in the API.
+  The one case the hooks cannot see is a guest config removed out of band, so
+  `destroy_config` never ran. That is an administrator's to notice and clean up:
+  `pve-meta ls --orphans` lists the vmids the store holds a file for that are not in the
+  vmlist, and `pve-meta rm <vmid>` removes one under `cfs_lock_domain("pve-meta-<vmid>")`
+  — the same lock every write holds — with the vmlist re-read inside the lock, refusing
+  a vmid that is live and an empty vmlist (which is what a process that skipped
+  `cfs_update` sees). **Nothing sweeps on a timer**, and there is no orphan concept in
+  the API: a periodic sweep was removed together with its two-phase locking, because
+  the create hook already closes the one hazard it existed for.
 * **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up
   `/etc/pve`". The QEMU backup command cannot embed foreign blobs, so a partial guarantee
   is not offered.
@@ -798,12 +800,11 @@ the editor.
 ## 9. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, prefixes+permissions+selectors, shape, edit set, lint, api layer, store, gc
-crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
+crates/pve-meta-core     document model, views, prefixes+permissions+selectors, shape, edit set, lint, api layer, store
+crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, api exports (native perlmod conversion)
 crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
 perl/PVE/API2/Ext/Meta.pm
-bin/pve-meta             the local reader for hook scripts (Perl over PVE::RS::Meta; /usr/sbin)
-libexec/gc               the manual GC broom (§6)
+bin/pve-meta             the local CLI for hook scripts and orphan cleanup (Perl over PVE::RS::Meta; /usr/sbin)
 pages/                   the two page manifests, guest and datacenter (§7)
 prefixes/                packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)

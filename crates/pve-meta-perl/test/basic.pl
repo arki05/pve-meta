@@ -132,7 +132,7 @@ for my $gone (qw(on_clone export_for_backup import_from_backup
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
-# gc() -- what replaces the destroy hook and the whole orphan concept.
+# stored_vmids() -- what `pve-meta ls --orphans` and `pve-meta rm` are built on.
 # =========================================================================
 
 write_file('9100.yaml', "traefik:\n  host: live\n");
@@ -140,54 +140,23 @@ write_file('999500.yaml', "traefik:\n  host: gone\n");
 write_file('datacenter.yaml', "note: keep me\n");
 PVE::RS::Meta::on_snapshot(9100, 'keep');
 PVE::RS::Meta::on_snapshot(999500, 'snapA');
-PVE::RS::Meta::on_snapshot(999500, 'snapB');
+# A snapshot copy with no live document still names a vmid the store holds.
+write_file('9200.old.yaml', "a: 1\n");
 
-is(PVE::RS::Meta::gc([9100]), 3, 'gc removes the stale document and both its snapshot copies');
-ok(file_exists('9100.yaml'), 'a guest still in the vmlist is untouched');
-ok(file_exists('9100.keep.yaml'), '... and so are its snapshots');
-ok(!file_exists('999500.yaml'), 'the stale document is gone');
-ok(!file_exists('999500.snapA.yaml'), 'the stale snapshot copies are gone');
-ok(!file_exists('999500.snapB.yaml'), '... both of them');
+is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200, 999500],
+    'stored_vmids lists every guest vmid with any file, sorted, never the datacenter');
+
+# The only removal path for a stale vmid is the destroy hook, run by `pve-meta rm`
+# under the document's own write lock (docs/DESIGN.md section 6).
+is(PVE::RS::Meta::on_destroy(999500), 2, 'on_destroy removes a stale document and its snapshot copy');
+is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200], '... and the vmid leaves the list');
 ok(file_exists('datacenter.yaml'), 'the datacenter document is never a guest');
 
-is(PVE::RS::Meta::gc([9100]), 0, 'gc is idempotent');
-is(PVE::RS::Meta::gc([9100, 999500]), 0, 'a vmid back in the vmlist is not removed');
-# A whole sweep is a vmid the store does not have -- an empty vmlist is
-# refused, because it is also what a process that skipped cfs_update() sees.
-$res = eval { PVE::RS::Meta::gc([]) };
-ok(!defined($res), 'gc refuses an empty vmlist, like gc_purge');
-like($@, api_error_status(500), 'the empty-vmlist refusal is prefixed 500:');
-is(PVE::RS::Meta::gc([999999]), 2, 'a sweep against a vmlist with no stored vmid removes everything stale');
-ok(file_exists('datacenter.yaml'), '... still never the datacenter document');
+for my $gone (qw(gc gc_candidates gc_purge)) {
+    ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
+}
 
-# The two-phase GC /usr/libexec/pve-meta/gc actually runs: nominate under
-# 'pve-meta-gc', then purge one vmid at a time under "pve-meta-$vmid" with the
-# vmlist re-read *inside* that lock. Without the re-check, a document written
-# after the outer vmlist read is deleted with its PUT already answered 200.
-write_file('9100.yaml', "traefik:\n  host: live\n");
-PVE::RS::Meta::on_snapshot(9100, 'keep');
-is_deeply(PVE::RS::Meta::gc_candidates([9100]), [], 'nothing is stale against the live vmlist');
-
-# ... the guest at 999500 is created and its metadata written afterwards.
-write_file('999500.yaml', "traefik:\n  host: fresh\n");
-is_deeply(PVE::RS::Meta::gc_candidates([9100]), [999500],
-    'gc_candidates nominates the vmid missing from the snapshot');
-is(PVE::RS::Meta::gc_purge(999500, [9100, 999500]), 0,
-    'gc_purge keeps a vmid the re-read vmlist has');
-ok(file_exists('999500.yaml'), 'the document written after the snapshot survives');
-
-$res = eval { PVE::RS::Meta::gc_purge(999500, []) };
-ok(!defined($res), 'gc_purge refuses an empty vmlist rather than purging');
-like($@, qr/empty vmlist/, '... and says why');
-ok(file_exists('999500.yaml'), '... and removed nothing');
-
-is(PVE::RS::Meta::gc_purge(999500, [9100]), 1, 'gc_purge removes a vmid that really is gone');
-ok(!file_exists('999500.yaml'), '... the document is gone');
-is(PVE::RS::Meta::gc_purge(999500, [9100]), 0, 'gc_purge is idempotent');
-ok(file_exists('9100.yaml'), 'a live guest is never touched by gc_purge');
-ok(file_exists('datacenter.yaml'), '... and neither is the datacenter document');
-
-unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
+unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$root/9200.old.yaml");
 
 # =========================================================================
 # The perlmod boundary: native hashes and arrays.

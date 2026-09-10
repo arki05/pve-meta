@@ -69,8 +69,8 @@ sweeps is therefore never stale, and the new guest inherits the old document **f
 The create hook closes that window instead of narrowing it, and covers the destroy that
 never ran because its node was down.
 
-The script survives as a manual broom (`/usr/libexec/pve-meta/gc`) for a config removed out
-of band; no timer runs it.
+For a config removed out of band, where `destroy_config` never ran, `pve-meta ls --orphans`
+and `pve-meta rm <vmid>` are the manual cleanup; no timer sweeps.
 
 ## What is not carried, and why
 

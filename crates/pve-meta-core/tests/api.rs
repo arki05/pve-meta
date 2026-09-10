@@ -2,7 +2,7 @@
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::api::{
-    access, delete_document, effective, gc, gc_candidates, gc_purge, get_document, list_guests,
+    access, delete_document, effective, get_document, list_guests,
     parse_id, permissions_list, prefixes_list, put_document, version, ApiError, ApiPutResult,
     ApiViewDocument, CallerAcl, GuestInput, PermissionEntry,
 };
@@ -1071,89 +1071,6 @@ fn prefixes_list_carries_failures_keyed_like_a_loaded_prefix() {
     assert!(rows[1].get("path").is_none(), "no filesystem path on the wire");
     assert!(rows[1].get("schema").is_none(), "a failed row has nothing a loaded one promises");
 }
-
-#[test]
-fn gc_removes_documents_and_snapshots_whose_vmid_is_gone() {
-    // `docs/DESIGN.md` §6: this replaces the destroy hook and the whole
-    // orphan concept.
-    let (_dir, store) = store();
-    seed(&store, "100", "traefik:\n  host: x\n");
-    seed(&store, "999500", "traefik:\n  host: gone\n");
-    seed(&store, "datacenter", "a: 1\n");
-    store.snapshot(100, "keep").unwrap();
-    store.snapshot(999500, "snapA").unwrap();
-    store.snapshot(999500, "snapB").unwrap();
-
-    assert_eq!(gc(&store, &[100]).unwrap(), 3, "one document plus two snapshots");
-    assert!(read_raw(&store, "100").is_some());
-    assert!(read_raw(&store, "999500").is_none());
-    assert_eq!(store.list_snapshots(100).unwrap(), vec!["keep".to_string()]);
-    assert!(store.list_snapshots(999500).unwrap().is_empty());
-    // The datacenter document is never a guest.
-    assert!(read_raw(&store, "datacenter").is_some());
-
-    // Idempotent, and a full vmlist removes nothing.
-    assert_eq!(gc(&store, &[100]).unwrap(), 0);
-    assert_eq!(gc(&store, &[100, 999500]).unwrap(), 0);
-    // A whole sweep is expressed with a vmid the store does not have, not
-    // with an empty list: an empty vmlist is refused (it is what an
-    // un-refreshed pmxcfs cache looks like).
-    assert!(gc(&store, &[]).is_err(), "an empty vmlist must be refused");
-    assert_eq!(gc(&store, &[999_999]).unwrap(), 2);
-    assert!(read_raw(&store, "100").is_none());
-    assert!(read_raw(&store, "datacenter").is_some());
-}
-
-#[test]
-fn gc_re_validates_liveness_inside_the_per_vmid_lock() {
-    // The reported race, as an in-crate reproduction: the vmlist snapshot
-    // the GC pass started from predates a `PUT` that has already been
-    // answered `200`, and the whole-sweep `gc()` deletes that fresh
-    // document without a trace. `libexec/gc` takes
-    // `cfs_lock_domain("pve-meta-<vmid>")` per candidate and re-reads the
-    // vmlist inside it; `gc_purge` is what that re-read is checked by.
-    let (_dir, store) = store();
-    seed(&store, "100", "traefik:\n  host: live\n");
-
-    // The snapshot Perl read before taking any lock. 999500 does not
-    // exist yet, so it is not in it.
-    let snapshot = [100u32];
-    assert!(gc_candidates(&store, &snapshot).unwrap().is_empty());
-
-    // ... then a guest is created at 999500 and its metadata written.
-    seed(&store, "999500", "traefik:\n  host: fresh\n");
-    store.snapshot(999500, "s1").unwrap();
-    assert_eq!(gc_candidates(&store, &snapshot).unwrap(), vec![999500]);
-
-    // Under the per-vmid lock, the *fresh* vmlist has it: nothing is
-    // purged, and the document the PUT stored survives.
-    let fresh = [100u32, 999500];
-    assert_eq!(gc_purge(&store, 999500, &fresh).unwrap(), 0);
-    assert_eq!(read_raw(&store, "999500").as_deref(), Some("traefik:\n  host: fresh\n"));
-    assert_eq!(store.list_snapshots(999500).unwrap(), vec!["s1".to_string()]);
-
-    // An empty fresh vmlist is refused rather than read as "every guest
-    // is gone" — the guard lives on the destructive call itself, not
-    // only in the one Perl caller.
-    let err = gc_purge(&store, 999500, &[]).unwrap_err();
-    assert_eq!(status(&err), 500, "{err}");
-    assert!(read_raw(&store, "999500").is_some());
-
-    // A vmid that really is gone is still purged, with its snapshots.
-    assert_eq!(gc_purge(&store, 999500, &[100]).unwrap(), 2);
-    assert!(read_raw(&store, "999500").is_none());
-    assert!(store.list_snapshots(999500).unwrap().is_empty());
-    // Idempotent: the loser of a race against another node's GC pass.
-    assert_eq!(gc_purge(&store, 999500, &[100]).unwrap(), 0);
-
-    // For contrast, the unvalidated whole sweep is what the report
-    // reproduced — it deletes against the stale snapshot alone.
-    seed(&store, "999500", "traefik:\n  host: fresh\n");
-    assert_eq!(gc(&store, &snapshot).unwrap(), 1);
-    assert!(read_raw(&store, "999500").is_none());
-}
-
-// -- a file that vanishes under a request is never a 500 ----------------
 
 #[test]
 fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {

@@ -2,16 +2,14 @@
 //!
 //! Three families of exports, all thin wrappers over [`pve_meta_core`]:
 //!
-//! * the **snapshot hooks** (`on_snapshot`/`on_rollback`/`on_delsnap`), called
-//!   from the one patched PVE Perl file (`PVE/AbstractConfig.pm`, package
-//!   `libpve-guest-common-perl`; `docs/DESIGN.md` §6). These are the only
-//!   lifecycle hooks that exist: destroy is a GC, clone and backup are not
-//!   carried;
-//! * the **GC** (`gc_candidates`/`gc_purge`, and the unvalidated whole-sweep
-//!   `gc`), run by hand from `/usr/libexec/pve-meta/gc` under the cluster lock
-//!   -- nothing runs it on a timer (`docs/DESIGN.md` §6),
-//!   which removes documents and snapshot copies whose vmid has left the
-//!   vmlist; and
+//! * the **lifecycle hooks** (`on_create`/`on_destroy`, and
+//!   `on_snapshot`/`on_rollback`/`on_delsnap`), called from the one patched
+//!   PVE Perl file (`PVE/AbstractConfig.pm`, package
+//!   `libpve-guest-common-perl`; `docs/DESIGN.md` §6). Clone and backup are
+//!   not carried;
+//! * `stored_vmids`, the store's own list of guest vmids, which is what lets
+//!   `pve-meta ls --orphans` and `pve-meta rm` find and remove a document
+//!   whose guest config was deleted out of band (`docs/DESIGN.md` §6); and
 //! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`
 //!   (`docs/DESIGN.md` §5), implemented in [`pve_meta_core::api`] — this
 //!   crate only supplies the store and the registry.
@@ -157,55 +155,17 @@ mod pve_rs_meta {
         Ok(open_store().purge(vmid)?)
     }
 
-    /// The stale vmids: everything the store holds a file for that is not in
-    /// `$vmids`, the vmlist the caller passes in as a native array ref.
-    /// Removes nothing.
+    /// Every vmid the store holds any file for -- a document, a snapshot
+    /// copy, or both -- sorted ascending. The datacenter document is not a
+    /// guest and is never listed.
     ///
-    /// The first half of the two-phase GC `/usr/libexec/pve-meta/gc` runs:
-    /// this under `cfs_lock_domain('pve-meta-gc')`, then one
-    /// [`gc_purge`](Self::gc_purge) per vmid under that vmid's own
-    /// `cfs_lock_domain("pve-meta-$vmid")`. Splitting it is what closes the
-    /// window in which a `PUT` that landed after the vmlist was read had its
-    /// fresh document purged.
+    /// What `pve-meta ls --orphans` subtracts the vmlist from, and what
+    /// `pve-meta rm` checks before removing anything: the one case the
+    /// create and destroy hooks cannot see is a guest config deleted out of
+    /// band, and this is how an administrator finds what it left behind.
     #[export]
-    pub fn gc_candidates(vmids: Vec<u32>) -> Result<Vec<u32>, api::ApiError> {
-        api::gc_candidates(&open_store(), &vmids)
-    }
-
-    /// Removes `$vmid`'s document **and every snapshot copy**, but only if
-    /// `$live` — a vmlist the caller re-read *inside*
-    /// `cfs_lock_domain("pve-meta-$vmid")` — still does not contain it.
-    /// Returns the number of files removed, `0` if the guest is live again.
-    ///
-    /// Dies if `$live` is empty: an empty vmlist means "every guest is gone",
-    /// which is also what a process that has not called
-    /// `PVE::Cluster::cfs_update()` sees.
-    #[export]
-    pub fn gc_purge(vmid: u32, live: Vec<u32>) -> Result<usize, api::ApiError> {
-        api::gc_purge(&open_store(), vmid, &live)
-    }
-
-    /// The unvalidated whole sweep: removes every document **and snapshot
-    /// copy** whose vmid is not in `$vmids`, in one pass, holding no
-    /// per-vmid lock. Returns the number of files removed.
-    ///
-    /// This is **not** what removes a destroyed guest's document -- `on_destroy`
-    /// above does that, on every destroy path. It is the sweep for the one case
-    /// the hooks cannot see: a guest config removed out of band. There is no
-    /// orphan concept in the API: no orphan listing, no orphan rule, no orphan
-    /// delete. The datacenter document is never a guest
-    /// and is never removed.
-    ///
-    /// **Not what the timer runs.** It cannot re-validate a candidate against
-    /// a vmlist read under that document's write lock, so a `PUT` that landed
-    /// after `$vmids` was read loses its document silently; new callers want
-    /// `gc_candidates` + `gc_purge`.
-    ///
-    /// Dies on an empty `$vmids`, like `gc_purge`: it is indistinguishable
-    /// from a caller that has not run `PVE::Cluster::cfs_update()`.
-    #[export]
-    pub fn gc(vmids: Vec<u32>) -> Result<usize, api::ApiError> {
-        api::gc(&open_store(), &vmids)
+    pub fn stored_vmids() -> Result<Vec<u32>, Error> {
+        Ok(open_store().stored_vmids()?)
     }
 
     /// Returns this crate's version string. Used by

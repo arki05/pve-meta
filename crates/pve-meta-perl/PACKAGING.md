@@ -21,7 +21,7 @@ needs from them rather than duplicating their contents.
     Description: pve-meta store bindings for PVE (Rust, perlmod)
      PVE::RS::Meta, a Perl binding (via perlmod) to pve-meta's guest metadata
      store: the snapshot/rollback/delsnap hooks called from
-     libpve-guest-common-perl, the store GC, and the api_* functions behind
+     libpve-guest-common-perl and the api_* functions behind
      PVE::API2::Ext::Meta.
     ```
 
