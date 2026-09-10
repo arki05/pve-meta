@@ -503,17 +503,34 @@ __PACKAGE__->register_method({
         . "/usr/share/pve-meta/prefixes and /etc/pve/meta.d/prefixes, with a cluster "
         . "file overriding the packaged one of the same name. The file name is the "
         . "prefix. Sorted most-specific first, which is the order that resolves which "
-        . "prefix governs a path -- longest prefix wins and schemas never merge. A "
-        . "malformed file is skipped with a warning and does not appear here.",
+        . "prefix governs a path -- longest prefix wins and schemas never merge. A file "
+        . "that did not load -- unreadable, or not valid as a prefix -- still appears "
+        . "here: it is named ('prefix' is its file name) and carries 'error' instead of "
+        . "'selector'/'schema', so it can be found and repaired at /meta/prefixes/{name} "
+        . "rather than quietly not existing.",
     parameters => {
         additionalProperties => 0,
         properties => {},
     },
     returns => {
         type => 'array',
-        # `{ prefix, description?, selector, schema? }` -- `schema` is a free-form
-        # PVE::JSONSchema-dialect subtree.
-        items => { type => 'object', additionalProperties => 1 },
+        # `{ prefix, description?, selector, schema? }` for a loaded prefix --
+        # `schema` is a free-form PVE::JSONSchema-dialect subtree -- or
+        # `{ prefix, origin, error }` for one that did not load.
+        items => {
+            type => 'object',
+            additionalProperties => 1,
+            properties => {
+                error => {
+                    type => 'string',
+                    optional => 1,
+                    description => "Present only on an entry for a file that did not load: "
+                        . "the parser's or the filesystem's own message. 'prefix' is still "
+                        . "the file name and 'origin' still says packaged or cluster, so the "
+                        . "row can be opened and repaired the same way a loaded one can.",
+                },
+            },
+        },
     },
     code => sub {
         return _call(\&PVE::RS::Meta::api_prefixes);
@@ -533,8 +550,12 @@ __PACKAGE__->register_method({
     description => "Every permission file (docs/DESIGN.md §3.2): the files in "
         . "/etc/pve/meta.d/permissions. Cluster-only on purpose -- there is deliberately no "
         . "packaged permissions directory, because an operator's own package may ship a "
-        . "prefix definition (what it expects) but must never ship its own. A malformed "
-        . "file is skipped with a warning and does not appear here.",
+        . "prefix definition (what it expects) but must never ship its own. A file that did "
+        . "not load -- unreadable, or not valid as a permission -- still appears here: it is "
+        . "named ('name' is its file name) and carries 'error' instead of 'authid'/'rules'. "
+        . "It grants nothing (a malformed permission file must never grant anything), and it "
+        . "can be found and repaired at /meta/permissions/{name} rather than quietly not "
+        . "existing.",
     parameters => {
         additionalProperties => 0,
         properties => {},
@@ -542,7 +563,22 @@ __PACKAGE__->register_method({
     returns => {
         type => 'array',
         # `{ name, authid, description?, rules: [{ prefix, mode, selector }] }`
-        items => { type => 'object', additionalProperties => 1 },
+        # for a loaded permission, or `{ name, origin, error }` for one that
+        # did not load.
+        items => {
+            type => 'object',
+            additionalProperties => 1,
+            properties => {
+                error => {
+                    type => 'string',
+                    optional => 1,
+                    description => "Present only on an entry for a file that did not load: "
+                        . "the parser's or the filesystem's own message. 'name' is still "
+                        . "the file name and 'origin' still says packaged or cluster, so the "
+                        . "row can be opened and repaired the same way a loaded one can.",
+                },
+            },
+        },
     },
     code => sub {
         return _call(\&PVE::RS::Meta::api_permissions);

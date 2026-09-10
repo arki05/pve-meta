@@ -56,7 +56,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Permission, PrefixDef};
+use crate::registry::{self, Permission, PrefixDef, RegistryFailure};
 use crate::scopes::Effective;
 use crate::store::{DocId, MetaStore, RegistryKind, DISK_FORMAT};
 use crate::view;
@@ -392,14 +392,35 @@ pub fn access(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) 
 /// Not filtered per caller: a permission says who may touch which prefix, which is
 /// exactly what the UI's Access column shows for every row, and the threat
 /// model puts listings out of scope (`docs/DESIGN.md` §1).
-pub fn permissions_list(permission_files: &[Permission]) -> Vec<Permission> {
-    permission_files.to_vec()
+///
+/// `failures` rides along in the same array (see [`PermissionEntry`]): this is
+/// the one place a file that did not load is still visible at all, because it
+/// is the one endpoint feeding the grid an administrator would otherwise have
+/// no reason to suspect is short a row. Nothing that *decides* anything --
+/// [`effective`], [`access`], the write pipeline -- ever sees `failures`;
+/// only this listing does.
+pub fn permissions_list(
+    permission_files: &[Permission],
+    failures: &[RegistryFailure],
+) -> Vec<PermissionEntry> {
+    permission_files
+        .iter()
+        .cloned()
+        .map(PermissionEntry::Loaded)
+        .chain(failures.iter().cloned().map(|f| PermissionEntry::Failed(f.into())))
+        .collect()
 }
 
 /// `GET /meta/prefixes`: every prefix, most-specific first, readable by
-/// every authenticated user.
-pub fn prefixes_list(prefixes: &[PrefixDef]) -> Vec<PrefixDef> {
-    prefixes.to_vec()
+/// every authenticated user, plus every file that did not load (see
+/// [`permissions_list`], the same reasoning applies here).
+pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Vec<PrefixEntry> {
+    prefixes
+        .iter()
+        .cloned()
+        .map(PrefixEntry::Loaded)
+        .chain(failures.iter().cloned().map(|f| PrefixEntry::Failed(f.into())))
+        .collect()
 }
 
 /// `GET /meta/guests`: for every guest Perl passed in, the metadata the

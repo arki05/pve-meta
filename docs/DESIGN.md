@@ -129,6 +129,23 @@ this is two concepts and not one.
 
 * Files are parsed strictly and independently; a malformed file is skipped with a
   warning and contributes nothing. It never affects another file.
+* **A skipped file is still listed.** Skipping it and saying nothing made a prefix that
+  stopped parsing — a hand-edit, a bad package upgrade, a half-finished replication —
+  simply cease to exist: absent from `GET /meta/prefixes`, absent from the grid, and its
+  name surviving only in `version?detail=1` or `pve-meta ls` on the node. That was the
+  one failure mode with no observable symptom. The two list endpoints therefore return
+  it as a named entry carrying an `error` and nothing else, the grid marks it, and Edit
+  opens it where it can be repaired. The loader only ever tries files whose *name* is
+  already valid, so a skipped file always has a name to be listed under.
+  It contributes nothing all the same: `load_prefixes` and `load_permissions` hand back
+  only what parsed, so a malformed permission file grants nothing and a malformed prefix
+  describes nothing. The listing is the only place the two halves meet.
+* **A document that does not parse is edited as text.** The tree has no rows to show for
+  one, and a tree showing none would be indistinguishable from an empty document — one
+  Apply away from replacing the file with nothing. So the editor opens it in Text mode
+  with the Tree view unavailable until it parses, which is also where §4's repair (a
+  root replace with a full document) is expressed. Monaco puts the parser's own
+  complaint on the offending line.
 * Prefixes are non-empty. `authid` is a PVE user or token id.
 * A **selector** restricts to guests: `all`, or `tag: <t>` (the guest carries the PVE
   tag), read from the cluster's cached guest properties. Adding the tag is the

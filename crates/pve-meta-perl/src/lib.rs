@@ -63,7 +63,7 @@ mod pve_rs_meta {
     use anyhow::Error;
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
-    use pve_meta_core::registry::{Permission, PrefixDef};
+    use pve_meta_core::registry::Permission;
     use pve_meta_core::store::MetaStore;
 
     use super::{open_store, RollbackOutcome};
@@ -82,14 +82,10 @@ mod pve_rs_meta {
         store.registry().load_permissions()
     }
 
-    /// Every prefix, packaged then cluster-wide, most-specific prefix first
-    /// (`docs/DESIGN.md` §3.1). Read per request, like the permissions: the
-    /// directories are tiny, pmxcfs caches them, and a stale prefix would be
-    /// a stale schema. See [`open_permissions`] for why this goes through
-    /// `store`'s registry rather than reading the environment itself.
-    fn open_prefixes(store: &MetaStore) -> Vec<PrefixDef> {
-        store.registry().load_prefixes()
-    }
+    // No `open_prefixes` counterpart: nothing here decides anything from a
+    // prefix (a prefix names no principal, so it never gates a read or
+    // write), and `api_prefixes` below reads `Registry::list_prefixes`
+    // directly because it -- alone -- needs the files that failed to load too.
 
     // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
     //
@@ -246,16 +242,29 @@ mod pve_rs_meta {
         api::version(&open_store(), detail, id)
     }
 
-    /// `GET /meta/permissions` -> every permission, as native hashes.
+    /// `GET /meta/permissions` -> every permission, as native hashes, plus a
+    /// row for any file in the directory that failed to load -- named, with
+    /// `error` set, and nothing else -- so a hand-edit or a bad package
+    /// upgrade that broke a file is visible here instead of just in the log
+    /// (`docs/DESIGN.md` §1). This is the one export that reads
+    /// `Registry::list_permissions` rather than `open_permissions`: every
+    /// other export needs the parsed grants alone, because a file that did
+    /// not load must never grant anything.
     #[export]
-    pub fn api_permissions() -> Result<Vec<Permission>, Error> {
-        Ok(api::permissions_list(&open_permissions(&open_store())))
+    pub fn api_permissions() -> Result<Vec<api::PermissionEntry>, Error> {
+        let store = open_store();
+        let (permissions, failures) = store.registry().list_permissions();
+        Ok(api::permissions_list(&permissions, &failures))
     }
 
-    /// `GET /meta/prefixes` -> every prefix, most-specific first.
+    /// `GET /meta/prefixes` -> every prefix, most-specific first, plus a row
+    /// for any file that failed to load. See [`api_permissions`] -- the same
+    /// reasoning, and the same `Registry::list_prefixes` shape.
     #[export]
-    pub fn api_prefixes() -> Result<Vec<PrefixDef>, Error> {
-        Ok(api::prefixes_list(&open_prefixes(&open_store())))
+    pub fn api_prefixes() -> Result<Vec<api::PrefixEntry>, Error> {
+        let store = open_store();
+        let (prefixes, failures) = store.registry().list_prefixes();
+        Ok(api::prefixes_list(&prefixes, &failures))
     }
 
     /// `GET /meta/schemas` -> `{ prefix, permission }`, the two registry file

@@ -600,16 +600,47 @@ $res = eval { PVE::RS::Meta::api_get('datacenter', 'traefik', 'json', scoped_acl
 ok(!defined($res), 'and a scoped datacenter read is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# A malformed file is skipped with a warning and contributes nothing; it never
-# takes another file's grants away. Both directories, independently.
+# A malformed file is skipped with a warning and grants/defines nothing; it
+# never takes another file's grants away. But it is not *invisible* any more
+# (this is the whole feature): the listing carries a row for it too, named,
+# with 'error' set and nothing else -- the one place an administrator can
+# find out a file stopped loading at all, instead of only a log line nobody
+# reads (docs/DESIGN.md §1). Both directories, independently.
+#
+# `alsobroken` names the very authid under test, deliberately: a malformed
+# permission file has to grant nothing even when it claims to be for the
+# principal whose access this test is about to re-check.
 write_permission('broken', "authid: nope-not-an-authid\n");
-write_permission('alsobroken', "authid: a\@pve\nrules:\n  - prefix: x\n    mode: sideways\n");
+write_permission('alsobroken', "authid: scoped\@pve!t1\nrules:\n  - prefix: x\n    mode: sideways\n");
 write_prefix('brokenns', "selector: { nonsense: true }\n");
-write_prefix('a b', "selector: { all: true }\n"); # not a valid prefix, so not a definition
-is(scalar(@{ PVE::RS::Meta::api_permissions() }), 1, 'a malformed permission file is skipped');
-is(scalar(@{ PVE::RS::Meta::api_prefixes() }), 3, 'a malformed prefix file is skipped');
+write_prefix('a b', "selector: { all: true }\n"); # not a valid file name, so not addressable at all
+
+my $perms_all = PVE::RS::Meta::api_permissions();
+is(scalar(@$perms_all), 3, 'api_permissions lists the good file plus both malformed ones');
+my @perms_failed = sort { $a->{name} cmp $b->{name} } grep { exists $_->{error} } @$perms_all;
+is(scalar(@perms_failed), 2, '... two of the three carry an error');
+is_deeply([map { $_->{name} } @perms_failed], ['alsobroken', 'broken'],
+    '... named by file name, the same key a loaded permission uses');
+is($perms_failed[0]->{origin}, 'cluster', '... and where it would have to be repaired');
+ok(!exists $perms_failed[0]->{authid} && !exists $perms_failed[0]->{rules},
+    '... nothing a loaded permission promises');
+ok((grep { $_->{name} eq 'scoped' && !exists $_->{error} } @$perms_all),
+    '... and the one good file is still there, unmarked');
+
+my $prefixes_all = PVE::RS::Meta::api_prefixes();
+is(scalar(@$prefixes_all), 4, 'api_prefixes lists the three good ones plus the malformed one');
+my @ns_failed = grep { exists $_->{error} } @$prefixes_all;
+is(scalar(@ns_failed), 1, '... one of them carries an error');
+is($ns_failed[0]->{prefix}, 'brokenns', '... named by prefix, the same key a loaded prefix uses');
+ok(!exists $ns_failed[0]->{path}, '... no filesystem path is on the wire');
+ok(!exists $ns_failed[0]->{selector} && !exists $ns_failed[0]->{schema},
+    '... nothing a loaded prefix promises');
+ok(!(grep { defined($_->{prefix}) && $_->{prefix} eq 'a b' } @$prefixes_all),
+    "'a b' cannot be addressed at all, so it is not even a failure row");
+
 is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
-    '... and the valid ones still grant exactly what they did');
+    '... and the valid ones still grant exactly what they did -- the malformed '
+    . 'file for the same authid grants nothing at all');
 unlink("$grantdir/broken.yaml", "$grantdir/alsobroken.yaml",
     "$nsdir/brokenns.yaml", "$nsdir/a b.yaml");
 

@@ -565,6 +565,46 @@ console.log('\n--- Apply is offered wherever a write could succeed ---');
     eq('a missing access object is not write access', U.hasAnyWrite(undefined), false);
 }
 
+console.log('\n--- a registry file that did not load is still a row ---');
+{
+    const G = ctx.PVE.meta.RegistryGrid.statics;
+    // Before this, `load_dirs` dropped a file it could not parse and the listing
+    // never mentioned it, so a prefix that stopped parsing ceased to exist with
+    // nothing anywhere saying so -- the one failure mode with no symptom.
+    const pfx = G.rowsFrom('prefixes', [
+        { prefix: 'good', selector: { all: true }, origin: 'cluster' },
+        { prefix: 'broken', origin: 'packaged', error: 'mapping values are not allowed here' },
+    ]);
+    eq('both files are rows', pfx.map((r) => r.name), ['good', 'broken']);
+    eq('the failure keeps its error', pfx[1].error, 'mapping values are not allowed here');
+    eq('... and says so where it would say what it does', pfx[1].description, pfx[1].error);
+    eq('... and is still addressable, which is how it gets repaired', pfx[1].id, 'prefixes/broken');
+    eq('... and keeps the origin, which is where to look for it', pfx[1].origin, 'packaged');
+    eq('a file that loaded carries no error', pfx[0].error, undefined);
+
+    const perm = G.rowsFrom('permissions', [
+        { name: 'ops', authid: 'a@pve!t', rules: [], origin: 'cluster' },
+        { name: 'bad', origin: 'cluster', error: 'missing field `authid`' },
+    ]);
+    eq('permissions the same way', perm.map((r) => r.name), ['ops', 'bad']);
+    eq('a failed permission claims no authid', perm[1].authid, '');
+    eq('... and no rules', perm[1].summary, '');
+
+    // The safety half: a file that did not load must never describe anything.
+    const p2 = Object.assign({}, panel, {
+        prefixes: [
+            { prefix: 'netbird', selector: { all: true } },
+            { prefix: 'broken', selector: { all: true }, error: 'nope' },
+        ],
+    });
+    p2.applicablePrefixes = P.applicablePrefixes;
+    eq(
+        'a failed prefix reaches no guest, even carrying a selector',
+        p2.applicablePrefixes.call(p2).map((n) => n.prefix),
+        ['netbird'],
+    );
+}
+
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
 {
     // A prefix with no schema used to paint no row at all, so `netbird` -- which

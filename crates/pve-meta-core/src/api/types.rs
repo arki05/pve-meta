@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::registry::{Origin, Permission, PrefixDef, RegistryFailure};
 use crate::scopes::Scope;
 
 /// The caller, as `PVE::API2::Ext::Meta` computes it: their authid, the two
@@ -155,4 +156,64 @@ pub struct GuestInput {
     /// here so one row shape serves every caller.
     #[serde(default)]
     pub write: bool,
+}
+
+/// `GET /meta/prefixes`' element: a loaded prefix, or a file that failed to
+/// load. Untagged, so each element serializes as itself -- a `PrefixDef`'s own
+/// shape, or [`FailedPrefix`]'s -- and a consumer that only wants the good
+/// ones can filter on whether `error` is present rather than unwrap a variant
+/// tag that has no counterpart in the file format.
+///
+/// Two concrete enums (this and [`PermissionEntry`]) rather than one generic
+/// `RegistryEntry<T>`: a failed prefix has to serialize with the key `prefix`
+/// and a failed permission with `name`, because that is the key their loaded
+/// counterparts already use, and a bare `RegistryFailure` (whose field is
+/// always `name`) cannot supply both from one `Serialize` impl.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum PrefixEntry {
+    Loaded(PrefixDef),
+    Failed(FailedPrefix),
+}
+
+/// A prefix file that did not load, keyed like a loaded [`PrefixDef`]
+/// (`prefix`, not `name`) so one array can mix both and a reader can find
+/// either by the same field. No filesystem path: `origin` already says
+/// packaged or cluster, which is what a repair needs (`docs/DESIGN.md` §1).
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedPrefix {
+    pub prefix: String,
+    pub origin: Origin,
+    pub error: String,
+}
+
+impl From<RegistryFailure> for FailedPrefix {
+    fn from(f: RegistryFailure) -> Self {
+        FailedPrefix { prefix: f.name, origin: f.origin, error: f.error }
+    }
+}
+
+/// `GET /meta/permissions`' element: a loaded permission, or a file that
+/// failed to load. See [`PrefixEntry`] for why this is untagged and why it is
+/// its own enum rather than a shared generic.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum PermissionEntry {
+    Loaded(Permission),
+    Failed(FailedPermission),
+}
+
+/// A permission file that did not load, keyed like a loaded [`Permission`]
+/// (`name`). No filesystem path, for the same reason as [`FailedPrefix`].
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedPermission {
+    pub name: String,
+    pub origin: Origin,
+    pub error: String,
+}
+
+impl From<RegistryFailure> for FailedPermission {
+    fn from(f: RegistryFailure) -> Self {
+        FailedPermission { name: f.name, origin: f.origin, error: f.error }
+    }
 }

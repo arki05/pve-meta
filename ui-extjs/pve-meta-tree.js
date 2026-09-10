@@ -2341,6 +2341,9 @@ PVE.meta.Doc = {
             return;
         }
         Proxmox.Utils.setErrorMask(me, true);
+        // Cleared here and set only by `loadDocument`: it describes the document
+        // this load is about to read, not the one the panel used to hold.
+        me.docParseError = '';
         me.loadPrefixes(() =>
             me.loadPermissions(() =>
                 me.loadAccess(() =>
@@ -2470,20 +2473,26 @@ PVE.meta.Doc = {
                     success: function (response) {
                         let d = response.result.data || {};
                         // The server could read the bytes but they are not a
-                        // document. Do *not* fall back to the empty document: the
-                        // tree would look empty and an Apply would replace the file
-                        // with whatever was staged on top of nothing. Report it, the
-                        // way the JSON view's 422 used to.
+                        // document. The tree cannot show one -- there are no rows --
+                        // and it must not pretend the document is empty, because an
+                        // Apply would then replace the file with whatever was staged
+                        // on top of nothing.
+                        //
+                        // So hand it to the text editor, which is the one place a
+                        // document that is not a document can still be worked on, and
+                        // is where DESIGN §4 says the repair happens: a root replace
+                        // with a full document. Monaco already puts the parser's own
+                        // complaint on the offending line, so nothing here has to
+                        // explain what is wrong. `docParseError` is what keeps the
+                        // tree out of reach until it parses again.
                         if (d.parse_error) {
-                            Proxmox.Utils.setErrorMask(
-                                me,
-                                Ext.htmlEncode(
-                                    Ext.String.format(
-                                        gettext('The stored document cannot be read: {0}'),
-                                        d.parse_error,
-                                    ),
-                                ),
-                            );
+                            me.docParseError = d.parse_error;
+                            me.docState[me.docId] = { digest: d.digest || '', data: {} };
+                            me.buildTree();
+                            me.syncButtons();
+                            next();
+                            me.setModeButton('text');
+                            me.enterTextMode();
                             return;
                         }
                         let data;
@@ -3920,6 +3929,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncAccessLabel: function () {
         let me = this;
         let modeBtn = me.down('#modeBtn');
+        if (modeBtn && modeBtn.items.getAt(0)) {
+            // A document that does not parse has no rows to show, and a tree that
+            // showed none would be indistinguishable from an empty document -- one
+            // Apply away from replacing the file with nothing. Text is the only
+            // view of it until it parses.
+            let tree = modeBtn.items.getAt(0);
+            tree.setDisabled(!!me.docParseError);
+            tree.setTooltip(
+                me.docParseError
+                    ? Ext.String.format(
+                          gettext('This document is not valid YAML and can only be repaired as text: {0}'),
+                          me.docParseError,
+                      )
+                    : undefined,
+            );
+        }
         if (modeBtn && modeBtn.items.getAt(1)) {
             // The Text card is the whole document at the root view, and a scope-only
             // principal may not read that at all (DESIGN §3): do not offer it. Staged
@@ -3964,6 +3989,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return []; // prefixes apply to guest documents only (DESIGN section 3.3)
         }
         return (me.prefixes || []).filter(function (ns) {
+            // A file that did not load is in this list so the registry grid can show
+            // it (DESIGN §3.3), and it must never describe anything: it has no
+            // selector, so the test below would drop it anyway, but relying on that
+            // would make a safety property an accident of another rule.
+            if (ns.error) {
+                return false;
+            }
             let sel = ns.selector || {};
             return sel.all || (sel.tag && me.tags.indexOf(sel.tag) !== -1);
         });
@@ -4566,6 +4598,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // not advisory: the server refuses the real write for the same reason, tick or
         // no tick. Showing it as an error is honest; showing it as something you can
         // override is not, and it cost every Apply a second request.
+        // Unreachable while the Tree card is disabled, and here anyway: the rule is
+        // that a document which does not parse is repaired whole, and the planned
+        // document the tree would send is built on an empty one.
+        if (me.docParseError) {
+            Ext.Msg.alert(
+                gettext('Error'),
+                Ext.htmlEncode(
+                    Ext.String.format(
+                        gettext('This document is not valid YAML; repair it as text: {0}'),
+                        me.docParseError,
+                    ),
+                ),
+            );
+            return;
+        }
+
         let warnings = me.applyFindingsFor(planned);
         if (!warnings.length) {
             write();
@@ -5172,6 +5220,28 @@ Ext.define('PVE.meta.RegistryGrid', {
         rowsFrom: function (kind, list) {
             let U = PVE.meta.Utils;
             return (list || []).map(function (e) {
+                // A file in the directory that did not load. It is named -- the
+                // loader only ever tries files whose name is already valid -- and
+                // that is the whole point: before this it was simply absent, so a
+                // prefix that stopped parsing ceased to exist with nothing anywhere
+                // saying so. Its row says what is wrong, in the column that would
+                // otherwise say what it does, and Edit still opens it, which is
+                // where it gets repaired.
+                if (e.error) {
+                    let name = kind === 'permissions' ? e.name : e.prefix;
+                    return {
+                        name: name,
+                        id: kind + '/' + name,
+                        error: e.error,
+                        description: e.error,
+                        authid: '',
+                        summary: '',
+                        selector: '',
+                        schema: '',
+                        origin: e.origin || 'cluster',
+                        overrides: false,
+                    };
+                }
                 if (kind === 'permissions') {
                     return {
                         name: e.name,
@@ -5225,7 +5295,14 @@ Ext.define('PVE.meta.RegistryGrid', {
                 text: isPrefix ? gettext('Prefix') : gettext('Name'),
                 dataIndex: 'name',
                 flex: 2,
-                renderer: Ext.htmlEncode,
+                // The same marker the tree puts on a row whose value does not match
+                // its schema, one step further out: this whole file does not match
+                // the format it is in. The Description column carries the parser's
+                // own words, so the icon does not have to say anything.
+                renderer: (v, meta, rec) =>
+                    rec.data.error
+                        ? Ext.htmlEncode(v) + ' <i class="fa fa-exclamation-triangle warning"></i>'
+                        : Ext.htmlEncode(v),
             },
         ];
         if (isPrefix) {

@@ -3,11 +3,11 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::api::{
     access, delete_document, effective, gc, gc_candidates, gc_purge, get_document, list_guests,
-    parse_id, permissions_list, put_document, version, ApiError, ApiPutResult, ApiViewDocument,
-    CallerAcl, GuestInput,
+    parse_id, permissions_list, prefixes_list, put_document, version, ApiError, ApiPutResult,
+    ApiViewDocument, CallerAcl, GuestInput, PermissionEntry,
 };
 use pve_meta_core::path::Path as DocPath;
-use pve_meta_core::registry::{self, Permission};
+use pve_meta_core::registry::{self, Origin, Permission, RegistryFailure};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind};
 use serde_json::json;
 
@@ -1014,10 +1014,62 @@ fn access_returns_the_tags_only_to_a_caller_who_may_read_the_guest() {
 
 #[test]
 fn permissions_list_returns_every_permission() {
-    let gs = permissions_list(&regs());
+    let gs = permissions_list(&regs(), &[]);
     assert_eq!(gs.len(), 1);
-    assert_eq!(gs[0].authid, "scoped@pve!t1");
-    assert_eq!(gs[0].rules.len(), 2);
+    match &gs[0] {
+        PermissionEntry::Loaded(g) => {
+            assert_eq!(g.authid, "scoped@pve!t1");
+            assert_eq!(g.rules.len(), 2);
+        }
+        PermissionEntry::Failed(_) => panic!("regs() has no failures"),
+    }
+}
+
+/// The one place a file that did not load is visible at all (`docs/DESIGN.md`
+/// §1 and the module docs on `registry::RegistryFailure`): the listing has to
+/// carry both a loaded entry and a failed one, and the failed one has to be
+/// keyed the same way a loaded row is, or a consumer reading both arrays has
+/// no field to find either by.
+#[test]
+fn permissions_list_carries_failures_keyed_like_a_loaded_permission() {
+    let failures = vec![RegistryFailure {
+        name: "broken".to_string(),
+        origin: Origin::Cluster,
+        error: "bad mode".to_string(),
+    }];
+    let gs = permissions_list(&regs(), &failures);
+    assert_eq!(gs.len(), 2);
+
+    let rows: Vec<serde_json::Value> =
+        gs.iter().map(|g| serde_json::to_value(g).unwrap()).collect();
+    assert_eq!(rows[0]["name"], json!("scoped"));
+    assert!(rows[0].get("error").is_none(), "a loaded row has no error");
+    assert_eq!(rows[1]["name"], json!("broken"), "keyed like a loaded permission -- 'name'");
+    assert_eq!(rows[1]["origin"], json!("cluster"));
+    assert_eq!(rows[1]["error"], json!("bad mode"));
+    assert!(rows[1].get("path").is_none(), "no filesystem path on the wire");
+    assert!(rows[1].get("authid").is_none(), "a failed row has nothing a loaded one promises");
+}
+
+#[test]
+fn prefixes_list_carries_failures_keyed_like_a_loaded_prefix() {
+    let prefixes = vec![registry::parse_prefix("traefik", "selector: {all: true}\n").unwrap()];
+    let failures = vec![RegistryFailure {
+        name: "brokenns".to_string(),
+        origin: Origin::Packaged,
+        error: "missing 'selector'".to_string(),
+    }];
+    let ns = prefixes_list(&prefixes, &failures);
+    assert_eq!(ns.len(), 2);
+
+    let rows: Vec<serde_json::Value> = ns.iter().map(|n| serde_json::to_value(n).unwrap()).collect();
+    assert_eq!(rows[0]["prefix"], json!("traefik"));
+    assert!(rows[0].get("error").is_none());
+    assert_eq!(rows[1]["prefix"], json!("brokenns"), "keyed like a loaded prefix -- 'prefix'");
+    assert_eq!(rows[1]["origin"], json!("packaged"));
+    assert_eq!(rows[1]["error"], json!("missing 'selector'"));
+    assert!(rows[1].get("path").is_none(), "no filesystem path on the wire");
+    assert!(rows[1].get("schema").is_none(), "a failed row has nothing a loaded one promises");
 }
 
 #[test]

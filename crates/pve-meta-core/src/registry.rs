@@ -199,6 +199,26 @@ pub struct Permission {
     pub overrides: bool,
 }
 
+/// A file in a registry directory that did not load: unreadable, or not
+/// valid as the kind it lives in (a bad `selector`, an unknown field, text
+/// that is not YAML at all). Silently dropping this -- what `load_dirs`
+/// always did -- is the one failure mode in the project with no observable
+/// symptom (see the module docs): the name is missing everywhere a caller
+/// would look for it, and only a log line ever said so.
+///
+/// `yaml_files` has already filtered to names [`is_valid_file_name`] accepts
+/// before `load_dirs` calls the parser at all, so `name` here is always
+/// something `GET /meta/prefixes/{name}` or `GET /meta/permissions/{name}`
+/// can open -- never a name a hand-edit made unaddressable in the first place.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RegistryFailure {
+    /// The file name without `.yaml`, which for a prefix IS the prefix.
+    pub name: String,
+    pub origin: Origin,
+    /// Why it did not load, as the parser or the filesystem put it.
+    pub error: String,
+}
+
 // -- strict parsing ------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -473,12 +493,25 @@ impl Registry {
 
     /// [`load_prefixes`] over this registry's own prefix directories.
     pub fn load_prefixes(&self) -> Vec<PrefixDef> {
-        load_prefixes(self.dirs(RegistryKind::PrefixDef))
+        self.list_prefixes().0
     }
 
     /// [`load_permissions`] over this registry's own permission directories.
     pub fn load_permissions(&self) -> Vec<Permission> {
-        load_permissions(self.dirs(RegistryKind::Permission))
+        self.list_permissions().0
+    }
+
+    /// Every prefix, plus every file that did not load, from one walk of this
+    /// registry's own prefix directories. `GET /meta/prefixes`'s source: the
+    /// one listing where a failure has to survive (see [`RegistryFailure`]).
+    pub fn list_prefixes(&self) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
+        prefixes_with_failures(self.dirs(RegistryKind::PrefixDef))
+    }
+
+    /// Every permission, plus every file that did not load, likewise --
+    /// `GET /meta/permissions`'s source.
+    pub fn list_permissions(&self) -> (Vec<Permission>, Vec<RegistryFailure>) {
+        permissions_with_failures(self.dirs(RegistryKind::Permission))
     }
 }
 
@@ -489,13 +522,19 @@ impl Registry {
 /// rather than `Origin::Packaged` -- is decided in exactly one place,
 /// [`Registry::write_dir`]; this just derives the same last-directory-wins
 /// fact for every entry as it folds them in.
+///
+/// Returns the failures alongside the parsed items -- an unreadable file and
+/// an unparseable one both count -- so a caller that needs to show them (`GET
+/// /meta/prefixes`, `GET /meta/permissions`) can have both from one walk of
+/// the directories, instead of two.
 fn load_dirs<T>(
     dirs: &[PathBuf],
     kind: &str,
     parse: impl Fn(&str, &str) -> Result<T>,
     stamp: impl Fn(&mut T, Origin, bool),
-) -> Vec<(String, T)> {
+) -> (Vec<(String, T)>, Vec<RegistryFailure>) {
     let mut by_name: BTreeMap<String, T> = BTreeMap::new();
+    let mut failures = Vec::new();
     let last = dirs.len().saturating_sub(1);
     for (index, dir) in dirs.iter().enumerate() {
         let origin = if index == last { Origin::Cluster } else { Origin::Packaged };
@@ -507,6 +546,7 @@ fn load_dirs<T>(
                         "skipping unreadable {kind} file {}: {e}",
                         path.display()
                     );
+                    failures.push(RegistryFailure { name, origin, error: e.to_string() });
                     continue;
                 }
             };
@@ -523,24 +563,24 @@ fn load_dirs<T>(
                         "skipping malformed {kind} file {}: {e}",
                         path.display()
                     );
+                    failures.push(RegistryFailure { name, origin, error: e.to_string() });
                 }
             }
         }
     }
-    by_name.into_iter().collect()
+    (by_name.into_iter().collect(), failures)
 }
 
-/// Every prefix in `dirs` (lowest precedence first, later directories
-/// overriding earlier **by file name**), **sorted most-specific first** — the
-/// order [`governing`] relies on.
-pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
-    let mut out: Vec<PrefixDef> = load_dirs(dirs, "prefix", parse_prefix, |p, origin, over| {
+/// [`load_dirs`] for prefixes, plus the most-specific-first sort
+/// [`governing`] relies on -- shared by [`load_prefixes`] (which drops the
+/// failures) and [`Registry::list_prefixes`] (which keeps them), so the two
+/// can never compute the sort differently.
+fn prefixes_with_failures(dirs: &[PathBuf]) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
+    let (parsed, failures) = load_dirs(dirs, "prefix", parse_prefix, |p, origin, over| {
         p.origin = origin;
         p.overrides = over;
-    })
-        .into_iter()
-        .map(|(_, ns)| ns)
-        .collect();
+    });
+    let mut out: Vec<PrefixDef> = parsed.into_iter().map(|(_, ns)| ns).collect();
     // Longest prefix first; ties by name, so the order is stable and the UI
     // shows something deterministic.
     out.sort_by(|a, b| {
@@ -550,18 +590,38 @@ pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
             .cmp(&a.prefix.segments().len())
             .then_with(|| a.prefix.to_string().cmp(&b.prefix.to_string()))
     });
-    out
+    (out, failures)
+}
+
+/// Every prefix in `dirs` (lowest precedence first, later directories
+/// overriding earlier **by file name**), **sorted most-specific first** — the
+/// order [`governing`] relies on.
+pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
+    // Drops the failures, and must keep dropping them: a file that did not
+    // parse is not a prefix, and it must never reach `governing`, which
+    // decides what a document's shape *is*. `Registry::list_prefixes` is the
+    // one place the same failure survives, for the listing that has to show it.
+    prefixes_with_failures(dirs).0
+}
+
+/// [`load_dirs`] for permissions, split out for the same reason as
+/// [`prefixes_with_failures`].
+fn permissions_with_failures(dirs: &[PathBuf]) -> (Vec<Permission>, Vec<RegistryFailure>) {
+    let (parsed, failures) = load_dirs(dirs, "permission", parse_permission, |g, origin, over| {
+        g.origin = origin;
+        g.overrides = over;
+    });
+    (parsed.into_iter().map(|(_, g)| g).collect(), failures)
 }
 
 /// Every grant in `dirs`, sorted by file name.
 pub fn load_permissions(dirs: &[PathBuf]) -> Vec<Permission> {
-    load_dirs(dirs, "permission", parse_permission, |g, origin, over| {
-        g.origin = origin;
-        g.overrides = over;
-    })
-        .into_iter()
-        .map(|(_, g)| g)
-        .collect()
+    // Same drop, the other direction, and just as deliberate: a file that did
+    // not parse is not a permission, and it must never reach `scopes_for` --
+    // a malformed permission file must grant nothing, not "grant nothing
+    // until someone reads the log". `Registry::list_permissions` is where the
+    // failure survives instead.
+    permissions_with_failures(dirs).0
 }
 
 fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
@@ -965,6 +1025,59 @@ rules:
     fn a_missing_directory_is_not_an_error() {
         assert!(load_prefixes(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
         assert!(load_permissions(&[PathBuf::from("/nonexistent/pve-meta")]).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_prefix_file_is_listed_named_but_never_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "traefik.yaml", NS);
+        write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
+        let reg = Registry::new(vec![dir.path().to_path_buf()], vec![]);
+
+        let (parsed, failures) = reg.list_prefixes();
+        assert_eq!(
+            parsed.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
+            vec!["traefik"],
+            "only the good file becomes a prefix",
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].name, "broken", "the file name, not anything inside it");
+        assert!(!failures[0].error.is_empty());
+        // Same rule as `Registry::write_dir` -- one directory, nothing packaged.
+        assert_eq!(failures[0].origin, Origin::Cluster);
+
+        // What `governing`/the write path actually consult must never see it.
+        assert_eq!(reg.load_prefixes(), parsed);
+    }
+
+    #[test]
+    fn a_malformed_permission_file_is_listed_named_and_grants_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "good.yaml", PERMISSION_FILE);
+        // Well-formed enough to name a real authid -- the point is that a
+        // parse failure refuses it regardless of who it claims to be for.
+        write(
+            dir.path(),
+            "broken.yaml",
+            "authid: svc@pve!traefik\nrules:\n  - prefix: x\n    mode: sideways\n    selector: {all: true}\n",
+        );
+        let reg = Registry::new(vec![], vec![dir.path().to_path_buf()]);
+
+        let (parsed, failures) = reg.list_permissions();
+        assert_eq!(parsed.len(), 1, "only the good file becomes a permission");
+        assert_eq!(parsed[0].name, "good");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].name, "broken");
+        assert!(!failures[0].error.is_empty());
+        assert_eq!(failures[0].origin, Origin::Cluster);
+
+        // What `access`/`effective` actually consult must never see it.
+        assert_eq!(reg.load_permissions(), parsed);
+
+        // The important check: even though the malformed file's own `authid`
+        // matches exactly, a file that did not parse grants nothing.
+        let scopes = scopes_for(&parsed, "svc@pve!traefik", &["traefik".to_string()]);
+        assert_eq!(scopes.len(), 2, "only the good file's two rules -- nothing from `broken`");
     }
 
     #[test]
