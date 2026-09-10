@@ -98,9 +98,16 @@ Grants for a caller on a guest document:
   `Sys.Audit` / `Sys.Modify` on `/`).
 * Scopes = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
-* Reading view `P` needs full read or a scope covering `P`; writing needs full write or
-  a `rw` scope covering every path the write touches; a write to the root view needs
-  full write. A caller with no rule at all gets 403 on read.
+* Reading view `P` needs full read or a scope covering `P`. A caller with no rule at all
+  gets 403 on read.
+* **A write is authorized by what it changes, not by what it is addressed to**: every
+  path the plan touches — values changed, keys added, keys removed — needs full write or
+  a `rw` scope. So one write may span two granted prefixes even though the view covering
+  both is the document root. On top of that a write needs read access to the view it
+  names (otherwise the check is a read oracle) and *some* write permission on the
+  document (key order is not a path, so a pure reordering touches nothing). A document
+  that cannot be read back is the exception: repairing it as a whole needs full write,
+  because there is no stored content to check the change against.
 
 This is a blast-radius limiter, not a security boundary against an adversary — see
 `docs/DESIGN.md` §1 for the threat model.

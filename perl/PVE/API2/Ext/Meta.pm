@@ -830,11 +830,17 @@ __PACKAGE__->register_method({
     path => 'guests/{vmid}',
     method => 'PUT',
     permissions => {
-        description => "Anybody may call this; the caller must be able to write the "
-            . "named view (VM.Config.Options, or a granted rw scope covering it) "
-            . "and every path the write touches -- otherwise 403. Writing the whole "
-            . "document (no 'view') requires VM.Config.Options. Unknown vmids are 404, "
-            . "not created.",
+        description => "Anybody may call this. What authorizes the write is what it "
+            . "*changes*: every path it touches -- values changed, keys added, keys "
+            . "removed -- must be covered by VM.Config.Options or by a granted rw "
+            . "scope, otherwise 403. The 'view' is where the write is aimed, not what "
+            . "it may do, so one write may span two granted prefixes even though the "
+            . "view covering both is the whole document. On top of that the caller "
+            . "must be able to read the named view and must hold some write permission "
+            . "on the document (docs/DESIGN.md 3.4). A document that cannot be read "
+            . "back is the exception: repairing it as a whole requires "
+            . "VM.Config.Options, since there is no stored content to check the change "
+            . "against. Unknown vmids are 404, not created.",
         user => 'all',
     },
     description => "Writes a guest's metadata document (or a view/prefix of it).",

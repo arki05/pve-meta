@@ -492,6 +492,21 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
     staged.pop();
 }
 
+console.log('\n--- Apply is offered wherever a write could succeed ---');
+{
+    // Mirrors `Effective::has_any_write`. The server decides what a write may
+    // change; this only decides whether offering the button is honest.
+    eq('full write access', U.hasAnyWrite({ write: 1, scopes: [] }), true);
+    eq('one rw scope', U.hasAnyWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }), true);
+    eq(
+        'read-only scopes are not write access',
+        U.hasAnyWrite({ write: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }),
+        false,
+    );
+    eq('an auditor holds nothing', U.hasAnyWrite({ read: 1, write: 0, scopes: [] }), false);
+    eq('a missing access object is not write access', U.hasAnyWrite(undefined), false);
+}
+
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
 {
     // A prefix with no schema used to paint no row at all, so `netbird` -- which

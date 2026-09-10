@@ -116,6 +116,19 @@ PVE.meta.Utils = {
     // That is the only comment-key rule (DESIGN §3).
     covers: (p, path) => path === p || path === p + '__' || path.indexOf(p + '.') === 0,
 
+    // May this caller write *anything* in this document: full write access, or at
+    // least one `rw` scope.
+    //
+    // A deliberate mirror of `Effective::has_any_write`, in the same spirit as
+    // `covers` above -- the server enforces the rule and the editor predicts it, so
+    // that Apply is offered exactly where a write could succeed. What the write may
+    // actually change is decided server-side, by what it changes (DESIGN §3.4); this
+    // only answers whether there is any point offering the button.
+    hasAnyWrite: function (access) {
+        let a = access || {};
+        return !!a.write || (a.scopes || []).some((s) => s.mode === 'rw');
+    },
+
     kindOf: function (value) {
         if (Ext.isArray(value)) {
             return 'array';
@@ -417,9 +430,14 @@ PVE.meta.Utils = {
     // The narrowest view that covers every staged path -- the write Apply sends.
     //
     // One write, because the whole point is that the intermediate states are the
-    // ones the server refuses. Narrow, because a root write needs full write access
-    // while a scoped principal may hold only its own prefix (DESIGN §3.4), and
-    // because a write that names less is a write that can collide with less.
+    // ones the server refuses. Narrow, because a write that names less is a write
+    // that can collide with less, and because a scope-only principal cannot name
+    // the root view at all -- it may not read the whole document (DESIGN §3.4).
+    //
+    // Narrow is no longer a *permission* requirement, and this deliberately does
+    // not consult the caller's scopes. What a write may do is decided by what it
+    // changes: a plan spanning two granted prefixes, whose narrowest view is
+    // therefore the document root, is an ordinary write the server takes.
     //
     // A delete cannot be expressed by replacing the thing being deleted, so a staged
     // delete at the common ancestor moves the write one level up: the parent is
@@ -3033,7 +3051,14 @@ Ext.define('PVE.meta.TreePanel', {
         PVE.meta.Footer.sync(me, {
             // In text mode the buffer is the edit, and Apply is offered whenever the
             // caller may write at all -- the diff is what decides if it is worth it.
-            canApply: textMode ? !!me.access.write : me.isDirty(),
+            //
+            // "At all" means any rw scope, not full write access. A whole-document
+            // write is authorized by what it changes (DESIGN §3.4), so a principal
+            // holding `rw` on one prefix can perfectly well apply a buffer whose only
+            // changes are inside it -- and the server refuses the rest, naming the path
+            // it refused. Requiring full write here disabled the button for exactly the
+            // callers this view is most useful to.
+            canApply: textMode ? PVE.meta.Utils.hasAnyWrite(me.access) : me.isDirty(),
             // The same count in both views: the buffer is rendered from the planned
             // document, so those staged edits are in it. Showing it only in the tree
             // made switching to Text look like it had dropped them.
@@ -3868,12 +3893,12 @@ Ext.define('PVE.meta.TreePanel', {
         // One staged delete is a DELETE, not a replace of its parent.
         //
         // `writeView` steps up a level for a delete, because you cannot remove a key by
-        // replacing it -- but for a *top-level* key that step lands on the document
-        // root, and a root write needs full write access (DESIGN §3.4). So a principal
-        // holding `rw` on `traefik` could stage Remove on the `traefik` row, see it
-        // struck through, and get "writing the whole document requires full write
-        // access" on Apply -- for a delete the server would have taken as
-        // `DELETE ?view=traefik`, which is what this panel sent before staging existed.
+        // replacing it -- and for a *top-level* key that step lands on the document
+        // root. That used to be a 403 for a scoped principal; now the server reads a
+        // root replace by what it changes, so it would be allowed. This stays anyway,
+        // because `DELETE ?view=traefik` is the smaller write: it names one subtree
+        // instead of the whole document, so it collides with less, and it does not
+        // require the caller to be able to send back every key it did not touch.
         let onlyDelete =
             me.pending.length === 1 && me.pending[0].op === 'delete' && me.pending[0].path;
         let write = function () {

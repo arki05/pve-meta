@@ -145,10 +145,52 @@ this is two concepts and not one.
   (datacenter: `Sys.Audit` / `Sys.Modify` on `/`).
 * `scopes` = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
-* Reading view `P` requires full read or a scope covering `P`; writing requires full
-  write or a `rw` scope covering every touched path; a write to the root view requires
-  full write. A read by a caller with no rule at all is 403. Authorization is decided
-  from the request and a plan computed against a copy, never from a diff of stored data.
+* Reading view `P` requires full read or a scope covering `P`. A read by a caller with
+  no rule at all is 403.
+
+**A write is authorized by what it changes, not by what it is addressed to.** The plan
+is computed against a copy of the stored document, and every path it touches — every
+value that changed, every key that appeared, every key that vanished — must be covered
+by full write or by a `rw` scope. The view named in the request is where the write is
+aimed, not what it is allowed to do.
+
+This used to be the other way round: the view itself had to sit inside a writable scope,
+and the root view demanded full write outright. That is coarser than the question anyone
+is asking, and it refused writes that violated nobody's permissions. A permission file
+has `rules`, plural, so holding `rw` on two prefixes and editing one key in each is
+ordinary — and the narrowest view covering both is the document root. A key reordering
+is the same story: it changes no path at all, so it can only be expressed as a
+whole-document write. Both were 403s for writes whose every change was permitted.
+
+Two request-shaped refusals remain, and neither is about the content:
+
+* **You must be able to read the view you name.** Otherwise the content check is a read
+  oracle — replace a key you cannot read with a guess, and `200` versus `403` tells you
+  whether the guess was right. Requiring read access makes the oracle answer a question
+  you could have asked outright. It is also what keeps a scope-only principal out of the
+  root view, since `covers` never covers the root: it cannot replace a document it can
+  only see part of.
+* **You must have some write permission on this document** — full write, or at least one
+  `rw` scope. The content check measures changed *paths*, and key order is not one, so a
+  pure reordering touches nothing and would otherwise let a read-only auditor rewrite the
+  file.
+
+The consequence of that second rule is deliberate and worth stating plainly: **key order
+is not access-controlled.** Anyone who may write something in a document may reorder its
+keys, including keys they may not otherwise touch. Order is preserved because rewriting
+someone's file differently from how they wrote it is rude, not because anything reads it
+— no lookup, no precedence and no selector depends on it. The alternative is an editor
+where saving as text can fail for reasons nobody can see.
+
+`full_write` short-circuits both, and does not require being able to read: a PVE ACL can
+grant `VM.Config.Options` without `VM.Audit`.
+
+**The one exception is a document that cannot be read back** (§4). Its stored value *is*
+the empty document, so the diff has nothing to compare against: a scoped principal
+replacing the root with nothing but its own subtree would produce a touched list entirely
+inside its own scope, while destroying every other prefix's content in a file nobody can
+currently read. Content-based authorization needs content to authorize against, so the
+whole-document repair keeps requiring full write.
 
 **PVE ACLs cannot express this**, which is why permissions are ours and not
 `pveum acl modify /meta/traefik`. `PVE::AccessControl::check_path` is a hardcoded
@@ -414,8 +456,10 @@ narrowest view covering every staged path, carrying the planned subtree. For a s
 row that is exactly the one-key write it used to send immediately; for the selector
 change it is one `replace` at `selector`, which is the only thing the server will take.
 A staged delete moves the write one level up, since a key cannot be removed by replacing
-it. Narrow on purpose: a root write needs full write access, while a scoped principal
-may hold only its own prefix (§3.4).
+it. Narrow on purpose: a write that names less is a write that can collide with less, and
+a scope-only principal cannot name the root view at all (§3.4). It is no longer narrow
+for *permission* reasons — what a write may do is decided by what it changes — so a plan
+whose narrowest view is the document root is an ordinary write now, not a 403.
 
 A staged row is rendered the way proxmoxlib's own `PendingObjectGrid` renders a config
 change that has not taken effect yet — the stored value, then the pending one beneath it

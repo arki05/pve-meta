@@ -108,6 +108,20 @@ impl Effective {
                 .any(|s| s.mode == Mode::Rw && covers(&s.prefix, path))
     }
 
+    /// `true` if this principal may write **something** in this document:
+    /// full write access, or at least one read-write scope.
+    ///
+    /// Not a substitute for [`Effective::can_write`], which answers about a
+    /// path. This answers the coarser question the API's request-shaped gate
+    /// asks — *have you any business writing here at all* — so that a caller
+    /// with no write permission whatsoever cannot reach the content check and
+    /// use it as an oracle, and cannot cause the file to be rewritten by a
+    /// change the content check does not measure (see
+    /// `api::authorize_view_write`).
+    pub fn has_any_write(&self) -> bool {
+        self.full_write || self.scopes.iter().any(|s| s.mode == Mode::Rw)
+    }
+
     /// The prefixes to union for a "no view" read (see
     /// [`crate::view::filter`]): the whole document (`[Path::root()]`) for
     /// full read access, else every scope's prefix (of either mode).
@@ -249,6 +263,26 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(g.readable_prefixes(), vec![Path::root()]);
+    }
+
+    #[test]
+    fn has_any_write_is_full_write_or_one_rw_scope() {
+        assert!(!Effective::default().has_any_write());
+        assert!(Effective { full_write: true, ..Default::default() }.has_any_write());
+        assert!(!Effective {
+            full_read: true,
+            scopes: vec![Scope { prefix: p("netbird"), mode: Mode::Ro }],
+            ..Default::default()
+        }
+        .has_any_write());
+        assert!(Effective {
+            scopes: vec![
+                Scope { prefix: p("netbird"), mode: Mode::Ro },
+                Scope { prefix: p("traefik"), mode: Mode::Rw },
+            ],
+            ..Default::default()
+        }
+        .has_any_write());
     }
 
     #[test]

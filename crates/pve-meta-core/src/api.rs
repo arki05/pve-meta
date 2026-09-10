@@ -676,15 +676,24 @@ pub fn get_document(
 ///
 /// The value planned against is the empty document (nothing else can be
 /// recovered), so any narrower write would silently discard everything the
-/// file contains. `authorize_view_write` has already established that a root
-/// view requires `full_write`, so this is the documented repair path and
-/// nothing else.
+/// file contains.
 ///
 /// One condition, one gate: whatever makes a document unrecoverable, the
 /// repair is the same two shapes and nothing narrower — a root `merge` very
 /// much included, since it is planned against the empty document too.
+///
+/// **And it takes `full_write`, which is the one place that rule survives.**
+/// Everywhere else a write is authorized by what it changes, because the diff
+/// against the stored document can see what that is. Here it cannot: the
+/// stored value *is* the empty document, so a scoped principal replacing the
+/// root with nothing but its own subtree would produce a touched list entirely
+/// inside its own scope — and destroy every other prefix's content in a file
+/// nobody can currently read. Content-based authorization needs content to
+/// authorize against; when there is none, the coarse rule is the only honest
+/// one.
 fn check_repairable(
     stored: &Stored,
+    access: &Effective,
     view_path: &DocPath,
     is_merge: bool,
 ) -> Result<(), anyhow::Error> {
@@ -692,6 +701,13 @@ fn check_repairable(
         return Ok(());
     };
     if view_path.is_root() && !is_merge {
+        if !access.full_write {
+            return Err(anyhow::anyhow!(
+                "403: not permitted: this document cannot be read back, so repairing it \
+                 replaces content that cannot be checked against your permissions; \
+                 repairing it as a whole requires full write access"
+            ));
+        }
         return Ok(());
     }
     Err(bad_request(format!(
@@ -700,17 +716,63 @@ fn check_repairable(
     )))
 }
 
-/// Every write's up-front, request-shaped authorization gate: the caller must
-/// be able to write the view they named, and only a caller with full write
-/// access may write the root view (`docs/DESIGN.md` §3).
+/// Every write's up-front, request-shaped authorization gate.
+///
+/// **What authorizes a write is what it changes, not what it is addressed
+/// to.** The real gate is `Effective::check_write` in [`plan_write`], which
+/// runs over the paths the write actually touches — computed by `patch::diff`
+/// against the stored document, so it sees every value that changed, every key
+/// that appeared and every key that vanished, wherever the write was aimed.
+/// This function only refuses the requests that must not reach that check at
+/// all.
+///
+/// It used to be the other way round: the view had to be inside a writable
+/// scope, and the root view demanded `full_write` outright. That is strictly
+/// coarser than the question anyone is actually asking, and it refused writes
+/// that violate nobody's permissions — a permission file has `rules`, plural,
+/// so holding `rw` on two prefixes and editing one key in each is ordinary,
+/// and the narrowest view covering both is the document root. Same for a key
+/// reordering, which changes no path at all and can only be expressed as a
+/// whole-document write. Both were 403s for writes whose every change was
+/// permitted (`docs/DESIGN.md` §3.4).
+///
+/// Two things still have to be refused here, and neither is about the content:
+///
+/// * **You must be able to read the view you name.** Otherwise the content
+///   check becomes a read oracle: replace a key you cannot read with a guess,
+///   and `200` versus `403` tells you whether the guess was right. Requiring
+///   read access makes the oracle answer a question you could have asked
+///   outright. This also keeps a scope-only principal out of the root view —
+///   `covers` never covers the root — which is what stops it from replacing a
+///   document it can only see part of.
+/// * **You must have some write permission on this document.** The content
+///   check measures changed *paths*, and key order is not one: a pure
+///   reordering touches nothing and would sail through, letting a read-only
+///   auditor rewrite a file. `has_any_write` is the floor that keeps the
+///   people who may not write here from causing a write at all.
+///
+/// `full_write` short-circuits both: it is the existing "may write the whole
+/// document" answer, and it does not depend on being able to read it (a PVE
+/// ACL can grant `VM.Config.Options` without `VM.Audit`, and that principal
+/// could write the root before this change).
 fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), anyhow::Error> {
-    if view_path.is_root() && !access.full_write {
+    if access.full_write {
+        return Ok(());
+    }
+    if !access.has_any_write() {
         return Err(anyhow::anyhow!(
-            "403: not permitted: writing the whole document requires full write access; \
-             name an explicit view inside a writable prefix"
+            "403: not permitted: no write access to this document"
         ));
     }
-    if !access.can_write(view_path) {
+    if !access.can_read(view_path) {
+        // The root gets its own sentence: `forbidden` names the path it
+        // refused, and the root's name is the empty string.
+        if view_path.is_root() {
+            return Err(anyhow::anyhow!(
+                "403: not permitted: writing the whole document requires being able to \
+                 read the whole document; name a view inside a prefix you hold"
+            ));
+        }
         return Err(forbidden(view_path));
     }
     Ok(())
@@ -830,7 +892,7 @@ pub fn put_document(
 
     store.check_precondition(&doc_id, digest).map_err(api_err)?;
     let stored = read_stored(store, &doc_id)?;
-    check_repairable(&stored, &view_path, is_merge)?;
+    check_repairable(&stored, &access, &view_path, is_merge)?;
 
     // (2) Plan the mutation against a *copy*; the stored document is only
     //     touched once the plan has passed every check.
@@ -904,7 +966,7 @@ pub fn delete_document(
     let stored = read_stored(store, &doc_id)?;
     // A root DELETE removes the file whole, so it repairs an unrecoverable
     // document exactly like a root replace does.
-    check_repairable(&stored, &view_path, false)?;
+    check_repairable(&stored, &access, &view_path, false)?;
 
     let mut planned = stored.value.clone();
     let touched = plan_write(&mut planned, &access, |v| {
@@ -1097,6 +1159,33 @@ mod tests {
         }
     }
 
+    /// `VM.Audit` and no `VM.Config.Options`, plus whatever scopes the
+    /// permission files give it: the principal every one of these rules is
+    /// actually about. It can read the whole document, so it can compose a
+    /// faithful whole-document write; what it may *change* is its scopes.
+    fn auditor(tags: &[&str]) -> CallerAcl {
+        CallerAcl {
+            authid: "scoped@pve!t1".to_string(),
+            read: true,
+            write: false,
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// A permission file with two `rw` rules, which is the ordinary shape the
+    /// old view gate could not express a write for: the narrowest view
+    /// covering one key in each is the document root.
+    fn two_rw() -> Vec<Permission> {
+        vec![registry::parse_permission(
+            "two",
+            "authid: scoped@pve!t1\n\
+             rules:\n\
+             \x20 - prefix: traefik\n    mode: rw\n    selector: {all: true}\n\
+             \x20 - prefix: netbird\n    mode: rw\n    selector: {all: true}\n",
+        )
+        .unwrap()]
+    }
+
     fn seed(store: &MetaStore, id: &str, text: &str) {
         store.put_raw(&parse_id(id).unwrap(), text, None).unwrap();
     }
@@ -1131,7 +1220,23 @@ mod tests {
         dry_run: bool,
         acl: &CallerAcl,
     ) -> Result<ApiPutResult, anyhow::Error> {
-        put_document(store, &regs(), id, view, fmt, payload, mode, digest, dry_run, acl)
+        put_with(store, &regs(), id, view, fmt, payload, mode, digest, dry_run, acl)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put_with(
+        store: &MetaStore,
+        permission_files: &[Permission],
+        id: &str,
+        view: Option<&str>,
+        fmt: &str,
+        payload: &str,
+        mode: &str,
+        digest: Option<&str>,
+        dry_run: bool,
+        acl: &CallerAcl,
+    ) -> Result<ApiPutResult, anyhow::Error> {
+        put_document(store, permission_files, id, view, fmt, payload, mode, digest, dry_run, acl)
     }
 
     fn del(
@@ -1141,7 +1246,18 @@ mod tests {
         digest: Option<&str>,
         acl: &CallerAcl,
     ) -> Result<ApiPutResult, anyhow::Error> {
-        delete_document(store, &regs(), id, view, digest, acl)
+        del_with(store, &regs(), id, view, digest, acl)
+    }
+
+    fn del_with(
+        store: &MetaStore,
+        permission_files: &[Permission],
+        id: &str,
+        view: Option<&str>,
+        digest: Option<&str>,
+        acl: &CallerAcl,
+    ) -> Result<ApiPutResult, anyhow::Error> {
+        delete_document(store, permission_files, id, view, digest, acl)
     }
 
     // -- grants from registrations ----------------------------------------
@@ -1310,6 +1426,165 @@ fn version_detail_names_the_documents_that_changed() {
             assert_eq!(status(&err), 403, "{err}");
         }
         assert_eq!(read_raw(&store, "100").unwrap(), before);
+    }
+
+    // -- what authorizes a write is what it changes -----------------------
+    //
+    // `docs/DESIGN.md` §3.4. The gate used to be the *view*: it had to sit
+    // inside a writable scope, and the root view took full write access. That
+    // refused writes which violated nobody's permissions, so these fix the
+    // rule at the level it is actually about.
+
+    #[test]
+    fn one_write_may_span_two_granted_prefixes() {
+        // A permission file has `rules`, plural. Editing one key in each of
+        // two `rw` prefixes is ordinary, and no view but the root covers both.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
+        let doc = r#"{"traefik":{"host":"b"},"netbird":{"groups":["wan"]}}"#;
+        let res = put_with(
+            &store, &two_rw(), "100", None, "json", doc, "replace", None, false, &auditor(&[]),
+        )
+        .expect("every change is inside a granted prefix");
+        assert_eq!(
+            res.touched.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(),
+            vec!["traefik.host", "netbird.groups"]
+        );
+    }
+
+    #[test]
+    fn a_whole_document_write_still_answers_for_every_key_it_changes() {
+        // The permissiveness is exactly "every change is permitted" and not one
+        // step further: the same root replace that is allowed above is refused
+        // the moment it reaches outside the scopes -- by changing a key, and by
+        // quietly dropping one, which is the shape that would lose data.
+        let (_dir, store) = store();
+        let stored = "traefik:\n  host: a\nhomelab:\n  owner: arki\n";
+        for (label, doc) in [
+            ("changes an outside key", r#"{"traefik":{"host":"b"},"homelab":{"owner":"mallory"}}"#),
+            ("drops an outside key", r#"{"traefik":{"host":"b"}}"#),
+            ("adds an outside key", r#"{"traefik":{"host":"a"},"homelab":{"owner":"arki"},"new":1}"#),
+        ] {
+            seed(&store, "100", stored);
+            let err = put_with(
+                &store, &two_rw(), "100", None, "json", doc, "replace", None, false, &auditor(&[]),
+            )
+            .unwrap_err();
+            assert_eq!(status(&err), 403, "{label}: {err}");
+            assert!(err.to_string().contains("homelab") || err.to_string().contains("new"), "{label}: {err}");
+            assert_eq!(read_raw(&store, "100").as_deref(), Some(stored), "{label} mutated");
+        }
+    }
+
+    #[test]
+    fn reordering_keys_is_a_write_a_scoped_principal_may_make() {
+        // Key order is data -- the model preserves it -- but it is not a path,
+        // so a reordering changes nothing the permission rules are written
+        // about. It can only be expressed as a whole-document write, which is
+        // why it used to be a 403 for anyone without full write access.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
+        let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
+        let res = put_with(
+            &store, &two_rw(), "100", None, "json", reordered, "replace", None, false,
+            &auditor(&[]),
+        )
+        .expect("a reordering changes no path");
+        assert!(res.touched.is_empty(), "{:?}", res.touched);
+        assert_eq!(
+            read_raw(&store, "100").as_deref(),
+            Some("netbird:\n  groups:\n  - lan\ntraefik:\n  host: a\n"),
+            "the reordering is what was asked for, so it is what is stored"
+        );
+    }
+
+    #[test]
+    fn a_reader_with_no_write_permission_cannot_cause_a_write() {
+        // The floor under the content check. A reordering touches no path, so
+        // the content check has nothing to refuse -- and without this, an
+        // auditor holding nothing but `VM.Audit` could rewrite the file.
+        let (_dir, store) = store();
+        let stored = "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n";
+        seed(&store, "100", stored);
+        let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
+        let readonly = CallerAcl { authid: "auditor@pve".into(), read: true, ..Default::default() };
+        let err = put(&store, "100", None, "json", reordered, "replace", None, false, &readonly)
+            .unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
+        assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
+
+        // A read-only *scope* is not write permission either.
+        let ro_only = vec![registry::parse_permission(
+            "ro",
+            "authid: auditor@pve\nrules:\n\x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
+        )
+        .unwrap()];
+        let err = put_with(
+            &store, &ro_only, "100", None, "json", reordered, "replace", None, false, &readonly,
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
+        assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
+    }
+
+    #[test]
+    fn a_write_you_may_not_read_is_refused_before_it_can_answer_anything() {
+        // Without the read requirement the content check is a read oracle:
+        // replace a key you cannot read with a guess, and 200-versus-403 tells
+        // you whether the guess was right, one guess at a time.
+        let (_dir, store) = store();
+        seed(&store, "100", "traefik:\n  host: a\nsecret:\n  token: hunter2\n");
+        // `two_rw` grants traefik and netbird; `secret` is neither, and this
+        // principal has no full read.
+        for guess in ["\"hunter2\"", "\"wrong\""] {
+            let err = put_with(
+                &store, &two_rw(), "100", Some("secret.token"), "json", guess, "replace", None,
+                false, &scoped(&[]),
+            )
+            .unwrap_err();
+            assert_eq!(status(&err), 403, "{guess}: {err}");
+            // The refusal must not depend on the guess, or it is the oracle again.
+            assert_eq!(err.to_string(), "403: not permitted: secret.token", "{guess}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_document_is_repaired_only_by_full_write() {
+        // The one place the coarse rule survives, because the diff is blind
+        // here: the stored value is the empty document, so a scoped principal
+        // replacing the root with its own subtree produces a touched list
+        // entirely inside its own scope -- while destroying every other
+        // prefix's content in a file nobody can currently read.
+        // Written past the store, because a document this broken is exactly
+        // what `put_raw` refuses to create: it arrived by hand, or from an
+        // older writer, or from a half-finished replication.
+        let (dir, store) = store();
+        let broken = "traefik:\n  host: a\nhomelab: [unclosed\n";
+        std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
+        let before = std::fs::read_to_string(dir.path().join("100.yaml")).unwrap();
+        let err = put_with(
+            &store, &two_rw(), "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace",
+            None, false, &auditor(&[]),
+        )
+        .unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
+        assert!(err.to_string().contains("cannot be read back"), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), before);
+
+        // Full write access still repairs it, exactly as documented.
+        put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &full())
+            .expect("the documented repair path");
+    }
+
+    #[test]
+    fn a_root_delete_still_answers_for_everything_it_removes() {
+        let (_dir, store) = store();
+        let stored = "traefik:\n  host: a\nhomelab:\n  owner: arki\n";
+        seed(&store, "100", stored);
+        let err = del_with(&store, &two_rw(), "100", None, None, &auditor(&[])).unwrap_err();
+        assert_eq!(status(&err), 403, "{err}");
+        assert!(err.to_string().contains("homelab"), "{err}");
+        assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
     }
 
     #[test]

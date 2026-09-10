@@ -489,11 +489,87 @@ $res = eval { PVE::RS::Meta::api_get('9400', 'other', 'json', scoped_acl('traefi
 ok(!defined($res), 'a scoped principal cannot read a view outside its scopes');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# The root view always needs full write.
+# A scope-only principal still cannot write the root view -- not because the root
+# needs full write any more, but because it cannot *read* the whole document, and
+# authorizing a write by what it changes needs the caller to be able to say what
+# the document is (docs/DESIGN.md 3.4).
 $res = eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"other":2}', 'merge', undef, 0,
         scoped_acl('traefik')) };
-ok(!defined($res), 'a scoped principal cannot write the root view');
-like($@, qr/full write access/, 'the 403 explains that the root view needs full write access');
+ok(!defined($res), 'a scope-only principal cannot write the root view');
+like($@, qr/read the whole document/, 'the 403 explains that it cannot read the whole document');
+
+# A caller with no write permission at all cannot write anything, even a change
+# that touches no path: key order is not a path, so nothing else would stop it.
+my $auditor = { authid => 'auditor@pve', read => 1, write => 0, tags => [] };
+$res = eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"traefik":{"spec":{}}}',
+        'replace', undef, 0, $auditor) };
+ok(!defined($res), 'a read-only auditor cannot write at all');
+like($@, qr/no write access/, '... and the 403 says it has no write access at all');
+
+# -------------------------------------------------------------------------
+# A write is authorized by what it *changes*, not by the view it names.
+# -------------------------------------------------------------------------
+#
+# This principal has VM.Audit (so it can read and therefore compose a whole
+# document) and no VM.Config.Options; what it may change is its rw scopes.
+sub audit_scoped_acl {
+    my (@tags) = @_;
+    return { authid => 'scoped@pve!t1', read => 1, write => 0, tags => [@tags] };
+}
+
+write_permission('tworw', <<'YAML');
+authid: scoped@pve!t1
+rules:
+  - prefix: traefik
+    mode: rw
+    selector: { all: true }
+  - prefix: netbird
+    mode: rw
+    selector: { all: true }
+YAML
+
+# Literal JSON throughout this block, not `encode_json`: a Perl hash has no key
+# order, and both the touched list and the stored key order are the assertions.
+my $DOC_A = '{"traefik":{"host":"a"},"netbird":{"groups":["lan"]},"homelab":{"owner":"arki"}}';
+PVE::RS::Meta::api_put('9401', undef, 'json', $DOC_A, 'replace', undef, 0, $FULL);
+
+# One write spanning two granted prefixes. The narrowest view covering both is
+# the document root, which used to be a flat 403.
+$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
+    '{"traefik":{"host":"b"},"netbird":{"groups":["wan"]},"homelab":{"owner":"arki"}}',
+    'replace', undef, 0, audit_scoped_acl()) };
+ok(defined($res), 'one root write may span two granted prefixes');
+is_deeply([map { $_->{path} } @{ $res->{touched} }], ['traefik.host', 'netbird.groups'],
+    '... and it answers for exactly the two paths it changed');
+
+# The same write, reaching one key further, is refused -- and changes nothing.
+$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
+    '{"traefik":{"host":"c"},"netbird":{"groups":["wan"]},"homelab":{"owner":"mallory"}}',
+    'replace', undef, 0, audit_scoped_acl()) };
+ok(!defined($res), 'a root write that changes an ungranted key is refused');
+like($@, api_error_status(403), '... with 403:');
+is(PVE::RS::Meta::api_get('9401', 'homelab.owner', 'json', $FULL)->{data}, 'arki',
+    '... and wrote nothing');
+
+# Dropping an ungranted key is a change too -- this is the shape that loses data.
+$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
+    '{"traefik":{"host":"b"},"netbird":{"groups":["wan"]}}',
+    'replace', undef, 0, audit_scoped_acl()) };
+ok(!defined($res), 'a root write that drops an ungranted key is refused');
+is_deeply(PVE::RS::Meta::api_get('9401', 'homelab', 'json', $FULL)->{data}, { owner => 'arki' },
+    '... and the key is still there');
+
+# Reordering the keys changes no path, so it is allowed -- and it is a real
+# change to the file, so it is stored.
+$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
+    '{"homelab":{"owner":"arki"},"netbird":{"groups":["wan"]},"traefik":{"host":"b"}}',
+    'replace', undef, 0, audit_scoped_acl()) };
+ok(defined($res), 'reordering keys is a write a scoped principal may make');
+is_deeply($res->{touched}, [], '... and it touches no path');
+like(read_file('9401.yaml'), qr/\Ahomelab:/, '... and the new order is what is on disk');
+
+unlink("$grantdir/tworw.yaml");
+PVE::RS::Meta::api_delete('9401', undef, undef, $FULL);
 
 # An empty merge at an arbitrary prefix creates nothing.
 my $before_hack = PVE::RS::Meta::api_get('9400', undef, 'json', $FULL);
