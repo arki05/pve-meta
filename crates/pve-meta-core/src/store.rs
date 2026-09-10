@@ -423,19 +423,6 @@ impl MetaStore {
             .join(format!("{vmid}.{name}.{}", DISK_FORMAT.ext()))
     }
 
-    /// Locates `id`'s document file, if it exists.
-    ///
-    /// **An observation, not a guarantee**, and deliberately no longer used by
-    /// anything in this module: `locate(id)` followed by an operation on the
-    /// path it returned is a check-then-act pair, and the racing loser of that
-    /// pair is what turned a concurrent `DELETE` into an
-    /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500 (see the module
-    /// docs). Call the operation itself and handle its outcome.
-    pub fn locate(&self, id: &DocId) -> Result<Option<PathBuf>> {
-        let path = self.read_path_for(id);
-        Ok(path.is_file().then_some(path))
-    }
-
     fn check_size(size: u64) -> Result<()> {
         if size > MAX_BYTES {
             return Err(Error::TooLarge {

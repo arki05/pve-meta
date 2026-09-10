@@ -129,7 +129,7 @@ fn put_raw_rejects_invalid_yaml_and_invalid_documents() {
         Err(Error::Lint(_))
     ));
     // Nothing was written.
-    assert!(store.locate(&DocId::Guest(100)).unwrap().is_none());
+    assert!(store.digest_of(&DocId::Guest(100)).unwrap().is_none());
 }
 
 #[test]
