@@ -705,6 +705,23 @@ lose nothing by that: they bind server-side, on the API a scope-only principal a
 uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
 exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.
 
+**The editor's YAML is the store's YAML.** Two emitters write documents a user reads
+— `serde_yaml_ng` on the server, js-yaml in the browser — and every line they disagree
+about is a line the editor shows differently from the file, and that its diff then
+attributes to whatever was actually being edited. js-yaml's YAML 1.1 compatibility
+quoted `25565:25565` and `1:30:00` (sexagesimals) and `yes` (a boolean) that the store
+writes bare, and it indented block sequences the store writes flush. Both were settings;
+`testdata/yaml-cases.json` is what keeps them together, holding one document of the
+values that historically break hand-written YAML and the exact bytes the store writes
+for it, checked by both suites. Turning off the 1.1 compatibility is safe only because
+both ends read YAML 1.2 semantics and neither resolves those forms to anything but a
+string — the store already wrote them bare.
+
+`renderBuffer` still prefers the text the editor was handed when the document is
+unchanged, for the case the alignment does not cover: the store rewrites a file only
+when asked to write one, so a hand-edited file keeps its own valid-but-not-canonical
+layout until someone applies something.
+
 **The editor reads the document as YAML, never as JSON**, and that is a correctness
 requirement. perlmod renders a document as a native Perl hash on the way out, and a Perl
 hash has no key order: the same document comes back with its keys in different orders

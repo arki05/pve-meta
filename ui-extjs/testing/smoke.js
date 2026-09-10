@@ -532,6 +532,38 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
     staged.pop();
 }
 
+console.log('\n--- the two YAML emitters write the same bytes (shared fixture) ---');
+{
+    // The store writes documents with serde_yaml_ng and this editor writes them
+    // with js-yaml. Every line the two disagree about is a line the editor shows
+    // differently from the file, and that its diff then blames on whatever you
+    // were editing. Both suites read this table; add a value to the file.
+    const y = JSON.parse(
+        fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'yaml-cases.json'), 'utf8'),
+    );
+    eq('the shared yaml fixture is present', Object.keys(y.document).length >= 40, true);
+    const dumped = U.yamlDump(y.document);
+    if (dumped !== y.canonical) {
+        const a = y.canonical.split('\n');
+        const b = dumped.split('\n');
+        for (let i = 0; i < Math.max(a.length, b.length); i++) {
+            if (a[i] !== b[i]) {
+                console.log('FAIL yaml dump differs from the store at line ' + (i + 1));
+                console.log('  store  ' + JSON.stringify(a[i]));
+                console.log('  editor ' + JSON.stringify(b[i]));
+                fails++;
+                break;
+            }
+        }
+    } else {
+        console.log('ok   the editor dumps a document exactly as the store writes it');
+    }
+    // And the other direction: the store's own text reads back as the document.
+    eq('the editor reads the store\'s canonical text back exactly', U.yamlLoad(y.canonical), y.document);
+    // The round trip the JSON/YAML toggle makes, on the hardest values there are.
+    eq('a JSON round trip changes nothing', U.yamlLoad(U.yamlDump(JSON.parse(JSON.stringify(y.document)))), y.document);
+}
+
 console.log('\n--- the document is read as YAML because key order is data ---');
 {
     // `GET ...?format=json` renders the document as a native Perl hash on the way
@@ -943,19 +975,23 @@ console.log('\n--- nesting: a schema-less prefix still shadows ---');
 }
 
 console.log('\n--- round trip: a view toggle must not invent changes ---');
-// serde_yaml and js-yaml lay the same document out differently, so re-dumping on the
-// way back from JSON made a *presentation* toggle report unsaved changes.
+// Re-dumping on the way back from JSON made a *presentation* toggle report unsaved
+// changes. The two emitters agreeing (the fixture block above) removes most of that,
+// but not the reason `renderBuffer` exists: the store rewrites a file only when it is
+// asked to write one, so what the editor is handed can be a file as somebody *wrote*
+// it -- valid YAML in a layout no emitter would choose. Re-dumping that on a toggle
+// still invents changes to a document nobody edited.
 const SERVER_YAML = [
     'traefik:',
     '  spec:',
-    '    host: a.example',
+    '    host: "a.example"',
     '    port: 80',
     '  routers:',
-    '  - rule: Host(`a`)',
+    '    - rule: Host(`a`)',
     '',
 ].join('\n');
 const parsed = U.yamlLoad(SERVER_YAML);
-eq('a js-yaml redump differs from the server text (the bug\'s premise)',
+eq('a redump differs from a hand-written file (the bug\'s premise)',
     U.yamlDump(parsed) !== SERVER_YAML, true);
 eq('sameDocument sees through the layout difference',
     U.sameDocument(parsed, SERVER_YAML), true);
@@ -981,6 +1017,9 @@ eq('parseBuffer reads JSON as JSON and everything else as YAML',
     [{ a: 1 }, { a: 1 }]);
 eq('dumpBuffer is the plain, unconditional inverse (what Format wants)',
     U.dumpBuffer(parsed, 'yaml') !== SERVER_YAML, true);
+// And what Format produces is now the store's own layout, so Format then Apply does
+// not hand back something the server immediately writes differently.
+eq('Format lands on canonical text', U.dumpBuffer(parsed, 'yaml'), U.yamlDump(parsed));
 eq('originalInLang renders the loaded document in the other syntax',
     U.originalInLang(SERVER_YAML, 'json'), JSON.stringify(parsed, null, 2));
 eq('originalInLang is the identity for yaml -- no reparse, so it never throws',

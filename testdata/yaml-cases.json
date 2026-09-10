@@ -1,0 +1,69 @@
+{
+  "__": "One document and the canonical YAML the store writes for it, read by BOTH YAML implementations' suites: crates/pve-meta-core (serde_yaml_ng, via format::dump/parse) and ui-extjs/testing/smoke.js (js-yaml, via Utils.yamlDump/yamlLoad). Add a value here, never to one suite -- the same reasoning as covers-cases.json and governing-cases.json.",
+  "__why": "The editor renders a document as YAML text and the store writes it as YAML text, with two different emitters. When they disagree the editor shows -- and its diff attributes to your edit -- lines nobody touched: js-yaml's YAML 1.1 compatibility quoted '25565:25565' and '1:30:00' that the store writes bare, and indented block sequences the store writes flush. Both are settings (noCompatMode, noArrayIndent); neither is guessable, and nothing would have told us if they drifted apart again.",
+  "__scope": "The values are what has historically broken hand-written YAML: structural punctuation, quote characters, comment markers, strings that look like numbers/booleans/nulls, non-ASCII including characters whose UTF-8 has a byte in the C1 range, and the container shapes. Keys are deliberately plain -- a document key is limited to the path charset (DESIGN section 2), so only values can be hostile.",
+  "document": {
+    "colonpair": "25565:25565",
+    "sexagesimal": "1:30:00",
+    "leadzero": "007",
+    "yes": "yes",
+    "no": "no",
+    "on": "on",
+    "off": "off",
+    "t": "true",
+    "f": "False",
+    "nul": "null",
+    "tilde": "~",
+    "hex": "0x10",
+    "octal": "0o17",
+    "exp": "1e5",
+    "inf": ".inf",
+    "nan": ".nan",
+    "empty": "",
+    "space": "a b",
+    "lead": " leading",
+    "trail": "trailing ",
+    "hash": "trailing #hash",
+    "colonspace": "has: colon",
+    "dash": "- not a list",
+    "quote": "it's",
+    "dquote": "say \"hi\"",
+    "brace": "{brace}",
+    "bracket": "[bracket]",
+    "anchor": "&anchor",
+    "alias": "*alias",
+    "pipe": "|pipe",
+    "fold": ">fold",
+    "pct": "%percent",
+    "at": "@at",
+    "tick": "`tick",
+    "bang": "!bang",
+    "uni": "ünïcøde",
+    "cjk": "日本語",
+    "emoji": "🚀",
+    "multiline": "line one\nline two\nline three\n",
+    "num": 42,
+    "float": 1.5,
+    "bool": true,
+    "list": [
+      "a",
+      "b"
+    ],
+    "listofmaps": [
+      {
+        "k": 1
+      },
+      {
+        "k": 2
+      }
+    ],
+    "nested": {
+      "a": {
+        "b": "c"
+      }
+    },
+    "emptymap": {},
+    "emptylist": []
+  },
+  "canonical": "colonpair: 25565:25565\nsexagesimal: 1:30:00\nleadzero: '007'\nyes: yes\nno: no\non: on\noff: off\nt: 'true'\nf: 'False'\nnul: 'null'\ntilde: '~'\nhex: '0x10'\noctal: '0o17'\nexp: '1e5'\ninf: '.inf'\nnan: '.nan'\nempty: ''\nspace: a b\nlead: ' leading'\ntrail: 'trailing '\nhash: 'trailing #hash'\ncolonspace: 'has: colon'\ndash: '- not a list'\nquote: it's\ndquote: say \"hi\"\nbrace: '{brace}'\nbracket: '[bracket]'\nanchor: '&anchor'\nalias: '*alias'\npipe: '|pipe'\nfold: '>fold'\npct: '%percent'\nat: '@at'\ntick: '`tick'\nbang: '!bang'\nuni: ünïcøde\ncjk: 日本語\nemoji: 🚀\nmultiline: |\n  line one\n  line two\n  line three\nnum: 42\nfloat: 1.5\nbool: true\nlist:\n- a\n- b\nlistofmaps:\n- k: 1\n- k: 2\nnested:\n  a:\n    b: c\nemptymap: {}\nemptylist: []\n"
+}

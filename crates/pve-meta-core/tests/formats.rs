@@ -127,3 +127,44 @@ fn lint_errors_surface_through_parse() {
     let err = parse(Format::Json, "[1, 2, 3]").unwrap_err();
     assert!(matches!(err, Error::Lint(_)));
 }
+
+/// The canonical YAML this crate writes, against the table the editor's suite
+/// reads too (`testdata/yaml-cases.json`).
+///
+/// `serde_yaml_ng` here, js-yaml over there, and both write documents a user
+/// reads. Every line the two disagree about is a line the editor shows
+/// differently from the file, and that its diff then attributes to whatever
+/// was actually being edited: js-yaml's YAML 1.1 compatibility quoted
+/// `25565:25565` and `1:30:00` that this side writes bare, and indented block
+/// sequences this side writes flush. Both were settings on the other end;
+/// neither was guessable, and nothing would have said so if they drifted apart
+/// again.
+///
+/// The values are the ones that historically break hand-written YAML --
+/// structural punctuation, quote characters, comment markers, strings that
+/// look like numbers, booleans or nulls, and non-ASCII including characters
+/// whose UTF-8 carries a byte in the C1 range. Keys are plain on purpose: a
+/// document key is limited to the path charset (`docs/DESIGN.md` §2), so only
+/// values can be hostile.
+#[test]
+fn canonical_yaml_matches_the_shared_cases() {
+    let raw = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/yaml-cases.json"
+    ))
+    .expect("the shared fixture is part of the repository");
+    let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let document = doc["document"].clone();
+    let canonical = doc["canonical"].as_str().expect("canonical text");
+    assert!(
+        document.as_object().map(|m| m.len()).unwrap_or(0) >= 40,
+        "the fixture should not have been emptied"
+    );
+
+    assert_eq!(dump(Format::Yaml, &document), canonical, "the canonical dump moved");
+    assert_eq!(
+        parse(Format::Yaml, canonical).unwrap(),
+        document,
+        "and it must read back as the document it came from"
+    );
+}

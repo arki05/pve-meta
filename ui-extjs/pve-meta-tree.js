@@ -765,6 +765,26 @@ PVE.meta.Utils = {
         return doc === undefined || doc === null ? {} : doc;
     },
 
+    // The store's own canonical YAML, produced by a different emitter.
+    //
+    // These options are not taste. The store writes documents with
+    // `serde_yaml_ng`; this writes them with js-yaml; and every line the two
+    // disagree about is a line the editor shows differently from the file, and
+    // that its diff then attributes to whatever you were actually editing. The
+    // shared table in `testdata/yaml-cases.json` is what holds them together --
+    // both suites dump the same document and expect the same bytes.
+    //
+    // `noCompatMode` turns off js-yaml's YAML 1.1 compatibility quoting, which
+    // wrapped `25565:25565` and `1:30:00` (YAML 1.1 sexagesimals) and `yes`
+    // (a YAML 1.1 boolean) in quotes the store does not write. It is safe here
+    // and only here: both ends read YAML 1.2 semantics -- the store through
+    // `serde_yaml_ng`, this editor through `JSON_SCHEMA` -- so neither resolves
+    // those forms to anything but a string, and the store already writes them
+    // bare. It does not touch quoting the *active* schema needs, so `'007'` and
+    // `'true'` stay quoted on both sides.
+    //
+    // `noArrayIndent` matches the store's block sequences, which sit flush with
+    // their key rather than indented under it.
     yamlDump: function (value) {
         return PVE.meta.Utils.yamlLib().dump(value, {
             schema: PVE.meta.Utils.yamlLib().JSON_SCHEMA, // as yamlLoad, for the same reason
@@ -772,6 +792,8 @@ PVE.meta.Utils = {
             lineWidth: -1, // never fold: a folded line is a changed line in the diff
             noRefs: true, // anchors/aliases are not part of the document model
             sortKeys: false, // documents are ordered maps (DESIGN §2)
+            noCompatMode: true, // see above
+            noArrayIndent: true, // see above
         });
     },
 
