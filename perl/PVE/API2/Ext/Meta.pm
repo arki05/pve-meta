@@ -230,6 +230,13 @@ my $TEXT_SCHEMA = {
     description => "The new view content, as YAML text. Exactly one of 'data'/'text' is required.",
 };
 
+my $DRY_RUN_SCHEMA = {
+    type => 'boolean',
+    optional => 1,
+    default => 0,
+    description => "Validate and diff without writing.",
+};
+
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
@@ -613,6 +620,114 @@ __PACKAGE__->register_method({
     },
 });
 
+# -- one document, three methods ---------------------------------------------
+#
+# Every kind of document -- a guest's, the datacenter's, a prefix file, a
+# permission file -- is read, written and removed by the same three calls into
+# Rust ($get_view / $put_view / $delete_view). What differs is how the request
+# names the document, which ACL answers describe the caller on it, what lock a
+# write holds, and what the API docs say. Those are a spec, and the three
+# methods are generated from it: two copies of a read/write pair is how this
+# project has produced every wrong-result bug it has had, and the guest and
+# datacenter triples used to be exactly that beside the generated registry ones.
+#
+#   name      the method-name suffix: get_<name>, put_<name>, delete_<name>
+#   path      the REST path, with its parameter placeholder if it has one
+#   params    that parameter's schema ({} for the datacenter)
+#   id        $param -> the document id Rust addresses
+#   lock      $param -> the cfs_lock_domain suffix every write holds
+#   acl       ($rpcenv, $authuser, $param) -> the caller's ACL hash
+#   check     optional, $param -> dies unless the document may be addressed.
+#             Runs before a read and *inside* the lock before a write, so a
+#             guest destroyed in between is a 404 and not a resurrected file;
+#             and before the ACL is computed, so a 404 costs no ACL lookups.
+#   describe  { get, put, delete } -> the method descriptions
+#   perms     { get, put, delete } -> the permission descriptions
+sub _register_document_methods {
+    my ($spec) = @_;
+    my ($name, $path, $params) = @$spec{qw(name path params)};
+    my $check = $spec->{check} // sub { };
+
+    my $caller = sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        return $spec->{acl}->($rpcenv, $authuser, $param);
+    };
+
+    __PACKAGE__->register_method({
+        name => "get_$name",
+        path => $path,
+        method => 'GET',
+        permissions => { description => $spec->{perms}{get}, user => 'all' },
+        description => $spec->{describe}{get},
+        parameters => {
+            additionalProperties => 0,
+            properties => { %$params, view => $VIEW_SCHEMA, format => $FORMAT_SCHEMA },
+        },
+        returns => $VIEW_RETURNS,
+        code => sub {
+            my ($param) = @_;
+            $check->($param);
+            return $get_view->($spec->{id}->($param), $param, $caller->($param));
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "put_$name",
+        protected => 1,
+        path => $path,
+        method => 'PUT',
+        permissions => { description => $spec->{perms}{put}, user => 'all' },
+        description => $spec->{describe}{put},
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                %$params,
+                view => $VIEW_SCHEMA,
+                data => $DATA_SCHEMA,
+                text => $TEXT_SCHEMA,
+                mode => $MODE_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+                dry_run => $DRY_RUN_SCHEMA,
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+            return _locked($spec->{lock}->($param), sub {
+                $check->($param);
+                return $put_view->($spec->{id}->($param), $param, $caller->($param));
+            });
+        },
+    });
+
+    __PACKAGE__->register_method({
+        name => "delete_$name",
+        protected => 1,
+        path => $path,
+        method => 'DELETE',
+        permissions => { description => $spec->{perms}{delete}, user => 'all' },
+        description => $spec->{describe}{delete},
+        parameters => {
+            additionalProperties => 0,
+            properties => {
+                %$params,
+                view => $VIEW_SCHEMA,
+                digest => get_standard_option('pve-config-digest'),
+            },
+        },
+        returns => $PUT_RETURNS,
+        code => sub {
+            my ($param) = @_;
+            return _locked($spec->{lock}->($param), sub {
+                $check->($param);
+                return $delete_view->($spec->{id}->($param), $param, $caller->($param));
+            });
+        },
+    });
+}
+
 # -- registry documents ------------------------------------------------------
 
 # The file name, which for a prefix *is* its prefix -- so it is dotted when
@@ -629,10 +744,8 @@ my $REGISTRY_NAME_SCHEMA = {
         . "'homelab.docker.yaml' declares 'homelab.docker'.",
 };
 
-# The six endpoints below are generated rather than written twice: a prefix
-# and a permission file are the same document to everything but the parser that validates
-# what is written (`api::check_registry_shape`), and two copies of a read/write
-# pair is how this project has produced every wrong-result bug it has had.
+# A prefix and a permission file are the same document to everything but the
+# parser that validates what is written (`api::check_registry_shape`).
 for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
     my ($dir, $one) = @$kind;
     my $where = $one eq 'prefix'
@@ -640,121 +753,35 @@ for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
           . "/usr/share/pve-meta/prefixes if there is one"
         : "/etc/pve/meta.d/permissions";
 
-    __PACKAGE__->register_method({
-        name => "get_$one",
+    _register_document_methods({
+        name => $one,
         path => "$dir/{name}",
-        method => 'GET',
-        permissions => {
-            description => "Readable by every authenticated user, exactly as the "
+        params => { name => $REGISTRY_NAME_SCHEMA },
+        id => sub { "$dir/$_[0]->{name}" },
+        lock => sub { "$one-$_[0]->{name}" },
+        acl => sub { _registry_acl($_[0], $_[1]) },
+        perms => {
+            get => "Readable by every authenticated user, exactly as the "
                 . "GET /meta/$dir listing is (docs/DESIGN.md §1).",
-            user => 'all',
-        },
-        description => "Gets one $one file as a document (or a view/prefix of it). "
-            . "Unlike the GET /meta/$dir listing, which returns what the loader "
-            . "parsed, this returns the file itself -- including a file the loader "
-            . "would skip, so a malformed one can be seen and repaired.",
-        parameters => {
-            additionalProperties => 0,
-            properties => {
-                name => $REGISTRY_NAME_SCHEMA,
-                view => $VIEW_SCHEMA,
-                format => $FORMAT_SCHEMA,
-            },
-        },
-        returns => $VIEW_RETURNS,
-        code => sub {
-            my ($param) = @_;
-
-            my $rpcenv = PVE::RPCEnvironment::get();
-            my $authuser = $rpcenv->get_user();
-
-            return $get_view->(
-                "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
-            );
-        },
-    });
-
-    __PACKAGE__->register_method({
-        name => "put_$one",
-        protected => 1,
-        path => "$dir/{name}",
-        method => 'PUT',
-        permissions => {
-            description => "Requires Sys.Modify on / (docs/DESIGN.md §3).",
-            user => 'all',
-        },
-        description => "Writes one $one file (or a view/prefix of it), in $where. "
-            . "The result must parse as a $one: a file the loader would skip is "
-            . "refused with a 400 rather than written, because a write that made the "
-            . "$one silently disappear would otherwise answer 200.",
-        parameters => {
-            additionalProperties => 0,
-            properties => {
-                name => $REGISTRY_NAME_SCHEMA,
-                view => $VIEW_SCHEMA,
-                data => $DATA_SCHEMA,
-                text => $TEXT_SCHEMA,
-                mode => $MODE_SCHEMA,
-                digest => get_standard_option('pve-config-digest'),
-                dry_run => {
-                    type => 'boolean',
-                    optional => 1,
-                    default => 0,
-                    description => "Validate and diff without writing.",
-                },
-            },
-        },
-        returns => $PUT_RETURNS,
-        code => sub {
-            my ($param) = @_;
-
-            my $rpcenv = PVE::RPCEnvironment::get();
-            my $authuser = $rpcenv->get_user();
-
-            return _locked("$one-$param->{name}", sub {
-                return $put_view->(
-                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
-                );
-            });
-        },
-    });
-
-    __PACKAGE__->register_method({
-        name => "delete_$one",
-        protected => 1,
-        path => "$dir/{name}",
-        method => 'DELETE',
-        permissions => {
-            description => "Requires Sys.Modify on / for the view and every touched "
+            put => "Requires Sys.Modify on / (docs/DESIGN.md §3).",
+            delete => "Requires Sys.Modify on / for the view and every touched "
                 . "path, same as PUT.",
-            user => 'all',
         },
-        description => "Removes one $one file, or the subtree at 'view'. "
-            . ($one eq 'prefix'
-                ? "A packaged prefix is never removed: deleting the cluster file "
-                  . "that overrode it reverts to the packaged one, which is then what "
-                  . "a following GET returns."
-                : "Permission files are cluster-only, so this removes the file."),
-        parameters => {
-            additionalProperties => 0,
-            properties => {
-                name => $REGISTRY_NAME_SCHEMA,
-                view => $VIEW_SCHEMA,
-                digest => get_standard_option('pve-config-digest'),
-            },
-        },
-        returns => $PUT_RETURNS,
-        code => sub {
-            my ($param) = @_;
-
-            my $rpcenv = PVE::RPCEnvironment::get();
-            my $authuser = $rpcenv->get_user();
-
-            return _locked("$one-$param->{name}", sub {
-                return $delete_view->(
-                    "$dir/$param->{name}", $param, _registry_acl($rpcenv, $authuser),
-                );
-            });
+        describe => {
+            get => "Gets one $one file as a document (or a view/prefix of it). "
+                . "Unlike the GET /meta/$dir listing, which returns what the loader "
+                . "parsed, this returns the file itself -- including a file the loader "
+                . "would skip, so a malformed one can be seen and repaired.",
+            put => "Writes one $one file (or a view/prefix of it), in $where. "
+                . "The result must parse as a $one: a file the loader would skip is "
+                . "refused with a 400 rather than written, because a write that made the "
+                . "$one silently disappear would otherwise answer 200.",
+            delete => "Removes one $one file, or the subtree at 'view'. "
+                . ($one eq 'prefix'
+                    ? "A packaged prefix is never removed: deleting the cluster file "
+                      . "that overrode it reverts to the packaged one, which is then what "
+                      . "a following GET returns."
+                    : "Permission files are cluster-only, so this removes the file."),
         },
     });
 }
@@ -828,46 +855,20 @@ __PACKAGE__->register_method({
     },
 });
 
-__PACKAGE__->register_method({
-    name => 'get_guest',
+_register_document_methods({
+    name => 'guest',
     path => 'guests/{vmid}',
-    method => 'GET',
-    permissions => {
-        description => "The response is filtered to what the caller may read (VM.Audit, "
+    params => { vmid => get_standard_option('pve-vmid') },
+    id => sub { "$_[0]->{vmid}" },
+    lock => sub { $_[0]->{vmid} },
+    acl => sub { _guest_acl($_[0], $_[1], $_[2]->{vmid}) },
+    check => sub { _assert_guest_exists($_[0]->{vmid}) },
+    perms => {
+        get => "The response is filtered to what the caller may read (VM.Audit, "
             . "or a granted scope whose selector matches this guest). A caller with "
             . "neither is refused with 403, as is a 'view' outside the caller's read "
             . "access. A vmid that is not in the vmlist is 404 (docs/DESIGN.md §5).",
-        user => 'all',
-    },
-    description => "Gets a guest's metadata document (or a view/prefix of it).",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            vmid => get_standard_option('pve-vmid'),
-            view => $VIEW_SCHEMA,
-            format => $FORMAT_SCHEMA,
-        },
-    },
-    returns => $VIEW_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-        my $vmid = $param->{vmid};
-
-        _assert_guest_exists($vmid);
-        return $get_view->("$vmid", $param, _guest_acl($rpcenv, $authuser, $vmid));
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'put_guest',
-    protected => 1,
-    path => 'guests/{vmid}',
-    method => 'PUT',
-    permissions => {
-        description => "Anybody may call this. What authorizes the write is what it "
+        put => "Anybody may call this. What authorizes the write is what it "
             . "*changes*: every path it touches -- values changed, keys added, keys "
             . "removed -- must be covered by VM.Config.Options or by a granted rw "
             . "scope, otherwise 403. The 'view' is where the write is aimed, not what "
@@ -878,174 +879,38 @@ __PACKAGE__->register_method({
             . "back is the exception: repairing it as a whole requires "
             . "VM.Config.Options, since there is no stored content to check the change "
             . "against. Unknown vmids are 404, not created.",
-        user => 'all',
-    },
-    description => "Writes a guest's metadata document (or a view/prefix of it).",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            vmid => get_standard_option('pve-vmid'),
-            view => $VIEW_SCHEMA,
-            data => $DATA_SCHEMA,
-            text => $TEXT_SCHEMA,
-            mode => $MODE_SCHEMA,
-            digest => get_standard_option('pve-config-digest'),
-            dry_run => {
-                type => 'boolean',
-                optional => 1,
-                default => 0,
-                description => "Validate and diff without writing.",
-            },
-        },
-    },
-    returns => $PUT_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-        my $vmid = $param->{vmid};
-
-        return _locked($vmid, sub {
-            _assert_guest_exists($vmid);
-            return $put_view->("$vmid", $param, _guest_acl($rpcenv, $authuser, $vmid));
-        });
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'delete_guest',
-    protected => 1,
-    path => 'guests/{vmid}',
-    method => 'DELETE',
-    permissions => {
-        description => "Anybody may call this; same write rules as PUT. Removes only "
+        delete => "Anybody may call this; same write rules as PUT. Removes only "
             . "the current document -- snapshot copies belong to the guest lifecycle "
             . "and are never touched from here. Unknown vmids are 404.",
-        user => 'all',
     },
-    description => "Removes a guest's document, or the subtree at 'view'.",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            vmid => get_standard_option('pve-vmid'),
-            view => $VIEW_SCHEMA,
-            digest => get_standard_option('pve-config-digest'),
-        },
-    },
-    returns => $PUT_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-        my $vmid = $param->{vmid};
-
-        return _locked($vmid, sub {
-            _assert_guest_exists($vmid);
-            return $delete_view->("$vmid", $param, _guest_acl($rpcenv, $authuser, $vmid));
-        });
+    describe => {
+        get => "Gets a guest's metadata document (or a view/prefix of it).",
+        put => "Writes a guest's metadata document (or a view/prefix of it).",
+        delete => "Removes a guest's document, or the subtree at 'view'.",
     },
 });
 
 # -- datacenter -----------------------------------------------------------
 
-__PACKAGE__->register_method({
-    name => 'get_datacenter',
+_register_document_methods({
+    name => 'datacenter',
     path => 'datacenter',
-    method => 'GET',
-    permissions => {
-        description => "Requires Sys.Audit on / (docs/DESIGN.md §3 -- scopes never "
+    params => {},
+    id => sub { 'datacenter' },
+    lock => sub { 'datacenter' },
+    acl => sub { _datacenter_acl($_[0], $_[1]) },
+    perms => {
+        get => "Requires Sys.Audit on / (docs/DESIGN.md §3 -- scopes never "
             . "apply to the datacenter document); anyone else is refused with 403.",
-        user => 'all',
-    },
-    description => "Gets the datacenter metadata document (or a view/prefix of it).",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            view => $VIEW_SCHEMA,
-            format => $FORMAT_SCHEMA,
-        },
-    },
-    returns => $VIEW_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return $get_view->('datacenter', $param, _datacenter_acl($rpcenv, $authuser));
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'put_datacenter',
-    protected => 1,
-    path => 'datacenter',
-    method => 'PUT',
-    permissions => {
-        description => "Requires Sys.Modify on / for the view and every touched path "
+        put => "Requires Sys.Modify on / for the view and every touched path "
             . "(docs/DESIGN.md §3).",
-        user => 'all',
-    },
-    description => "Writes the datacenter metadata document (or a view/prefix of it).",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            view => $VIEW_SCHEMA,
-            data => $DATA_SCHEMA,
-            text => $TEXT_SCHEMA,
-            mode => $MODE_SCHEMA,
-            digest => get_standard_option('pve-config-digest'),
-            dry_run => {
-                type => 'boolean',
-                optional => 1,
-                default => 0,
-                description => "Validate and diff without writing.",
-            },
-        },
-    },
-    returns => $PUT_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return _locked('datacenter', sub {
-            return $put_view->('datacenter', $param, _datacenter_acl($rpcenv, $authuser));
-        });
-    },
-});
-
-__PACKAGE__->register_method({
-    name => 'delete_datacenter',
-    protected => 1,
-    path => 'datacenter',
-    method => 'DELETE',
-    permissions => {
-        description => "Requires Sys.Modify on / for the view and every touched path, "
+        delete => "Requires Sys.Modify on / for the view and every touched path, "
             . "same as PUT.",
-        user => 'all',
     },
-    description => "Removes the datacenter document, or the subtree at 'view'.",
-    parameters => {
-        additionalProperties => 0,
-        properties => {
-            view => $VIEW_SCHEMA,
-            digest => get_standard_option('pve-config-digest'),
-        },
-    },
-    returns => $PUT_RETURNS,
-    code => sub {
-        my ($param) = @_;
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        return _locked('datacenter', sub {
-            return $delete_view->('datacenter', $param, _datacenter_acl($rpcenv, $authuser));
-        });
+    describe => {
+        get => "Gets the datacenter metadata document (or a view/prefix of it).",
+        put => "Writes the datacenter metadata document (or a view/prefix of it).",
+        delete => "Removes the datacenter document, or the subtree at 'view'.",
     },
 });
 
