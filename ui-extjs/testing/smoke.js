@@ -56,7 +56,15 @@ const ctx = {
         isArray: Array.isArray,
         encode: JSON.stringify,
         decode: JSON.parse,
-        apply: Object.assign,
+        // Ext's real semantics, not Object.assign: the optional third argument is
+        // *defaults*, applied before `config`, so config wins over it. A shim that
+        // let the last argument win hid a guard that never guarded.
+        apply(object, config, defaults) {
+            if (defaults) {
+                Object.assign(object, defaults);
+            }
+            return Object.assign(object, config || {});
+        },
         emptyFn() {},
         htmlEncode: (s) => String(s),
         String: { format: (t, ...a) => t.replace(/\{(\d)\}/g, (m, i) => a[i]) },
@@ -315,6 +323,29 @@ throws('complex keys are refused', () => Codec.parse('? [1, 2]\n: v\n', 'yaml'),
 eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true }] });
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
+
+console.log('\n--- request: the destroyed-component guard around API2Request ---');
+{
+    const sent = [];
+    ctx.Proxmox.Utils.API2Request = (req) => sent.push(req);
+    const owner = { isDestroyed: false };
+    let calls = [];
+    ctx.PVE.meta.request(owner, { url: '/x', params: { a: 1 }, success: (r) => calls.push(['ok', r]), failure: (r) => calls.push(['fail', r]) });
+    const req = sent.pop();
+    eq('method defaults to GET and the request is passed through', [req.method, req.url, req.params], ['GET', '/x', { a: 1 }]);
+    req.success('r1');
+    req.failure('r2');
+    eq('callbacks reach the owner while it lives', calls, [['ok', 'r1'], ['fail', 'r2']]);
+    owner.isDestroyed = true;
+    calls = [];
+    req.success('r3');
+    req.failure('r4');
+    eq('... and are dropped once it is destroyed -- the guard is what API2Request got, not the originals', calls, []);
+    ctx.PVE.meta.request({ isDestroyed: false }, { url: '/y', method: 'PUT' });
+    eq('an explicit method wins over the default', sent.pop().method, 'PUT');
+    eq('no failure handler stays no handler', sent.length === 0 && ctx.PVE.meta.request({}, { url: '/z' }) === undefined && sent.pop().failure, undefined);
+    delete ctx.Proxmox.Utils.API2Request;
+}
 
 console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
 // The Text card and the subtree window used to hold one copy each of Format, the

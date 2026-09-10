@@ -431,9 +431,12 @@ PVE.meta.compose = function (...parts) {
 // wrapped so they become no-ops once `owner` is gone.
 PVE.meta.request = function (owner, opts) {
     let guard = (fn) => (fn ? (...args) => (owner.isDestroyed ? undefined : fn(...args)) : undefined);
-    Proxmox.Utils.API2Request(
-        Ext.apply({ method: 'GET' }, opts, { success: guard(opts.success), failure: guard(opts.failure) }),
-    );
+    // Two-argument `Ext.apply`s, applied in order, so the guarded callbacks are
+    // what wins. The three-argument form puts its last argument *under* the
+    // config, which would have handed API2Request the unguarded originals.
+    let req = Ext.apply({ method: 'GET' }, opts);
+    Ext.apply(req, { success: guard(opts.success), failure: guard(opts.failure) });
+    Proxmox.Utils.API2Request(req);
 };
 
 // ---------------------------------------------------------------------------
