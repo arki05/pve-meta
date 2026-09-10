@@ -74,6 +74,7 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::path::Path;
 use crate::scopes::{Mode, Scope};
+use crate::store::RegistryKind;
 
 /// The packaged prefix directory.
 pub const PREFIX_PACKAGED_DIR: &str = "/usr/share/pve-meta/prefixes";
@@ -421,12 +422,73 @@ pub fn permission_dirs() -> Vec<PathBuf> {
     dirs_from(PERMISSION_DIRS_ENV, &[PERMISSION_CLUSTER_DIR])
 }
 
+/// Owns the two drop-directory lists. Everything that needs to know where a
+/// prefix or permission file lives -- `MetaStore`, the perlmod bindings, a
+/// test -- is handed one of these rather than reading
+/// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` (or the environment at
+/// all) on its own: two callers reading the same variable independently agree
+/// only because nothing changes it mid-process, and that was never a
+/// guarantee, just an accident of everything running in one process.
+#[derive(Debug, Clone)]
+pub struct Registry {
+    prefix_dirs: Vec<PathBuf>,
+    permission_dirs: Vec<PathBuf>,
+}
+
+impl Registry {
+    /// Reads `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` (or the
+    /// compiled-in defaults) once. See [`crate::store::MetaStore::new`]'s doc
+    /// comment for why that has to happen exactly once per store rather than
+    /// wherever a directory list happens to be needed next.
+    pub fn from_env() -> Self {
+        Registry { prefix_dirs: prefix_dirs(), permission_dirs: permission_dirs() }
+    }
+
+    /// Explicit directories, lowest precedence first -- for tests and
+    /// sandboxes that must not consult the environment.
+    pub fn new(prefix_dirs: Vec<PathBuf>, permission_dirs: Vec<PathBuf>) -> Self {
+        Registry { prefix_dirs, permission_dirs }
+    }
+
+    /// The directories of `kind`, lowest precedence first.
+    pub fn dirs(&self, kind: RegistryKind) -> &[PathBuf] {
+        match kind {
+            RegistryKind::PrefixDef => &self.prefix_dirs,
+            RegistryKind::Permission => &self.permission_dirs,
+        }
+    }
+
+    /// The one directory of `kind` a write may land in, if any is configured.
+    ///
+    /// **The last directory is the writable one.** This is the one place that
+    /// says so; `load_dirs` derives its origin stamping from the same fact,
+    /// and `MetaStore::registry_write_dir` calls this rather than restating
+    /// it. `None` when `dirs(kind)` is empty, so a caller with no directories
+    /// configured -- `PVE_META_*_DIRS` set to nothing, or
+    /// [`Registry::new`] given none -- decides its own fallback instead of
+    /// silently writing to the compiled-in default.
+    pub fn write_dir(&self, kind: RegistryKind) -> Option<PathBuf> {
+        self.dirs(kind).last().cloned()
+    }
+
+    /// [`load_prefixes`] over this registry's own prefix directories.
+    pub fn load_prefixes(&self) -> Vec<PrefixDef> {
+        load_prefixes(self.dirs(RegistryKind::PrefixDef))
+    }
+
+    /// [`load_permissions`] over this registry's own permission directories.
+    pub fn load_permissions(&self) -> Vec<Permission> {
+        load_permissions(self.dirs(RegistryKind::Permission))
+    }
+}
+
 /// Loads one drop-directory list, later directories overriding earlier by file
 /// name, and stamps each survivor with where it came from.
 ///
-/// **The last directory is the writable one** -- the same rule
-/// `store::MetaStore::registry_write_dir` applies -- so everything below it is a
-/// package's, read-only, and displaced rather than edited.
+/// Which directory is writable -- and so, here, which is `Origin::Cluster`
+/// rather than `Origin::Packaged` -- is decided in exactly one place,
+/// [`Registry::write_dir`]; this just derives the same last-directory-wins
+/// fact for every entry as it folds them in.
 fn load_dirs<T>(
     dirs: &[PathBuf],
     kind: &str,
@@ -500,16 +562,6 @@ pub fn load_permissions(dirs: &[PathBuf]) -> Vec<Permission> {
         .into_iter()
         .map(|(_, g)| g)
         .collect()
-}
-
-/// [`load_prefixes`] over [`prefix_dirs`].
-pub fn load_prefixes_default() -> Vec<PrefixDef> {
-    load_prefixes(&prefix_dirs())
-}
-
-/// [`load_permissions`] over [`permission_dirs`].
-pub fn load_permissions_default() -> Vec<Permission> {
-    load_permissions(&permission_dirs())
 }
 
 fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
@@ -683,8 +735,8 @@ rules:
         assert_eq!(by("mine").origin, Origin::Cluster);
         assert!(!by("mine").overrides);
 
-        // The last directory is the writable one, and that is the only thing
-        // that decides this -- with a single directory nothing is packaged.
+        // Same rule as `Registry::write_dir` -- with a single directory
+        // nothing is packaged.
         let only = load_prefixes(&[dir.path().join("cluster")]);
         assert!(only.iter().all(|p| p.origin == Origin::Cluster));
     }

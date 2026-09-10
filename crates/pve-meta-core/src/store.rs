@@ -43,6 +43,7 @@ use crate::error::{Error, Result};
 use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
+use crate::registry::Registry;
 
 /// Warn threshold for document size (informational only; reported through
 /// [`crate::warn`]).
@@ -313,24 +314,23 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The on-disk metadata store.
 ///
-/// Three directories, not one: `root` holds the guest and datacenter documents
-/// and the snapshot copies, and the two registry drop-directory *lists* hold
-/// the prefix and permission files ([`DocId::Registry`]). The lists are ordered
-/// lowest precedence first, exactly as `crate::registry` loads them, so the
-/// **last** entry of each is the one a write goes to -- the cluster directory,
-/// with the packaged one below it staying read-only. Writing a prefix whose
-/// name a packaged file already uses therefore creates the cluster override
-/// rather than editing the package's file, and deleting it falls back to the
+/// Two things, not one: `root` holds the guest and datacenter documents and
+/// the snapshot copies, and `registry` holds the prefix and permission
+/// drop-directory lists ([`DocId::Registry`]). Those lists are ordered lowest
+/// precedence first, exactly as [`Registry`] loads them, so the **last**
+/// entry of each is the one a write goes to -- the cluster directory, with
+/// the packaged one below it staying read-only. Writing a prefix whose name a
+/// packaged file already uses therefore creates the cluster override rather
+/// than editing the package's file, and deleting it falls back to the
 /// packaged one, which is the same rule the loader has always applied.
 pub struct MetaStore {
     root: PathBuf,
-    prefix_dirs: Vec<PathBuf>,
-    permission_dirs: Vec<PathBuf>,
+    registry: Registry,
 }
 
 impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
-    /// to exist yet), with the registry directories `crate::registry` itself
+    /// to exist yet), with the registry directories [`Registry::from_env`]
     /// would load -- the packaged and cluster defaults, or whatever
     /// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` say.
     ///
@@ -341,11 +341,7 @@ impl MetaStore {
     /// lives. Tests that want their own directories pass them explicitly with
     /// [`MetaStore::with_registry_dirs`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        MetaStore {
-            root: root.into(),
-            prefix_dirs: crate::registry::prefix_dirs(),
-            permission_dirs: crate::registry::permission_dirs(),
-        }
+        MetaStore { root: root.into(), registry: Registry::from_env() }
     }
 
     /// [`MetaStore::new`] with the registry directories given explicitly,
@@ -356,34 +352,39 @@ impl MetaStore {
         prefix_dirs: Vec<PathBuf>,
         permission_dirs: Vec<PathBuf>,
     ) -> Self {
-        MetaStore {
-            root: root.into(),
-            prefix_dirs,
-            permission_dirs,
-        }
+        MetaStore::with_registry(root, Registry::new(prefix_dirs, permission_dirs))
     }
 
-    /// The directories a registry kind is loaded from, lowest precedence first.
-    fn registry_dirs(&self, kind: RegistryKind) -> &[PathBuf] {
-        match kind {
-            RegistryKind::PrefixDef => &self.prefix_dirs,
-            RegistryKind::Permission => &self.permission_dirs,
-        }
+    /// [`MetaStore::new`] with a [`Registry`] given directly, for a caller
+    /// that already built or was handed one and would otherwise have to take
+    /// it apart into two `Vec<PathBuf>` just to satisfy
+    /// [`MetaStore::with_registry_dirs`], which is defined in terms of this
+    /// rather than the other way around.
+    pub fn with_registry(root: impl Into<PathBuf>, registry: Registry) -> Self {
+        MetaStore { root: root.into(), registry }
+    }
+
+    /// The [`Registry`] this store reads and writes registry documents
+    /// through, for a caller that needs the same directory lists (loading the
+    /// prefixes or permissions themselves, say) rather than a second,
+    /// independently-read copy.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// The one directory of `kind` a write may land in: the highest-precedence
-    /// one.
+    /// one -- [`Registry::write_dir`]'s rule.
     ///
     /// An empty list -- `PVE_META_*_DIRS` set to nothing, or
     /// [`MetaStore::with_registry_dirs`] given none -- means no directory was
     /// configured, and falls back **inside `root`** rather than to the
     /// compiled-in `/etc/pve` default. A caller that went out of its way to
     /// have no registry directories (a test, a `--root` sandbox) must not have
-    /// its writes land in the live cluster because of it.
+    /// its writes land in the live cluster because of it. That fallback needs
+    /// `root`, which `Registry` does not have, so it stays here.
     fn registry_write_dir(&self, kind: RegistryKind) -> PathBuf {
-        self.registry_dirs(kind)
-            .last()
-            .cloned()
+        self.registry
+            .write_dir(kind)
             .unwrap_or_else(|| self.root.join("meta.d").join(kind.as_str()))
     }
 
@@ -408,7 +409,7 @@ impl MetaStore {
             return self.path_for(id);
         };
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-        for dir in self.registry_dirs(*kind).iter().rev() {
+        for dir in self.registry.dirs(*kind).iter().rev() {
             let candidate = dir.join(&file);
             if candidate.is_file() {
                 return candidate;
@@ -949,11 +950,8 @@ impl MetaStore {
                 &document_id,
             )?,
         }
-        for (kind, dirs) in [
-            (RegistryKind::PrefixDef, &self.prefix_dirs),
-            (RegistryKind::Permission, &self.permission_dirs),
-        ] {
-            for dir in dirs {
+        for kind in [RegistryKind::PrefixDef, RegistryKind::Permission] {
+            for dir in self.registry.dirs(kind) {
                 // The full directory path, not just the kind: two directories
                 // of the same kind hold same-named files on purpose, and the
                 // token must be able to tell them apart.

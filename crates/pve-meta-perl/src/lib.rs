@@ -63,7 +63,8 @@ mod pve_rs_meta {
     use anyhow::Error;
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
-    use pve_meta_core::registry::{self, Permission, PrefixDef};
+    use pve_meta_core::registry::{Permission, PrefixDef};
+    use pve_meta_core::store::MetaStore;
 
     use super::{open_store, RollbackOutcome};
 
@@ -71,16 +72,23 @@ mod pve_rs_meta {
     /// operator's `.deb` may ship a prefix but must never ship its own
     /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
     /// a stale grant is a wrong answer about who may write.
-    fn open_permissions() -> Vec<Permission> {
-        registry::load_permissions_default()
+    ///
+    /// Goes through `store`'s own registry rather than reading
+    /// `PVE_META_PERMISSION_DIRS` again: `store` already read it once
+    /// (`MetaStore::new`), and a second, independent read of the same
+    /// variable is exactly the kind of state that only agreed with the
+    /// store's by coincidence.
+    fn open_permissions(store: &MetaStore) -> Vec<Permission> {
+        store.registry().load_permissions()
     }
 
     /// Every prefix, packaged then cluster-wide, most-specific prefix first
     /// (`docs/DESIGN.md` §3.1). Read per request, like the permissions: the
     /// directories are tiny, pmxcfs caches them, and a stale prefix would be
-    /// a stale schema.
-    fn open_prefixes() -> Vec<PrefixDef> {
-        registry::load_prefixes_default()
+    /// a stale schema. See [`open_permissions`] for why this goes through
+    /// `store`'s registry rather than reading the environment itself.
+    fn open_prefixes(store: &MetaStore) -> Vec<PrefixDef> {
+        store.registry().load_prefixes()
     }
 
     // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
@@ -241,13 +249,13 @@ mod pve_rs_meta {
     /// `GET /meta/permissions` -> every permission, as native hashes.
     #[export]
     pub fn api_permissions() -> Result<Vec<Permission>, Error> {
-        Ok(api::permissions_list(&open_permissions()))
+        Ok(api::permissions_list(&open_permissions(&open_store())))
     }
 
     /// `GET /meta/prefixes` -> every prefix, most-specific first.
     #[export]
     pub fn api_prefixes() -> Result<Vec<PrefixDef>, Error> {
-        Ok(api::prefixes_list(&open_prefixes()))
+        Ok(api::prefixes_list(&open_prefixes(&open_store())))
     }
 
     /// `GET /meta/schemas` -> `{ prefix, permission }`, the two registry file
@@ -264,7 +272,7 @@ mod pve_rs_meta {
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
-        Ok(api::access(&open_permissions(), &doc_id, &acl))
+        Ok(api::access(&open_permissions(&open_store()), &doc_id, &acl))
     }
 
     /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already
@@ -276,7 +284,8 @@ mod pve_rs_meta {
         guests: Vec<GuestInput>,
         has: Option<&str>,
     ) -> Result<Vec<api::GuestListEntry>, api::ApiError> {
-        api::list_guests(&open_store(), &open_permissions(), authid, &guests, has)
+        let store = open_store();
+        api::list_guests(&store, &open_permissions(&store), authid, &guests, has)
     }
 
     /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
@@ -288,7 +297,8 @@ mod pve_rs_meta {
         format: &str,
         acl: CallerAcl,
     ) -> Result<api::ApiViewDocument, api::ApiError> {
-        api::get_document(&open_store(), &open_permissions(), id, view, format, &acl)
+        let store = open_store();
+        api::get_document(&store, &open_permissions(&store), id, view, format, &acl)
     }
 
     /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
@@ -312,9 +322,10 @@ mod pve_rs_meta {
         dry_run: bool,
         acl: CallerAcl,
     ) -> Result<api::ApiPutResult, api::ApiError> {
+        let store = open_store();
         api::put_document(
-            &open_store(),
-            &open_permissions(),
+            &store,
+            &open_permissions(&store),
             id,
             view,
             format,
@@ -335,6 +346,7 @@ mod pve_rs_meta {
         digest: Option<&str>,
         acl: CallerAcl,
     ) -> Result<api::ApiPutResult, api::ApiError> {
-        api::delete_document(&open_store(), &open_permissions(), id, view, digest, &acl)
+        let store = open_store();
+        api::delete_document(&store, &open_permissions(&store), id, view, digest, &acl)
     }
 }
