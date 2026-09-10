@@ -72,12 +72,14 @@ const ctx = {
             ctx.__defined.push(name);
         },
         data: { TreeModel: {} },
+        Msg: { alert: (title, msg) => ctx.__alerts.push([title, msg]) },
         window: { Window: {} },
         panel: { Panel: {} },
         button: { Segmented: {} },
     },
     Proxmox: { Utils: { format_boolean: (v) => (v ? 'Yes' : 'No') } },
     __defined: [],
+    __alerts: [],
 };
 ctx.PVE = {};
 vm.createContext(ctx);
@@ -313,6 +315,88 @@ throws('complex keys are refused', () => Codec.parse('? [1, 2]\n: v\n', 'yaml'),
 eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true }] });
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
+
+console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
+// The Text card and the subtree window used to hold one copy each of Format, the
+// YAML | JSON switch, Diff and "did anything change", and the copies drifted.
+// These are the shared ones, driven through a fake editor: the rules they call
+// are the core's; what is checked is the choreography around them.
+{
+    const Buffer = ctx.PVE.meta.Buffer;
+    const editor = (value) => ({
+        value,
+        sets: 0,
+        getValue() { return this.value; },
+        setValue(v) { this.value = v; this.sets++; },
+        getModel() { return 'the-model'; },
+    });
+    const alerts = () => ctx.__alerts.splice(0);
+    const langsSet = [];
+    ctx.window.monaco = { editor: { setModelLanguage: (model, lang) => langsSet.push([model, lang]) } };
+    const diffs = [];
+    ctx.PVE.meta.Monaco.confirmDiff = (cfg) => diffs.push(cfg);
+    const btn = { value: null, suspended: 0, suspendEvents() { this.suspended++; }, resumeEvents() { this.suspended--; }, setValue(v) { this.value = v; } };
+
+    // A file as somebody wrote it: valid YAML in a layout no emitter would choose.
+    const handWritten = 'b:   1\na: [x, y]\n';
+    const canonical = Codec.dump(Codec.parse(handWritten, 'yaml'), 'yaml');
+    eq('the hand-written layout is not the canonical one', canonical !== handWritten, true);
+
+    // baseline
+    eq('baseline in YAML is the loaded text itself', Buffer.baseline({ editor: editor(''), lang: 'yaml', original: handWritten }), { lang: 'yaml', text: handWritten });
+    eq('baseline in JSON is the loaded text as JSON', Buffer.baseline({ editor: editor(''), lang: 'json', original: handWritten }), { lang: 'json', text: Codec.dump({ b: 1, a: ['x', 'y'] }, 'json') });
+    eq('a loaded text that is not YAML falls back to a YAML baseline', Buffer.baseline({ editor: editor(''), lang: 'json', original: 'a: [\n' }), { lang: 'yaml', text: 'a: [\n' });
+
+    // unchanged
+    eq('unchanged: the loaded text, untouched', Buffer.unchanged({ editor: editor(handWritten), lang: 'yaml', original: handWritten }), true);
+    eq('... says so', alerts(), [['Notice', 'No changes.']]);
+    eq('unchanged: an edit', Buffer.unchanged({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }), false);
+    eq('... silently', alerts(), []);
+    eq('unchanged: the same document toggled to JSON is still unchanged', Buffer.unchanged({ editor: editor(Codec.dump({ b: 1, a: ['x', 'y'] }, 'json')), lang: 'json', original: handWritten }), true);
+    alerts();
+
+    // format
+    let ed = editor(handWritten);
+    eq('format re-dumps canonically', Buffer.format({ editor: ed, lang: 'yaml', original: handWritten }), true);
+    eq('... to the store\'s own layout', ed.value, canonical);
+    eq('format of a canonical buffer changes nothing', Buffer.format({ editor: ed, lang: 'yaml', original: handWritten }), false);
+    eq('... and does not touch the editor', ed.sets, 1);
+    ed = editor('a: [\n');
+    eq('format refuses a buffer that does not parse', Buffer.format({ editor: ed, lang: 'yaml', original: '' }), false);
+    eq('... leaves it alone', [ed.value, ed.sets], ['a: [\n', 0]);
+    eq('... and says why', alerts().map((a) => a[0]), ['Cannot format']);
+
+    // convert + render: the presentation toggle, there and back
+    ed = editor(handWritten);
+    const buf = { editor: ed, lang: 'yaml', original: handWritten };
+    const value = Buffer.convert(buf, 'json', btn);
+    eq('convert parses the buffer in its current language', value, { b: 1, a: ['x', 'y'] });
+    buf.lang = 'json';
+    Buffer.render(buf, value);
+    eq('render switches the model language', langsSet, [['the-model', 'json']]);
+    eq('... and shows the value as JSON', ed.value, Codec.dump(value, 'json'));
+    const back = Buffer.convert(buf, 'yaml', btn);
+    buf.lang = 'yaml';
+    Buffer.render(buf, back);
+    eq('switching back to YAML restores the hand-written text, not a re-dump', ed.value, handWritten);
+    eq('... (the regression the two copies had between them)', ed.value !== canonical, true);
+    ed.value = 'b: 2\n';
+    Buffer.render(buf, Buffer.convert(buf, 'json', btn));
+    eq('an edited document is re-dumped, since the loaded text no longer matches', ed.value, 'b: 2\n');
+    eq('no alert and the toggle was never reset', [alerts(), btn.value, btn.suspended], [[], null, 0]);
+    ed = editor('a: [\n');
+    eq('convert refuses a buffer that does not parse', Buffer.convert({ editor: ed, lang: 'yaml', original: '' }, 'json', btn), undefined);
+    eq('... puts the toggle back on the current language, events suspended around it', [btn.value, btn.suspended], ['yaml', 0]);
+    eq('... names the target language', alerts().map((a) => a[1].indexOf('Cannot convert to JSON') === 0), [true]);
+    eq('... and the buffer is untouched', ed.sets, 0);
+
+    // diff
+    Buffer.diff({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }, 'the title');
+    eq('diff shows the buffer against the baseline', diffs.pop(), { title: 'the title', original: handWritten, modified: 'b: 2\n', lang: 'yaml' });
+    Buffer.diff({ editor: editor('{}'), lang: 'json', original: 'a: [\n' }, 't');
+    eq('... falling back to YAML when the loaded text cannot be shown as JSON', diffs.pop().lang, 'yaml');
+    delete ctx.window.monaco;
+}
 
 console.log('\n--- YAML property test: parse(dump(x)) deep-equals x ---');
 // A seeded PRNG, so a failure names a document that can be reproduced exactly.

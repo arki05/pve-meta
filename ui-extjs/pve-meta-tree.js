@@ -424,6 +424,18 @@ PVE.meta.compose = function (...parts) {
     return out;
 };
 
+// One API request on behalf of a component that may be destroyed before the
+// answer lands: a tab switch tears the panel down while requests are in flight,
+// and no callback may touch a destroyed one. Everything in `opts` goes to
+// `API2Request` as given (method defaults to GET); `success` and `failure` are
+// wrapped so they become no-ops once `owner` is gone.
+PVE.meta.request = function (owner, opts) {
+    let guard = (fn) => (fn ? (...args) => (owner.isDestroyed ? undefined : fn(...args)) : undefined);
+    Proxmox.Utils.API2Request(
+        Ext.apply({ method: 'GET' }, opts, { success: guard(opts.success), failure: guard(opts.failure) }),
+    );
+};
+
 // ---------------------------------------------------------------------------
 // The core: pve-meta-core, built for the browser (crates/pve-meta-wasm).
 //
@@ -583,6 +595,105 @@ PVE.meta.Codec = {
         return lang === 'json'
             ? PVE.meta.Codec.dump(PVE.meta.Codec.parse(originalYaml, 'yaml'), 'json')
             : originalYaml;
+    },
+};
+
+// ---------------------------------------------------------------------------
+// Buffer: what both text editors do to a Monaco buffer, independent of where
+// the buffer came from -- the loaded text in the buffer's language, Format,
+// the YAML | JSON switch, Diff, and "did anything change".
+//
+// The whole-document Text card and the subtree window each held a copy of all
+// of these, and copies drift: the window's toggle once re-dumped where the
+// card's kept the server's text, and a Format button called a helper the other
+// had renamed. A `buffer` is the small interface both editors hold:
+// `{ editor, lang, original }` -- the Monaco editor, the language it is
+// showing, and the text it was loaded with, which is always the store's YAML.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Buffer = {
+    // The loaded text as the buffer's language shows it: what a diff or a "did
+    // anything change" is measured against. A stored file that cannot be read as
+    // YAML cannot be rendered as JSON; the comparison then falls back to the YAML
+    // rather than being lost. Returns `{ lang, text }`.
+    baseline: function (buffer) {
+        try {
+            return { lang: buffer.lang, text: PVE.meta.Codec.originalInLang(buffer.original, buffer.lang) };
+        } catch (_err) {
+            return { lang: 'yaml', text: buffer.original };
+        }
+    },
+
+    // True -- and says so -- when the buffer holds exactly what was loaded.
+    unchanged: function (buffer) {
+        if (buffer.editor.getValue() !== PVE.meta.Buffer.baseline(buffer).text) {
+            return false;
+        }
+        Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
+        return true;
+    },
+
+    // The buffer against what was loaded, without committing to it.
+    diff: function (buffer, title) {
+        let base = PVE.meta.Buffer.baseline(buffer);
+        PVE.meta.Monaco.confirmDiff({
+            title: title,
+            original: base.text,
+            modified: buffer.editor.getValue(),
+            lang: base.lang,
+        });
+    },
+
+    // Re-dump the buffer canonically in the language showing: two-space indent, no
+    // folding, key order preserved -- the same dumper the YAML | JSON toggle uses, so
+    // formatting then toggling is a no-op. Refuses a buffer that does not parse
+    // rather than mangling it. Returns true when the text changed.
+    format: function (buffer) {
+        let text = buffer.editor.getValue();
+        try {
+            let formatted = PVE.meta.Codec.dump(PVE.meta.Codec.parse(text, buffer.lang), buffer.lang);
+            if (formatted === text) {
+                return false;
+            }
+            buffer.editor.setValue(formatted);
+            return true;
+        } catch (err) {
+            Ext.Msg.alert(gettext('Cannot format'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            return false;
+        }
+    },
+
+    // The first half of the YAML | JSON switch: the buffer as a value, ready to be
+    // shown in `lang`. If it does not parse, says so, puts the toggle `btn` back,
+    // and returns undefined -- the buffer stays as it was. Between this and
+    // `render` the caller records the new language, because rendering fires the
+    // editor's change listeners and they read it.
+    convert: function (buffer, lang, btn) {
+        try {
+            return PVE.meta.Codec.parse(buffer.editor.getValue(), buffer.lang);
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Error'),
+                Ext.String.format(
+                    gettext('Cannot convert to {0}: {1}'),
+                    lang.toUpperCase(),
+                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+                ),
+            );
+            btn.suspendEvents();
+            btn.setValue(buffer.lang);
+            btn.resumeEvents();
+            return undefined;
+        }
+    },
+
+    // The second half: show `value` in `buffer.lang`. `Codec.render`, not a bare
+    // dump: switching back to YAML prefers the server's own text when the document
+    // is unchanged, so a presentation toggle never turns a no-op into a whitespace
+    // diff.
+    render: function (buffer, value) {
+        window.monaco.editor.setModelLanguage(buffer.editor.getModel(), buffer.lang);
+        buffer.editor.setValue(PVE.meta.Codec.render(value, buffer.lang, buffer.original));
     },
 };
 
@@ -1895,6 +2006,10 @@ Ext.define('PVE.meta.TextWindow', {
         });
     },
 
+    buffer: function () {
+        return { editor: this.editor, lang: this.lang, original: this.original };
+    },
+
     // The buffer against what was loaded, without committing to it -- the same view
     // Apply ends with, offered on its own.
     showBufferDiff: function () {
@@ -1902,20 +2017,7 @@ Ext.define('PVE.meta.TextWindow', {
         if (!me.editor) {
             return;
         }
-        let lang = me.lang;
-        let original;
-        try {
-            original = PVE.meta.Codec.originalInLang(me.original, lang);
-        } catch (_err) {
-            lang = 'yaml';
-            original = me.original;
-        }
-        PVE.meta.Monaco.confirmDiff({
-            title: me.view || gettext('(whole document)'),
-            original: original,
-            modified: me.editor.getValue(),
-            lang: lang,
-        });
+        PVE.meta.Buffer.diff(me.buffer(), me.view || gettext('(whole document)'));
     },
 
     // Apply is live as soon as there is a buffer; the diff decides whether there is
@@ -1933,83 +2035,37 @@ Ext.define('PVE.meta.TextWindow', {
         });
     },
 
-    // Presentation only: re-render the same value in the other syntax. If we cannot
-    // parse the buffer we say so and stay put; the server remains the YAML authority.
-    // The same canonical re-dump the text card's Format does, on this window's own
-    // editor -- through `Utils.parseBuffer`/`dumpBuffer`, so the two Format buttons
-    // cannot drift. It refuses a buffer that does not parse rather than mangling it.
     formatBuffer: function () {
         let me = this;
-        let ed = me.editor;
-        if (!ed) {
+        if (!me.editor) {
             return;
         }
-        let text = ed.getValue();
-        try {
-            let U = PVE.meta.Utils;
-            let formatted = PVE.meta.Codec.dump(PVE.meta.Codec.parse(text, me.lang), me.lang);
-            if (formatted !== text) {
-                ed.setValue(formatted);
-            }
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Cannot format'),
-                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-            );
-        }
+        PVE.meta.Buffer.format(me.buffer());
     },
 
+    // Presentation only: the same value in the other syntax. If the buffer does not
+    // parse we say so and stay put; the server remains the YAML authority.
     switchLang: function (lang) {
         let me = this;
-        let btn = me.lookupReference('langbtn');
         if (!me.editor || lang === me.lang) {
             return;
         }
-        let value;
-        try {
-            value = PVE.meta.Codec.parse(me.editor.getValue(), me.lang);
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Error'),
-                Ext.String.format(
-                    gettext('Cannot convert to {0}: {1}'),
-                    lang.toUpperCase(),
-                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-                ),
-            );
-            btn.suspendEvents();
-            btn.setValue(me.lang);
-            btn.resumeEvents();
+        let value = PVE.meta.Buffer.convert(me.buffer(), lang, me.lookupReference('langbtn'));
+        if (value === undefined) {
             return;
         }
         me.lang = lang;
-        window.monaco.editor.setModelLanguage(me.editor.getModel(), lang);
-        // `renderBuffer`, not a bare dump: switching JSON -> YAML must not turn a
-        // no-op round trip into a whitespace diff (see the comment on that function).
-        // This editor used to dump unconditionally here, which the Text card's own
-        // toggle did not.
-        me.editor.setValue(PVE.meta.Codec.render(value, lang, me.original));
+        PVE.meta.Buffer.render(me.buffer(), value);
     },
 
     // Apply applies, and the window closes when the write lands. The diff is a button
     // of its own now, so stopping to show it again was asking twice for one decision.
     showDiff: function () {
         let me = this;
-        if (!me.editor) {
+        if (!me.editor || PVE.meta.Buffer.unchanged(me.buffer())) {
             return;
         }
-        let edited = me.editor.getValue();
-        let original = me.original;
-        try {
-            original = PVE.meta.Codec.originalInLang(me.original, me.lang);
-        } catch (_err) {
-            original = me.original;
-        }
-        if (edited === original) {
-            Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
-            return;
-        }
-        me.apply(edited, me.lang);
+        me.apply(me.editor.getValue(), me.lang);
     },
 
     apply: function (text, lang) {
@@ -2088,22 +2144,20 @@ PVE.meta.Doc = {
 
     // --- loading -----------------------------------------------------------
 
-    // Every load is a chain of these. A tab switch destroys the panel while requests
-    // are still in flight, so no callback may touch a destroyed one.
+    // Every load is a chain of these. A failure the caller did not handle masks
+    // the panel with it.
     request: function (opts) {
         let me = this;
-        let guard = (fn) => (fn ? (...args) => (me.isDestroyed ? undefined : fn(...args)) : undefined);
-        Proxmox.Utils.API2Request({
-            method: 'GET',
-            url: opts.url,
-            params: opts.params,
-            success: guard(opts.success),
-            failure: guard(
-                opts.failure ||
-                    ((response) =>
-                        Proxmox.Utils.setErrorMask(me, response.htmlStatus || gettext('Error'))),
+        PVE.meta.request(
+            me,
+            Ext.apply(
+                {
+                    failure: (response) =>
+                        Proxmox.Utils.setErrorMask(me, response.htmlStatus || gettext('Error')),
+                },
+                opts,
             ),
-        });
+        );
     },
 
     reload: function () {
@@ -2412,6 +2466,15 @@ PVE.meta.TextCard = {
         };
     },
 
+    // The **stored** document is the baseline, not the planned one. `textRendered`
+    // renders the planned document -- staged edits included, which is the point of
+    // it -- so comparing the buffer with that would answer "nothing changed" for
+    // exactly the case where something did: stage an edit in the tree, switch to
+    // Text, Apply. It said "No changes." and wrote nothing.
+    textBuffer: function () {
+        return { editor: this.textEditor, lang: this.textLang, original: this.textOriginal };
+    },
+
     // The buffer against the file, without committing to anything. Text mode's Apply
     // shows the same diff, but only as the last step before writing -- and wanting to
     // see what you changed is not the same as wanting to write it.
@@ -2420,21 +2483,10 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return;
         }
-        let lang = me.textLang;
-        let original;
-        try {
-            original = PVE.meta.Codec.originalInLang(me.textOriginal, lang);
-        } catch (_err) {
-            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
-            original = me.textOriginal;
-        }
-        PVE.meta.Monaco.confirmDiff({
-            title: Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
-            original: original,
-            modified: me.textEditor.getValue(),
-            lang: lang,
-            // No `apply`: this is the view, not the decision.
-        });
+        PVE.meta.Buffer.diff(
+            me.textBuffer(),
+            Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
+        );
     },
 
     setModeButton: function (value) {
@@ -2606,65 +2658,32 @@ PVE.meta.TextCard = {
         me.syncButtons();
     },
 
-    // Presentation only, exactly like the selection window's toggle.
+    // Presentation only, exactly like the selection window's toggle. `textLang` is
+    // recorded between convert and render: rendering fires the change listener,
+    // which annotates the buffer in whatever language it finds there.
     switchTextLang: function (lang) {
         let me = this;
-        let btn = me.down('#textLangBtn');
         if (!me.textEditor || lang === me.textLang) {
             return;
         }
-        let value;
-        try {
-            value = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Error'),
-                Ext.String.format(
-                    gettext('Cannot convert to {0}: {1}'),
-                    lang.toUpperCase(),
-                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-                ),
-            );
-            btn.suspendEvents();
-            btn.setValue(me.textLang);
-            btn.resumeEvents();
+        let value = PVE.meta.Buffer.convert(me.textBuffer(), lang, me.down('#textLangBtn'));
+        if (value === undefined) {
             return;
         }
         me.textLang = lang;
-        window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
-
-        // `renderBuffer`: switching back to YAML prefers the server's own text when
-        // the document is unchanged (see the comment on that function) rather than
-        // re-dumping unconditionally.
-        me.textEditor.setValue(PVE.meta.Codec.render(value, lang, me.textOriginal));
+        PVE.meta.Buffer.render(me.textBuffer(), value);
         me.annotateText();
     },
 
-    // Re-dump the buffer canonically in whichever language is showing: two-space
-    // indent, no folding, key order preserved. For hand-written YAML that has drifted
-    // from the store's own layout, and it is the same dumper the JSON/YAML toggle uses,
-    // so formatting then toggling is a no-op.
-    //
-    // Refuses on a buffer that does not parse rather than mangling it -- the squiggle
-    // already says where.
+    // For hand-written YAML that has drifted from the store's own layout. The
+    // squiggles are recomputed because the lines moved.
     formatText: function () {
         let me = this;
         if (!me.textEditor) {
             return;
         }
-        let text = me.textEditor.getValue();
-        try {
-            let U = PVE.meta.Utils;
-            let formatted = PVE.meta.Codec.dump(PVE.meta.Codec.parse(text, me.textLang), me.textLang);
-            if (formatted !== text) {
-                me.textEditor.setValue(formatted);
-                me.annotateText();
-            }
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Cannot format'),
-                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-            );
+        if (PVE.meta.Buffer.format(me.textBuffer())) {
+            me.annotateText();
         }
     },
 
@@ -2673,24 +2692,11 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return;
         }
-        let lang = me.textLang;
-        let edited = me.textEditor.getValue();
-        // Against the **stored** document, not the planned one. `textRendered` renders
-        // the planned document -- staged edits included, which is the point of it --
-        // so comparing the buffer with that answers "nothing changed" for exactly the
-        // case where something did: stage an edit in the tree, switch to Text, Apply.
-        // It said "No changes." and wrote nothing.
-        let original;
-        try {
-            original = PVE.meta.Codec.originalInLang(me.textOriginal, lang);
-        } catch (_err) {
-            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
-            original = me.textOriginal;
-        }
-        if (edited === original) {
-            Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
+        let buffer = me.textBuffer();
+        if (PVE.meta.Buffer.unchanged(buffer)) {
             return;
         }
+        let edited = me.textEditor.getValue();
         // The whole document, at the root view, as **text** -- not as a dump of the
         // planned document. That is the one thing this path does that the tree's Apply
         // cannot: a `#` comment is not part of the document model (DESIGN §2), so it
@@ -2719,11 +2725,12 @@ PVE.meta.TextCard = {
             write();
             return;
         }
+        let base = PVE.meta.Buffer.baseline(buffer);
         PVE.meta.Monaco.confirmDiff({
             title: gettext('(whole document)'),
-            original: original,
+            original: base.text,
             modified: edited,
-            lang: lang,
+            lang: base.lang,
             warnings: warnings,
             apply: write,
         });
@@ -5136,11 +5143,7 @@ Ext.define('PVE.meta.RegistryGrid', {
     },
 
     request: function (opts) {
-        let me = this;
-        let guard = (fn) => (fn ? (...args) => (me.isDestroyed ? undefined : fn(...args)) : undefined);
-        Proxmox.Utils.API2Request(
-            Ext.apply({ method: 'GET', success: guard(opts.success), failure: guard(opts.failure) }, opts),
-        );
+        PVE.meta.request(this, opts);
     },
 
     reload: function () {
