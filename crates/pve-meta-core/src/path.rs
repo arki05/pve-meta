@@ -114,9 +114,8 @@ impl FromStr for Path {
     }
 }
 
-/// Serializes as the dotted string form (`Display`), e.g. for a
-/// [`crate::scopes::Scope`]'s `prefix` in the `grants_json` wire shape
-/// (`{"prefix":"traefik","mode":"rw"}`).
+/// Serializes as the dotted string form (`Display`), e.g. a
+/// [`crate::scopes::Scope`]'s `prefix` where `GET /meta/access` reports it.
 impl serde::Serialize for Path {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

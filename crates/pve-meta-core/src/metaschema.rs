@@ -89,7 +89,7 @@ properties:
     optional: 1
     description: >-
       The entries this principal gets: each one a prefix, a mode ('ro' or 'rw') and a
-      selector. Effective accumulate by containment, so an entry on 'homelab' also covers
+      selector. Permissions accumulate by containment, so an entry on 'homelab' also covers
       'homelab.docker'. Optional because a file with none is a principal that may touch
       nothing, which is a legitimate (if pointless) state -- and the misspelling that
       would otherwise produce it by accident is already refused, since an unknown key

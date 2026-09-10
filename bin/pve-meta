@@ -5,7 +5,7 @@
 # Installed at /usr/sbin/pve-meta. **A local reader, not an API client**: it
 # calls PVE::RS::Meta directly against /etc/pve/meta, so it needs no ticket, no
 # token and no pveproxy, and it works in a hook script that runs before the API
-# is reachable (docs/DESIGN.md section 6). That is the whole reason it exists --
+# is reachable. That is the whole reason it exists --
 # `pvesh get /meta/guests/<vmid>` already does this for anyone who has an API
 # session, and a hook script does not.
 #

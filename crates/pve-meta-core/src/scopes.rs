@@ -3,7 +3,7 @@
 //!
 //! A [`Effective`] is built per request by [`crate::api`] from two inputs: the
 //! PVE ACL answers Perl passes in (`full_read`/`full_write`) and the scope
-//! entries of the [registrations](crate::registry) whose `authid` is the
+//! rules of the [permission files](crate::registry) whose `authid` is the
 //! caller and whose selector matches the guest. Scopes are **additive**: they
 //! never restrict a principal that already holds the ACL, and they apply to
 //! guest documents only — the datacenter document is governed by ACLs alone.

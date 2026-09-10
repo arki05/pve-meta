@@ -623,7 +623,7 @@ the authority, and an Apply sends the buffer back as `text`.
 
 A second implementation in pwt/Yew was built to the same specification and compared on
 the lab; it was removed once the choice was made (git tag `pwt-ui-removed`). It cost
-~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript for the same page,
+~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript, measured at the time of the comparison,
 and its only structural advantage — that it never parses YAML itself — was answered by
 vendoring a real parser with a property test. What it was genuinely better at, native
 unit tests, is the thing `ui-extjs/testing/` has to keep earning.
@@ -654,6 +654,16 @@ pass); orphan listing/deletion/access rules; the clone and backup hooks and thei
 hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for permissions, guest lists and results
 (`_grants_json`, `_inflate_view`, `parse_permissions`, `data_json`); the "View as" selector.
 
+## 11. Deviations from DIRECTION.md, with reasons
+
+* **Lifecycle is snapshot-only, not zero.** Rollback restoring metadata was an explicit
+  product decision; it costs one patched file in the least-churned package.
+* **The pwt implementation was not dropped by fiat — it was compared first.** DIRECTION
+  §5.4 argued for switching on the premise that `Ext.tree.Panel` had no pwt equivalent;
+  it does (`DataTable` + `TreeStore`, used by PDM). Both were built to this §8 and judged
+  on the lab. ExtJS won on size and build surface, not on the doc's original argument,
+  and pwt was then removed (§8, git tag `pwt-ui-removed`).
+
 ## 12. Why revision 6 splits the registration
 
 Revision 5 had one object doing two jobs, and the type said so: `authid` was
@@ -683,13 +693,3 @@ What the split buys beyond correctness is that the store's vocabulary loses the 
 package that drops a prefix, has an administrator issue a grant, and creates an LXC
 with credentials injected. Nothing at runtime needs the concept, so nothing in the core
 carries it.
-
-## 11. Deviations from DIRECTION.md, with reasons
-
-* **Lifecycle is snapshot-only, not zero.** Rollback restoring metadata was an explicit
-  product decision; it costs one patched file in the least-churned package.
-* **The pwt implementation was not dropped by fiat — it was compared first.** DIRECTION
-  §5.4 argued for switching on the premise that `Ext.tree.Panel` had no pwt equivalent;
-  it does (`DataTable` + `TreeStore`, used by PDM). Both were built to this §8 and judged
-  on the lab. ExtJS won on size and build surface, not on the doc's original argument,
-  and pwt was then removed (§8, git tag `pwt-ui-removed`).

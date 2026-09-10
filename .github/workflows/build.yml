@@ -55,6 +55,17 @@ jobs:
           command -v grass >/dev/null 2>&1 || cargo install grass --locked
           grass --version
 
+      # The suites ran only when a human typed the command: `debian/rules`
+      # overrides `dh_auto_test`, so `make deb` builds without testing, and
+      # tagged builds published to the apt repo with no gate at all. They run
+      # here, before the packages are built, on the same container that has
+      # every dependency they need.
+      - name: Rust tests, clippy and rustdoc
+        run: make check test
+
+      - name: The perlmod boundary suite
+        run: make -C crates/pve-meta-perl check
+
       - name: Build .deb packages
         run: make deb
 

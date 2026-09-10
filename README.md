@@ -279,7 +279,7 @@ live node.
 | `prefixes/` | Packaged example prefixes (none required) |
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
-| `patches/lifecycle/` | The one guest-lifecycle diff (snapshot/rollback/delete-snapshot) + `lifecycle.toml` manifest |
+| `patches/` | `lifecycle.toml`, the managed-patch manifest, and `lifecycle/` holding the one guest-lifecycle diff it names |
 | `pages/` | The "Metadata" tab's page manifest |
 | `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |

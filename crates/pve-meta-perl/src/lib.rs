@@ -30,7 +30,7 @@
 //!
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
-//! `test/basic.pl`); the registration directories likewise with
+//! `test/basic.pl`); the prefix and permission directories likewise with
 //! `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`.
 
 use std::path::PathBuf;
@@ -185,9 +185,11 @@ mod pve_rs_meta {
     /// copy** whose vmid is not in `$vmids`, in one pass, holding no
     /// per-vmid lock. Returns the number of files removed.
     ///
-    /// This is what replaces the `on_destroy` hook and, with it, the whole
-    /// orphan concept: there is no orphan listing, no orphan grant rule and
-    /// no orphan delete in the API. The datacenter document is never a guest
+    /// This is **not** what removes a destroyed guest's document -- `on_destroy`
+    /// above does that, on every destroy path. It is the sweep for the one case
+    /// the hooks cannot see: a guest config removed out of band. There is no
+    /// orphan concept in the API: no orphan listing, no orphan rule, no orphan
+    /// delete. The datacenter document is never a guest
     /// and is never removed.
     ///
     /// **Not what the timer runs.** It cannot re-validate a candidate against
@@ -242,7 +244,7 @@ mod pve_rs_meta {
         Ok(api::prefixes_list(&open_prefixes()))
     }
 
-    /// `GET /meta/schemas` -> `{ prefix, grant }`, the two registry file
+    /// `GET /meta/schemas` -> `{ prefix, permission }`, the two registry file
     /// formats described in the same dialect a prefix uses, so the editor
     /// can show one as a typed tree.
     #[export]
@@ -251,7 +253,7 @@ mod pve_rs_meta {
     }
 
     /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
-    /// with the registrations' selectors already resolved against `$acl`'s
+    /// with the permissions' selectors already resolved against `$acl`'s
     /// tags. `$id` is a vmid or `"datacenter"`.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {

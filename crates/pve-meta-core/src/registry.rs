@@ -300,12 +300,6 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
     }
 }
 
-/// Parses one prefix file. `name` is the file's base name, which **is** the
-/// prefix.
-///
-/// # Errors
-/// [`Error::Registry`] describing the first problem; [`Error::Parse`] if
-/// the text is not YAML at all.
 /// Whether `name` is a usable registry **file** name (the part before `.yaml`).
 ///
 /// One rule, because three places need it and they must agree: `parse_id`
@@ -321,6 +315,12 @@ pub fn is_valid_file_name(name: &str) -> bool {
     !name.is_empty() && name.split('.').all(crate::path::is_valid_segment)
 }
 
+/// Parses one prefix file. `name` is the file's base name, which **is** the
+/// prefix.
+///
+/// # Errors
+/// [`Error::Registry`] describing the first problem; [`Error::Parse`] if the
+/// text is not YAML at all.
 pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
     // Dotted form only. `Path::parse` also accepts `a/b`, which must never be a
     // prefix name: the name is used as a file name, so accepting a separator
@@ -519,7 +519,13 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
         let Some(stem) = file_name.strip_suffix(".yaml") else {
             continue;
         };
-        if stem.is_empty() || !entry.path().is_file() {
+        // The same rule `api::parse_id` and `store::registry_document_id` apply. It
+        // was missing here, which meant a hand-created `my file.yaml` *loaded* -- it
+        // granted scopes and appeared in the listing -- while `GET
+        // /meta/permissions/my file` was a 400, so nothing could open or repair it.
+        // `is_valid_file_name`'s own doc says three places need it and must agree;
+        // this was the third.
+        if !is_valid_file_name(stem) || !entry.path().is_file() {
             continue;
         }
         out.push((stem.to_string(), entry.path()));
@@ -565,7 +571,7 @@ pub fn governing<'a>(
 /// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
 /// prefixes nest, and deliberately so — permission is a union, shape is not.
 ///
-/// Effective apply to **guest documents only**; the datacenter document is
+/// Permissions apply to **guest documents only**; the datacenter document is
 /// governed by ACLs alone, so this is never called for it.
 pub fn scopes_for(files: &[Permission], authid: &str, tags: &[String]) -> Vec<Scope> {
     let mut out = Vec::new();
@@ -616,6 +622,23 @@ rules:
 
     fn write(dir: &std::path::Path, name: &str, text: &str) {
         std::fs::write(dir.join(name), text).unwrap();
+    }
+
+    #[test]
+    fn a_file_the_api_could_not_address_is_not_loaded_either() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.yaml"), "selector: {all: true}\n").unwrap();
+        std::fs::write(dir.path().join("homelab.docker.yaml"), "selector: {all: true}\n").unwrap();
+        // Names no id can name: `GET /meta/prefixes/<name>` refuses all three, so
+        // loading them would put a prefix in the listing that nothing can open.
+        for bad in ["my file", "a/b", "a..b", ".hidden"] {
+            let _ = std::fs::write(dir.path().join(format!("{bad}.yaml")), "selector: {all: true}\n");
+        }
+        let loaded: Vec<String> = load_prefixes(&[dir.path().to_path_buf()])
+            .into_iter()
+            .map(|p| p.prefix.to_string())
+            .collect();
+        assert_eq!(loaded, ["homelab.docker", "ok"], "only the addressable ones");
     }
 
     #[test]

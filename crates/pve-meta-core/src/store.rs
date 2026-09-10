@@ -62,8 +62,7 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// [`MAX_BYTES`] only ever applied to *writes*, so a multi-megabyte file
 /// dropped into `/etc/pve/meta` out of band (a bad rsync, a replicated file
 /// from a future version, a mistake) was read and SHA-256'd on every request
-/// that touched it — including `api::permissions`, which reads `datacenter.yaml`
-/// on every request that touched it.
+/// that touched it.
 ///
 /// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
 /// can ever reach it, so hitting it always means the file arrived out of
@@ -121,7 +120,7 @@ impl fmt::Display for RegistryKind {
 /// the shape of every wrong-result bug this project has had.
 ///
 /// Two things are *not* uniform, and both live outside this type: a registry
-/// document is governed by ACLs alone (`api::permissions` gives it no scopes -- a
+/// document is governed by ACLs alone (`api::effective` gives it no scopes -- a
 /// permission file that could widen its own grants would be self-registration), and
 /// its content must additionally parse as the kind it claims to be, which
 /// `api::put_document` checks before writing.
@@ -488,8 +487,8 @@ impl MetaStore {
     /// Every API write is already lint-gated, so invalid content can only
     /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
     /// backup, pmxcfs replication). Linting on the way *in* made one bad key
-    /// anywhere in `datacenter.yaml` a cluster-wide outage — `api::permissions`
-    /// reads that document on every guest request — and, worse, blocked the
+    /// anywhere in `datacenter.yaml` a cluster-wide outage — permissions lived in
+    /// that document then, so every guest request read it — and, worse, blocked the
     /// administrator's own repair, since they could neither read the document
     /// to see the problem nor write over it. Strict validation belongs to the
     /// content being written, and lives in [`MetaStore::put_raw`]'s parse of
@@ -500,7 +499,7 @@ impl MetaStore {
     /// an anchor or an explicit tag still 400'd every endpoint for everyone.
     /// A syntax error is now reported per document, in
     /// [`Document::parse_error`], with the empty document as the value — the
-    /// caller decides (`api::permissions` grants nothing and warns; a read answers
+    /// caller decides (`api::effective` grants nothing and warns; a read answers
     /// with `parse_error` and no data; a full-write caller may replace the
     /// whole document to repair it).
     ///

@@ -1874,6 +1874,9 @@ Ext.define('PVE.meta.TextWindow', {
                 },
             ].concat(
                 PVE.meta.Footer.actions({
+                    // Stated, like the panel states its own: there is no buffer until
+                    // Monaco loads, and `syncFooter` turns it on when there is.
+                    applyDisabled: true,
                     diff: () => me.showBufferDiff(),
                     format: () => me.formatBuffer(),
                     apply: () => me.showDiff(),
@@ -1897,6 +1900,11 @@ Ext.define('PVE.meta.TextWindow', {
                         minimap: { enabled: false },
                         scrollBeyondLastLine: false,
                     });
+                    // Without these the footer never learns there is a buffer:
+                    // `syncFooter` was written and never called, so the secondary
+                    // button kept an undo icon over the word Close whatever you did.
+                    me.syncFooter();
+                    me.editor.onDidChangeModelContent(() => me.syncFooter());
                 },
                 (err) => Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err))),
             );
@@ -2569,9 +2577,10 @@ Ext.define('PVE.meta.TreePanel', {
     // other); a registry document has one schema at its root (which shadows nothing,
     // so it is its own list); the datacenter document has neither.
     //
-    // One function, two callers -- the tree's row markers and the text editor's --
-    // because they are the same question asked twice, and the last four wrong-result
-    // bugs in this file were all a rule with two implementations.
+    // One function, every caller that needs it -- the row markers, the text editor's
+    // squiggles, and the warning banner Apply shows. They are the same question asked
+    // three times, and a rule with more than one implementation is one waiting to
+    // disagree with itself.
     grammarSplit: function (docId) {
         let all = this.grammarFor(docId);
         let rooted = all.filter((ns) => ns.schema && !ns.prefix);
@@ -2647,9 +2656,10 @@ Ext.define('PVE.meta.TreePanel', {
     // re-apply it on top of the new value.
     stage: function (path, op, value) {
         let me = this;
-        // The empty path is the document: it replaces everything, including edits
-        // staged under keys that no longer exist in it.
-        let under = (p) => path === '' || p === path || p.indexOf(path + '.') === 0;
+        // `containsPath` plus one case it does not have: the empty path is the
+        // *document*, and replacing that replaces everything -- including edits staged
+        // under keys the new document does not have.
+        let under = (p) => path === '' || PVE.meta.Utils.containsPath(path, p);
         me.pending = me.pending.filter((e) => !under(e.path));
         me.pending.push({ path: path, op: op, value: value });
         me.buildTree();
@@ -2663,7 +2673,7 @@ Ext.define('PVE.meta.TreePanel', {
     // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
     // so "what would Discard drop" and "what did staging replace" are one rule.
     pendingUnder: function (path) {
-        return this.pending.filter((e) => e.path === path || e.path.indexOf(path + '.') === 0);
+        return this.pending.filter((e) => PVE.meta.Utils.containsPath(path, e.path));
     },
 
     // Drops the staged edits on one row, leaving the rest alone.
@@ -3368,12 +3378,11 @@ Ext.define('PVE.meta.TreePanel', {
         walk(entry, schema);
     },
 
+    // The declared type as the kind the editor and `parseValue` speak. One mapping:
+    // `Utils.schemaValueKind` had a second copy of it, so adding a type to one and not
+    // the other would have made a row's editor disagree with the parser behind it.
     schemaKind: function (schema) {
-        let t = (schema && schema.type) || 'string';
-        if (t === 'integer' || t === 'number') {
-            return 'number';
-        }
-        return t === 'boolean' || t === 'array' ? t : 'string';
+        return PVE.meta.Utils.schemaValueKind((schema && schema.type) || 'string');
     },
 
     // The merged rows of ONE document: what is present in it, plus what its grammar
@@ -3663,10 +3672,9 @@ Ext.define('PVE.meta.TreePanel', {
     // the planned subtree as its content -- for a single row edit that is exactly the
     // one-key write this used to send immediately.
     //
-    // The server is asked twice: once with `dry_run=1`, whose complaints become the
-    // diff dialog's warning banner, and then for real. That is how a rule the client
-    // cannot know -- "exactly one of all/tag" is not expressible in the schema
-    // dialect (DESIGN §3.6) -- still gets said before the write rather than after.
+    // Apply applies: it stops for the diff only when the planned document would not
+    // match the schema (see `confirmAndApply`, which says why there is no `dry_run`
+    // pass).
     applyPending: function () {
         let me = this;
         if (!me.isDirty()) {
@@ -3693,7 +3701,31 @@ Ext.define('PVE.meta.TreePanel', {
         };
         let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Lint.valueAt(me.dataOf(me.docId), view);
 
+        // One staged delete is a DELETE, not a replace of its parent.
+        //
+        // `writeView` steps up a level for a delete, because you cannot remove a key by
+        // replacing it -- but for a *top-level* key that step lands on the document
+        // root, and a root write needs full write access (DESIGN §3.4). So a principal
+        // holding `rw` on `traefik` could stage Remove on the `traefik` row, see it
+        // struck through, and get "writing the whole document requires full write
+        // access" on Apply -- for a delete the server would have taken as
+        // `DELETE ?view=traefik`, which is what this panel sent before staging existed.
+        let onlyDelete =
+            me.pending.length === 1 && me.pending[0].op === 'delete' && me.pending[0].path;
         let write = function () {
+            if (onlyDelete) {
+                let q = Ext.Object.toQueryString({
+                    view: me.pending[0].path,
+                    digest: me.digestOf(me.docId),
+                });
+                me.submit(
+                    { url: me.urlFor(me.docId) + '?' + q, method: 'DELETE' },
+                    function () {
+                        me.pending = [];
+                    },
+                );
+                return;
+            }
             me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
                 me.pending = [];
             });

@@ -1083,6 +1083,23 @@ console.log('\n--- text is just another way to edit rows ---');
     eq('the document replaces everything under it', stub.pending, [{ path: '', op: 'set', value: { a: 1 } }]);
 }
 
+console.log('\n--- a single delete has to stay a DELETE ---');
+{
+    // `writeView` steps up a level for a delete -- you cannot remove a key by replacing
+    // it -- but for a top-level key that step lands on the document root, and a root
+    // write needs full write access. A scoped writer removing its own prefix would get
+    // a 403 for something the server would have taken as `DELETE ?view=traefik`.
+    eq('a top-level delete would write the document', U.writeView([{ path: 'traefik', op: 'delete' }]), '');
+    // ... so Apply sends the narrow DELETE instead, which is what this shape is for.
+    eq('a nested delete writes its parent', U.writeView([{ path: 'a.b', op: 'delete' }]), 'a');
+    // Two edits are a replace again: only a lone delete has a narrower spelling.
+    eq(
+        'a delete beside a set is not one',
+        U.writeView([{ path: 'a', op: 'delete' }, { path: 'b', op: 'set', value: 1 }]),
+        '',
+    );
+}
+
 console.log('\n--- a staged value is linted like a stored one ---');
 {
     // Findings are computed against the *planned* document, so a value that breaks
@@ -1186,28 +1203,6 @@ console.log('\n--- a list is a container, like a map ---');
     // not recognise -- it describes nothing and constrains nothing.
     eq('an unknown shape is still legible', U.itemSummary({ a: 1 }), '{"a":1}');
     eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
-}
-
-console.log('\n--- adding one rule to a permission file ---');
-{
-    const R = ctx.PVE.meta.AddRuleWindow.statics;
-    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
-        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
-    ]);
-    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
-        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
-    ]);
-    // Appending, not replacing: `rules` is written whole because a view addresses
-    // through maps only, so the existing entries have to come along.
-    eq(
-        'the ones already there come with it',
-        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
-            prefix: 'traefik', mode: 'rw', selector: 'all',
-        }).map((r) => r.prefix),
-        ['netbird', 'traefik'],
-    );
-    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
-    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
 }
 
 console.log('\n--- adding one rule to a permission file ---');
