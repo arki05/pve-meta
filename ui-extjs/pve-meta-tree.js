@@ -1076,8 +1076,13 @@ PVE.meta.Monaco = {
             title: gettext('Confirm') + ': ' + Ext.htmlEncode(cfg.title),
             itemId: 'pveMetaDiffWindow',
             modal: true,
-            width: 1000,
-            height: 620,
+            // Fitted to the viewport, not fixed: at 620px tall on a shorter window it
+            // pushed its own Apply and Back buttons off the bottom of the screen with
+            // nothing to scroll, so the only way out was Escape -- which nothing says.
+            width: Math.min(1000, Ext.Element.getViewportWidth() - 40),
+            height: Math.min(620, Ext.Element.getViewportHeight() - 40),
+            maxHeight: Ext.Element.getViewportHeight() - 40,
+            constrain: true,
             layout: 'border',
             referenceHolder: true,
             items: [
@@ -2887,7 +2892,10 @@ Ext.define('PVE.meta.TreePanel', {
             // In text mode the buffer is the edit, and Apply is offered whenever the
             // caller may write at all -- the diff is what decides if it is worth it.
             canApply: textMode ? !!me.access.write : me.isDirty(),
-            count: textMode ? 0 : me.pending.length,
+            // The same count in both views: the buffer is rendered from the planned
+            // document, so those staged edits are in it. Showing it only in the tree
+            // made switching to Text look like it had dropped them.
+            count: me.pending.length,
             dirty: textMode ? true : me.isDirty(),
             dirtyText: me.onClose ? gettext('Discard') : gettext('Revert'),
             cleanText: me.onClose ? gettext('Close') : gettext('Revert'),
@@ -3944,7 +3952,12 @@ Ext.define('PVE.meta.TreePanel', {
             return false;
         }
         try {
-            return me.textEditor.getValue() !== me.textRendered(me.textLang);
+            // The stored document, for the same reason `applyText` uses it: comparing
+            // against the planned one would call a staged edit "not dirty".
+            return (
+                me.textEditor.getValue() !==
+                PVE.meta.Utils.originalInLang(me.textOriginal, me.textLang)
+            );
         } catch (_err) {
             return true; // cannot tell: assume there is something to lose
         }
@@ -4147,11 +4160,16 @@ Ext.define('PVE.meta.TreePanel', {
         }
         let lang = me.textLang;
         let edited = me.textEditor.getValue();
+        // Against the **stored** document, not the planned one. `textRendered` renders
+        // the planned document -- staged edits included, which is the point of it --
+        // so comparing the buffer with that answers "nothing changed" for exactly the
+        // case where something did: stage an edit in the tree, switch to Text, Apply.
+        // It said "No changes." and wrote nothing.
         let original;
         try {
-            original = me.textRendered(lang);
+            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
         } catch (_err) {
-            lang = 'yaml'; // cannot render the original as JSON; diff the YAML
+            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
             original = me.textOriginal;
         }
         if (edited === original) {
@@ -4212,6 +4230,8 @@ Ext.define('PVE.meta.TreePanel', {
                     return;
                 }
                 me.pending = [];
+                me.buildTree();
+                me.syncButtons();
                 me.refreshText();
             },
         );
