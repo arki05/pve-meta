@@ -20,6 +20,16 @@
  * The Tree|Text segmented button at the right end of the toolbar swaps the body in
  * place; leaving Text with an edited buffer asks first.
  *
+ * `PVE.meta.TreePanel` is composed at definition time from three method sets that
+ * share one `this` (`PVE.meta.compose`, below the other `PVE.meta.*` helpers):
+ * `PVE.meta.Doc` owns one document's transport and state -- the API calls, the
+ * digest, the cached data; `PVE.meta.TextCard` owns the Text card and the Tree|Text
+ * switch; the `Ext.define` body itself is left with the tree -- rows, staging, the
+ * toolbar, the columns, the editors, Apply. Three responsibilities in one class is
+ * what made a change in one keep going wrong because of another; the split names
+ * the seams instead of letting them stay implicit in which third of the file a
+ * method happened to live in.
+ *
  * Editing is a modal row editor (Edit, double-click, or Enter), the field chosen from
  * the grammar type and falling back to the value's own type; editability is per row from
  * `GET /meta/access`. A commit is one minimal write:
@@ -766,6 +776,32 @@ PVE.meta.Utils = {
     },
 
     errText: (err) => String((err && (err.message || err.msg)) || err),
+};
+
+// ---------------------------------------------------------------------------
+// compose: merge plain objects into one, member name by member name.
+// ---------------------------------------------------------------------------
+
+// TreePanel's methods are composed from three sets below (`PVE.meta.Doc`,
+// `PVE.meta.TextCard`, and the tree itself), all sharing one `this`.
+// `Ext.apply`-style merging would resolve a name defined in two of them by
+// keeping whichever was applied last -- silently, the same way a write that
+// does not check its digest silently overwrites somebody else's. The loser
+// here is not a row, it is a method: one definition quietly replaces the
+// other, and the dead one still looks used because its name is still in the
+// file. Throwing on the collision turns that into a load-time error instead
+// of a "why doesn't this do what the comment says" bug report.
+PVE.meta.compose = function (...parts) {
+    let out = {};
+    parts.forEach(function (part) {
+        Object.keys(part).forEach(function (key) {
+            if (Object.prototype.hasOwnProperty.call(out, key)) {
+                throw new Error('PVE.meta.compose: duplicate member "' + key + '"');
+            }
+            out[key] = part[key];
+        });
+    });
+    return out;
 };
 
 // ---------------------------------------------------------------------------
@@ -2203,10 +2239,904 @@ Ext.define('PVE.meta.TextWindow', {
 });
 
 // ---------------------------------------------------------------------------
+// One document's transport and state: the API calls and what came back.
+//
+// Everything that reads or writes `docState`, or talks to `/meta/*` directly.
+// The tree and the Text card each render a document; neither one owns it --
+// this is the seam that used to be invisible because both sides just called
+// `this.request`, `this.reload`, `this.write`, and nobody had to say which
+// `this` they meant.
+// ---------------------------------------------------------------------------
+
+PVE.meta.Doc = {
+    // --- documents -----------------------------------------------------------
+
+    // The API path of a document, from its id. Total by construction: a registry id
+    // is `prefixes/<name>` -- the path it is served at -- and everything else is a
+    // vmid or the literal `datacenter` (`api::parse_id`).
+    urlFor: function (id) {
+        if (id === 'datacenter') {
+            return '/meta/datacenter';
+        }
+        return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
+    },
+
+    // What kind of document an id names -- which decides what governs its rows.
+    docKind: function (id) {
+        if (id === 'datacenter') {
+            return 'datacenter';
+        }
+        if (id.indexOf('prefixes/') === 0) {
+            return 'prefix';
+        }
+        if (id.indexOf('permissions/') === 0) {
+            return 'permission';
+        }
+        return 'guest';
+    },
+
+    docTitle: function (id) {
+        let cut = id.indexOf('/');
+        return cut === -1 ? id : id.slice(cut + 1);
+    },
+
+    // The digest to send with a write, and the parsed document to build rows from.
+    // Per document, because a compare-and-swap is per document: one shared `digest`
+    // field would have sent a prefix's digest with a write to the datacenter.
+    digestOf: function (id) {
+        return (this.docState[id] || {}).digest || '';
+    },
+
+    dataOf: function (id) {
+        return (this.docState[id] || {}).data || {};
+    },
+
+    setDigest: function (id, digest) {
+        if (digest) {
+            this.docState[id] = this.docState[id] || { data: {} };
+            this.docState[id].digest = digest;
+        }
+    },
+
+    // --- loading -----------------------------------------------------------
+
+    // Every load is a chain of these. A tab switch destroys the panel while requests
+    // are still in flight, so no callback may touch a destroyed one.
+    request: function (opts) {
+        let me = this;
+        let guard = (fn) => (fn ? (...args) => (me.isDestroyed ? undefined : fn(...args)) : undefined);
+        Proxmox.Utils.API2Request({
+            method: 'GET',
+            url: opts.url,
+            params: opts.params,
+            success: guard(opts.success),
+            failure: guard(
+                opts.failure ||
+                    ((response) =>
+                        Proxmox.Utils.setErrorMask(me, response.htmlStatus || gettext('Error'))),
+            ),
+        });
+    },
+
+    reload: function () {
+        let me = this;
+        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
+            return;
+        }
+        // Staged edits are the reason a reload is not free any more: re-reading the
+        // document is fine, but the overlay on top of it would be describing changes
+        // against content that has moved. Ask, the same way leaving Text mode dirty
+        // does.
+        if (me.isDirty()) {
+            Ext.Msg.confirm(
+                gettext('Confirm'),
+                gettext('Discard the unapplied changes and reload?'),
+                function (btn) {
+                    if (btn === 'yes') {
+                        me.pending = [];
+                        me.reload();
+                    }
+                },
+            );
+            return;
+        }
+        Proxmox.Utils.setErrorMask(me, true);
+        me.loadPrefixes(() =>
+            me.loadPermissions(() =>
+                me.loadAccess(() =>
+                    me.loadSchemas(() =>
+                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
+                    ),
+                ),
+            ),
+        );
+    },
+
+    // /meta/prefixes and /meta/permissions are revision 6; against an older API they
+    // simply fail and the Access column and the schema-declared rows stay empty,
+    // rather than the page.
+    loadPrefixes: function (next) {
+        let me = this;
+        me.request({
+            url: '/meta/prefixes',
+            success: function (response) {
+                // Served most-specific first (DESIGN section 3.1) -- the order
+                // `Utils.governing` relies on. Sorted again here so the UI does not
+                // depend on the server's ordering for correctness.
+                me.prefixes = PVE.meta.Utils.bySpecificity(response.result.data || []);
+                next();
+            },
+            failure: function () {
+                me.prefixes = [];
+                next();
+            },
+        });
+    },
+
+    loadPermissions: function (next) {
+        let me = this;
+        me.request({
+            url: '/meta/permissions',
+            success: function (response) {
+                me.permissions = response.result.data || [];
+                next();
+            },
+            failure: function () {
+                me.permissions = [];
+                next();
+            },
+        });
+    },
+
+    // There is no separate tag request: `GET /meta/access` returns the guest's
+    // tags with the access answer (see `loadAccess`). It used to be
+    // `GET /meta/guests`, which reads, parses and digests every document in the
+    // cluster -- to learn one guest's tags, on every open of every guest tab
+    // that has a `tag:` selector anywhere in the registry, which the shipped
+    // traefik prefix has.
+
+    loadAccess: function (next) {
+        let me = this;
+        me.request({
+            url: '/meta/access',
+            // Ask about the document this panel is actually showing. `dc: 1` used to
+            // stand in for "not a guest", which stopped being true the moment a
+            // prefix or permission file could be the document: those are readable by every
+            // authenticated user, and asking about the datacenter document instead
+            // answered with Sys.Audit -- disabling Text mode on a file the caller may
+            // certainly read (DESIGN §3.5).
+            params: { id: me.docId },
+            success: function (response) {
+                me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
+                // The server resolved the selectors it enforces; these tags are
+                // for the *rendering* decisions the client makes on top -- which
+                // prefixes apply to this guest. Same tags, same authority, one
+                // request instead of two.
+                me.tags = me.access.tags || [];
+                me.syncAccessLabel();
+                next();
+            },
+        });
+    },
+
+    // The meta-schema, once per load and only where it is used: it describes a
+    // registry document, and a guest tab never shows one.
+    loadSchemas: function (next) {
+        let me = this;
+        if (!me.dc) {
+            next();
+            return;
+        }
+        me.request({
+            url: '/meta/schemas',
+            success: function (response) {
+                me.schemas = response.result.data || {};
+                next();
+            },
+            // An older API has no /meta/schemas: the registry documents still show
+            // as trees, just without declared rows or hovers.
+            failure: () => next(),
+        });
+    },
+
+    // This panel's one document.
+    // Reads the document as YAML, and that is a correctness requirement, not a
+    // formatting preference.
+    //
+    // perlmod renders a document as a **native Perl hash**, and a Perl hash has no
+    // key order at all: two `GET`s of the same document come back with their keys
+    // in different orders, depending on which pvedaemon worker answered (verified
+    // on the lab -- three requests, two different orders). Key order is data in
+    // this model (DESIGN section 2), and `plannedData()` is exactly what an Apply
+    // at the root view sends back, so reading JSON meant writing the document back
+    // in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
+    // its rows; the file changed anyway. The canonical YAML text is the one
+    // representation on this wire that carries the order the store actually holds.
+    //
+    // js-yaml is loaded first rather than assumed: it is lazy, and calling into it
+    // before it is there is a bug this editor has already had once.
+    //
+    // One narrower loss remains and cannot be fixed here: JavaScript objects order
+    // integer-like keys first, so a document with keys `2` and `1` cannot round
+    // trip through any client built on plain objects. That is a property of the
+    // language, and it is a far smaller hole than the one it replaces.
+    loadDocument: function (next) {
+        let me = this;
+        PVE.meta.Yaml.load().then(
+            function () {
+                me.request({
+                    url: me.urlFor(me.docId),
+                    params: { format: 'yaml' },
+                    success: function (response) {
+                        let d = response.result.data || {};
+                        // The server could read the bytes but they are not a
+                        // document. Do *not* fall back to the empty document: the
+                        // tree would look empty and an Apply would replace the file
+                        // with whatever was staged on top of nothing. Report it, the
+                        // way the JSON view's 422 used to.
+                        if (d.parse_error) {
+                            Proxmox.Utils.setErrorMask(
+                                me,
+                                Ext.htmlEncode(
+                                    Ext.String.format(
+                                        gettext('The stored document cannot be read: {0}'),
+                                        d.parse_error,
+                                    ),
+                                ),
+                            );
+                            return;
+                        }
+                        let data;
+                        try {
+                            data = PVE.meta.Utils.yamlLoad(d.text || '');
+                        } catch (err) {
+                            Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                            return;
+                        }
+                        me.docState[me.docId] = { digest: d.digest || '', data: data };
+                        me.buildTree();
+                        me.syncButtons();
+                        next();
+                    },
+                });
+            },
+            function (err) {
+                // Without YAML this panel cannot read a document faithfully, and
+                // reading it unfaithfully is what this whole path exists to stop.
+                Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            },
+        );
+    },
+
+    poll: function () {
+        let me = this;
+        if (
+            !me.rendered ||
+            me.isDestroyed ||
+            me.editing ||
+            me.textWindow ||
+            me.mode === 'text' ||
+            // Never pull the document out from under staged edits. The token keeps
+            // moving; the next tick after Apply or Revert picks the change up.
+            me.isDirty()
+        ) {
+            return;
+        }
+        Proxmox.Utils.API2Request({
+            url: '/meta/version',
+            method: 'GET',
+            // Scoped to the document this panel shows. Unscoped, every tick of
+            // every open tab read and hashed every document *and every snapshot
+            // copy* in the cluster to answer a question about one guest, and any
+            // guest changing anywhere reloaded every open editor. The scoped
+            // token still covers the prefix and permission directories, so a
+            // registry change reloads this panel the way it always did.
+            params: { id: me.docId },
+            failure: Ext.emptyFn, // transient; the next tick tries again
+            success: function (response) {
+                let token = (response.result.data || {}).token;
+                if (me.token === null) {
+                    me.token = token;
+                } else if (token && token !== me.token) {
+                    // Re-check: an edit (or a text editor) may have started while
+                    // this request was in flight. Do *not* advance me.token here -
+                    // leaving it stale means the next 5 s tick sees the same change
+                    // and retries, instead of the reload being lost silently.
+                    if (me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
+                        return;
+                    }
+                    me.token = token;
+                    me.reload();
+                }
+            },
+        });
+    },
+
+    // --- writes -------------------------------------------------------------
+
+    write: function (docId, params, onSuccess) {
+        this.submit({ url: this.urlFor(docId), method: 'PUT', params: params }, onSuccess);
+    },
+
+    submit: function (opts, onSuccess) {
+        let me = this;
+        Proxmox.Utils.API2Request(
+            Ext.apply(
+                {
+                    waitMsgTarget: me,
+                    success: function () {
+                        if (onSuccess) {
+                            onSuccess();
+                        }
+                        me.reload();
+                    },
+                    failure: function (response) {
+                        // The API's message, verbatim. A 409 means somebody else wrote the
+                        // document since we read it: reload first, then say so.
+                        let conflict = String((response.result || {}).status) === '409';
+                        if (conflict) {
+                            if (me.mode === 'text') {
+                                me.refreshText();
+                            } else {
+                                me.reload();
+                            }
+                        }
+                        Ext.Msg.alert(
+                            conflict ? gettext('Conflict') : gettext('Error'),
+                            response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
+                        );
+                    },
+                },
+                opts,
+            ),
+        );
+    },
+};
+
+// ---------------------------------------------------------------------------
+// The whole-document Monaco card and the Tree | Text mode switch.
+//
+// Everything about looking at the document as one text buffer instead of
+// rows: building the card, entering and leaving text mode, Format/Apply/
+// Discard, and the squiggles and hovers that annotate the buffer. It reads
+// and writes through `PVE.meta.Doc` the same way the tree does; it does not
+// know a row exists.
+// ---------------------------------------------------------------------------
+
+PVE.meta.TextCard = {
+    buildTextCard: function () {
+        let me = this;
+        return {
+            xtype: 'panel',
+            itemId: 'metaText',
+            layout: 'fit',
+            border: false,
+            items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
+        };
+    },
+
+    // The buffer against the file, without committing to anything. Text mode's Apply
+    // shows the same diff, but only as the last step before writing -- and wanting to
+    // see what you changed is not the same as wanting to write it.
+    showTextDiff: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let lang = me.textLang;
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+        } catch (_err) {
+            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
+            original = me.textOriginal;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
+            original: original,
+            modified: me.textEditor.getValue(),
+            lang: lang,
+            // No `apply`: this is the view, not the decision.
+        });
+    },
+
+    setModeButton: function (value) {
+        let btn = this.down('#modeBtn');
+        if (!btn || btn.getValue() === value) {
+            return;
+        }
+        btn.suspendEvents();
+        btn.setValue(value);
+        btn.resumeEvents();
+    },
+
+    // --- the Text card ------------------------------------------------------
+
+    onModeChange: function (value) {
+        let me = this;
+        if (value === me.mode) {
+            return;
+        }
+        if (value === 'text') {
+            me.enterTextMode();
+        } else {
+            me.leaveTextMode();
+        }
+    },
+
+    textIsDirty: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return false;
+        }
+        try {
+            // The stored document, for the same reason `applyText` uses it: comparing
+            // against the planned one would call a staged edit "not dirty".
+            return (
+                me.textEditor.getValue() !==
+                PVE.meta.Utils.originalInLang(me.textOriginal, me.textLang)
+            );
+        } catch (_err) {
+            return true; // cannot tell: assume there is something to lose
+        }
+    },
+
+    // The loaded document rendered in `lang`; the diff's "original" side and the
+    // yardstick the dirty check uses. `Utils.originalInLang` -- the subtree
+    // window's own diff used to inline the same conversion rather than share this.
+    // What the buffer should show: the **planned** document -- stored plus whatever is
+    // staged -- in `lang`. With nothing staged this is the server's own text, comments
+    // and all, because `renderBuffer` prefers the original when the document is
+    // unchanged. That is what makes Tree and Text two views of one thing rather than
+    // two editors that have to be kept apart.
+    textRendered: function (lang) {
+        let me = this;
+        if (!me.isDirty()) {
+            return PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+        }
+        return PVE.meta.Utils.renderBuffer(me.plannedData(), lang, me.textOriginal);
+    },
+
+    enterTextMode: function () {
+        let me = this;
+        me.mode = 'text';
+        // Which document the Text card shows. On a guest tab there is only one; on
+        // the datacenter tab it is the one the selection is in, so switching to Text
+        // with a prefix row selected edits that prefix -- the alternative was
+        // a full-document editor that could only ever mean one of several documents.
+        let rec = me.getSelection()[0];
+        me.textDocId = (rec && rec.data.docId) || me.docId;
+        me.syncButtons();
+        me.getLayout().setActiveItem(me.down('#metaText'));
+        Proxmox.Utils.setErrorMask(me, true);
+        me.request({
+            url: me.urlFor(me.textDocId),
+            params: { format: 'yaml' },
+            success: function (response) {
+                let d = response.result.data || {};
+                me.setDigest(me.textDocId, d.digest);
+                // The server's own text, comments and all -- but what the buffer shows
+                // is the *planned* document, so staged edits are there too. With
+                // nothing staged the two are the same text (`renderBuffer` prefers the
+                // original when the document is unchanged), so opening text mode on an
+                // untouched document still shows the file as it was written.
+                me.textOriginal = d.text || '';
+                me.showTextEditor();
+            },
+            failure: function (response) {
+                Proxmox.Utils.setErrorMask(me, false);
+                Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error'));
+                me.abortTextMode();
+            },
+        });
+    },
+
+    showTextEditor: function () {
+        let me = this;
+        PVE.meta.Monaco.load().then(
+            function (monaco) {
+                if (me.isDestroyed || me.mode !== 'text') {
+                    return;
+                }
+                Proxmox.Utils.setErrorMask(me, false);
+                if (me.textEditor) {
+                    me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
+                    return;
+                }
+                me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
+                    value: me.textRendered(me.textLang),
+                    language: 'yaml',
+                    theme: PVE.meta.Monaco.theme(),
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                });
+                // Squiggles describe the text the server sent; typing moves the lines,
+                // so they are dropped on the first edit and come back on the next load.
+                me.textEditor.onDidChangeModelContent(function () {
+                    me.annotateText();
+                });
+                me.annotateText();
+            },
+            function (err) {
+                Proxmox.Utils.setErrorMask(me, false);
+                Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                me.abortTextMode();
+            },
+        );
+    },
+
+    // Text mode could not be entered: fall back to the tree without asking.
+    abortTextMode: function () {
+        let me = this;
+        me.mode = 'tree';
+        me.setModeButton('tree');
+        me.getLayout().setActiveItem(me.down('#metaTree'));
+        me.syncButtons();
+    },
+
+    // Going back to the tree keeps whatever was typed: the buffer is turned into
+    // staged edits on rows, so the tree shows which keys changed and to what, and one
+    // Apply writes them. Switching views is not a decision about your work any more --
+    // it used to ask you to discard it, which is why it felt like a trap.
+    //
+    // The one thing that can stop it is a buffer that does not parse: there is no
+    // document to show as a tree, and guessing at one would lose what was typed. So it
+    // says so and stays put.
+    leaveTextMode: function () {
+        let me = this;
+        let parsed;
+        try {
+            parsed = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+        } catch (err) {
+            me.setModeButton('text');
+            Ext.Msg.alert(
+                gettext('Cannot show this as a tree'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)) +
+                    '<br><br>' +
+                    Ext.htmlEncode(gettext('Fix the text, or Discard it, and try again.')),
+            );
+            return;
+        }
+        me.pending = PVE.meta.Utils.diffDocuments(me.dataOf(me.textDocId), parsed);
+        PVE.meta.Monaco.dispose(me.textEditor);
+        me.textEditor = null;
+        me.mode = 'tree';
+        me.setModeButton('tree');
+        me.getLayout().setActiveItem(me.down('#metaTree'));
+        me.buildTree();
+        me.syncButtons();
+    },
+
+    // Presentation only, exactly like the selection window's toggle.
+    switchTextLang: function (lang) {
+        let me = this;
+        let btn = me.down('#textLangBtn');
+        if (!me.textEditor || lang === me.textLang) {
+            return;
+        }
+        let value;
+        try {
+            value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Error'),
+                Ext.String.format(
+                    gettext('Cannot convert to {0}: {1}'),
+                    lang.toUpperCase(),
+                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+                ),
+            );
+            btn.suspendEvents();
+            btn.setValue(me.textLang);
+            btn.resumeEvents();
+            return;
+        }
+        me.textLang = lang;
+        window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
+
+        // `renderBuffer`: switching back to YAML prefers the server's own text when
+        // the document is unchanged (see the comment on that function) rather than
+        // re-dumping unconditionally.
+        me.textEditor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.textOriginal));
+        me.annotateText();
+    },
+
+    // Re-dump the buffer canonically in whichever language is showing: two-space
+    // indent, no folding, key order preserved. For hand-written YAML that has drifted
+    // from the store's own layout, and it is the same dumper the JSON/YAML toggle uses,
+    // so formatting then toggling is a no-op.
+    //
+    // Refuses on a buffer that does not parse rather than mangling it -- the squiggle
+    // already says where.
+    formatText: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let text = me.textEditor.getValue();
+        try {
+            let U = PVE.meta.Utils;
+            let formatted = U.dumpBuffer(U.parseBuffer(text, me.textLang), me.textLang);
+            if (formatted !== text) {
+                me.textEditor.setValue(formatted);
+                me.annotateText();
+            }
+        } catch (err) {
+            Ext.Msg.alert(
+                gettext('Cannot format'),
+                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
+            );
+        }
+    },
+
+    applyText: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return;
+        }
+        let lang = me.textLang;
+        let edited = me.textEditor.getValue();
+        // Against the **stored** document, not the planned one. `textRendered` renders
+        // the planned document -- staged edits included, which is the point of it --
+        // so comparing the buffer with that answers "nothing changed" for exactly the
+        // case where something did: stage an edit in the tree, switch to Text, Apply.
+        // It said "No changes." and wrote nothing.
+        let original;
+        try {
+            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
+        } catch (_err) {
+            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
+            original = me.textOriginal;
+        }
+        if (edited === original) {
+            Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
+            return;
+        }
+        // The whole document, at the root view, as **text** -- not as a dump of the
+        // planned document. That is the one thing this path does that the tree's Apply
+        // cannot: a `#` comment is not part of the document model (DESIGN §2), so it
+        // survives only for as long as nothing rewrites the file from the model.
+        // Sending the buffer keeps what was typed, comments included.
+        //
+        // The buffer already contains whatever was staged in the tree -- it is rendered
+        // from the planned document -- so this applies all of it, and the staged edits
+        // are spent.
+        let write = function () {
+            let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
+            params[me.textLang === 'json' ? 'data' : 'text'] = edited;
+            me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
+                me.pending = [];
+                me.refreshText();
+            });
+        };
+
+        // Same rule as the tree's Apply: stop only when the document would not match
+        // the schema, because that is the one case where seeing the diff changes what
+        // you decide. The tick keeps storing it anyway a deliberate act -- the server's
+        // lint decides what is *storable* (DESIGN §4), and an operator whose schema has
+        // drifted must not be able to lock the administrator out of editing.
+        let warnings = me.textFindings();
+        if (!warnings.length) {
+            write();
+            return;
+        }
+        PVE.meta.Monaco.confirmDiff({
+            title: gettext('(whole document)'),
+            original: original,
+            modified: edited,
+            lang: lang,
+            warnings: warnings,
+            apply: write,
+        });
+    },
+
+    // Drops everything unapplied -- the buffer's edits and the staged ones behind it,
+    // which are the same set: the buffer is rendered from the planned document.
+    discardText: function () {
+        let me = this;
+        if (!me.textIsDirty() && !me.isDirty()) {
+            me.refreshText();
+            return;
+        }
+        Ext.Msg.confirm(
+            gettext('Confirm'),
+            gettext('Discard the unapplied changes in the text editor?'),
+            function (btn) {
+                if (btn !== 'yes') {
+                    return;
+                }
+                me.pending = [];
+                me.buildTree();
+                me.syncButtons();
+                me.refreshText();
+            },
+        );
+    },
+
+    // Re-read the document and put it back in the buffer (after Apply, or Discard).
+    // Underline what is wrong with the buffer *as it is now*, and describe the key on
+    // each declared line on hover.
+    //
+    // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
+    // is the authority (DESIGN section 4):
+    //
+    //   * a YAML syntax error, as one Error marker on the line js-yaml reports. Monaco
+    //     ships a JSON language service that does this for the JSON view already, but
+    //     nothing validates YAML, so this is ours.
+    //   * every grammar finding, as Warning markers (PVE.meta.Lint).
+    //
+    // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
+    // not against the document the server last sent. Parsing is js-yaml on a document
+    // that is a few KB at most; if that ever shows up in typing latency, debounce it.
+    //
+    // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
+    // view the document still gets Monaco's own syntax validation but no schema
+    // squiggles.
+    annotateText: function () {
+        let me = this;
+        if (!me.textEditor || !window.monaco) {
+            return;
+        }
+        let model = me.textEditor.getModel();
+        if (!model) {
+            return;
+        }
+        let text = me.textEditor.getValue();
+        let markers = [];
+        let hovers = Object.create(null);
+
+        let parsed = null;
+        let parseError = null;
+        try {
+            parsed = PVE.meta.Utils.parseBuffer(text, me.textLang);
+        } catch (err) {
+            parseError = err;
+        }
+
+        if (parseError) {
+            if (me.textLang === 'yaml') {
+                // js-yaml's YAMLException carries a 0-based mark; anything else lands
+                // on line 1 rather than nowhere.
+                let mark = parseError.mark || {};
+                let line = typeof mark.line === 'number' ? mark.line + 1 : 1;
+                line = Math.min(Math.max(line, 1), model.getLineCount());
+                markers.push({
+                    startLineNumber: line,
+                    endLineNumber: line,
+                    startColumn: typeof mark.column === 'number' ? mark.column + 1 : 1,
+                    endColumn: model.getLineMaxColumn(line),
+                    message: parseError.reason || PVE.meta.Utils.errText(parseError),
+                    severity: monaco.MarkerSeverity.Error,
+                });
+            }
+        } else if (me.textLang === 'yaml') {
+            let g = me.textGrammar();
+            let all = g.all;
+            let applicable = g.withSchema;
+            if (applicable.length) {
+                let index = PVE.meta.Lint.lineIndex(text);
+                markers = PVE.meta.Lint.placed(
+                    PVE.meta.Lint.findings(parsed, applicable, all),
+                    index,
+                ).map(function (f) {
+                    return {
+                        startLineNumber: f.line,
+                        endLineNumber: f.line,
+                        startColumn: 1,
+                        endColumn: model.getLineMaxColumn(f.line),
+                        message: f.message,
+                        severity: monaco.MarkerSeverity.Warning,
+                    };
+                });
+                let schemas = PVE.meta.Lint.schemaIndex(applicable, all);
+                Object.keys(schemas).forEach(function (path) {
+                    let hover = PVE.meta.Lint.hoverText(schemas[path]);
+                    if (hover && index[path] !== undefined) {
+                        hovers[index[path]] = hover;
+                    }
+                });
+            }
+        }
+
+        monaco.editor.setModelMarkers(model, 'pve-meta', markers);
+        me.textHovers = hovers;
+        me.registerTextHover();
+    },
+
+    // The grammar findings the current buffer would *introduce*, as plain messages --
+    // what Apply warns about before it writes. Empty when the buffer does not parse
+    // (the write will fail on its own) or when no grammar applies. Same rule as the
+    // tree's Apply, through the same `introducedFindings`: a violation the document
+    // already had, on a path this buffer did not change, is not this edit's to vouch
+    // for. Reordering keys therefore stops demanding a tick, since a reordering
+    // changes no value at all.
+    textGrammar: function () {
+        return this.grammarSplit(this.textDocId || this.docId);
+    },
+
+    textFindings: function () {
+        let me = this;
+        if (!me.textEditor) {
+            return [];
+        }
+        let g = me.textGrammar();
+        let all = g.all;
+        let applicable = g.withSchema;
+        if (!applicable.length) {
+            return [];
+        }
+        try {
+            let U = PVE.meta.Utils;
+            let value = U.parseBuffer(me.textEditor.getValue(), me.textLang);
+            let stored = me.dataOf(me.textDocId || me.docId);
+            return U.introducedFindings(
+                PVE.meta.Lint.findings(stored, applicable, all),
+                PVE.meta.Lint.findings(value, applicable, all),
+                U.changedPaths(stored, value),
+            ).map((f) => f.path + ': ' + f.message);
+        } catch (_err) {
+            return [];
+        }
+    },
+
+    // One hover provider for the language, reading whichever panel owns the model that
+    // is asking. Monaco registers providers per-language, not per-editor.
+    registerTextHover: function () {
+        let me = this;
+        if (PVE.meta.textHoverRegistered || !window.monaco || !monaco.languages) {
+            return;
+        }
+        PVE.meta.textHoverRegistered = true;
+        monaco.languages.registerHoverProvider('yaml', {
+            provideHover: function (model, position) {
+                let owner = me.textEditor && me.textEditor.getModel() === model ? me : null;
+                let text = owner && owner.textHovers && owner.textHovers[position.lineNumber];
+                if (!text) {
+                    return null;
+                }
+                return {
+                    range: new monaco.Range(
+                        position.lineNumber,
+                        1,
+                        position.lineNumber,
+                        model.getLineMaxColumn(position.lineNumber),
+                    ),
+                    contents: [{ value: text }],
+                };
+            },
+        });
+    },
+
+    refreshText: function () {
+        let me = this;
+        me.request({
+            url: me.urlFor(me.textDocId),
+            params: { format: 'yaml' },
+            success: function (response) {
+                let d = response.result.data || {};
+                me.setDigest(me.textDocId, d.digest);
+                me.textOriginal = d.text || '';
+                if (me.textEditor) {
+                    me.textEditor.setValue(me.textRendered(me.textLang));
+                    me.annotateText();
+                }
+            },
+        });
+    },
+};
+
+// ---------------------------------------------------------------------------
 // The panel: a card layout over the tree and the full-document text editor.
 // ---------------------------------------------------------------------------
 
-Ext.define('PVE.meta.TreePanel', {
+// PVE.meta.compose, not Ext's `mixins`: the offline smoke harness stubs
+// Ext.define as "store the config object on the namespace" and reads
+// PVE.meta.TreePanel's members straight off it, so the members have to be
+// on the config object *before* Ext.define ever sees it -- composing here
+// has no class-loader order to get right, a real mixin merge would.
+Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     extend: 'Ext.panel.Panel',
     xtype: 'pveMetaTreePanel',
 
@@ -2331,17 +3261,6 @@ Ext.define('PVE.meta.TreePanel', {
         };
     },
 
-    buildTextCard: function () {
-        let me = this;
-        return {
-            xtype: 'panel',
-            itemId: 'metaText',
-            layout: 'fit',
-            border: false,
-            items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
-        };
-    },
-
     buildToolbar: function () {
         let me = this;
         return [
@@ -2418,31 +3337,6 @@ Ext.define('PVE.meta.TreePanel', {
             // Only shown when the caller is restricted (DESIGN §8).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
         ];
-    },
-
-    // The buffer against the file, without committing to anything. Text mode's Apply
-    // shows the same diff, but only as the last step before writing -- and wanting to
-    // see what you changed is not the same as wanting to write it.
-    showTextDiff: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return;
-        }
-        let lang = me.textLang;
-        let original;
-        try {
-            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
-        } catch (_err) {
-            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
-            original = me.textOriginal;
-        }
-        PVE.meta.Monaco.confirmDiff({
-            title: Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
-            original: original,
-            modified: me.textEditor.getValue(),
-            lang: lang,
-            // No `apply`: this is the view, not the decision.
-        });
     },
 
     // The one bar at the bottom, for both cards. Which view you are looking at on
@@ -2694,37 +3588,6 @@ Ext.define('PVE.meta.TreePanel', {
         ];
     },
 
-    // --- documents -----------------------------------------------------------
-
-    // The API path of a document, from its id. Total by construction: a registry id
-    // is `prefixes/<name>` -- the path it is served at -- and everything else is a
-    // vmid or the literal `datacenter` (`api::parse_id`).
-    urlFor: function (id) {
-        if (id === 'datacenter') {
-            return '/meta/datacenter';
-        }
-        return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
-    },
-
-    // What kind of document an id names -- which decides what governs its rows.
-    docKind: function (id) {
-        if (id === 'datacenter') {
-            return 'datacenter';
-        }
-        if (id.indexOf('prefixes/') === 0) {
-            return 'prefix';
-        }
-        if (id.indexOf('permissions/') === 0) {
-            return 'permission';
-        }
-        return 'guest';
-    },
-
-    docTitle: function (id) {
-        let cut = id.indexOf('/');
-        return cut === -1 ? id : id.slice(cut + 1);
-    },
-
     // What describes one document, in the two lists `Lint.findings` wants: what to
     // walk, and what shadows. A guest document has prefixes (which shadow each
     // other); a registry document has one schema at its root (which shadows nothing,
@@ -2759,24 +3622,6 @@ Ext.define('PVE.meta.TreePanel', {
             out[f.path] = f.message;
         });
         return out;
-    },
-
-    // The digest to send with a write, and the parsed document to build rows from.
-    // Per document, because a compare-and-swap is per document: one shared `digest`
-    // field would have sent a prefix's digest with a write to the datacenter.
-    digestOf: function (id) {
-        return (this.docState[id] || {}).digest || '';
-    },
-
-    dataOf: function (id) {
-        return (this.docState[id] || {}).data || {};
-    },
-
-    setDigest: function (id, digest) {
-        if (digest) {
-            this.docState[id] = this.docState[id] || { data: {} };
-            this.docState[id].digest = digest;
-        }
     },
 
     // --- staged edits --------------------------------------------------------
@@ -3070,137 +3915,6 @@ Ext.define('PVE.meta.TreePanel', {
         });
     },
 
-    setModeButton: function (value) {
-        let btn = this.down('#modeBtn');
-        if (!btn || btn.getValue() === value) {
-            return;
-        }
-        btn.suspendEvents();
-        btn.setValue(value);
-        btn.resumeEvents();
-    },
-
-    // --- loading -----------------------------------------------------------
-
-    // Every load is a chain of these. A tab switch destroys the panel while requests
-    // are still in flight, so no callback may touch a destroyed one.
-    request: function (opts) {
-        let me = this;
-        let guard = (fn) => (fn ? (...args) => (me.isDestroyed ? undefined : fn(...args)) : undefined);
-        Proxmox.Utils.API2Request({
-            method: 'GET',
-            url: opts.url,
-            params: opts.params,
-            success: guard(opts.success),
-            failure: guard(
-                opts.failure ||
-                    ((response) =>
-                        Proxmox.Utils.setErrorMask(me, response.htmlStatus || gettext('Error'))),
-            ),
-        });
-    },
-
-    reload: function () {
-        let me = this;
-        if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
-            return;
-        }
-        // Staged edits are the reason a reload is not free any more: re-reading the
-        // document is fine, but the overlay on top of it would be describing changes
-        // against content that has moved. Ask, the same way leaving Text mode dirty
-        // does.
-        if (me.isDirty()) {
-            Ext.Msg.confirm(
-                gettext('Confirm'),
-                gettext('Discard the unapplied changes and reload?'),
-                function (btn) {
-                    if (btn === 'yes') {
-                        me.pending = [];
-                        me.reload();
-                    }
-                },
-            );
-            return;
-        }
-        Proxmox.Utils.setErrorMask(me, true);
-        me.loadPrefixes(() =>
-            me.loadPermissions(() =>
-                me.loadAccess(() =>
-                    me.loadSchemas(() =>
-                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
-                    ),
-                ),
-            ),
-        );
-    },
-
-    // /meta/prefixes and /meta/permissions are revision 6; against an older API they
-    // simply fail and the Access column and the schema-declared rows stay empty,
-    // rather than the page.
-    loadPrefixes: function (next) {
-        let me = this;
-        me.request({
-            url: '/meta/prefixes',
-            success: function (response) {
-                // Served most-specific first (DESIGN section 3.1) -- the order
-                // `Utils.governing` relies on. Sorted again here so the UI does not
-                // depend on the server's ordering for correctness.
-                me.prefixes = PVE.meta.Utils.bySpecificity(response.result.data || []);
-                next();
-            },
-            failure: function () {
-                me.prefixes = [];
-                next();
-            },
-        });
-    },
-
-    loadPermissions: function (next) {
-        let me = this;
-        me.request({
-            url: '/meta/permissions',
-            success: function (response) {
-                me.permissions = response.result.data || [];
-                next();
-            },
-            failure: function () {
-                me.permissions = [];
-                next();
-            },
-        });
-    },
-
-    // There is no separate tag request: `GET /meta/access` returns the guest's
-    // tags with the access answer (see `loadAccess`). It used to be
-    // `GET /meta/guests`, which reads, parses and digests every document in the
-    // cluster -- to learn one guest's tags, on every open of every guest tab
-    // that has a `tag:` selector anywhere in the registry, which the shipped
-    // traefik prefix has.
-
-    loadAccess: function (next) {
-        let me = this;
-        me.request({
-            url: '/meta/access',
-            // Ask about the document this panel is actually showing. `dc: 1` used to
-            // stand in for "not a guest", which stopped being true the moment a
-            // prefix or permission file could be the document: those are readable by every
-            // authenticated user, and asking about the datacenter document instead
-            // answered with Sys.Audit -- disabling Text mode on a file the caller may
-            // certainly read (DESIGN §3.5).
-            params: { id: me.docId },
-            success: function (response) {
-                me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
-                // The server resolved the selectors it enforces; these tags are
-                // for the *rendering* decisions the client makes on top -- which
-                // prefixes apply to this guest. Same tags, same authority, one
-                // request instead of two.
-                me.tags = me.access.tags || [];
-                me.syncAccessLabel();
-                next();
-            },
-        });
-    },
-
     // The label is a restriction notice, so it says nothing at all for a caller with
     // full write access (DESIGN §8).
     syncAccessLabel: function () {
@@ -3230,139 +3944,6 @@ Ext.define('PVE.meta.TreePanel', {
         let scoped = (me.access.scopes || []).some((s) => s.mode === 'rw');
         label.setText(scoped ? gettext('Scoped write access') : gettext('Read-only'));
         label.setVisible(true);
-    },
-
-    // The meta-schema, once per load and only where it is used: it describes a
-    // registry document, and a guest tab never shows one.
-    loadSchemas: function (next) {
-        let me = this;
-        if (!me.dc) {
-            next();
-            return;
-        }
-        me.request({
-            url: '/meta/schemas',
-            success: function (response) {
-                me.schemas = response.result.data || {};
-                next();
-            },
-            // An older API has no /meta/schemas: the registry documents still show
-            // as trees, just without declared rows or hovers.
-            failure: () => next(),
-        });
-    },
-
-    // This panel's one document.
-    // Reads the document as YAML, and that is a correctness requirement, not a
-    // formatting preference.
-    //
-    // perlmod renders a document as a **native Perl hash**, and a Perl hash has no
-    // key order at all: two `GET`s of the same document come back with their keys
-    // in different orders, depending on which pvedaemon worker answered (verified
-    // on the lab -- three requests, two different orders). Key order is data in
-    // this model (DESIGN section 2), and `plannedData()` is exactly what an Apply
-    // at the root view sends back, so reading JSON meant writing the document back
-    // in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
-    // its rows; the file changed anyway. The canonical YAML text is the one
-    // representation on this wire that carries the order the store actually holds.
-    //
-    // js-yaml is loaded first rather than assumed: it is lazy, and calling into it
-    // before it is there is a bug this editor has already had once.
-    //
-    // One narrower loss remains and cannot be fixed here: JavaScript objects order
-    // integer-like keys first, so a document with keys `2` and `1` cannot round
-    // trip through any client built on plain objects. That is a property of the
-    // language, and it is a far smaller hole than the one it replaces.
-    loadDocument: function (next) {
-        let me = this;
-        PVE.meta.Yaml.load().then(
-            function () {
-                me.request({
-                    url: me.urlFor(me.docId),
-                    params: { format: 'yaml' },
-                    success: function (response) {
-                        let d = response.result.data || {};
-                        // The server could read the bytes but they are not a
-                        // document. Do *not* fall back to the empty document: the
-                        // tree would look empty and an Apply would replace the file
-                        // with whatever was staged on top of nothing. Report it, the
-                        // way the JSON view's 422 used to.
-                        if (d.parse_error) {
-                            Proxmox.Utils.setErrorMask(
-                                me,
-                                Ext.htmlEncode(
-                                    Ext.String.format(
-                                        gettext('The stored document cannot be read: {0}'),
-                                        d.parse_error,
-                                    ),
-                                ),
-                            );
-                            return;
-                        }
-                        let data;
-                        try {
-                            data = PVE.meta.Utils.yamlLoad(d.text || '');
-                        } catch (err) {
-                            Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
-                            return;
-                        }
-                        me.docState[me.docId] = { digest: d.digest || '', data: data };
-                        me.buildTree();
-                        me.syncButtons();
-                        next();
-                    },
-                });
-            },
-            function (err) {
-                // Without YAML this panel cannot read a document faithfully, and
-                // reading it unfaithfully is what this whole path exists to stop.
-                Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
-            },
-        );
-    },
-
-    poll: function () {
-        let me = this;
-        if (
-            !me.rendered ||
-            me.isDestroyed ||
-            me.editing ||
-            me.textWindow ||
-            me.mode === 'text' ||
-            // Never pull the document out from under staged edits. The token keeps
-            // moving; the next tick after Apply or Revert picks the change up.
-            me.isDirty()
-        ) {
-            return;
-        }
-        Proxmox.Utils.API2Request({
-            url: '/meta/version',
-            method: 'GET',
-            // Scoped to the document this panel shows. Unscoped, every tick of
-            // every open tab read and hashed every document *and every snapshot
-            // copy* in the cluster to answer a question about one guest, and any
-            // guest changing anywhere reloaded every open editor. The scoped
-            // token still covers the prefix and permission directories, so a
-            // registry change reloads this panel the way it always did.
-            params: { id: me.docId },
-            failure: Ext.emptyFn, // transient; the next tick tries again
-            success: function (response) {
-                let token = (response.result.data || {}).token;
-                if (me.token === null) {
-                    me.token = token;
-                } else if (token && token !== me.token) {
-                    // Re-check: an edit (or a text editor) may have started while
-                    // this request was in flight. Do *not* advance me.token here -
-                    // leaving it stale means the next 5 s tick sees the same change
-                    // and retries, instead of the reload being lost silently.
-                    if (me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
-                        return;
-                    }
-                    me.token = token;
-                    me.reload();
-                }
-            },
-        });
     },
 
     // --- rows ---------------------------------------------------------------
@@ -3985,7 +4566,7 @@ Ext.define('PVE.meta.TreePanel', {
         // not advisory: the server refuses the real write for the same reason, tick or
         // no tick. Showing it as an error is honest; showing it as something you can
         // override is not, and it cost every Apply a second request.
-        let warnings = me.textFindingsFor(planned);
+        let warnings = me.applyFindingsFor(planned);
         if (!warnings.length) {
             write();
             return;
@@ -4007,7 +4588,7 @@ Ext.define('PVE.meta.TreePanel', {
     // about what is wrong; they differ only in what they are for. The markers show
     // everything wrong with the document, which is honest. The banner asks you to
     // vouch for what this edit did, which is the only thing you can answer for.
-    textFindingsFor: function (planned) {
+    applyFindingsFor: function (planned) {
         let me = this;
         let U = PVE.meta.Utils;
         let g = me.grammarSplit(me.docId);
@@ -4183,523 +4764,7 @@ Ext.define('PVE.meta.TreePanel', {
             },
         });
     },
-
-    // --- the Text card ------------------------------------------------------
-
-    onModeChange: function (value) {
-        let me = this;
-        if (value === me.mode) {
-            return;
-        }
-        if (value === 'text') {
-            me.enterTextMode();
-        } else {
-            me.leaveTextMode();
-        }
-    },
-
-    textIsDirty: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return false;
-        }
-        try {
-            // The stored document, for the same reason `applyText` uses it: comparing
-            // against the planned one would call a staged edit "not dirty".
-            return (
-                me.textEditor.getValue() !==
-                PVE.meta.Utils.originalInLang(me.textOriginal, me.textLang)
-            );
-        } catch (_err) {
-            return true; // cannot tell: assume there is something to lose
-        }
-    },
-
-    // The loaded document rendered in `lang`; the diff's "original" side and the
-    // yardstick the dirty check uses. `Utils.originalInLang` -- the subtree
-    // window's own diff used to inline the same conversion rather than share this.
-    // What the buffer should show: the **planned** document -- stored plus whatever is
-    // staged -- in `lang`. With nothing staged this is the server's own text, comments
-    // and all, because `renderBuffer` prefers the original when the document is
-    // unchanged. That is what makes Tree and Text two views of one thing rather than
-    // two editors that have to be kept apart.
-    textRendered: function (lang) {
-        let me = this;
-        if (!me.isDirty()) {
-            return PVE.meta.Utils.originalInLang(me.textOriginal, lang);
-        }
-        return PVE.meta.Utils.renderBuffer(me.plannedData(), lang, me.textOriginal);
-    },
-
-    enterTextMode: function () {
-        let me = this;
-        me.mode = 'text';
-        // Which document the Text card shows. On a guest tab there is only one; on
-        // the datacenter tab it is the one the selection is in, so switching to Text
-        // with a prefix row selected edits that prefix -- the alternative was
-        // a full-document editor that could only ever mean one of several documents.
-        let rec = me.getSelection()[0];
-        me.textDocId = (rec && rec.data.docId) || me.docId;
-        me.syncButtons();
-        me.getLayout().setActiveItem(me.down('#metaText'));
-        Proxmox.Utils.setErrorMask(me, true);
-        me.request({
-            url: me.urlFor(me.textDocId),
-            params: { format: 'yaml' },
-            success: function (response) {
-                let d = response.result.data || {};
-                me.setDigest(me.textDocId, d.digest);
-                // The server's own text, comments and all -- but what the buffer shows
-                // is the *planned* document, so staged edits are there too. With
-                // nothing staged the two are the same text (`renderBuffer` prefers the
-                // original when the document is unchanged), so opening text mode on an
-                // untouched document still shows the file as it was written.
-                me.textOriginal = d.text || '';
-                me.showTextEditor();
-            },
-            failure: function (response) {
-                Proxmox.Utils.setErrorMask(me, false);
-                Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error'));
-                me.abortTextMode();
-            },
-        });
-    },
-
-    showTextEditor: function () {
-        let me = this;
-        PVE.meta.Monaco.load().then(
-            function (monaco) {
-                if (me.isDestroyed || me.mode !== 'text') {
-                    return;
-                }
-                Proxmox.Utils.setErrorMask(me, false);
-                if (me.textEditor) {
-                    me.textEditor.setValue(me.textRendered(me.textLang));
-                    me.annotateText();
-                    return;
-                }
-                me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
-                    value: me.textRendered(me.textLang),
-                    language: 'yaml',
-                    theme: PVE.meta.Monaco.theme(),
-                    automaticLayout: true,
-                    minimap: { enabled: false },
-                    scrollBeyondLastLine: false,
-                });
-                // Squiggles describe the text the server sent; typing moves the lines,
-                // so they are dropped on the first edit and come back on the next load.
-                me.textEditor.onDidChangeModelContent(function () {
-                    me.annotateText();
-                });
-                me.annotateText();
-            },
-            function (err) {
-                Proxmox.Utils.setErrorMask(me, false);
-                Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
-                me.abortTextMode();
-            },
-        );
-    },
-
-    // Text mode could not be entered: fall back to the tree without asking.
-    abortTextMode: function () {
-        let me = this;
-        me.mode = 'tree';
-        me.setModeButton('tree');
-        me.getLayout().setActiveItem(me.down('#metaTree'));
-        me.syncButtons();
-    },
-
-    // Going back to the tree keeps whatever was typed: the buffer is turned into
-    // staged edits on rows, so the tree shows which keys changed and to what, and one
-    // Apply writes them. Switching views is not a decision about your work any more --
-    // it used to ask you to discard it, which is why it felt like a trap.
-    //
-    // The one thing that can stop it is a buffer that does not parse: there is no
-    // document to show as a tree, and guessing at one would lose what was typed. So it
-    // says so and stays put.
-    leaveTextMode: function () {
-        let me = this;
-        let parsed;
-        try {
-            parsed = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
-        } catch (err) {
-            me.setModeButton('text');
-            Ext.Msg.alert(
-                gettext('Cannot show this as a tree'),
-                Ext.htmlEncode(PVE.meta.Utils.errText(err)) +
-                    '<br><br>' +
-                    Ext.htmlEncode(gettext('Fix the text, or Discard it, and try again.')),
-            );
-            return;
-        }
-        me.pending = PVE.meta.Utils.diffDocuments(me.dataOf(me.textDocId), parsed);
-        PVE.meta.Monaco.dispose(me.textEditor);
-        me.textEditor = null;
-        me.mode = 'tree';
-        me.setModeButton('tree');
-        me.getLayout().setActiveItem(me.down('#metaTree'));
-        me.buildTree();
-        me.syncButtons();
-    },
-
-    // Presentation only, exactly like the selection window's toggle.
-    switchTextLang: function (lang) {
-        let me = this;
-        let btn = me.down('#textLangBtn');
-        if (!me.textEditor || lang === me.textLang) {
-            return;
-        }
-        let value;
-        try {
-            value = PVE.meta.Utils.parseBuffer(me.textEditor.getValue(), me.textLang);
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Error'),
-                Ext.String.format(
-                    gettext('Cannot convert to {0}: {1}'),
-                    lang.toUpperCase(),
-                    Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-                ),
-            );
-            btn.suspendEvents();
-            btn.setValue(me.textLang);
-            btn.resumeEvents();
-            return;
-        }
-        me.textLang = lang;
-        window.monaco.editor.setModelLanguage(me.textEditor.getModel(), lang);
-
-        // `renderBuffer`: switching back to YAML prefers the server's own text when
-        // the document is unchanged (see the comment on that function) rather than
-        // re-dumping unconditionally.
-        me.textEditor.setValue(PVE.meta.Utils.renderBuffer(value, lang, me.textOriginal));
-        me.annotateText();
-    },
-
-    // Re-dump the buffer canonically in whichever language is showing: two-space
-    // indent, no folding, key order preserved. For hand-written YAML that has drifted
-    // from the store's own layout, and it is the same dumper the JSON/YAML toggle uses,
-    // so formatting then toggling is a no-op.
-    //
-    // Refuses on a buffer that does not parse rather than mangling it -- the squiggle
-    // already says where.
-    formatText: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return;
-        }
-        let text = me.textEditor.getValue();
-        try {
-            let U = PVE.meta.Utils;
-            let formatted = U.dumpBuffer(U.parseBuffer(text, me.textLang), me.textLang);
-            if (formatted !== text) {
-                me.textEditor.setValue(formatted);
-                me.annotateText();
-            }
-        } catch (err) {
-            Ext.Msg.alert(
-                gettext('Cannot format'),
-                Ext.htmlEncode(PVE.meta.Utils.errText(err)),
-            );
-        }
-    },
-
-    applyText: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return;
-        }
-        let lang = me.textLang;
-        let edited = me.textEditor.getValue();
-        // Against the **stored** document, not the planned one. `textRendered` renders
-        // the planned document -- staged edits included, which is the point of it --
-        // so comparing the buffer with that answers "nothing changed" for exactly the
-        // case where something did: stage an edit in the tree, switch to Text, Apply.
-        // It said "No changes." and wrote nothing.
-        let original;
-        try {
-            original = PVE.meta.Utils.originalInLang(me.textOriginal, lang);
-        } catch (_err) {
-            lang = 'yaml'; // cannot render the stored text as JSON; diff the YAML
-            original = me.textOriginal;
-        }
-        if (edited === original) {
-            Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
-            return;
-        }
-        // The whole document, at the root view, as **text** -- not as a dump of the
-        // planned document. That is the one thing this path does that the tree's Apply
-        // cannot: a `#` comment is not part of the document model (DESIGN §2), so it
-        // survives only for as long as nothing rewrites the file from the model.
-        // Sending the buffer keeps what was typed, comments included.
-        //
-        // The buffer already contains whatever was staged in the tree -- it is rendered
-        // from the planned document -- so this applies all of it, and the staged edits
-        // are spent.
-        let write = function () {
-            let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
-            params[me.textLang === 'json' ? 'data' : 'text'] = edited;
-            me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
-                me.pending = [];
-                me.refreshText();
-            });
-        };
-
-        // Same rule as the tree's Apply: stop only when the document would not match
-        // the schema, because that is the one case where seeing the diff changes what
-        // you decide. The tick keeps storing it anyway a deliberate act -- the server's
-        // lint decides what is *storable* (DESIGN §4), and an operator whose schema has
-        // drifted must not be able to lock the administrator out of editing.
-        let warnings = me.textFindings();
-        if (!warnings.length) {
-            write();
-            return;
-        }
-        PVE.meta.Monaco.confirmDiff({
-            title: gettext('(whole document)'),
-            original: original,
-            modified: edited,
-            lang: lang,
-            warnings: warnings,
-            apply: write,
-        });
-    },
-
-    // Drops everything unapplied -- the buffer's edits and the staged ones behind it,
-    // which are the same set: the buffer is rendered from the planned document.
-    discardText: function () {
-        let me = this;
-        if (!me.textIsDirty() && !me.isDirty()) {
-            me.refreshText();
-            return;
-        }
-        Ext.Msg.confirm(
-            gettext('Confirm'),
-            gettext('Discard the unapplied changes in the text editor?'),
-            function (btn) {
-                if (btn !== 'yes') {
-                    return;
-                }
-                me.pending = [];
-                me.buildTree();
-                me.syncButtons();
-                me.refreshText();
-            },
-        );
-    },
-
-    // Re-read the document and put it back in the buffer (after Apply, or Discard).
-    // Underline what is wrong with the buffer *as it is now*, and describe the key on
-    // each declared line on hover.
-    //
-    // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
-    // is the authority (DESIGN section 4):
-    //
-    //   * a YAML syntax error, as one Error marker on the line js-yaml reports. Monaco
-    //     ships a JSON language service that does this for the JSON view already, but
-    //     nothing validates YAML, so this is ours.
-    //   * every grammar finding, as Warning markers (PVE.meta.Lint).
-    //
-    // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
-    // not against the document the server last sent. Parsing is js-yaml on a document
-    // that is a few KB at most; if that ever shows up in typing latency, debounce it.
-    //
-    // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
-    // view the document still gets Monaco's own syntax validation but no schema
-    // squiggles.
-    annotateText: function () {
-        let me = this;
-        if (!me.textEditor || !window.monaco) {
-            return;
-        }
-        let model = me.textEditor.getModel();
-        if (!model) {
-            return;
-        }
-        let text = me.textEditor.getValue();
-        let markers = [];
-        let hovers = Object.create(null);
-
-        let parsed = null;
-        let parseError = null;
-        try {
-            parsed = PVE.meta.Utils.parseBuffer(text, me.textLang);
-        } catch (err) {
-            parseError = err;
-        }
-
-        if (parseError) {
-            if (me.textLang === 'yaml') {
-                // js-yaml's YAMLException carries a 0-based mark; anything else lands
-                // on line 1 rather than nowhere.
-                let mark = parseError.mark || {};
-                let line = typeof mark.line === 'number' ? mark.line + 1 : 1;
-                line = Math.min(Math.max(line, 1), model.getLineCount());
-                markers.push({
-                    startLineNumber: line,
-                    endLineNumber: line,
-                    startColumn: typeof mark.column === 'number' ? mark.column + 1 : 1,
-                    endColumn: model.getLineMaxColumn(line),
-                    message: parseError.reason || PVE.meta.Utils.errText(parseError),
-                    severity: monaco.MarkerSeverity.Error,
-                });
-            }
-        } else if (me.textLang === 'yaml') {
-            let g = me.textGrammar();
-            let all = g.all;
-            let applicable = g.withSchema;
-            if (applicable.length) {
-                let index = PVE.meta.Lint.lineIndex(text);
-                markers = PVE.meta.Lint.placed(
-                    PVE.meta.Lint.findings(parsed, applicable, all),
-                    index,
-                ).map(function (f) {
-                    return {
-                        startLineNumber: f.line,
-                        endLineNumber: f.line,
-                        startColumn: 1,
-                        endColumn: model.getLineMaxColumn(f.line),
-                        message: f.message,
-                        severity: monaco.MarkerSeverity.Warning,
-                    };
-                });
-                let schemas = PVE.meta.Lint.schemaIndex(applicable, all);
-                Object.keys(schemas).forEach(function (path) {
-                    let hover = PVE.meta.Lint.hoverText(schemas[path]);
-                    if (hover && index[path] !== undefined) {
-                        hovers[index[path]] = hover;
-                    }
-                });
-            }
-        }
-
-        monaco.editor.setModelMarkers(model, 'pve-meta', markers);
-        me.textHovers = hovers;
-        me.registerTextHover();
-    },
-
-    // The grammar findings the current buffer would *introduce*, as plain messages --
-    // what Apply warns about before it writes. Empty when the buffer does not parse
-    // (the write will fail on its own) or when no grammar applies. Same rule as the
-    // tree's Apply, through the same `introducedFindings`: a violation the document
-    // already had, on a path this buffer did not change, is not this edit's to vouch
-    // for. Reordering keys therefore stops demanding a tick, since a reordering
-    // changes no value at all.
-    textGrammar: function () {
-        return this.grammarSplit(this.textDocId || this.docId);
-    },
-
-    textFindings: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return [];
-        }
-        let g = me.textGrammar();
-        let all = g.all;
-        let applicable = g.withSchema;
-        if (!applicable.length) {
-            return [];
-        }
-        try {
-            let U = PVE.meta.Utils;
-            let value = U.parseBuffer(me.textEditor.getValue(), me.textLang);
-            let stored = me.dataOf(me.textDocId || me.docId);
-            return U.introducedFindings(
-                PVE.meta.Lint.findings(stored, applicable, all),
-                PVE.meta.Lint.findings(value, applicable, all),
-                U.changedPaths(stored, value),
-            ).map((f) => f.path + ': ' + f.message);
-        } catch (_err) {
-            return [];
-        }
-    },
-
-    // One hover provider for the language, reading whichever panel owns the model that
-    // is asking. Monaco registers providers per-language, not per-editor.
-    registerTextHover: function () {
-        let me = this;
-        if (PVE.meta.textHoverRegistered || !window.monaco || !monaco.languages) {
-            return;
-        }
-        PVE.meta.textHoverRegistered = true;
-        monaco.languages.registerHoverProvider('yaml', {
-            provideHover: function (model, position) {
-                let owner = me.textEditor && me.textEditor.getModel() === model ? me : null;
-                let text = owner && owner.textHovers && owner.textHovers[position.lineNumber];
-                if (!text) {
-                    return null;
-                }
-                return {
-                    range: new monaco.Range(
-                        position.lineNumber,
-                        1,
-                        position.lineNumber,
-                        model.getLineMaxColumn(position.lineNumber),
-                    ),
-                    contents: [{ value: text }],
-                };
-            },
-        });
-    },
-
-    refreshText: function () {
-        let me = this;
-        me.request({
-            url: me.urlFor(me.textDocId),
-            params: { format: 'yaml' },
-            success: function (response) {
-                let d = response.result.data || {};
-                me.setDigest(me.textDocId, d.digest);
-                me.textOriginal = d.text || '';
-                if (me.textEditor) {
-                    me.textEditor.setValue(me.textRendered(me.textLang));
-                    me.annotateText();
-                }
-            },
-        });
-    },
-
-    // --- writes -------------------------------------------------------------
-
-    write: function (docId, params, onSuccess) {
-        this.submit({ url: this.urlFor(docId), method: 'PUT', params: params }, onSuccess);
-    },
-
-    submit: function (opts, onSuccess) {
-        let me = this;
-        Proxmox.Utils.API2Request(
-            Ext.apply(
-                {
-                    waitMsgTarget: me,
-                    success: function () {
-                        if (onSuccess) {
-                            onSuccess();
-                        }
-                        me.reload();
-                    },
-                    failure: function (response) {
-                        // The API's message, verbatim. A 409 means somebody else wrote the
-                        // document since we read it: reload first, then say so.
-                        let conflict = String((response.result || {}).status) === '409';
-                        if (conflict) {
-                            if (me.mode === 'text') {
-                                me.refreshText();
-                            } else {
-                                me.reload();
-                            }
-                        }
-                        Ext.Msg.alert(
-                            conflict ? gettext('Conflict') : gettext('Error'),
-                            response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
-                        );
-                    },
-                },
-                opts,
-            ),
-        );
-    },
-});
+}, PVE.meta.Doc, PVE.meta.TextCard));
 
 // ---------------------------------------------------------------------------
 // One document in a window — what a registry grid opens.

@@ -101,6 +101,19 @@ eq('defined', ctx.__defined, [
     'PVE.meta.DatacenterPanel',
 ]);
 
+console.log('\n--- PVE.meta.compose: how the panel is three method sets sharing one `this` ---');
+eq('merges left to right into a new object', ctx.PVE.meta.compose({ a: 1 }, { b: 2 }, { c: 3 }), { a: 1, b: 2, c: 3 });
+const composeParts = [{ a: 1 }, { b: 2 }];
+ctx.PVE.meta.compose(...composeParts);
+eq('does not mutate its inputs', composeParts, [{ a: 1 }, { b: 2 }]);
+let composeThrew = false;
+try {
+    ctx.PVE.meta.compose({ a: 1 }, { a: 2 });
+} catch (err) {
+    composeThrew = true;
+}
+eq('throws on a duplicate member instead of picking a winner', composeThrew, true);
+
 console.log('\n--- covers / paths (shared fixture, mirrored in Rust) ---');
 // `covers` is mirrored in crates/pve-meta-core/src/scopes.rs on purpose: the server
 // enforces the rule, this editor predicts it, and an editor that predicts it
