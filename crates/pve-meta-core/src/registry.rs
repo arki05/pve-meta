@@ -375,10 +375,26 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
 /// dots -- which is exactly a prefix, since **the file name is the
 /// prefix**: `homelab.docker.yaml` declares `homelab.docker`. That admits the
 /// dots a prefix needs while still refusing everything that could address
-/// another directory (`/`, `..`, a leading dot) or another file type.
+/// another directory (`/`, `..`, a leading dot) or another file type -- and
+/// it is at most [`MAX_FILE_NAME_LEN`] long, because the name becomes
+/// `<name>.yaml` on disk.
+///
+/// The API's schema for the `{name}` parameter (`perl/PVE/API2/Ext/Meta.pm`,
+/// `pattern` + `maxLength`) mirrors both halves for a friendly 400 before the
+/// request reaches Rust; this is the rule.
 pub fn is_valid_file_name(name: &str) -> bool {
-    !name.is_empty() && name.split('.').all(crate::path::is_valid_segment)
+    !name.is_empty()
+        && name.len() <= MAX_FILE_NAME_LEN
+        && name.split('.').all(crate::path::is_valid_segment)
 }
+
+/// The longest registry file name (without `.yaml`) that is one. Bytes, which
+/// for the segment charset (ASCII) is characters. Linux caps a file name at
+/// 255 bytes; 128 leaves room for the suffix, a temp-name tag and anything
+/// pmxcfs adds, and matches what the API has always accepted -- a longer name
+/// could never have been written through it, so no file that loaded before
+/// stops loading because of this bound.
+pub const MAX_FILE_NAME_LEN: usize = 128;
 
 /// Parses one prefix file. `name` is the file's base name, which **is** the
 /// prefix.
@@ -391,7 +407,7 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
     // prefix name: the name is used as a file name, so accepting a separator
     // that is also the filesystem's would be the one way this identity could
     // reach outside its directory.
-    if name.contains('/') {
+    if !is_valid_file_name(name) {
         return Err(bad(format!("{name}: file name is not a valid prefix")));
     }
     let prefix = Path::parse(name)
@@ -830,6 +846,12 @@ rules:
         for bad in ["", ".", "..", ".hidden", "a/b", "a b", "a..b", "a.", ".a"] {
             assert!(!is_valid_file_name(bad), "{bad} was accepted");
         }
+        // The length bound the API schema has always carried (`maxLength => 128`)
+        // is part of the rule, so the editor's New dialog refuses what the server
+        // would refuse.
+        assert!(is_valid_file_name(&"a".repeat(MAX_FILE_NAME_LEN)));
+        assert!(!is_valid_file_name(&"a".repeat(MAX_FILE_NAME_LEN + 1)));
+        assert!(parse_prefix(&"a".repeat(MAX_FILE_NAME_LEN + 1), "selector: {all: true}\n").is_err());
         // The two halves of "the file name is the prefix" have to agree: a name
         // this accepts must parse as a prefix, and one it refuses must not.
         assert_eq!(

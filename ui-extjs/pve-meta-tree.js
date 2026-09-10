@@ -48,10 +48,13 @@
  * The rules -- YAML in and out, key names, who may touch a path, which prefix governs
  * one, what a schema makes of a value, what staged edits do to a document -- are not
  * implemented here. They are pve-meta-core, the server's own crate, built for the
- * browser (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`) and asked through
- * five named faces: Codec, Access, Shape, Edits, and the key-name checks on Utils. The
- * server stays the authority: an Apply sends the buffer or the planned subtree to the
- * API, which runs the same code again on the real write.
+ * browser (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`). Two of them are
+ * objects the panel holds -- a `PVE.meta.Shape` per document, which owns the prefix
+ * listing and the tags and caches what the core derives from them, and the
+ * `PVE.meta.EditSet` that is the staged edits -- and the rest are stateless faces:
+ * `Codec`, `Access`, and the key-name checks on `Utils`. The server stays the
+ * authority: an Apply sends the buffer or the planned subtree to the API, which runs
+ * the same code again on the real write.
  *
  * pve-ext's page loader loads this file and instantiates `pveMetaTreePanel` as the
  * tab (see README.md), so session, CSRF, dark theme and i18n all come from the PVE
@@ -424,10 +427,11 @@ PVE.meta.compose = function (...parts) {
 // The server's own code answers the questions this editor used to answer with a
 // second implementation: how a document reads and dumps, which key names are
 // legal, who may touch a path, which prefix governs one, what a schema makes of
-// a value, and what a set of staged edits does to a document. Those are the five
-// objects below it -- Codec, Access, Shape, Edits -- each a thin, named face over
-// one concept in the core, so a call site reads as the concept and not as a
-// string passed to `call`.
+// a value, and what a set of staged edits does to a document. Below it: `Codec`
+// and `Access`, stateless faces over the core's functions; `Shape` and `EditSet`,
+// objects that own their inputs (a Shape its listing and tags, an EditSet its
+// list) and whose methods are the core's -- so a call site reads as the concept
+// and not as a string passed to `call`, and what a Shape derives is computed once.
 //
 // The ABI is four exports and a JSON document each way (see the crate's own
 // doc comment): `pm_alloc`/`pm_free` for the request, `pm_call` to run it, and
@@ -617,73 +621,113 @@ PVE.meta.Access = {
 // merge (DESIGN §3.1). A registry document is shaped by its meta-schema rooted at
 // the document itself; the datacenter document by nothing.
 //
-// A Shape is the `GET /meta/prefixes` listing plus the guest's tags, and every
-// question is put to the core with both -- the core builds the shape afresh and
-// answers. The listing is a few kilobytes, the questions are asked once per
-// render, and holding a handle to state inside the wasm instead would be a
-// lifetime to manage for no measurable gain.
+// A Shape owns its two inputs -- the `GET /meta/prefixes` listing and the guest's
+// tags -- and caches what the core derives from them alone (the applicable
+// prefixes, the schema index, each `governing` answer). Only `findings` takes a
+// document, so only `findings` goes to the core every time. The panel keeps one
+// Shape per document and drops it when the listing, the tags or the meta-schema
+// change (`shapeFor`), which is what makes a render two core calls rather than
+// a dozen. Nothing is held inside the wasm between calls: the core rebuilds its
+// own Shape from the listing on each question, which costs microseconds and no
+// lifetime for this side to manage.
 // ---------------------------------------------------------------------------
 
-PVE.meta.Shape = {
-    // The shape of a guest document: the listed prefixes (loaded or not), the
-    // guest's tags.
-    of: function (prefixes, tags) {
-        return PVE.meta.Shape.make(prefixes || [], tags || []);
-    },
-
-    // The shape of a registry document: one schema, rooted at the document. The
-    // empty prefix is a prefix of everything and the least specific of all, so it
-    // governs the whole document without a special case anywhere.
-    rooted: function (schema) {
-        return PVE.meta.Shape.make(schema ? [{ prefix: '', selector: { all: true }, schema: schema }] : [], []);
-    },
-
-    empty: function () {
-        return PVE.meta.Shape.make([], []);
-    },
-
-    make: function (prefixes, tags) {
-        let byPrefix = Object.create(null);
-        prefixes.forEach((p) => (byPrefix[p.prefix] = p));
-        let ask = (fn, ...rest) => PVE.meta.Core.call(fn, prefixes, tags, ...rest);
-        return {
-            // The prefixes that reach this document, most-specific first, as the
-            // listing entries they came from (a failed one never appears).
-            declared: () => ask('shape_prefixes').map((name) => byPrefix[name]),
-            // Whether anything here carries a schema at all -- if not, there are no
-            // findings and no hovers to compute.
-            hasSchema: () => ask('shape_prefixes').some((name) => byPrefix[name].schema),
-            // The prefix governing `path`, as its listing entry, or `null`.
-            governing: function (path) {
-                let name = ask('shape_governing', path);
-                return name === null ? null : byPrefix[name];
-            },
-            // Every declared path with its schema node, parents first, pruned where
-            // a more specific prefix governs: `[{ path, prefix, schema }]`.
-            schemaIndex: () => ask('shape_schema_index'),
-            // Everything in `doc` that does not match what its governing schema
-            // says: `[{ path, msg }]`, sorted by path. Type, enum and range come
-            // from the core; a `format` is checked here with proxmoxlib's own
-            // validator for that name, which is the one thing the core leaves to
-            // whoever holds one.
-            findings: function (doc) {
-                let got = ask('shape_findings', doc);
-                let out = got.findings.slice();
-                got.formats.forEach(function (f) {
-                    let msg = PVE.meta.Utils.checkFormat(f.format, f.value);
-                    if (msg) {
-                        out.push({ path: f.path, msg: msg });
-                    }
-                });
-                out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-                return out;
-            },
-        };
-    },
+PVE.meta.Shape = function (prefixes, tags) {
+    let me = this;
+    me.prefixes = prefixes || [];
+    me.tags = tags || [];
+    me.byPrefix = Object.create(null);
+    me.prefixes.forEach((p) => (me.byPrefix[p.prefix] = p));
+    me.cache = { names: null, index: null, governing: Object.create(null) };
 };
 
+// The shape of a guest document: the listed prefixes (loaded or not), the guest's
+// tags.
+PVE.meta.Shape.of = (prefixes, tags) => new PVE.meta.Shape(prefixes, tags);
+
+// The shape of a registry document: one schema, rooted at the document. The empty
+// prefix is a prefix of everything and the least specific of all, so it governs
+// the whole document without a special case anywhere.
+PVE.meta.Shape.rooted = (schema) =>
+    new PVE.meta.Shape(schema ? [{ prefix: '', selector: { all: true }, schema: schema }] : [], []);
+
+PVE.meta.Shape.empty = () => new PVE.meta.Shape([], []);
+
+// Of the findings `after` has, those an edit is answerable for: not already in
+// `before`, or on a path in `changed` (in either direction). `shape::introduced`.
+PVE.meta.Shape.introduced = (before, after, changed) =>
+    PVE.meta.Core.call('findings_introduced', before || [], after || [], changed || []);
+
+Object.assign(PVE.meta.Shape.prototype, {
+    ask: function (fn, ...rest) {
+        return PVE.meta.Core.call(fn, this.prefixes, this.tags, ...rest);
+    },
+
+    // The prefixes that reach this document, most-specific first, by name.
+    names: function () {
+        let me = this;
+        if (me.cache.names === null) {
+            me.cache.names = me.ask('shape_prefixes');
+        }
+        return me.cache.names;
+    },
+
+    // ... as the listing entries they came from (a failed one never appears).
+    declared: function () {
+        let me = this;
+        return me.names().map((name) => me.byPrefix[name]);
+    },
+
+    // Whether anything here carries a schema at all -- if not, there are no
+    // findings and no hovers to compute.
+    hasSchema: function () {
+        return this.declared().some((d) => d.schema);
+    },
+
+    // The prefix governing `path`, as its listing entry, or `null`.
+    governing: function (path) {
+        let me = this;
+        let hit = me.cache.governing;
+        if (!(path in hit)) {
+            hit[path] = me.ask('shape_governing', path);
+        }
+        return hit[path] === null ? null : me.byPrefix[hit[path]];
+    },
+
+    // Every declared path with its schema node, parents first, pruned where a
+    // more specific prefix governs: `[{ path, prefix, schema }]`.
+    schemaIndex: function () {
+        let me = this;
+        if (me.cache.index === null) {
+            me.cache.index = me.ask('shape_schema_index');
+        }
+        return me.cache.index;
+    },
+
+    // Everything in `doc` that does not match what its governing schema says:
+    // `[{ path, msg }]`, in the core's one order (by path). Type, enum and range
+    // are decided by the core; a `format` comes back undecided, at its place in
+    // that order, and is checked here with proxmoxlib's own validator for that
+    // name -- the one thing the core leaves to whoever holds one. Resolved in
+    // place, so the order is never sorted twice by two rules.
+    findings: function (doc) {
+        let out = [];
+        this.ask('shape_findings', doc).forEach(function (r) {
+            if (r.msg !== undefined) {
+                out.push(r);
+                return;
+            }
+            let msg = PVE.meta.Utils.checkFormat(r.format, r.value);
+            if (msg) {
+                out.push({ path: r.path, msg: msg });
+            }
+        });
+        return out;
+    },
+});
+
 // ---------------------------------------------------------------------------
-// Edits: the staged edits on a document (`edit::EditSet`).
+// EditSet: the staged edits on a document (`edit::EditSet`).
 //
 // A row edit stages `{ path, op: 'set' | 'delete', value }`; the tree renders
 // `apply` -- the document as it would be; switching to text renders that same
@@ -692,40 +736,66 @@ PVE.meta.Shape = {
 // server's `view::replace` and a delete its `view::remove`, so what the editor
 // predicts and what a `PUT ?view=` does are the same function.
 //
-// The panel holds the list; these are the operations on it.
+// The set owns its list (`edits`, read it; never push to it) and every operation
+// on it is the core's. `stage` and `discardUnder` change the set in place, since
+// that is what a panel holding one wants; `between` makes a new one.
 // ---------------------------------------------------------------------------
 
-PVE.meta.Edits = {
-    // `edit` staged on top of `list`: every earlier edit at or under its path is
-    // dropped, since a write of `a` says everything about `a.b`.
-    stage: (list, edit) => PVE.meta.Core.call('edits_stage', list || [], edit),
+PVE.meta.EditSet = function (edits) {
+    this.edits = edits || [];
+};
+
+PVE.meta.EditSet.empty = () => new PVE.meta.EditSet([]);
+
+// What would have to be staged to turn `stored` into `edited`, as row edits; one
+// whole-document set when the change has no per-key expression (a key
+// reordering -- key order is data and must not be lost).
+PVE.meta.EditSet.between = (stored, edited) =>
+    new PVE.meta.EditSet(PVE.meta.Core.call('edits_between', stored, edited));
+
+// Every path at which two documents differ in *value* -- what an edit is
+// answerable for. A pure reordering changes none. `edit::changed_paths`.
+PVE.meta.EditSet.changedPaths = (was, now) => PVE.meta.Core.call('changed_paths', was, now);
+
+Object.defineProperty(PVE.meta.EditSet.prototype, 'length', {
+    get: function () {
+        return this.edits.length;
+    },
+});
+
+Object.assign(PVE.meta.EditSet.prototype, {
+    isEmpty: function () {
+        return this.edits.length === 0;
+    },
+
+    // Stages `edit` on top of what is here: every earlier edit at or under its
+    // path is dropped, since a write of `a` says everything about `a.b`.
+    stage: function (edit) {
+        this.edits = PVE.meta.Core.call('edits_stage', this.edits, edit);
+        return this;
+    },
 
     // The edits at or under `path` -- what discarding one row's edits removes.
-    under: (list, path) => PVE.meta.Core.call('edits_under', list || [], path),
+    under: function (path) {
+        return PVE.meta.Core.call('edits_under', this.edits, path);
+    },
 
-    discardUnder: (list, path) => PVE.meta.Core.call('edits_discard_under', list || [], path),
+    discardUnder: function (path) {
+        this.edits = PVE.meta.Core.call('edits_discard_under', this.edits, path);
+        return this;
+    },
 
-    // The document as it would be once `list` is applied to `stored`.
-    apply: (stored, list) => PVE.meta.Core.call('edits_apply', stored || {}, list || []),
-
-    // What would have to be staged to turn `stored` into `edited`, as row edits;
-    // one whole-document set when the change has no per-key expression (a key
-    // reordering -- key order is data and must not be lost).
-    between: (stored, edited) => PVE.meta.Core.call('edits_between', stored, edited),
+    // The document as it would be once these edits are applied to `stored`.
+    apply: function (stored) {
+        return PVE.meta.Core.call('edits_apply', stored || {}, this.edits);
+    },
 
     // The narrowest view covering every staged path (`''` is the document root),
     // or `null` with nothing staged.
-    writeView: (list) => PVE.meta.Core.call('edits_write_view', list || []),
-
-    // Every path at which two documents differ in *value* -- what an edit is
-    // answerable for. A pure reordering changes none.
-    changedPaths: (was, now) => PVE.meta.Core.call('changed_paths', was, now),
-
-    // Of the findings `after` has, those an edit is answerable for: not already
-    // in `before`, or on a path in `changed` (in either direction).
-    introduced: (before, after, changed) =>
-        PVE.meta.Core.call('findings_introduced', before || [], after || [], changed || []),
-};
+    writeView: function () {
+        return PVE.meta.Core.call('edits_write_view', this.edits);
+    },
+});
 
 // ---------------------------------------------------------------------------
 // Markers for the text editor: which line a finding goes on, and what a hover
@@ -2048,7 +2118,7 @@ PVE.meta.Doc = {
                 gettext('Discard the unapplied changes and reload?'),
                 function (btn) {
                     if (btn === 'yes') {
-                        me.pending = [];
+                        me.pending = PVE.meta.EditSet.empty();
                         me.reload();
                     }
                 },
@@ -2523,7 +2593,7 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        me.pending = PVE.meta.Edits.between(me.dataOf(me.textDocId), parsed);
+        me.pending = PVE.meta.EditSet.between(me.dataOf(me.textDocId), parsed);
         PVE.meta.Monaco.dispose(me.textEditor);
         me.textEditor = null;
         me.mode = 'tree';
@@ -2631,7 +2701,7 @@ PVE.meta.TextCard = {
             let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
             params[me.textLang === 'json' ? 'data' : 'text'] = edited;
             me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
-                me.pending = [];
+                me.pending = PVE.meta.EditSet.empty();
                 me.refreshText();
             });
         };
@@ -2671,7 +2741,7 @@ PVE.meta.TextCard = {
                 if (btn !== 'yes') {
                     return;
                 }
-                me.pending = [];
+                me.pending = PVE.meta.EditSet.empty();
                 me.buildTree();
                 me.syncButtons();
                 me.refreshText();
@@ -2785,10 +2855,10 @@ PVE.meta.TextCard = {
         try {
             let value = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
             let stored = me.dataOf(me.textDocId || me.docId);
-            return PVE.meta.Edits.introduced(
+            return PVE.meta.Shape.introduced(
                 shape.findings(stored),
                 shape.findings(value),
-                PVE.meta.Edits.changedPaths(stored, value),
+                PVE.meta.EditSet.changedPaths(stored, value),
             ).map((f) => f.path + ': ' + f.msg);
         } catch (_err) {
             return [];
@@ -2889,7 +2959,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.docState = Object.create(null); // id -> { digest, data }
         // Edits accumulate here until Apply, in the order they were made:
         // `{ path, op: 'set' | 'delete', value }`, at most one entry per path.
-        me.pending = [];
+        me.pending = PVE.meta.EditSet.empty();
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0, scopes: [] };
         me.prefixes = [];
@@ -3361,7 +3431,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (op === 'set') {
             edit.value = value;
         }
-        me.pending = PVE.meta.Edits.stage(me.pending, edit);
+        me.pending.stage(edit);
         me.buildTree();
         me.syncButtons();
     },
@@ -3373,7 +3443,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
     // so "what would Discard drop" and "what did staging replace" are one rule.
     pendingUnder: function (path) {
-        return PVE.meta.Edits.under(this.pending, path);
+        return this.pending.under(path);
     },
 
     // Drops the staged edits on one row, leaving the rest alone.
@@ -3395,7 +3465,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!me.pendingUnder(d.path).length) {
             return;
         }
-        me.pending = PVE.meta.Edits.discardUnder(me.pending, d.path);
+        me.pending.discardUnder(d.path);
         me.buildTree();
         me.syncButtons();
     },
@@ -3413,8 +3483,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             list.splice(index, 1); // it was appended; putting it back means removing it
         }
         if (JSON.stringify(list) === JSON.stringify(stored)) {
-            // Nothing of this list's edit is left to keep.
-            me.pending = me.pending.filter((e) => e.path !== path);
+            // Nothing of this list's edit is left to keep. Nothing can be staged
+            // *under* a list (its members are not addressable), so this drops
+            // exactly the list's own edit.
+            me.pending.discardUnder(path);
             me.buildTree();
             me.syncButtons();
             return;
@@ -3425,7 +3497,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The document as it would be. Everything the tree shows is computed from this,
     // so a staged value is linted, hovered and diffed exactly like a stored one.
     plannedData: function () {
-        return PVE.meta.Edits.apply(this.dataOf(this.docId), this.pending);
+        return this.pending.apply(this.dataOf(this.docId));
     },
 
     revertPending: function () {
@@ -3433,7 +3505,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!me.isDirty()) {
             return;
         }
-        me.pending = [];
+        me.pending = PVE.meta.EditSet.empty();
         me.buildTree();
         me.syncButtons();
     },
@@ -3451,19 +3523,51 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // it. One function, every caller that needs it -- the row builder, the row
     // markers, the text editor's squiggles and hovers, and the warning banner Apply
     // shows -- so they cannot disagree about what describes the document.
+    //
+    // One Shape per document, kept for as long as its inputs are the panel's
+    // current ones: a Shape caches what the core derives from the listing and the
+    // tags, and a render asks it three or four times. The cache is checked against
+    // the inputs by identity rather than cleared at the right moment -- every load
+    // replaces `prefixes`, `tags` or `schemas` with a new object, and a cache that
+    // had to be told about each of those is a cache that is stale the first time
+    // one is forgotten.
     shapeFor: function (id) {
+        let me = this;
+        me.shapes = me.shapes || Object.create(null);
+        let inputs = me.shapeInputs(id);
+        let have = me.shapes[id];
+        if (!have || have.inputs.length !== inputs.length || !inputs.every((v, i) => v === have.inputs[i])) {
+            have = me.shapes[id] = { inputs: inputs, shape: me.buildShape(id, inputs) };
+        }
+        return have.shape;
+    },
+
+    // What a document's Shape is built from. A guest's: the prefix listing and the
+    // guest's tags (the server resolved the selectors it enforces; these tags are for
+    // the rendering decisions the client makes on top, and the client only ever
+    // matches tags it was given, DESIGN §8). A registry file's: the meta-schema for
+    // its kind. The datacenter document's: nothing -- prefixes are guest-only.
+    shapeInputs: function (id) {
         let me = this;
         let kind = me.docKind(id);
         if (kind === 'guest') {
-            // The server resolved the selectors it enforces; these tags are for the
-            // rendering decisions the client makes on top, and the client only ever
-            // matches tags it was given (DESIGN §8).
-            return PVE.meta.Shape.of(me.prefixes, me.tags);
+            return [me.prefixes, me.tags];
         }
-        if (kind !== 'prefix' && kind !== 'permission') {
-            return PVE.meta.Shape.empty();
+        if (kind === 'prefix' || kind === 'permission') {
+            return [(me.schemas || {})[kind]];
         }
-        return PVE.meta.Shape.rooted(kind === 'prefix' ? me.schemas.prefix : me.schemas.permission);
+        return [];
+    },
+
+    buildShape: function (id, inputs) {
+        let kind = this.docKind(id);
+        if (kind === 'guest') {
+            return PVE.meta.Shape.of(inputs[0], inputs[1]);
+        }
+        if (kind === 'prefix' || kind === 'permission') {
+            return PVE.meta.Shape.rooted(inputs[0]);
+        }
+        return PVE.meta.Shape.empty();
     },
 
     // --- selection and buttons ----------------------------------------------
@@ -3914,7 +4018,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // change to the whole list: show it on the members that actually differ. Any
         // member the edit dropped comes back as a ghost, the same as a deleted key.
         let storedDoc = me.dataOf(me.docId);
-        me.pending.forEach(function (e) {
+        me.pending.edits.forEach(function (e) {
             if (e.op !== 'set' || !Array.isArray(e.value)) {
                 return;
             }
@@ -3940,7 +4044,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             });
         });
 
-        me.pending
+        me.pending.edits
             .filter((e) => e.op === 'delete')
             .forEach(function (e) {
                 let entry = root;
@@ -3967,7 +4071,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let findings = me.findingsFor();
         // What is staged, by path, so a changed row can show `stored -> pending`.
         let staged = Object.create(null);
-        me.pending.forEach((e) => (staged[e.path] = e.op));
+        me.pending.edits.forEach((e) => (staged[e.path] = e.op));
         let storedDoc = me.dataOf(me.docId);
 
         // Which *member* of a staged list actually differs. The edit is one write of
@@ -3994,7 +4098,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // edits beneath it. Both are invisible once the branch is collapsed.
         let below = PVE.meta.Utils.rollUp(findings);
         let stagedBelow = PVE.meta.Utils.rollUp(
-            me.pending.reduce(function (acc, e) {
+            me.pending.edits.reduce(function (acc, e) {
                 acc[e.path] = e.op === 'delete' ? gettext('removed') : gettext('changed');
                 return acc;
             }, Object.create(null)),
@@ -4188,7 +4292,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The dry run, the diff and the write.
     confirmAndApply: function () {
         let me = this;
-        let view = PVE.meta.Edits.writeView(me.pending);
+        let view = me.pending.writeView();
         let planned = me.plannedData();
         let subtree = view === '' ? planned : PVE.meta.Utils.valueAt(planned, view);
         if (subtree === undefined) {
@@ -4212,23 +4316,23 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // instead of the whole document, so it collides with less, and it does not
         // require the caller to be able to send back every key it did not touch.
         let onlyDelete =
-            me.pending.length === 1 && me.pending[0].op === 'delete' && me.pending[0].path;
+            me.pending.length === 1 && me.pending.edits[0].op === 'delete' && me.pending.edits[0].path;
         let write = function () {
             if (onlyDelete) {
                 let q = Ext.Object.toQueryString({
-                    view: me.pending[0].path,
+                    view: me.pending.edits[0].path,
                     digest: me.digestOf(me.docId),
                 });
                 me.submit(
                     { url: me.urlFor(me.docId) + '?' + q, method: 'DELETE' },
                     function () {
-                        me.pending = [];
+                        me.pending = PVE.meta.EditSet.empty();
                     },
                 );
                 return;
             }
             me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
-                me.pending = [];
+                me.pending = PVE.meta.EditSet.empty();
             });
         };
 
@@ -4288,10 +4392,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return [];
         }
         let stored = me.dataOf(me.docId);
-        return PVE.meta.Edits.introduced(
+        return PVE.meta.Shape.introduced(
             shape.findings(stored),
             shape.findings(planned),
-            PVE.meta.Edits.changedPaths(stored, planned),
+            PVE.meta.EditSet.changedPaths(stored, planned),
         ).map((f) => f.path + ': ' + f.msg);
     },
 

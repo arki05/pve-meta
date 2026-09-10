@@ -31,11 +31,18 @@ jobs:
             debhelper dh-cargo devscripts fakeroot dpkg-dev binaryen lintian \
             nodejs npm
 
+      # `--profile minimal` is rustc, cargo and rust-std for the host only.
+      # `make wasm` (a dependency of `make build` and `make check`) needs the
+      # wasm32 standard library as well, and building for a target that is not
+      # installed is a hard error, not a skip. The toolchain lives in ~/.rustup,
+      # which the cache below does not cover, so this runs on every job.
       - name: Install rustup toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" target add wasm32-unknown-unknown
+          "$HOME/.cargo/bin/rustup" component add clippy
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4

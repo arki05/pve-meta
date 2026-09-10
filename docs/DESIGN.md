@@ -540,7 +540,7 @@ work — it used to ask you to discard it, and the Text card used to be refused 
 while anything was staged.
 
 The core's `EditSet` is what makes that true (`edit.rs`; the editor reaches it as
-`PVE.meta.Edits`). An edit set is the one model behind both views: a `set` is
+`PVE.meta.EditSet`, the object the panel's staged edits are). An edit set is the one model behind both views: a `set` is
 `view::replace` and a `delete` is `view::remove` — the same two operations a `PUT ?view=`
 and a `DELETE ?view=` perform on the server — so what the tree predicts and what the
 store does are one function. `EditSet::between` recovers the edits from a typed

@@ -68,8 +68,8 @@ pub struct Finding {
 /// A `format:` the schema asks for on a string, which this crate cannot
 /// judge: a format is a `PVE::JSONSchema` format name, and the editor checks
 /// it with proxmoxlib's own validator for that name (`docs/DESIGN.md` §8)
-/// rather than a third implementation of what `ipv4` means. [`Findings`]
-/// carries these out for whoever holds such a validator.
+/// rather than a third implementation of what `ipv4` means. [`Shape::findings`]
+/// carries these out, in place, for whoever holds such a validator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatCheck {
     pub path: Path,
@@ -77,13 +77,32 @@ pub struct FormatCheck {
     pub value: String,
 }
 
-/// What [`Shape::findings`] found, and what it could not decide.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Findings {
-    /// Sorted by path.
-    pub findings: Vec<Finding>,
-    /// String values with a `format:` to check, in document order.
-    pub formats: Vec<FormatCheck>,
+/// One entry of what [`Shape::findings`] reports: a finding, or a format
+/// check it could not decide. Both in the one list so there is one ordering
+/// -- by path, decided here -- and a caller that resolves the format checks
+/// does so in place instead of sorting a second time by its own rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Report {
+    Finding(Finding),
+    Format(FormatCheck),
+}
+
+impl Report {
+    pub fn path(&self) -> &Path {
+        match self {
+            Report::Finding(f) => &f.path,
+            Report::Format(f) => &f.path,
+        }
+    }
+
+    /// The finding, if this is one.
+    pub fn finding(&self) -> Option<&Finding> {
+        match self {
+            Report::Finding(f) => Some(f),
+            Report::Format(_) => None,
+        }
+    }
 }
 
 /// The prefixes that reach one document, most-specific first.
@@ -192,32 +211,33 @@ impl Shape {
 
     /// Everything in `doc` that does not match what its governing schema
     /// says, plus the `format:` checks this crate leaves to a validator that
-    /// knows PVE's formats. Only what a row editor also enforces -- type,
-    /// enum, minimum/maximum, format -- so the marker and the field never
-    /// disagree about the same value.
-    pub fn findings(&self, doc: &Value) -> Findings {
-        let mut out = Findings::default();
+    /// knows PVE's formats -- one list, sorted by path (segment-wise, as
+    /// [`Path`] orders). Only what a row editor also enforces -- type, enum,
+    /// minimum/maximum, format -- so the marker and the field never disagree
+    /// about the same value.
+    pub fn findings(&self, doc: &Value) -> Vec<Report> {
+        let mut out = Vec::new();
         for owner in &self.prefixes {
             let Some(schema) = &owner.schema else { continue };
             let Some(value) = model::get_path(doc, &owner.prefix) else { continue };
             self.walk(owner, schema, value, owner.prefix.clone(), &mut out);
         }
-        out.findings.sort_by(|a, b| a.path.cmp(&b.path));
+        out.sort_by(|a, b| a.path().cmp(b.path()));
         out
     }
 
-    fn walk(&self, owner: &Declared, schema: &Value, value: &Value, path: Path, out: &mut Findings) {
+    fn walk(&self, owner: &Declared, schema: &Value, value: &Value, path: Path, out: &mut Vec<Report>) {
         if let Some(msg) = check_value(schema, value) {
-            out.findings.push(Finding { path, msg });
+            out.push(Report::Finding(Finding { path, msg }));
             return; // a value of the wrong shape says nothing useful about its children
         }
         if let (Value::String(s), Some(format)) = (value, schema.get("format").and_then(Value::as_str))
         {
-            out.formats.push(FormatCheck {
+            out.push(Report::Format(FormatCheck {
                 path: path.clone(),
                 format: format.to_string(),
                 value: s.clone(),
-            });
+            }));
         }
         let (Some(props), Value::Object(map)) =
             (schema.get("properties").and_then(Value::as_object), value)
@@ -371,8 +391,20 @@ mod tests {
              "a more specific prefix that does not reach this guest does not shadow: the parent governs"),
             (vec![tagged("homelab.docker", "docker"), all("homelab")], vec!["docker"], "homelab.docker.compose", Some("homelab.docker"),
              "... until it does"),
+            (vec![tagged("traefik", "traefik"), tagged("traefik.spec", "web")], vec!["traefik"], "traefik.spec.host", Some("traefik"),
+             "two independently tagged levels: the more specific prefix's selector missed, so the one that does reach this guest governs -- shadowing is decided among the prefixes that apply, not among all of them"),
+            (vec![tagged("traefik", "traefik"), tagged("traefik.spec", "web")], vec!["traefik", "web"], "traefik.spec.host", Some("traefik.spec"),
+             "... and once its selector matches too, the more specific one takes over"),
+            (vec![tagged("traefik", "traefik")], vec![], "traefik.spec", None,
+             "an untagged guest is not reached by a tag selector at all"),
+            (vec![all("a"), all("a__")], vec![], "a__", Some("a__"),
+             "the comment-key prefix queried directly: its own, not `a`'s -- `covers` would have said `a`"),
+            (vec![all("a")], vec![], "a.b__", Some("a"),
+             "a comment key *inside* the subtree is part of it, on both rules"),
             (vec![all("b"), all("a"), all("a.b.c"), all("a.b")], vec![], "a.b.c.d", Some("a.b.c"),
              "three deep, given in a scrambled order"),
+            (vec![all("x.y.z"), all("x"), all("x.y")], vec![], "x.y.other", Some("x.y"),
+             "... and the answer changes with the path, not with the input order"),
         ];
         for (declared, guest_tags, path, want, why) in cases {
             let shape = Shape::new(declared, &tags(&guest_tags));
@@ -445,30 +477,43 @@ mod tests {
 
         let doc = json!({"t": {"port": 70000, "host": "web.example", "mode": "c", "on": 1, "sub": "not a map"}});
         let got = shape.findings(&doc);
-        let msgs: Vec<String> = got.findings.iter().map(|f| format!("{}: {}", f.path, f.msg)).collect();
+        let shown: Vec<String> = got
+            .iter()
+            .map(|r| match r {
+                Report::Finding(f) => format!("{}: {}", f.path, f.msg),
+                Report::Format(f) => format!("{}: {}? {}", f.path, f.format, f.value),
+            })
+            .collect();
+        // One list, one order: the format check sits among the findings at its
+        // path, and `on: 1` passed (a boolean as 1/0 is the wire convention).
         assert_eq!(
-            msgs,
+            shown,
             [
+                "t.host: dns-name? web.example",
                 "t.mode: expected one of: a, b",
                 "t.port: must be at most 65535",
                 "t.sub: expected object",
             ]
         );
-        // `on: 1` passed: a boolean as 1/0 is the wire convention.
-        assert_eq!(
-            got.formats,
-            vec![FormatCheck { path: p("t.host"), format: "dns-name".into(), value: "web.example".into() }]
-        );
 
         let fine = json!({"t": {"port": 80, "host": "x", "mode": "a", "on": true, "sub": {"x": 1.5}}});
-        assert!(shape.findings(&fine).findings.is_empty());
+        assert!(shape.findings(&fine).iter().all(|r| r.finding().is_none()));
         // A wrong-shaped container says nothing about its children.
         let wrong = json!({"t": {"port": "eighty", "sub": {"x": "one"}}});
-        let paths: Vec<String> = shape.findings(&wrong).findings.iter().map(|f| f.path.to_string()).collect();
+        let paths: Vec<String> = shape.findings(&wrong).iter().map(|r| r.path().to_string()).collect();
         assert_eq!(paths, ["t.port", "t.sub.x"]);
         // An absent prefix has no findings; a document nothing describes has none.
-        assert!(shape.findings(&json!({})).findings.is_empty());
-        assert_eq!(Shape::empty().findings(&doc), Findings::default());
+        assert!(shape.findings(&json!({})).is_empty());
+        assert!(Shape::empty().findings(&doc).is_empty());
+
+        // The order is `Path`'s, segment by segment -- `a.b` before `a-c`, because
+        // `a` is a shorter segment than `a-c` -- not the string order a `.` and a
+        // `-` would give. There is exactly one sort, here.
+        let flat = json!({"type": "object", "properties": {"a-c": {"type": "integer"}, "a": {"type": "object", "properties": {"b": {"type": "integer"}}}}});
+        let shape = Shape::new(vec![decl("t", Selector::All, Some(flat))], &[]);
+        let paths: Vec<String> = shape.findings(&json!({"t": {"a-c": "x", "a": {"b": "y"}}})).iter().map(|r| r.path().to_string()).collect();
+        assert_eq!(paths, ["t.a.b", "t.a-c"]);
+        assert!(serde_json::to_string(&shape.findings(&json!({"t": {"a-c": "x"}}))).unwrap().starts_with(r#"[{"path":"t.a-c","msg":"#));
     }
 
     #[test]
@@ -505,7 +550,7 @@ mod tests {
             vec![decl("homelab", Selector::All, Some(parent.clone())), decl("homelab.docker", Selector::All, Some(child))],
             &[],
         );
-        assert!(both.findings(&doc).findings.is_empty());
+        assert!(both.findings(&doc).is_empty());
 
         // A schema-less child prefix still shadows: it governs its subtree and
         // says nothing about it, which is not the same as letting the parent say something.
@@ -513,11 +558,11 @@ mod tests {
             vec![decl("homelab", Selector::All, Some(parent.clone())), decl("homelab.docker", Selector::All, None)],
             &[],
         );
-        assert!(silent_child.findings(&doc).findings.is_empty());
+        assert!(silent_child.findings(&doc).is_empty());
 
         // Without the child, the parent's opinion counts.
         let parent_only = Shape::new(vec![decl("homelab", Selector::All, Some(parent))], &[]);
-        assert_eq!(parent_only.findings(&doc).findings.len(), 1);
-        assert_eq!(parent_only.findings(&doc).findings[0].path.to_string(), "homelab.docker.compose");
+        assert_eq!(parent_only.findings(&doc).len(), 1);
+        assert_eq!(parent_only.findings(&doc)[0].path().to_string(), "homelab.docker.compose");
     }
 }

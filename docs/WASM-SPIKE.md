@@ -1,10 +1,12 @@
 # The wasm spike: making the browser like Perl
 
-Branch `wasm-unify`, off `main` at `54f2b78`. Two commits: `968cf82` (the core grows
-the concepts the editor was reimplementing) and the one that follows it (the editor
-asks the core). Nothing was deployed; everything below was verified offline — `cargo
-test`, clippy and rustdoc on `pve-meta-core` and the new `pve-meta-wasm`, and a node
-harness that instantiates the built `.wasm` and drives the editor's helpers through it.
+Branch `wasm-unify`, off `main` at `54f2b78`. Three commits made the spike (`968cf82`:
+the core grows the concepts the editor was reimplementing; `fdee33e`: the editor asks
+the core; `e1a9baa`: load guards and this report), and a fourth answers the adversarial
+review's six conditions (§10). Nothing was deployed; everything below was verified
+offline — `cargo test`, clippy and rustdoc on `pve-meta-core` and the new
+`pve-meta-wasm`, and a node harness that instantiates the built `.wasm` and drives the
+editor's helpers through it.
 
 **Reached: all three tiers.** The codec and the pure rules (1), the staging model (2),
 and the schema lint (3) are one implementation each, in Rust, and the editor calls
@@ -15,9 +17,10 @@ different job now.
 before merging. The cost is ~205 KB gzipped over the wire on first load (against 13 KB
 for js-yaml), cached thereafter. The thing to verify is that pveproxy serves a `.wasm`
 compressed — the loader works either way, but the download is three times larger if
-not. The argument for adopting is not the line count (net +1.2k lines) but what the
-lines are: five named concepts where there were two piles of predicates, and a rule
-list that is empty for the first time.
+not. The argument for adopting is not the line count (net +1.4k lines) but what the
+lines are: five named concepts where there were two piles of predicates, two of them
+real objects on the browser side as well as the server's, and a rule list that is
+empty for the first time.
 
 ## 1. The problem, restated as a design problem
 
@@ -96,10 +99,39 @@ compares maps as sets (which is right for `patch::diff` — a reordering touches
 rule 4), so `model::same_ordered` was added for "is this the document that was typed".
 `JSON.stringify` equality was doing that job in JavaScript without anyone having said so.
 
-At the call sites: `stage`, `pendingUnder`, `discardRow`, `plannedData`, `leaveTextMode`,
-`confirmAndApply` and `applyFindingsFor` each became one call on `PVE.meta.Edits`.
+At the call sites: `me.pending` *is* a `PVE.meta.EditSet` now — an object that owns
+its list and whose methods (`stage`, `under`, `discardUnder`, `apply`, `writeView`) are
+the core's — so `stage`, `pendingUnder`, `discardRow`, `plannedData`, `leaveTextMode`,
+`confirmAndApply` and `applyFindingsFor` each became one method call on it.
 `discardRow` had been filtering by object identity against the result of
 `pendingUnder`; that could not survive a boundary crossing and became `discardUnder`.
+The places that still read the raw list (`documentEntries`' ghost rows, `buildTree`'s
+staged-path map, the lone-`DELETE` check) read `me.pending.edits` and say so.
+
+### What the browser holds, honestly
+
+The first version of this branch had `PVE.meta.Shape.make` return a bag of closures
+over two captured arguments and `PVE.meta.Edits` as free functions over a plain
+array, and called that five concepts. The review was right that it was two on the
+Rust side and RPC stubs on the browser side — and that the lack of an object is why
+`declared()` and `hasSchema()` each re-asked the core for the same prefix list on
+every render. Both are objects now:
+
+- **`PVE.meta.Shape`** owns its listing and tags and caches what the core derives from
+  them alone: the applicable prefix names, the schema index, and each `governing`
+  answer. Only `findings(doc)` crosses every time, because only it takes a document.
+  The panel keeps one Shape per document (`shapeFor`) and validates the cache against
+  its inputs *by identity* — every load replaces `prefixes`, `tags` or `schemas` with a
+  new object — rather than clearing it at the right moment, because a cache that must
+  be told is a cache that is stale the first time someone forgets. (The first draft
+  had a `forgetShapes()` hook in `reload`; the test suite's stubs, which copy a panel
+  with `Object.assign`, found the staleness within a minute.)
+- **`PVE.meta.EditSet`** owns the staged list. `stage` and `discardUnder` change it in
+  place, `between` and `empty` make one, `apply`/`writeView`/`under` ask the core.
+
+`Codec` and `Access` stay stateless faces: a codec has no state, and an `Effective`
+is one `GET /meta/access` answer the panel already holds. So the honest count is two
+objects and two faces on the browser side, over five concepts in the core.
 
 ### `scopes::Effective` — who may touch a path
 
@@ -123,7 +155,14 @@ first draft added one to both.
 
 `is_valid_segment` is public and defined by `invalid_char`, so the editor can name the
 character it refuses ("a space is not allowed in a key") without restating the charset.
-`registry::is_valid_file_name` reaches the New dialog's name field for the first time.
+`registry::is_valid_file_name` reaches the New dialog's name field for the first time —
+and now carries the whole rule: the Perl schema for `{name}` had a `maxLength => 128`
+beside its pattern, and only the pattern had a Rust twin, so the first version of this
+branch let the dialog accept a name the server 400s. `MAX_FILE_NAME_LEN` is in Rust
+with the charset (the name becomes `<name>.yaml` on disk), the Perl schema keeps both
+as the friendly-400 mirror, and since the loader filters directory entries through the
+same function, a file with a longer name would no longer load — which changes nothing
+in practice, because no such file could ever have been written through the API.
 
 ### The adapter — `crates/pve-meta-wasm`
 
@@ -147,10 +186,13 @@ stay one rule.
 - **The `format:` check.** A schema's `format` is a `PVE::JSONSchema` format name, and
   the editor validates it with proxmoxlib's own vtype for that name (DESIGN §8). The
   core does not know what `ipv4` means and should not learn — that would be a third
-  implementation of PVE's formats. So `Shape::findings` returns findings *plus* a list
-  of `FormatCheck { path, format, value }` it could not judge, and `PVE.meta.Shape.findings`
-  runs those through `Utils.checkFormat` and merges. This is a deliberate leak with a
-  type on it.
+  implementation of PVE's formats. So `Shape::findings` returns one list of `Report`s
+  — findings, and `FormatCheck { path, format, value }` entries it could not judge —
+  sorted by path once, in Rust, and `PVE.meta.Shape.findings` resolves the format
+  entries *in place* through `Utils.checkFormat`. (The first version returned two lists
+  and re-sorted the merge in JavaScript by string order, which disagrees with `Path`'s
+  segment order on `a.b` versus `a-c`; there is one sort now.) This is a deliberate
+  leak with a type on it.
 - **`valueAt`, `rollUp`, `sameValue`, `itemSummary`, `editorKind`, `editorFor` …**:
   render-time lookups and UI choices with no server twin.
 - **The Perl regex** in `perl/PVE/API2/Ext/Meta.pm:624` for registry names. It is a
@@ -186,6 +228,10 @@ the JavaScript faces. Both are tested.
 What the build needs: `rustup target add wasm32-unknown-unknown` on the build host
 (which uses rustup, per the Makefile's own comments); with a distro `rustc`, Debian's
 `libstd-rust-dev-wasm32` — I could not reach the build host to confirm it is in trixie.
+CI (`.github/workflows/build.yml`) installs rustup with `--profile minimal`, which is
+the host target only, so it now adds the wasm32 target (and clippy, which `make check`
+has always needed) in the same step; the first version of this branch left the
+workflow untouched and would have died at `make check` with `E0463`.
 No wasm-opt (measured: it saves 15% raw and 2% gzipped; not worth a build dependency),
 no npm, no bindgen. `make wasm` is one cargo invocation with a `[profile.wasm]` (size
 optimisation, LTO, one codegen unit, `panic = "abort"`, stripped). `make build` and
@@ -198,19 +244,21 @@ is the same cargo, a second target.
 
 ## 5. Counts
 
-Branch against `main`, this report excluded: 28 files, **+2,919 / −1,738**, net
-**+1,181** lines.
+Branch against `main`, this report excluded: 30 files, **+3,184 / −1,777**, net
+**+1,407** lines. (The review round added ~230 of those: the four restored cases, the
+length rule and its tests, the `Report` enum, the two browser objects, and the
+un-loaded tests.)
 
 Where the lines went:
 
 | | lines | of which tests |
 |---|---|---|
-| `crates/pve-meta-core/src/shape.rs` (new) | 523 | ~270 |
+| `crates/pve-meta-core/src/shape.rs` (new) | 568 | ~300 |
 | `crates/pve-meta-core/src/edit.rs` (new) | 342 | ~150 |
-| `crates/pve-meta-wasm/src/lib.rs` (new) | 684 | ~150 |
-| `crates/pve-meta-core/src/registry.rs` | +/− 233 | `governing` and its fixture test out; `from_wire`, `by_specificity`, `rules_reaching` in |
-| `ui-extjs/pve-meta-tree.js` | 5,631 → 5,230 (−401) | the helper region (Utils + Yaml + Lint: 1,075 lines) became Utils + Core + Codec + Access + Shape + Edits + Markers (752 lines); `addGrammar` 87 → `addShape` 96 |
-| `ui-extjs/testing/smoke.js` | 1,770 → 1,848 (+78) | rewritten over the new faces; adds the raw-ABI section; drops the covers/governing tables |
+| `crates/pve-meta-wasm/src/lib.rs` (new) | 694 | ~155 |
+| `crates/pve-meta-core/src/registry.rs` | +/− 250 | `governing` and its fixture test out; `from_wire`, `by_specificity`, `rules_reaching`, the name length in |
+| `ui-extjs/pve-meta-tree.js` | 5,631 → 5,356 (−275) | the helper region (Utils + Yaml + Lint: 1,080 lines on `main`) became Utils + Core + Codec + Access + Shape + EditSet + Markers (837 lines); `addGrammar` 87 → `addShape` 96 |
+| `ui-extjs/testing/smoke.js` | 1,770 → 1,889 (+119) | rewritten over the new objects; adds the un-loaded and raw-ABI sections; drops the covers/governing tables |
 | `ui-extjs/vendor/js-yaml.min.js` | −39,430 bytes | 2 "lines" in git |
 
 Duplicated logic removed from JavaScript, counted by function: the second YAML codec
@@ -220,19 +268,28 @@ selector match in `applicablePrefixes` and `applicablePermissions`, `keyPathErro
 regex, `setAtPath`, `deleteAtPath`, `applyPending`, `diffDocuments`, `changedPaths`,
 `introducedFindings`, `writeView`, `stage`'s subsumption, and `Lint.applicable`,
 `findings`, `walk`, `checkValue`, `typeMatches`, `schemaIndex`. Twenty-five functions,
-roughly 460 lines with their comments; what replaced them is ~250 lines of faces that
-do nothing but name a core call.
+roughly 460 lines with their comments; what replaced them is ~330 lines: two objects
+(`Shape`, `EditSet`) that own their inputs and cache, and two faces (`Codec`, `Access`)
+that do nothing but name a core call.
 
-Fixtures: `testdata/covers-cases.json` (24 lines) and `testdata/governing-cases.json`
-(118 lines) deleted — their tables are inline in `scopes.rs` and `shape.rs`, next to the
-one implementation. `testdata/yaml-cases.json` kept: its reason changed from "two
-emitters agree" to "a `serde_yaml_ng` upgrade did not move the bytes", and the harness
-runs it through the wasm as an end-to-end check. Honest score: two of three made
-unnecessary, one re-purposed.
+Fixtures: `testdata/covers-cases.json` (19 cases) and `testdata/governing-cases.json`
+(16 cases) deleted — their tables are inline in `scopes.rs` (19 of 19) and `shape.rs`
+(all 16, plus four of its own), next to the one implementation. The first transcription
+of the governing table dropped four cases, including the subtlest one (two
+independently tagged levels, where the more specific prefix's selector misses and the
+parent governs); the review caught it and they are back, verbatim in intent.
+`testdata/yaml-cases.json` kept: its reason changed from "two emitters agree" to "a
+`serde_yaml_ng` upgrade did not move the bytes", and the harness runs it through the
+wasm as an end-to-end check. Honest score: two of three made unnecessary, one
+re-purposed.
 
-Rust tests: 153 unit + 107 integration in core, 8 in the wasm crate; clippy and
-rustdoc clean with `-D warnings`. JavaScript: 403 checks in `smoke.js`, every section
-of the old suite carried over, all against the real `.wasm`.
+Tests: **268** in Rust (153 unit + 107 integration in `pve-meta-core`, 8 in
+`pve-meta-wasm`, plus one doctest), clippy and rustdoc clean with `-D warnings`.
+JavaScript: **416** checks in `smoke.js`, every section of the old suite carried over,
+all against the real `.wasm` — and thirteen of them run *before* the core is attached,
+so the three pre-load branches (`editableFor`, `keyPathError`, `fileNameError`) are
+exercised in the un-loaded state: the first fails closed, the two validators fail open,
+and none of them throws.
 
 ## 6. Size and load time
 
@@ -270,26 +327,46 @@ with the module cached, in node's V8. Browsers' streaming compilers are in the s
 range for this size. Not the cost; the download is.
 
 Per-call cost, measured through the real glue with a deliberately fat listing (8
-prefixes × 40 declared properties with descriptions, 34 KB of JSON):
+prefixes × 40 declared properties with descriptions, 34 KB of JSON) and a 320-key
+document with five `rw` scopes:
 
 | call | µs |
 |---|---|
-| `covers` | 1.4 |
-| `shape_governing` (re-parses the 34 KB listing) | 322 |
-| `shape_schema_index` | 1,131 |
-| `shape_findings` on a 320-key document | 699 |
-| `edits_apply`, one edit, 320 keys | 96 |
-| `edits_between`, 320 keys | 170 |
-| parse / dump YAML, 4 KB | 312 / 186 |
+| `covers` | 1.5 |
+| `access_can_write`, 5 scopes | 4.9 |
+| `shape_prefixes` (first ask on a Shape; re-parses the 34 KB listing) | 314 |
+| `shape_governing` on a fresh Shape / on a cached answer | 312 / 0.0 |
+| `shape_schema_index` (first ask) | 1,095 |
+| `shape_findings`, 320 keys, 320 format checks | 688 |
+| `edits_apply`, one edit, 320 keys | 93 |
+| `edits_between`, 320 keys | 163 |
+| parse / dump YAML, 4 KB | 298 / 177 |
 
-A render makes about four Shape calls (`declared`, `hasSchema`, `schemaIndex`,
-`findings`), so ~2.5 ms with that listing and well under a millisecond with a real one.
-The text editor's per-keystroke `annotateText` is the same three calls plus a parse.
-The old per-row `governing` calls are gone (the walks moved into the core), which is
-why a stateless Shape that re-parses its listing on every question was acceptable; a
-handle to a Shape kept inside the module would be the answer if listings ever grew to
-where this shows, and it was rejected here because it is a lifetime for JavaScript to
-manage for a gain nobody can measure today.
+What a render costs with that listing, counted from what `buildTree` actually asks
+(the first version of this report said ~2.5 ms; the review measured 6–7 ms and was
+right, for two reasons fixed since):
+
+- **Shape questions**: `declared` + `hasSchema` + `schemaIndex` + `findings`. The
+  first three are answered once per Shape now and the panel keeps one Shape per
+  document, so a render with a warm Shape pays only `findings` (0.7 ms); a cold one
+  pays 2.1 ms. Before memoisation `declared` and `hasSchema` each re-asked
+  `shape_prefixes` and a render asked two or three times over: ~0.8 ms of exact
+  duplicate work, which the review found and an object was the fix for.
+- **Per-row access**: the old per-row `governing` calls are gone, but *not* the
+  per-row calls — `accessFor` asks `covers` once per rule that reaches the guest and
+  `editableFor` asks `access_can_write` once, so a row costs ~10 µs at five scopes,
+  and 328 rows cost **3.4 ms**. That is now the dominant render cost, and it is the
+  next thing to batch (one `access_rows(access, rules, paths[])` call would make it
+  one crossing); it is left as is because 3 ms on a 328-row tree with five scopes is
+  not something anyone will see, and because a `Shape`-style object for access has no
+  cache to offer — every row is a different path.
+
+So: **~4 ms warm, ~5.5 ms cold** for the fat case; a real listing (two or three
+prefixes, a few dozen rows) is well under a millisecond either way. The text editor's
+per-keystroke `annotateText` is `findings` plus a parse (~1 ms) on a warm Shape. A
+handle to a Shape kept inside the module would remove the 0.3 ms `shape_prefixes` and
+1.1 ms `schema_index` a cold Shape pays, and was rejected because it is a lifetime for
+JavaScript to manage for a cost paid once per load.
 
 ## 7. What got harder
 
@@ -297,10 +374,15 @@ manage for a gain nobody can measure today.
   awaited a codec before reading a document. But now `editableFor`, the two name
   validators and the Access column all need the core, and `syncButtons` runs on render
   before the first load. Three guards (`Core.loaded()`) and an early `Core.load()` kick
-  in `initComponent` cover it; a validator with no core answers "fine" and leaves the
-  refusal to the server, which is what it did before this branch anyway. This is the
-  kind of edge an adversarial review should push on: any new call site that reaches the
-  core before `loadDocument` has awaited it will throw "The pve-meta core is not loaded".
+  in `initComponent` cover it: `editableFor` fails *closed* (nothing is editable until
+  the rule that decides it is here), the validators fail *open* (no early answer; the
+  server refuses the same names on its own, as it did before this branch). The review
+  pointed out that none of the three branches had a test, and this editor has shipped
+  two lazy-load ordering bugs already; `smoke.js` now runs its first section before
+  attaching the core and checks all three, plus that a direct `Core.call` throws
+  "not loaded" rather than trapping. Any *new* call site that reaches the core before
+  `loadDocument` has awaited it will still throw that error, which is the intended
+  failure: loud, not wrong.
 - **A panic is silent.** `panic = "abort"` and a stripped build mean a Rust panic inside
   the module surfaces as `RuntimeError: unreachable` with no message. Every function in
   the dispatch returns `Result` and the tests cover the error paths (bad UTF-8, bad
@@ -336,8 +418,10 @@ manage for a gain nobody can measure today.
   `EditSet` — the brief's Tier 3 "so the server could expose it too" is possible now and
   not done.
 - Size: the one-parser codec described in §6, if 200 KB gzipped is judged too much.
-- The `PVE.meta.Shape` face rebuilds the Rust `Shape` per question. A handle-based
-  variant is the obvious optimisation if a profile ever asks for it.
+- Per-row access (`covers` × rules + `access_can_write` per row, §6) as one batched
+  crossing, if a tree ever gets large enough for 10 µs a row to show.
+- A handle-based Shape inside the module, if the once-per-load 1.4 ms of a cold Shape
+  ever matters. It does not today.
 - The lab: nothing here ran in a browser. The headless scripts (`testing/headless-*.js`)
   need the lab and were updated only where they probed for js-yaml.
 
@@ -358,8 +442,40 @@ manage for a gain nobody can measure today.
   inserting a key anywhere but the end. That is the old `diffDocuments` behaviour,
   faithfully moved, and the test says so. A smarter diff that expresses "insert before"
   would need a write operation the API does not have.
+- The panel's Shape cache is keyed by document id and validated by the *identity* of
+  the Shape's inputs. That holds because every load assigns a fresh array or object;
+  a future change that mutated `me.prefixes` in place would serve a stale Shape, and
+  nothing but this sentence and a test that copies panels with `Object.assign` says so.
 
-## 10. The recommendation, and why
+## 10. What the review changed
+
+Six conditions, all addressed in the fourth commit; the substantive ones are folded
+into the sections above where they belong, so this is the index:
+
+1. **CI** installed no wasm32 target and would have failed at `make check` (§4).
+2. **Four `governing` cases** were dropped in the fixture-to-Rust transcription; all
+   sixteen are in `shape.rs` now (§5).
+3. **The three pre-load guards had no test**; `smoke.js` runs before attaching the
+   core and exercises them (§7).
+4. **The file-name length** was a client/server divergence in the one rule the branch
+   claimed to unify; `MAX_FILE_NAME_LEN` is in Rust beside the charset (§2, §3).
+5. **Duplicate `shape_prefixes` calls** per render, and **two sorts** of the findings
+   by two rules: memoised on a real Shape object, and one sort in Rust over one list
+   (§2, §6). The render number in this report was wrong and is corrected (§6).
+6. **The browser side had no objects**: `Shape` and `EditSet` are objects now, and the
+   framing of what the browser gained is corrected to what it is (§2).
+
+Being as critical of the fixes as the review was of the original: (2) and (4) were
+carelessness, not judgement — a transcription I did not diff against its source, and a
+Perl schema I read for its pattern and not its second line. (5)'s duplicate call is the
+kind of thing an object catches and a bag of closures does not, which is the review's
+point about (6) made concrete. (3) I had written the guards *because* of the two prior
+ordering bugs and still shipped them untested. What I would still push on: the identity
+check in `shapeFor` is a convention with one sentence guarding it; the per-row access
+cost is real and unbatched; and the un-loaded validators failing open is a choice that
+should be re-examined the day the server stops mirroring the rule.
+
+## 11. The recommendation, and why
 
 Adopt. The measure the owner asked for was the quality of the abstractions, and by that
 measure the result is better on both sides of the boundary, not only in the browser: the

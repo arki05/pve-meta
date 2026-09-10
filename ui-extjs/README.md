@@ -9,8 +9,11 @@ config panels.
 The editor implements no rules. The YAML codec, the key-name charset, who may touch a
 path, which prefix governs one, what a schema makes of a value and what staged edits do
 to a document are all `pve-meta-core` -- the server's own crate -- compiled for the
-browser and asked through five named faces (`PVE.meta.Codec`, `Access`, `Shape`,
-`Edits`, and the key-name checks on `Utils`). See `docs/WASM-SPIKE.md` for how and why.
+browser. The panel holds two objects over it -- a `PVE.meta.Shape` per document, which
+owns the prefix listing and the tags and caches what the core derives from them, and a
+`PVE.meta.EditSet`, the staged edits -- and calls two stateless faces, `PVE.meta.Codec`
+and `PVE.meta.Access`, plus the key-name checks on `Utils`. See `docs/WASM-SPIKE.md`
+for how and why.
 
 This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
 same specification and compared on the lab; it was removed once the choice was made (git

@@ -617,8 +617,9 @@ __PACKAGE__->register_method({
 
 # The file name, which for a prefix *is* its prefix -- so it is dotted when
 # the prefix is nested. The same shape `pve_meta_core::registry::is_valid_file_name`
-# accepts, which is what the Rust layer re-checks when it parses the id: this
-# pattern is the friendly 400, that check is the real one.
+# accepts -- the pattern AND the length (`MAX_FILE_NAME_LEN`) -- which is what
+# the Rust layer re-checks when it parses the id: this schema is the friendly
+# 400, that check is the real one, and the editor asks the same function.
 my $REGISTRY_NAME_SCHEMA = {
     type => 'string',
     pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',

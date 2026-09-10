@@ -598,6 +598,10 @@ mod tests {
         assert_eq!(ok("key_path_check", json!(["a/b"]))["char"], "/");
         assert_eq!(ok("file_name_valid", json!(["homelab.docker"])), json!(true));
         assert_eq!(ok("file_name_valid", json!(["my file"])), json!(false));
+        // The length bound is part of the rule, so the New dialog refuses what
+        // the API's `maxLength => 128` refuses.
+        assert_eq!(ok("file_name_valid", json!(["a".repeat(128)])), json!(true));
+        assert_eq!(ok("file_name_valid", json!(["a".repeat(129)])), json!(false));
     }
 
     #[test]
@@ -636,12 +640,18 @@ mod tests {
         assert_eq!(index[0]["path"], "homelab");
         assert_eq!(index[1], json!({"path": "homelab.notes", "prefix": "homelab", "schema": {"type": "string"}}));
         let findings = ok("shape_findings", json!([listing, [], {"homelab": {"notes": 5}}]));
-        assert_eq!(findings["findings"][0]["path"], "homelab.notes");
+        assert_eq!(findings, json!([{"path": "homelab.notes", "msg": "expected string"}]));
 
         // A registry document: its meta-schema rooted at the document.
         let rooted = json!([{"prefix": "", "selector": {"all": true}, "schema": {"type": "object", "properties": {"authid": {"type": "string"}}}}]);
         assert_eq!(ok("shape_governing", json!([rooted, [], "rules"])), json!(""));
-        assert_eq!(ok("shape_findings", json!([rooted, [], {"authid": 1}]))["findings"][0]["msg"], "expected string");
+        assert_eq!(ok("shape_findings", json!([rooted, [], {"authid": 1}]))[0]["msg"], "expected string");
+        // A format check rides in the same list, at its place in the one order.
+        let fmt = json!([{"prefix": "t", "selector": {"all": true}, "schema": {"type": "object", "properties": {"host": {"type": "string", "format": "dns-name"}, "z": {"type": "integer"}}}}]);
+        assert_eq!(
+            ok("shape_findings", json!([fmt, [], {"t": {"host": "h", "z": "no"}}])),
+            json!([{"path": "t.host", "format": "dns-name", "value": "h"}, {"path": "t.z", "msg": "expected integer"}])
+        );
     }
 
     #[test]
