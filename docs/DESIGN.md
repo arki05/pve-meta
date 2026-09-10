@@ -756,8 +756,8 @@ mounted as a native tab through the `script`/`xtype` manifest form (§7). Sessio
 theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe
 and no build step of the editor's own. The core arrives as `pve-meta-core.wasm`, a plain
 `cargo build` of `crates/pve-meta-wasm` for `wasm32-unknown-unknown` behind a
-four-export JSON-string ABI — no wasm-bindgen, no generated glue, no tool the Debian
-build would have to pin — loaded lazily like Monaco (`docs/WASM-SPIKE.md`). The server
+five-export JSON-string ABI — no wasm-bindgen, no generated glue, no tool the Debian
+build would have to pin — loaded lazily like Monaco (`docs/WASM-CORE.md`). The server
 stays the authority: an Apply sends the buffer back as `text` or the planned subtree as
 `data`, and the server runs the same code again on the real write.
 

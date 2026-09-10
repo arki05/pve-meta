@@ -31,7 +31,7 @@ MONACO := $(UI_DIR)/monaco/vs
 # perlmod bindings link, compiled for wasm32 and shipped next to the editor. Needs
 # the target installed on the build host -- `rustup target add
 # wasm32-unknown-unknown`, or Debian's `libstd-rust-dev-wasm32` with a distro rustc.
-# No other tool: no wasm-bindgen, no wasm-pack, no npm (see docs/WASM-SPIKE.md).
+# No other tool: no wasm-bindgen, no wasm-pack, no npm (see docs/WASM-CORE.md).
 WASM_TARGET := wasm32-unknown-unknown
 WASM := target/$(WASM_TARGET)/wasm/pve_meta_wasm.wasm
 

@@ -182,7 +182,7 @@ the PVE UI. No iframe. The rules it needs -- the YAML codec, key names, access, 
 prefix governs a path, what a schema says, what staged edits do -- are the server's own
 crate compiled for the browser (`crates/pve-meta-wasm`, a plain `cargo build` for
 wasm32, no wasm-bindgen), so the editor reimplements none of them; see
-`docs/WASM-SPIKE.md`. A second implementation in pwt/Yew was built to the same spec and
+`docs/WASM-CORE.md`. A second implementation in pwt/Yew was built to the same spec and
 compared on the lab before being removed — `docs/DESIGN.md` §8 and §11, git tag
 `pwt-ui-removed`.
 
@@ -297,7 +297,7 @@ live node.
 | `pages/` | The "Metadata" tab's page manifest |
 | `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
-| `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `PERL-BINDINGS-SPEC.md` |
+| `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |
 | `scripts/apt-repo/` | Signed apt repo build/publish scripts (Cloudflare R2) |
 | `scripts/watch-pve/` | The ceiling-watcher CI job |
 | `ceilings.toml` | Tested-ceiling versions for the two patched upstream packages |
