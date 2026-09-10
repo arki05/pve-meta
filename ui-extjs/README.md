@@ -2,9 +2,10 @@
 
 One file, `pve-meta-tree.js`, plain ES2017 with no build step of its own, plus the core
 (`pve-meta-core.wasm`, built by `make wasm` from `crates/pve-meta-wasm`) and `monaco/`
-(fetched by `make ui`, gitignored). It defines a panel (`xtype: pveMetaTreePanel`) that
-pve-ext's page loader instantiates as a native tab inside the PVE guest and datacenter
-config panels.
+(fetched by `make ui`, gitignored). It defines two panels that pve-ext's page loader
+instantiates as native tabs: `pveMetaTreePanel`, one document's editor, on every guest's
+config panel; and `pveMetaDatacenterPanel`, that editor over the datacenter document plus
+the two registry grids, on the Datacenter panel.
 
 The editor implements no rules. The YAML codec, the key-name charset, who may touch a
 path, which prefix governs one, what a schema makes of a value and what staged edits do
@@ -12,7 +13,7 @@ to a document are all `pve-meta-core` -- the server's own crate -- compiled for 
 browser. The panel holds two objects over it -- a `PVE.meta.Shape` per document, which
 owns the prefix listing and the tags and caches what the core derives from them, and a
 `PVE.meta.EditSet`, the staged edits -- and calls two stateless faces, `PVE.meta.Codec`
-and `PVE.meta.Access`, plus the key-name checks on `Utils`. See `docs/WASM-SPIKE.md`
+and `PVE.meta.Access`, plus the key-name checks on `Utils`. See `docs/WASM-CORE.md`
 for how and why.
 
 This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
@@ -22,17 +23,19 @@ tag `pwt-ui-removed`).
 Session, CSRF, dark theme, i18n and the whole page chrome come from the PVE UI. Nothing
 in this file re-derives any of them.
 
-## What it does (DESIGN §5, §7, §8)
+## What it does
 
-The panel is a **card layout over two bodies**, swapped in place by the **Tree | Text**
-segmented button at the right end of the toolbar.
+The behaviour is specified in `docs/DESIGN.md` §8 and not repeated here: one tree of
+the document the caller can see; lists as containers with one row per member; edits
+staged and written by one Apply at the narrowest covering view; Tree and Text as two
+views of the same planned document; the schema markers and the "Save anyway" banner;
+the footer that every editor shares; the datacenter tab's three sub-tabs and the two
+forms behind its registry grids. What follows is what is specific to *this* file.
 
 ### The Tree card
 
-* **One tree of the document the caller can see.** Columns **Key | Value | Description |
-  Access**, one line per row. Rows are the union of the keys present in the document and
-  the keys the governing prefixes declare. A declared-but-unset key renders faded,
-  showing `not set (default: …)`; "setting" it is just editing it.
+* Columns **Key | Value | Description | Access**, one line per row. A declared-but-unset
+  key renders faded, showing `not set (default: …)`.
 * **Row icons.** A folder on a map row (`fa fa-folder`, `fa fa-folder-open` while it is
   expanded — swapped on `itemexpand`/`itemcollapse`, since ExtJS has no per-node
   "expanded icon"), a document (`fa fa-file-text-o`) on a value row. No CSS ships with
@@ -41,75 +44,72 @@ segmented button at the right end of the toolbar.
   `#555`; `#e6e6e6` in proxmox-dark), so the icons match the rest of the UI by
   construction.
 * **Comment keys are not rows.** `k__` is the **Description** of row `k`; a bare `__`
-  documents the map it sits in. They are ordinary data everywhere else. The grammar's
+  documents the map it sits in. They are ordinary data everywhere else. The schema's
   own `description` is a different thing: it is the row's **tooltip**, never the
   Description column.
-* **Arrays are one text leaf**, shown as JSON. On commit, JSON is parsed if the text
-  starts with `[`, otherwise a comma-separated list is split.
-* **Access** lists *every* grant from `GET /meta/prefixes` and `GET /meta/permissions` whose scope covers the
-  row — `rw` ones by name in normal text, `ro` ones muted with `(ro)`, `rw` first. The
-  cell tooltip spells each one out with its selector (`example-traefik (rw, all
-  guests)`). Several principals may read a subtree; this column is about who writes and
-  who subscribes, not ownership. Scopes apply to guest documents only, so the datacenter
-  tree has no entries. `selector: { tag: … }` is resolved against the guest's `tags`, which
-  `GET /meta/access` returns alongside the access answer.
-* **No per-row action icons.** The toolbar is **Add | Edit | Remove | Edit selection as
-  text | Reload**, all targeting the selection: Add goes into the selected map, the
-  parent of a selected leaf, or the document root; Edit and Remove need a row; *Edit
-  selection as text* needs a selection.
+* **Access** lists every rule from `GET /meta/permissions` whose prefix covers the row,
+  resolved by the core (`rules_reaching`) against the guest's `tags`, which
+  `GET /meta/access` returns alongside the access answer — `rw` ones by name in normal
+  text, `ro` ones muted with `(ro)`, `rw` first. The cell tooltip spells each one out
+  with its selector (`example-traefik (rw, all guests)`). Scopes apply to guest documents
+  only, so the datacenter tree has no entries.
+* **The toolbar** acts on the document's *contents*: Add Rule (permission files only),
+  Add, Edit, Set to Default, Declare Key (prefix files only), Remove, Edit selection as
+  text, Reload, and at the right the muted *Scoped write access* / *Read-only* label
+  that appears only when the caller is restricted. Committing — Apply, Revert, Diff,
+  Format, and the Tree | Text toggle — lives in the footer (`PVE.meta.Footer`), which is
+  the same footer the Text card and the subtree window use.
 * **The row editor** is a modal window opened by Edit, a double-click, or Enter on the
-  selected row. Its field comes from the grammar's type first and the stored value's type
+  selected row. Its field comes from the schema's type first and the stored value's type
   second: `enum` → combobox, `boolean` → `proxmoxcheckbox`, `integer`/`number` →
-  numberfield, everything else → textfield. A declared type wins, deliberately: it is the
-  operator's statement of what the key means, and the API's JSON view cannot represent a
-  boolean (see *Known API friction* below).
+  numberfield, a `multiline` string or one that already has newlines → textarea,
+  everything else → textfield. A map, or a list of maps, skips the row editor and opens
+  Monaco on that subtree. A declared type wins, deliberately: it is the operator's
+  statement of what the key means.
 * **Editability is per row**, from `GET /meta/access`: full write, or an `rw` scope
-  covering that path. A non-editable row cannot be edited or removed.
+  covering that path. A non-editable row cannot be edited or removed. Until the core
+  has loaded, nothing is editable: `editableFor` fails closed.
 
 ### The Text card
 
-* The **whole document** in Monaco as YAML, with the same presentation-only YAML/JSON
-  view toggle, **Apply** (a Monaco side-by-side diff as the confirm step, then
-  `PUT ?view=&mode=replace&digest=…` at the root) and **Discard** (re-reads the
-  document into the buffer, asking first if the buffer was edited).
-* Switching back to **Tree** with an edited buffer asks first.
+* The **whole document** in Monaco as YAML, with the presentation-only YAML/JSON view
+  toggle, rendered from the *planned* document so staged row edits are in it. Apply
+  sends the buffer as `text` at the root view (`PUT ?view=&mode=replace&digest=…`).
+  Leaving Text parses the buffer back into staged edits; only a buffer that does not
+  parse refuses the switch, and it says so.
 * The card is the *root view*, which a scope-only principal may not read at all
-  (DESIGN §3) — so the **Text** segment is disabled when `/meta/access` reports no full
-  read, rather than offering a button that can only fail.
-* While the Text card is active the tree's toolbar buttons are disabled and the version
-  poll is suspended.
+  (DESIGN §3.4) — so the **Text** segment is disabled when `/meta/access` reports no
+  full read, rather than offering a button that can only fail.
 
 ### Everywhere
 
-* **A muted access label** — *Scoped write access* or *Read-only* — sits next to the
-  Tree | Text toggle, and **only when the caller is restricted**. A caller with full
-  write sees nothing there.
-* **Writes are minimal.** A row edit and the Add window issue
-  `PUT /meta/guests/{vmid}?view=<dotted.path>&mode=replace&data=<json scalar>&digest=…`;
-  Remove issues `DELETE …?view=<path>&digest=…`. On 409 the panel reloads (or re-reads
+* **The version poll** runs every 5 s (`Ext.TaskManager`) against
+  `GET /meta/version?id=<docId>` — this document plus the registry directories, never
+  the whole store — and reloads when the token changed: never while a row editor, the
+  selection text window or the Text card is open, and never while anything is staged.
+  A reload preserves which nodes were expanded.
+* **Conflicts.** Every write carries the digest. On 409 the panel reloads (or re-reads
   the text buffer) and shows the API's message verbatim under a *Conflict* title. Every
   other error is the API's message verbatim too.
-* **The version poll** runs every 5 s (`Ext.TaskManager`), compares the token from
-  `GET /meta/version`, and reloads the tree when it changed — never while a row editor,
-  the selection text window or the Text card is open. A reload preserves which nodes were
-  expanded.
 * **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window),
-  the Text card (the whole document, in the panel body), and the diff that confirms
-  either one's Apply. Its AMD loader is fetched lazily on first use from
+  the Text card (the whole document, in the panel body), and the diff behind the Diff
+  button and the "Save anyway" banner. Its AMD loader is fetched lazily on first use from
   `/pve2/js/pve-meta-extjs/vs/loader.js` — Monaco is vendored into the package by the
   top-level `make ui` (npm), never fetched from a CDN — and every editor and model is
-  disposed when its owner goes away.
+  disposed when its owner goes away. `PVE.meta.Monaco.load()` waits for the core first,
+  since every Monaco caller also needs the codec.
 
 ## The core
 
-`pve-meta-core.wasm` is `crates/pve-meta-wasm`: `pve-meta-core` behind a four-export
-JSON-string ABI (`pm_alloc`/`pm_free` for the request, `pm_call` to run it, `pm_output`
-for the response), built with a plain `cargo build --target wasm32-unknown-unknown
---profile wasm` and nothing else -- no wasm-bindgen, no generated glue. It installs next
-to the panel as `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm` and is
-loaded lazily by `PVE.meta.Core.load()` (`WebAssembly.instantiateStreaming`), the same
-way Monaco is; `PVE.meta.Monaco.load()` waits for it, since every Monaco caller also
-needs the codec.
+`pve-meta-core.wasm` is `crates/pve-meta-wasm`: `pve-meta-core` behind a JSON-string
+ABI of five exports (`pm_alloc`/`pm_free` for the request, `pm_call` to run it,
+`pm_output` for the response, `pm_abi` for the version the glue checks on attach), built
+with a plain `cargo build --target wasm32-unknown-unknown --profile wasm` and nothing
+else -- no wasm-bindgen, no generated glue. It installs next to the panel as
+`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm` and is loaded lazily by
+`PVE.meta.Core.load()` — `WebAssembly.instantiateStreaming` where pveproxy serves the
+file as `application/wasm`, falling back to `fetch` + `WebAssembly.instantiate` where
+it does not — the same way Monaco is.
 
 `PVE.meta.Core.call(name, ...args)` is the whole glue: encode `{fn, args}` as UTF-8 into
 a buffer the module hands out, call, decode the response, and turn an `err` into a
@@ -124,12 +124,19 @@ an Apply in YAML view sends the buffer to the API untouched as `text`, an Apply 
 tree sends the planned subtree as `data`, and the server runs the same code again on the
 real write.
 
+The editor **reads every document as YAML** (`format=yaml`), never as JSON: perlmod
+renders a document as a native Perl hash on the way out, and a Perl hash has no key
+order, so `format=json` cannot carry the order the store holds (DESIGN §8). That is what
+makes a root Apply write the file back in the order it was in.
+
 ## How it is wired
 
 pve-ext's page loader (`pve-ext/js/pve-ext-loader.js`) reads page manifests from
 `/usr/share/pve-ext/pages/*.json` through `GET /api2/json/ext/pages`. A manifest declares
-either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This one
-uses the second form:
+either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This
+editor ships **two** manifests in the second form over one script, because a manifest
+carries a single `xtype` and the guest tab and the datacenter tab are different panels
+(DESIGN §7):
 
 `pages/pve-meta.json`:
 
@@ -138,12 +145,16 @@ uses the second form:
     "id": "pve-meta",
     "title": "Metadata",
     "iconCls": "fa fa-tags",
-    "targets": ["lxc", "qemu", "dc"],
+    "targets": ["lxc", "qemu"],
     "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",
     "xtype": "pveMetaTreePanel",
-    "requires": { "vms": ["VM.Audit"], "dc": ["Sys.Audit"] }
+    "requires": { "vms": ["VM.Audit"] }
 }
 ```
+
+`pages/pve-meta-dc.json` is the same with `"id": "pve-meta-dc"`, `"targets": ["dc"]`,
+`"xtype": "pveMetaDatacenterPanel"` and `"requires": { "dc": ["Sys.Audit"] }`. The
+loader fetches a `script` once per URL, so the second manifest costs no second download.
 
 The file installs to `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-tree.js` with
 `pve-meta-core.wasm` next to it, which pveproxy serves at the `script` path above
@@ -165,20 +176,20 @@ repository copy's header still says otherwise.
 ## Verifying it
 
 * `node --check pve-meta-tree.js`
-* eslint 9 (`no-unused-vars` with `caughtErrorsIgnorePattern: '^_'`, `no-undef`,
-  `eqeqeq`, `no-var`, …) with `Ext`, `PVE`, `Proxmox` and `gettext` as globals — clean,
-  for the panel and for `testing/*.js`.
-* `node testing/smoke.js` — offline, no DOM, after `make wasm`. It loads the real file
-  into `node:vm` behind a small `Ext`/`Proxmox` shim, instantiates the *built*
-  `pve-meta-core.wasm` synchronously and hands it to `PVE.meta.Core.attach`, so the
-  shipped bytes and the shipped glue are what gets tested. It starts with the raw ABI
-  (a megabyte through the buffer, a memory growth, non-ASCII, error locations) and then
-  drives the editor's own logic: the row-editor field choice, the document+shape row
-  merge, Access resolution and per-row editability, staging, and the codec — including
-  a **round-trip property test**: a fixed corpus of hostile documents plus 500 generated
-  ones (keys and values with colons, quotes, hashes, unicode, numeric-looking strings,
-  booleans, nested maps and arrays), asserting `parse(dump(x))` deep-equals `x` with key
-  order intact. The rules themselves are tested where they live, in Rust.
+* `node testing/smoke.js` — offline, no DOM, after `make wasm` (`make check` runs it
+  when `node` is present). It loads the real file into `node:vm` behind a small
+  `Ext`/`Proxmox` shim, instantiates the *built* `pve-meta-core.wasm` synchronously and
+  hands it to `PVE.meta.Core.attach`, so the shipped bytes and the shipped glue are what
+  gets tested. It starts *before* attaching the core, so the three pre-load branches
+  (`editableFor` fails closed, the two name validators fail open, `Core.call` says "not
+  loaded" rather than trapping) are exercised; then the raw ABI (a megabyte through the
+  buffer, a memory growth, non-ASCII, error locations); then the editor's own logic: the
+  row-editor field choice, the document+shape row merge, Access resolution and per-row
+  editability, staging, and the codec — including a **round-trip property test**: a
+  fixed corpus of hostile documents plus 500 generated ones (keys and values with
+  colons, quotes, hashes, unicode, numeric-looking strings, booleans, nested maps and
+  arrays), asserting `parse(dump(x))` deep-equals `x` with key order intact. The rules
+  themselves are tested where they live, in Rust.
 * `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
   Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
@@ -190,10 +201,12 @@ repository copy's header still says otherwise.
 
 ## Screenshots
 
-Taken on `pvemeta-node1` (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8)
-inside the real UI, against the live revision-5 API, with two live grants
-(`example-traefik`, `rw` on `traefik` for all guests, with a grammar; `scoped`, `rw` on
-`traefik` for tag `traefik` and `ro` on `netbird` for all guests).
+In `docs/screenshots/`, taken on `pvemeta-node1` (pve-manager 9.2.11, ExtJS 7.0.0,
+proxmox-widget-toolkit 5.2.8) inside the real UI, against the revision-5 API, with two
+live grants (`example-traefik`, `rw` on `traefik` for all guests, with a schema;
+`scoped`, `rw` on `traefik` for tag `traefik` and `ro` on `netbird` for all guests).
+The columns and the row editor are as shown; the chrome has moved since (Apply, Revert
+and the Tree | Text toggle are in the footer now, and edits stage rather than write).
 
 | File | What it shows |
 |---|---|
@@ -202,7 +215,7 @@ inside the real UI, against the live revision-5 API, with two live grants
 | `extjs-rowedit-light.png`, `extjs-rowedit-dark.png` | the row editor (opened by a double-click), with the comment key as its Description field |
 | `extjs-text-light.png`, `extjs-text-dark.png` | the Text card: the whole document in Monaco, YAML |
 | `extjs-text-json-light.png`, `extjs-text-json-dark.png` | the same after the JSON view toggle |
-| `extjs-text-dirty-light.png`, `extjs-text-dirty-dark.png` | leaving Text with an edited buffer asks first |
+| `extjs-text-dirty-light.png`, `extjs-text-dirty-dark.png` | leaving Text with an edited buffer, as it asked before staging replaced the question |
 | `extjs-selection-text-light.png`, `extjs-selection-text-dark.png` | *Edit selection as text* on the `traefik` subtree |
 | `extjs-selection-text-json-light.png`, `extjs-selection-text-json-dark.png` | the same value after the JSON toggle |
 | `extjs-diff-light.png`, `extjs-diff-dark.png` | the Monaco diff shown to confirm Apply |
@@ -211,12 +224,3 @@ inside the real UI, against the live revision-5 API, with two live grants
 | `extjs-readonly-dark.png` | a caller with read but no write: "Read-only", every editing button disabled |
 | `extjs-addkey.png` | the Add Key window |
 | `extjs-datacenter.png` | the same panel over `/meta/datacenter` |
-
-## Known API friction
-
-`GET …?format=json` returns YAML booleans as `1`/`0` — the file still says `flag: true`,
-but the JSON view cannot tell a boolean from the integer 1. Any client is affected, not
-just this one. This panel copes by letting a grammar's declared `type: boolean` decide
-the editor (a `proxmoxcheckbox`, which accepts the integer 1 as true) and by rendering
-booleans through `Proxmox.Utils.format_boolean`; without a grammar such a key looks like
-a number and gets a numberfield.

@@ -194,8 +194,8 @@ the tab was shown; never rely on `requires` for security.
 pveproxy already maps `/pve2/js/` to `/usr/share/pve-manager/js/` (see
 `add_dirs()` in `PVE::Service::pveproxy`) — that's how
 `pve-ext-loader.js` itself gets served. Ship your page's own static files
-(e.g. `pve-meta`'s Monaco-based iframe editor, or its ExtJS `script`+`xtype`
-page) under `/usr/share/pve-manager/js/<your-app>/`, and point `url` (an
+(e.g. `pve-meta`'s ExtJS `script`+`xtype` page, with its Monaco tree and
+`.wasm` core beside it) under `/usr/share/pve-manager/js/<your-app>/`, and point `url` (an
 HTML entry point) or `script` (a JS file defining your `xtype`) at
 `/pve2/js/<your-app>/...?{query}` — a same-origin, host/port-relative path
 either way, so there is no cross-origin/mixed-content concern, exactly like
@@ -349,7 +349,7 @@ by construction — they simply never name the same file.
 `pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
 project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
 is a worked example of all four steps, for the one guest-lifecycle file it
-patches (lifecycle is snapshot-only; see `docs/LIFECYCLE-PATCHES.md`).
+patches (the whole guest lifecycle is one file; see `docs/LIFECYCLE-PATCHES.md`).
 
 ## Summary: what pve-ext ships
 

@@ -1,9 +1,10 @@
-# Guest lifecycle: the snapshot trio
+# Guest lifecycle: one patched file
 
-pve-meta carries guest metadata through exactly three lifecycle events: snapshot,
-rollback and delete-snapshot. Everything else is either handled by a GC job or not
-carried at all. This is deliberate (`docs/DESIGN.md` §6, §10, §11) — a smaller, honestly
-documented guarantee beats a wide one with a silent gap.
+pve-meta carries guest metadata through five lifecycle events — create, destroy,
+snapshot, rollback and delete-snapshot — all hooked in one file, `PVE/AbstractConfig.pm`.
+Clone and backup are not carried, and nothing runs on a timer. This is deliberate
+(`docs/DESIGN.md` §6, §10, §11) — a smaller, honestly documented guarantee beats a wide
+one with a silent gap.
 
 ## The snapshot trio
 

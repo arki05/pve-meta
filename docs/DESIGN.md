@@ -459,9 +459,10 @@ adding a key beside it, since a list has no keys.
   dialect, an editor hint, and the server neither reads nor validates it (§4). A schema's
   `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
   format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
-  `mac-addr`, `dns-name`, `address`, `email` — the same set in both implementations,
-  wired to proxmoxlib's own vtypes in `ui-extjs`. **A format neither knows constrains
-  nothing**: this is an affordance so a human is told before the round trip, never an
+  `mac-addr`, `dns-name`, `address`, `email` — wired to proxmoxlib's own vtypes in
+  `ui-extjs`; the core hands a `format` back unjudged (below) rather than carrying a
+  third implementation of what `ipv4` means. **A format the editor does not know
+  constrains nothing**: this is an affordance so a human is told before the round trip, never an
   authority — the server's one lint is that (§4), and an operator writing through the
   API is not policed by it. There is deliberately no `pattern`/regex: a format is a
   name PVE already defines and validates, a regex is one more dialect to own.
@@ -638,10 +639,9 @@ toggle report unsaved changes. The diff dialog sets `ignoreTrimWhitespace: false
 Monaco defaults it to `true`, which hid exactly the indentation-only changes that shape
 produces, leaving a confirm dialog that showed nothing while Apply was enabled. A muted "Scoped write access"
 or "Read-only" label appears next to the toggle only when the caller is restricted. No
-per-row action icons. Editability is per row from `/meta/access`; a row edit is
-`PUT ?view=<path>&mode=replace` with the scalar, delete is `DELETE ?view=<path>`, the
-digest is sent and a 409 reloads. The version poll refreshes the tree and the permission files,
-never while an editor is open.
+per-row action icons. Editability is per row from `/meta/access`. Every write carries
+the digest and a 409 reloads. The version poll refreshes the tree and the registry
+grids, never while an editor is open or anything is staged.
 
 **Which ACL answers apply is a property of the document, not of the tab.** `GET
 /meta/access` takes the document's `id`, because the three kinds answer differently and
@@ -809,7 +809,10 @@ crates/pve-meta-core     document model, views, prefixes+permissions+selectors, 
 crates/pve-meta-perl     PVE::RS::Meta: snapshot hooks, gc, api exports (native perlmod conversion)
 crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
 perl/PVE/API2/Ext/Meta.pm
-prefixes/              packaged example prefixes (none required)
+bin/pve-meta             the local reader for hook scripts (Perl over PVE::RS::Meta; /usr/sbin)
+libexec/gc               the manual GC broom (§6)
+pages/                   the two page manifests, guest and datacenter (§7)
+prefixes/                packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor tab (plain JS, native ExtJS panel)
@@ -831,8 +834,9 @@ hook — what went is the GC *timer*, not the destroy hook); JSON-string crossin
 
 ## 11. Deviations from DIRECTION.md, with reasons
 
-* **Lifecycle is snapshot-only, not zero.** Rollback restoring metadata was an explicit
-  product decision; it costs one patched file in the least-churned package.
+* **Lifecycle is one patched file, not zero.** Rollback restoring metadata was an explicit
+  product decision; it costs one patched file in the least-churned package, and the
+  create and destroy hooks (§6) ride in the same file for nothing more.
 * **The pwt implementation was not dropped by fiat — it was compared first.** DIRECTION
   §5.4 argued for switching on the premise that `Ext.tree.Panel` had no pwt equivalent;
   it does (`DataTable` + `TreeStore`, used by PDM). Both were built to this §8 and judged

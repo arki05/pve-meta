@@ -217,11 +217,13 @@ generic seams, so pve-meta itself patches nothing directly:
 * **UI pages.** One `<script>` line in `index.html.tpl` loads `pve-ext-loader.js`, which
   fetches `GET /api2/json/ext/pages` and adds one tab per manifest to its declared
   targets — a same-origin iframe (`url`) or a native ExtJS panel loaded once and
-  instantiated in place (`script` + `xtype`). pve-meta ships one, `pages/pve-meta.json`,
-  in the `script`+`xtype` form.
+  instantiated in place (`script` + `xtype`). pve-meta ships two in the
+  `script`+`xtype` form, `pages/pve-meta.json` (guests) and `pages/pve-meta-dc.json`
+  (the datacenter), over one script — a manifest carries a single `xtype`, and the two
+  tabs are different panels.
 * **Managed patches.** `pve-ext-patch` applies, verifies, removes and reports a set of
   dpkg-diverted file patches described by TOML manifests; pve-meta ships one
-  (`patches/lifecycle.toml`) for the snapshot/rollback/delete-snapshot hook.
+  (`patches/lifecycle.toml`) for the five guest-lifecycle hooks.
 
 pve-meta depends on pve-ext; the lifecycle patch is pve-meta's own manifest.
 
@@ -294,7 +296,7 @@ live node.
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/` | `lifecycle.toml`, the managed-patch manifest, and `lifecycle/` holding the one guest-lifecycle diff it names |
-| `pages/` | The "Metadata" tab's page manifest |
+| `pages/` | The "Metadata" tab's two page manifests (guest, datacenter) |
 | `libexec/gc` | Manual GC broom; no timer runs it (see `docs/DESIGN.md` §6) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
 | `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |

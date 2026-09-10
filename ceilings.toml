@@ -1,7 +1,7 @@
 # Tested ceilings for the upstream Proxmox packages our patches touch: the
 # two hooks pve-ext ships for pve-manager (pve-ext/patches/pve-manager.toml)
 # and pve-meta's one guest-lifecycle diff (patches/lifecycle.toml), which
-# touches libpve-guest-common-perl (lifecycle is snapshot-only -- see
+# touches libpve-guest-common-perl (the whole lifecycle is one file -- see
 # docs/DESIGN.md section 6 and docs/LIFECYCLE-PATCHES.md; pve-container and
 # qemu-server are no longer patched at all).
 #

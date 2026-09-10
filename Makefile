@@ -61,11 +61,12 @@ ui:
 		echo "warning: npm not found, packaging without Monaco (no Text card, no diff)" >&2; \
 	fi
 
-# Per docs/DESIGN.md section 5, pve-meta is a consumer of pve-ext's three generic
+# Per docs/DESIGN.md section 7, pve-meta is a consumer of pve-ext's three generic
 # seams (see pve-ext/README.md), not a package that patches PVE itself:
 #   - API module:    perl/PVE/API2/Ext/Meta.pm, discovered by PVE::API2::Ext at
 #                     pvedaemon/pveproxy startup -- no registration diff needed.
-#   - UI page:       pages/pve-meta.json, discovered by pve-ext-loader.js.
+#   - UI pages:      pages/pve-meta.json and pages/pve-meta-dc.json, discovered by
+#                     pve-ext-loader.js.
 #   - Managed patch: patches/lifecycle.toml + patches/lifecycle/*.diff, applied by
 #                     `pve-ext-patch apply pve-meta-lifecycle` from debian/pve-meta.postinst.
 # Two binary packages come from this source (see debian/control):
@@ -73,9 +74,9 @@ ui:
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own `install` target, invoked with
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
 #
-# Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module (if
-# it's been generated yet -- see docs/DESIGN.md section 3), the ExtJS editor tab
-# and its vendored assets (served by pveproxy), and the pve-ext page/patch
+# Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module
+# (docs/DESIGN.md section 5), the ExtJS editor tab with its core `.wasm` and
+# vendored Monaco (served by pveproxy), the two CLIs, and the pve-ext page/patch
 # manifests.
 install:
 	if [ -f perl/PVE/API2/Ext/Meta.pm ]; then \
@@ -88,9 +89,9 @@ install:
 	# that plus the two registry lists, and a manifest carries a single `xtype`.
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
 	install -D -m 0644 pages/pve-meta-dc.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-dc.json
-	# pve-ext managed-patch manifest for the guest-lifecycle snapshot hooks
+	# pve-ext managed-patch manifest for the guest-lifecycle hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
-	# lifecycle is snapshot-only, see docs/LIFECYCLE-PATCHES.md).
+	# the whole lifecycle is one patched file, see docs/LIFECYCLE-PATCHES.md).
 	# Installed under its own declared `id` (patches/lifecycle.toml's
 	# top-level `id = "..."` field), not its checkout filename -- so that
 	# pve-ext-patch's claim identity, read from the manifest's own content
@@ -136,7 +137,7 @@ install:
 	# pve-ext UI-page manifests for the editor (see pages/, docs/DESIGN.md
 	# section 8) and its static files. Both are the `script`+`xtype` form: pve-ext's
 	# loader defines the class and puts a native ExtJS panel in the tab, so there is
-	# no iframe and no wasm. Two manifests, one file: they name different `xtype`s
+	# no iframe. Two manifests, one file: they name different `xtype`s
 	# (a guest's document editor, and the datacenter's three sub-tabs) out of the
 	# same script, which the loader fetches once.
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json

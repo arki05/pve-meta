@@ -8,12 +8,12 @@
 # here in the source tree and once installed), which is why the `diff`
 # value below is "lifecycle/<file>.diff" rather than a bare filename.
 #
-# Lifecycle is snapshot-only in this revision (docs/DESIGN.md section 6 and
-# 11): on_snapshot/on_rollback/on_delsnap are the only genuinely
-# un-replaceable hook (a periodic GC replaces the former on_destroy hook,
-# and clone/backup are not carried at all -- see docs/LIFECYCLE-PATCHES.md
-# for why). This manifest used to cover seven files across pve-container,
-# qemu-server and libpve-guest-common-perl; it is down to this one file.
+# The whole lifecycle is one patched file (docs/DESIGN.md section 6 and
+# 11): create, destroy, snapshot, rollback and delete-snapshot all funnel
+# through methods of PVE::AbstractConfig, so the five hooks hang off that
+# one file, and clone/backup are not carried at all -- see
+# docs/LIFECYCLE-PATCHES.md for why. This manifest used to cover seven
+# files across pve-container, qemu-server and libpve-guest-common-perl.
 #
 # `id` is this manifest's stable claim identity (see pve-ext/bin/pve-ext-patch's
 # header comment): the root Makefile installs this file under

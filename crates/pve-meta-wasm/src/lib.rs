@@ -4,14 +4,17 @@
 //! # The ABI
 //!
 //! A plain `cargo build --target wasm32-unknown-unknown`; no `wasm-bindgen`,
-//! no build tool beyond cargo. Four exports:
+//! no build tool beyond cargo. Five exports:
 //!
 //! * `pm_alloc(len) -> ptr` / `pm_free(ptr, len)` -- a buffer the caller
 //!   copies its request into and releases afterwards;
 //! * `pm_call(ptr, len) -> out_len` -- runs one request and leaves the
 //!   response in an output buffer this module owns;
 //! * `pm_output() -> ptr` -- that buffer. It is reused by the next call, so
-//!   the caller copies the response out before calling again.
+//!   the caller copies the response out before calling again;
+//! * `pm_abi() -> u32` -- [`ABI`], which the glue checks on attach so a
+//!   `.wasm` and a script from different builds fail loudly rather than
+//!   mis-read each other.
 //!
 //! A request is one UTF-8 JSON document, `{"fn": <name>, "args": [...]}`,
 //! and a response is `{"ok": <value>}` or `{"err": {"message": ..., "line"?,

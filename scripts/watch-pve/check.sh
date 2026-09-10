@@ -12,8 +12,8 @@
 #      index.html.tpl and PVE/API2.pm;
 #   3. for libpve-guest-common-perl: the same `pve-ext-patch --root
 #      <extracted> verify`, against a copy of patches/lifecycle.toml
-#      filtered down to that package's own entries (lifecycle is
-#      snapshot-only in this revision -- one file, one package -- but the
+#      filtered down to that package's own entries (the whole lifecycle
+#      is one file in one package, but the
 #      filter step is kept so a future entry doesn't require re-deriving
 #      this logic; see docs/DESIGN.md section 6 and
 #      docs/LIFECYCLE-PATCHES.md).

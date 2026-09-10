@@ -1,7 +1,7 @@
 /*
  * pve-meta-tree.js — the native ExtJS implementation of the pve-meta editor.
  *
- * One panel with two cards (DESIGN.md §5, §7, §8):
+ * One panel, one edited document, two views of it (DESIGN.md §7, §8):
  *
  *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
  *     document the caller can see. Rows are the union of the keys present in the
@@ -11,14 +11,17 @@
  *     renders faded with its default, and "setting" it is just editing it. Map rows
  *     carry a folder icon (open when expanded), value rows a document icon, both at the
  *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
- *     for the map itself) are not rows — `k__` is the Description of row `k`. Arrays are
- *     one text leaf. Access lists every permission whose prefix covers the row.
+ *     for the map itself) are not rows — `k__` is the Description of row `k`. A list is
+ *     a container like a map, one row per member. Access lists every permission whose
+ *     prefix covers the row.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
- *     toggle), Apply through a diff dialog and Discard.
+ *     toggle) over the same planned document.
  *
- * The Tree|Text segmented button at the right end of the toolbar swaps the body in
- * place; leaving Text with an edited buffer asks first.
+ * The Tree|Text segmented button in the footer (`PVE.meta.Footer`) swaps the body in
+ * place. Both views show the document as it *would be* with the staged edits applied;
+ * leaving Text parses the buffer back into staged edits, and only a buffer that does
+ * not parse can refuse the switch.
  *
  * `PVE.meta.TreePanel` is composed at definition time from three method sets that
  * share one `this` (`PVE.meta.compose`, below the other `PVE.meta.*` helpers):
@@ -32,12 +35,12 @@
  *
  * Editing is a modal row editor (Edit, double-click, or Enter), the field chosen from
  * the grammar type and falling back to the value's own type; editability is per row from
- * `GET /meta/access`. A commit is one minimal write:
- *   PUT /meta/guests/{vmid}?view=<dotted.path>&mode=replace&data=<json>&digest=<d>
+ * `GET /meta/access`. Edits are staged (`PVE.meta.EditSet`) and one Apply writes them:
+ *   PUT /meta/guests/{vmid}?view=<narrowest covering path>&mode=replace&data=<json>&digest=<d>
  * 409 (digest mismatch) reloads and reports the API's message verbatim. A 5 s poll of
  * `GET /meta/version?id=<docid>` — this document plus the registry, never the whole
  * store — refreshes the tree when the content token changed, and never while a row
- * editor, the text window or the Text card is open.
+ * editor, the text window or the Text card is open, or anything is staged.
  *
  * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
  * card on the whole document, and the diff that confirms either one's Apply. Its AMD
@@ -322,7 +325,7 @@ PVE.meta.Utils = {
 
     // The field a row's value is edited with. The grammar's declared type wins over the
     // type inferred from the stored value: it is the operator's statement of what the
-    // key means, and the API's JSON view cannot tell a boolean from the integer 1.
+    // key means, so a stored `1` under a declared `boolean` still gets the checkbox.
     editorFor: function (d) {
         if (d.enumValues) {
             return {
