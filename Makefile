@@ -35,7 +35,7 @@ MONACO := $(UI_DIR)/monaco/vs
 WASM_TARGET := wasm32-unknown-unknown
 WASM := target/$(WASM_TARGET)/wasm/pve_meta_wasm.wasm
 
-.PHONY: build ui wasm deb install clean check test doc
+.PHONY: build ui wasm deb install clean check check-perl test doc
 
 build: wasm
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
@@ -196,6 +196,18 @@ check: doc wasm
 	else \
 		echo "warning: node not found, skipping the ui-extjs smoke suite" >&2; \
 	fi
+
+# Every shell and Perl file, compiled but not run. The PVE modules the Perl
+# files `use` are stubbed (scripts/perl-stubs) so this runs on a laptop and in
+# CI's plain Debian container; on a PVE host `perl -c` without -I is stricter.
+# pve-ext-patch rewrites files inside pve-manager and libpve-guest-common-perl,
+# which is the strongest reason for it to be the one script shellcheck sees.
+check-perl:
+	shellcheck pve-ext/bin/pve-ext-patch
+	@for f in perl/PVE/API2/Ext/Meta.pm pve-ext/perl/PVE/API2/Ext.pm \
+	          bin/pve-meta examples/maintenance-hook.pl; do \
+		perl -Iscripts/perl-stubs -c $$f || exit 1; \
+	done
 
 test:
 	$(CARGO) test -p pve-meta-core -p pve-meta-wasm

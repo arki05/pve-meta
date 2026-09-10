@@ -29,7 +29,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential curl git pkg-config libssl-dev libperl-dev perl \
             debhelper dh-cargo devscripts fakeroot dpkg-dev lintian \
-            nodejs npm
+            nodejs npm shellcheck
 
       # `--profile minimal` is rustc, cargo and rust-std for the host only.
       # `make wasm` (a dependency of `make build` and `make check`) needs the
@@ -72,6 +72,13 @@ jobs:
 
       - name: The perlmod boundary suite
         run: make -C crates/pve-meta-perl check
+
+      # shellcheck on pve-ext-patch and perl -c on every Perl file, against
+      # stub PVE modules: this container has no PVE, and the patch tool that
+      # rewrites core PVE files was otherwise never checked anywhere but by
+      # hand.
+      - name: Shell and Perl syntax
+        run: make check-perl
 
       - name: Build .deb packages
         run: make deb
