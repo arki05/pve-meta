@@ -119,6 +119,25 @@ fn walk(v: &Value, path: &Path, out: &mut Vec<Lint>) {
     }
 }
 
+/// `true` if `a` and `b` are the same document **including key order**.
+///
+/// `Value`'s own `==` compares maps as sets, which is right for "did a value
+/// change" (a reordering touches no path, `docs/DESIGN.md` §3.4) and wrong
+/// for "is this the document that was typed": key order is data (§2), and a
+/// staged edit set that loses a reordering has lost something.
+pub fn same_ordered(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter().zip(y.iter()).all(|((ka, va), (kb, vb))| ka == kb && same_ordered(va, vb))
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(va, vb)| same_ordered(va, vb))
+        }
+        _ => a == b,
+    }
+}
+
 /// Looks up `path` in `doc`. Object keys and array indices are both
 /// supported as path segments. Returns `None` if any segment is missing, out
 /// of bounds, or addresses through a scalar.

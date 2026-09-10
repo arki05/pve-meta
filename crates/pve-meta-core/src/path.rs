@@ -14,10 +14,18 @@ use crate::error::Error;
 /// map is gone, and access-control data lives outside documents entirely
 /// (§3). Neither character is a path separator (those are `.` and `/`), so
 /// this does not introduce any addressing ambiguity.
-pub(crate) fn is_valid_segment(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '!')
+pub fn is_valid_segment(s: &str) -> bool {
+    !s.is_empty() && invalid_char(s).is_none()
+}
+
+/// The first character of `s` that the segment charset does not admit, if
+/// any. This is the charset [`is_valid_segment`] is defined by; it is
+/// separate so an editor can *name* the character it refuses ("a space is
+/// not allowed in a key") instead of restating the charset as a regex of its
+/// own -- which is how the browser and the server came to hold two copies.
+pub fn invalid_char(s: &str) -> Option<char> {
+    s.chars()
+        .find(|&c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '!'))
 }
 
 /// A path into a document: a sequence of object-key or array-index segments.

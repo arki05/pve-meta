@@ -53,8 +53,9 @@
 //!
 //! # The two nesting rules are opposites, deliberately
 //!
-//! [`governing`]: **most-specific wins, schemas never merge.** The longest
-//! declared prefix covering a path governs it; no other contributes.
+//! [`crate::shape::Shape::governing`]: **most-specific wins, schemas never
+//! merge.** The longest declared prefix covering a path governs it; no other
+//! contributes.
 //!
 //! [`scopes_for`]: **permissions accumulate by containment.** A grant on `homelab`
 //! covers `homelab.docker`, because "you may write `homelab`" not implying its
@@ -123,6 +124,49 @@ impl Selector {
             Selector::Tag(t) => tags.iter().any(|have| have == t),
         }
     }
+
+    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`,
+    /// `GET /meta/permissions`), which is [`Selector`]'s own serialization
+    /// after a trip through Perl -- where `true` becomes `1`. That is the one
+    /// tolerance here; the rule ("exactly one of `all: true` or `tag: <name>`")
+    /// is [`parse_selector`]'s, applied unchanged, so a file and a listing
+    /// cannot mean different things by the same selector.
+    ///
+    /// # Errors
+    /// [`Error::Registry`] as [`parse_selector`].
+    pub fn from_wire(v: &Value) -> Result<Selector> {
+        let Some(map) = v.as_object() else {
+            return Err(bad("selector: not a map"));
+        };
+        let all = match map.get("all") {
+            None => None,
+            Some(Value::Bool(b)) => Some(*b),
+            Some(Value::Number(n)) => Some(n.as_i64() == Some(1)),
+            Some(Value::String(s)) => Some(s == "1"),
+            Some(_) => return Err(bad("selector: 'all' is not a boolean")),
+        };
+        let tag = match map.get("tag") {
+            None => None,
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(_) => return Err(bad("selector: 'tag' is not a string")),
+        };
+        if map.keys().any(|k| k != "all" && k != "tag") {
+            return Err(bad("selector: unknown field"));
+        }
+        parse_selector("selector", Some(RawSelector { all, tag }))
+    }
+}
+
+/// Most-specific first: the longer prefix sorts before the shorter, and
+/// equal depths by name, so the order is total and the UI shows something
+/// deterministic. The order [`crate::shape::Shape`] resolves in, and the
+/// order `GET /meta/prefixes` lists in -- one comparator, so the listing a
+/// client sees is the order the server would have resolved.
+pub fn by_specificity(a: &Path, b: &Path) -> std::cmp::Ordering {
+    b.segments()
+        .len()
+        .cmp(&a.segments().len())
+        .then_with(|| a.to_string().cmp(&b.to_string()))
 }
 
 /// One prefix: a prefix, what it is, and where it applies.
@@ -571,36 +615,28 @@ fn load_dirs<T>(
     (by_name.into_iter().collect(), failures)
 }
 
-/// [`load_dirs`] for prefixes, plus the most-specific-first sort
-/// [`governing`] relies on -- shared by [`load_prefixes`] (which drops the
-/// failures) and [`Registry::list_prefixes`] (which keeps them), so the two
-/// can never compute the sort differently.
+/// [`load_dirs`] for prefixes, plus the most-specific-first sort the listing
+/// promises (`docs/DESIGN.md` §5) -- shared by [`load_prefixes`] (which drops
+/// the failures) and [`Registry::list_prefixes`] (which keeps them), so the
+/// two can never compute the sort differently.
 fn prefixes_with_failures(dirs: &[PathBuf]) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
     let (parsed, failures) = load_dirs(dirs, "prefix", parse_prefix, |p, origin, over| {
         p.origin = origin;
         p.overrides = over;
     });
     let mut out: Vec<PrefixDef> = parsed.into_iter().map(|(_, ns)| ns).collect();
-    // Longest prefix first; ties by name, so the order is stable and the UI
-    // shows something deterministic.
-    out.sort_by(|a, b| {
-        b.prefix
-            .segments()
-            .len()
-            .cmp(&a.prefix.segments().len())
-            .then_with(|| a.prefix.to_string().cmp(&b.prefix.to_string()))
-    });
+    out.sort_by(|a, b| by_specificity(&a.prefix, &b.prefix));
     (out, failures)
 }
 
 /// Every prefix in `dirs` (lowest precedence first, later directories
 /// overriding earlier **by file name**), **sorted most-specific first** — the
-/// order [`governing`] relies on.
+/// order `GET /meta/prefixes` lists them in.
 pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
     // Drops the failures, and must keep dropping them: a file that did not
-    // parse is not a prefix, and it must never reach `governing`, which
-    // decides what a document's shape *is*. `Registry::list_prefixes` is the
-    // one place the same failure survives, for the listing that has to show it.
+    // parse is not a prefix, and it must never reach a `Shape`, which decides
+    // what a document's shape *is*. `Registry::list_prefixes` is the one
+    // place the same failure survives, for the listing that has to show it.
     prefixes_with_failures(dirs).0
 }
 
@@ -650,36 +686,6 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
     }
     out.sort();
     out
-}
-
-/// The prefix governing `path`: the one whose prefix is the **longest** that
-/// covers it, among those whose selector matches `tags`.
-///
-/// Most-specific wins and schemas never merge (`docs/DESIGN.md` §3.1). With
-/// both `homelab` and `homelab.docker` declared, `homelab.docker.compose` is
-/// governed by `homelab.docker` alone — `homelab`'s own `properties.docker` is
-/// shadowed, not combined. Merging two schemas is what `allOf`/`$ref` exist
-/// for, and where parent and child have different owners it would mean two
-/// owners fighting over one key.
-///
-/// `prefixes` must be sorted most-specific first ([`load_prefixes`]), so
-/// this is the first match.
-///
-/// **Nothing in this crate calls it**, and that is deliberate rather than an
-/// oversight: schema resolution happens in the editor, which is the only
-/// consumer that needs it today. It stays because this crate owns the data
-/// model, so this is where the rule and its tests belong — and because the
-/// moment a second consumer appears (a client library, a hook script, a second
-/// UI) the alternative is each of them re-deriving it. If that never happens,
-/// delete it rather than letting it drift from the implementation that runs.
-pub fn governing<'a>(
-    prefixes: &'a [PrefixDef],
-    path: &Path,
-    tags: &[String],
-) -> Option<&'a PrefixDef> {
-    prefixes
-        .iter()
-        .find(|ns| ns.selector.matches(tags) && ns.prefix.is_prefix_of(path))
 }
 
 /// The scopes `authid` holds on a guest carrying `tags`: the union of every
@@ -801,72 +807,14 @@ rules:
         assert!(only.iter().all(|p| p.origin == Origin::Cluster));
     }
 
-    /// The schema-shadowing rule against the fixture the JavaScript editor's
-    /// suite reads too (`testdata/governing-cases.json`).
-    ///
-    /// `governing` is mirrored in `ui-extjs`'s `PVE.meta.Utils.governing`, and
-    /// unlike `covers` only *one* of the two runs in production -- this one has
-    /// no caller in the crate at all (see its own doc comment). That makes the
-    /// shared table the entire point of keeping it: the dead twin is what holds
-    /// the live one honest, and a twin tested against its own hand-written
-    /// cases would drift without either side noticing.
-    ///
-    /// The fixture gives the prefixes unsorted and with their selectors, so
-    /// both sides run their whole chain -- here that is `load_prefixes` (parse,
-    /// then sort most-specific-first) followed by `governing` (which applies
-    /// the selector itself); over there it is the selector filter, then
-    /// `bySpecificity`, then `governing`. Factored differently, same answer, or
-    /// the editor paints a row against a schema the server never chose.
     #[test]
-    fn governing_matches_the_shared_cases() {
-        let raw = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/governing-cases.json"
-        ))
-        .expect("the shared fixture is part of the repository");
-        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let cases = doc["cases"].as_array().expect("cases array");
-        assert!(cases.len() >= 12, "the fixture should not have been emptied");
-
-        for case in cases {
-            // Through real files, because the file name *is* the prefix and the
-            // sort that `governing` relies on lives in `load_prefixes`. A test
-            // that built the list by hand would be testing neither.
-            let dir = tempfile::tempdir().unwrap();
-            for def in case["prefixes"].as_array().unwrap() {
-                let name = def["prefix"].as_str().unwrap();
-                let sel = &def["selector"];
-                let body = if sel["all"].as_bool() == Some(true) {
-                    "selector: {all: true}\n".to_string()
-                } else {
-                    format!("selector: {{tag: {}}}\n", sel["tag"].as_str().unwrap())
-                };
-                std::fs::write(dir.path().join(format!("{name}.yaml")), body).unwrap();
-            }
-            let prefixes = load_prefixes(&[dir.path().to_path_buf()]);
-            assert_eq!(
-                prefixes.len(),
-                case["prefixes"].as_array().unwrap().len(),
-                "every fixture prefix should have loaded"
-            );
-
-            let tags: Vec<String> = case["tags"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t.as_str().unwrap().to_string())
-                .collect();
-            let path = Path::parse(case["path"].as_str().unwrap()).unwrap();
-            let got = governing(&prefixes, &path, &tags).map(|n| n.prefix.to_string());
-            let want = case["governing"].as_str().map(str::to_string);
-            assert_eq!(
-                got,
-                want,
-                "governing({:?}) with tags {:?}: {}",
-                case["path"].as_str().unwrap(),
-                tags,
-                case["why"].as_str().unwrap(),
-            );
+    fn a_wire_selector_is_the_file_selector_after_perls_booleans() {
+        // Perl renders `true` as `1`; the rule is still `parse_selector`'s.
+        assert_eq!(Selector::from_wire(&json!({"all": true})).unwrap(), Selector::All);
+        assert_eq!(Selector::from_wire(&json!({"all": 1})).unwrap(), Selector::All);
+        assert_eq!(Selector::from_wire(&json!({"tag": "t"})).unwrap(), Selector::Tag("t".into()));
+        for bad in [json!({}), json!({"all": 0}), json!({"all": true, "tag": "t"}), json!({"tag": ""}), json!({"pool": "p"}), json!("all")] {
+            assert!(Selector::from_wire(&bad).is_err(), "{bad} should not be a selector");
         }
     }
 
@@ -964,7 +912,7 @@ rules:
     }
 
     #[test]
-    fn prefixes_load_most_specific_first_and_governing_takes_the_first_match() {
+    fn prefixes_load_most_specific_first_and_shape_takes_the_first_match() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "homelab.yaml", "selector: {all: true}\nschema: {type: object}\n");
         write(dir.path(), "homelab.docker.yaml", "selector: {all: true}\nschema: {type: object, properties: {compose: {type: string}}}\n");
@@ -975,22 +923,13 @@ rules:
             "longest prefix first",
         );
 
+        // Through real files, because the file name *is* the prefix; the
+        // rule itself is `shape::Shape`'s and tested there.
         let p = |s: &str| Path::parse(s).unwrap();
-        // Most specific wins; schemas never merge.
-        assert_eq!(
-            governing(&all, &p("homelab.docker.compose"), &[]).unwrap().prefix.to_string(),
-            "homelab.docker",
-        );
-        assert_eq!(
-            governing(&all, &p("homelab.notes"), &[]).unwrap().prefix.to_string(),
-            "homelab",
-        );
-        // The child's own prefix is governed by the child, not the parent.
-        assert_eq!(
-            governing(&all, &p("homelab.docker"), &[]).unwrap().prefix.to_string(),
-            "homelab.docker",
-        );
-        assert!(governing(&all, &p("unrelated"), &[]).is_none());
+        let shape = crate::shape::Shape::of_guest(&all, &[]);
+        assert_eq!(shape.governing(&p("homelab.docker.compose")).unwrap().prefix.to_string(), "homelab.docker");
+        assert_eq!(shape.governing(&p("homelab.notes")).unwrap().prefix.to_string(), "homelab");
+        assert!(shape.governing(&p("unrelated")).is_none());
     }
 
     #[test]

@@ -532,6 +532,7 @@ impl MetaStore {
         let raw = String::from_utf8(bytes.clone()).map_err(|e| Error::Parse {
             format: DISK_FORMAT,
             msg: format!("invalid utf-8: {e}"),
+            at: None,
         })?;
         let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
             Ok(value) => (value, None),

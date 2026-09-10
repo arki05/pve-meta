@@ -1,13 +1,17 @@
 //! `pve-meta-core`: the pure-Rust, platform-independent document model,
 //! formats, patch engine, registry and file store behind `pve-meta`.
 //!
-//! Its only consumer is `crates/pve-meta-perl` (`PVE::RS::Meta`), which
-//! exposes the snapshot hooks, the GC and the `api_*` functions backing
-//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §5). There is no daemon and
-//! no CLI.
+//! Two consumers, neither of which reimplements anything here:
+//! `crates/pve-meta-perl` (`PVE::RS::Meta`), which exposes the snapshot
+//! hooks, the GC and the `api_*` functions backing
+//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §5); and
+//! `crates/pve-meta-wasm`, the browser build the editor asks for the codec,
+//! the path rules, [`scopes::Effective`], [`shape::Shape`] and
+//! [`edit::EditSet`]. There is no daemon and no CLI.
 //!
 //! No networking, no async, no PVE-specific crates. Builds and passes tests
-//! on macOS and Linux.
+//! on macOS and Linux, and builds for `wasm32-unknown-unknown` (the
+//! filesystem-facing modules compile there and are simply never called).
 //!
 //! # Module map
 //!
@@ -15,6 +19,12 @@
 //!   authorization, the lint, `touched` reporting, the GC) that
 //!   `PVE::RS::Meta`'s `api_*` functions export to
 //!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §5).
+//! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
+//!   most-specific first: what governs a path, what its schema says
+//!   (`docs/DESIGN.md` §3.1). Schemas shadow.
+//! - [`edit`] — [`edit::EditSet`], the editor's staged edits: apply them to
+//!   the stored document, recover them from an edited one, and the narrowest
+//!   view one Apply writes (`docs/DESIGN.md` §8).
 //! - [`model`] — the [`model::Value`] alias (an order-preserving
 //!   `serde_json::Value`), the one document [`model::lint`], comment keys
 //!   (`foo__`), and path lookup.
@@ -147,6 +157,7 @@ macro_rules! warn_line {
 
 pub mod api;
 pub mod digest;
+pub mod edit;
 pub mod error;
 pub mod format;
 pub mod metaschema;
@@ -155,6 +166,7 @@ pub mod patch;
 pub mod path;
 pub mod registry;
 pub mod scopes;
+pub mod shape;
 pub mod store;
 pub mod view;
 

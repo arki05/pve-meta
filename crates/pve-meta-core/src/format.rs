@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use saphyr_parser::{Event, Parser};
 
-use crate::error::Error;
+use crate::error::{Error, Location};
 use crate::model::{self, Value};
 
 /// A supported document serialization format.
@@ -72,9 +72,11 @@ impl FromStr for Format {
 /// anchors, aliases, explicit tags, or non-string keys).
 pub(crate) fn parse_raw(format: Format, text: &str) -> Result<Value, Error> {
     match format {
-        Format::Json => {
-            serde_json::from_str(text).map_err(|e| Error::Parse { format, msg: e.to_string() })
-        }
+        Format::Json => serde_json::from_str(text).map_err(|e| Error::Parse {
+            format,
+            msg: e.to_string(),
+            at: Some(Location { line: e.line(), column: e.column() }),
+        }),
         Format::Yaml => parse_yaml(text),
     }
 }
@@ -126,7 +128,14 @@ fn parse_yaml(text: &str) -> Result<Value, Error> {
     serde_yaml_ng::from_str::<Value>(text).map_err(|e| Error::Parse {
         format: Format::Yaml,
         msg: e.to_string(),
+        // serde_yaml_ng's `Location` is 1-based on both axes already.
+        at: e.location().map(|l| Location { line: l.line(), column: l.column() }),
     })
+}
+
+/// Where a saphyr span starts, 1-based. A saphyr `Marker` is 0-based.
+fn span_start(span: &saphyr_parser::Span) -> Location {
+    Location { line: span.start.line() + 1, column: span.start.col() + 1 }
 }
 
 /// Context used while walking saphyr's event stream to reject anchors,
@@ -136,10 +145,11 @@ enum Ctx {
     Map { expect_key: bool },
 }
 
-fn yaml_err(msg: impl Into<String>) -> Error {
+fn yaml_err(msg: impl Into<String>, at: Location) -> Error {
     Error::Parse {
         format: Format::Yaml,
         msg: msg.into(),
+        at: Some(at),
     }
 }
 
@@ -156,38 +166,40 @@ fn scan_yaml_safety(text: &str) -> Result<(), Error> {
         }
     }
 
-    fn reject_if_key_position(stack: &[Ctx]) -> Result<(), Error> {
+    fn reject_if_key_position(stack: &[Ctx], at: Location) -> Result<(), Error> {
         if let Some(Ctx::Map { expect_key: true }) = stack.last() {
-            return Err(yaml_err(
-                "non-string (complex) mapping keys are not allowed",
-            ));
+            return Err(yaml_err("non-string (complex) mapping keys are not allowed", at));
         }
         Ok(())
     }
 
     for ev in parser {
-        let (event, _span) = ev.map_err(|e| yaml_err(e.to_string()))?;
+        let (event, span) = ev.map_err(|e| {
+            let m = e.marker();
+            yaml_err(e.to_string(), Location { line: m.line() + 1, column: m.col() + 1 })
+        })?;
+        let at = span_start(&span);
         match &event {
             Event::Alias(_) => {
-                return Err(yaml_err("YAML aliases are not allowed"));
+                return Err(yaml_err("YAML aliases are not allowed", at));
             }
             Event::Scalar(_, _, anchor, tag) => {
                 if *anchor != 0 {
-                    return Err(yaml_err("YAML anchors are not allowed"));
+                    return Err(yaml_err("YAML anchors are not allowed", at));
                 }
                 if tag.is_some() {
-                    return Err(yaml_err("YAML explicit tags are not allowed"));
+                    return Err(yaml_err("YAML explicit tags are not allowed", at));
                 }
                 note_child(&mut stack);
             }
             Event::SequenceStart(anchor, tag) => {
                 if *anchor != 0 {
-                    return Err(yaml_err("YAML anchors are not allowed"));
+                    return Err(yaml_err("YAML anchors are not allowed", at));
                 }
                 if tag.is_some() {
-                    return Err(yaml_err("YAML explicit tags are not allowed"));
+                    return Err(yaml_err("YAML explicit tags are not allowed", at));
                 }
-                reject_if_key_position(&stack)?;
+                reject_if_key_position(&stack, at)?;
                 stack.push(Ctx::Seq);
             }
             Event::SequenceEnd => {
@@ -196,12 +208,12 @@ fn scan_yaml_safety(text: &str) -> Result<(), Error> {
             }
             Event::MappingStart(anchor, tag) => {
                 if *anchor != 0 {
-                    return Err(yaml_err("YAML anchors are not allowed"));
+                    return Err(yaml_err("YAML anchors are not allowed", at));
                 }
                 if tag.is_some() {
-                    return Err(yaml_err("YAML explicit tags are not allowed"));
+                    return Err(yaml_err("YAML explicit tags are not allowed", at));
                 }
-                reject_if_key_position(&stack)?;
+                reject_if_key_position(&stack, at)?;
                 stack.push(Ctx::Map { expect_key: true });
             }
             Event::MappingEnd => {

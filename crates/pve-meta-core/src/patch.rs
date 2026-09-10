@@ -2,12 +2,15 @@
 //! structural diff that turns a whole-document replace into the same
 //! leaf-granular `Touched` list.
 
+use serde::{Deserialize, Serialize};
+
 use crate::model::Value;
 use crate::path::Path;
 
 /// What happened to a path when a patch was applied (or when two documents
 /// were diffed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Op {
     /// The value at this path was created or replaced.
     Set,

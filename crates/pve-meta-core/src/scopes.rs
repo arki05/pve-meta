@@ -68,7 +68,7 @@ pub struct Effective {
 /// [`Path::is_prefix_of`] stays a pure structural predicate. A bare `__` (the
 /// note about a whole *map*) has no subject key and is therefore covered only
 /// where the map itself is.
-pub(crate) fn covers(prefix: &Path, path: &Path) -> bool {
+pub fn covers(prefix: &Path, path: &Path) -> bool {
     if prefix.is_prefix_of(path) {
         return true;
     }

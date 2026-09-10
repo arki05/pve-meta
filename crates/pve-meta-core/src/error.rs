@@ -9,6 +9,14 @@ use crate::store::DocId;
 /// Convenience alias for `Result<T, Error>`, used throughout this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A position in a document's text, 1-based on both axes, as a parser
+/// reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Location {
+    pub line: usize,
+    pub column: usize,
+}
+
 /// All errors that can be produced by `pve-meta-core`.
 ///
 /// `Display` messages are written to be suitable for direct use as an HTTP API
@@ -22,6 +30,11 @@ pub enum Error {
         format: Format,
         /// A human-readable description of the failure.
         msg: String,
+        /// Where in the text, when the parser knows. An editor puts its
+        /// marker on this line; the message alone would leave it guessing
+        /// (and js-yaml's `mark` was the one thing of it the editor leaned
+        /// on that the server's message did not carry).
+        at: Option<Location>,
     },
 
     /// The document failed the lint (see [`crate::model::lint`]).
