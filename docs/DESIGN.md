@@ -23,10 +23,11 @@ Every guest (vmid) has one **document**: `/etc/pve/meta/<vmid>.yaml`, a nested
 key-value tree in the JSON data model — strings, numbers, booleans, arrays, maps — with
 two rules on top:
 
-* **Ordered maps, no nulls.** Key insertion order is kept on disk; absent means unset.
-  Order is preserved as a courtesy to whoever wrote the file, and the editor treats a
-  reordering as a change (`edit::EditSet::between`), but no lookup, selector or
-  permission depends on it.
+* **Ordered maps, no nulls.** Key insertion order is kept on disk as a courtesy to
+  whoever wrote the file; absent means unset. Order is not a value: two maps with the
+  same keys and values in different orders are the same document, a reordering stages
+  nothing in the editor, and no lookup, selector or permission depends on it. A
+  reordering typed in Text mode is written only when applied from Text mode.
 * **Comment keys.** A key ending in `__` is a string note about its sibling (`host__`
   documents `host`; a bare `__` documents the containing map). Comment keys are
   ordinary data; the UI shows them as the row's description.

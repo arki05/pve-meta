@@ -609,8 +609,8 @@ for (let i = 0; i < 500 + CORPUS.length; i++) {
         }
         continue;
     }
-    // JSON.stringify compares structure, values *and* key order, which is what an
-    // ordered-map document model needs.
+    // JSON.stringify compares structure, values *and* key order: the codec keeps
+    // the order it was given, even though order is not a value.
     if (JSON.stringify(back) !== JSON.stringify(doc)) {
         propFails++;
         if (propFails <= 3) {
@@ -731,13 +731,12 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
     sd.setToDefault.call(sd, row({ present: false }));
     eq('a row with no default stages nothing', staged.length, 0);
 
-    // Structural values compare by content, not identity -- key order included, since
-    // key order is data.
+    // Structural values compare by content, not identity, and a map in another key
+    // order is the same value.
     sd.setToDefault.call(sd, row({ present: true, rawValue: ['a'], defaultValue: ['a'] }));
     eq('an equal list is already at its default', staged.length, 0);
     sd.setToDefault.call(sd, row({ present: true, rawValue: { b: 1, a: 1 }, defaultValue: { a: 1, b: 1 } }));
-    eq('a reordered map is not the same value', staged.length, 1);
-    staged.pop();
+    eq('a map in another key order is the same value', staged.length, 0);
 }
 
 console.log('\n--- the hostile document: the editor writes exactly what the store writes ---');
@@ -770,13 +769,12 @@ console.log('\n--- the hostile document: the editor writes exactly what the stor
     eq('a JSON round trip changes nothing', Codec.parse(Codec.dump(JSON.parse(JSON.stringify(y.document)), 'yaml'), 'yaml'), y.document);
 }
 
-console.log('\n--- the document is read as YAML because key order is data ---');
+console.log('\n--- the document is read as YAML: the file\'s own order survives a staged edit ---');
 {
-    // `GET ...?format=json` renders the document as a native Perl hash on the way
-    // out, and a Perl hash has no order: the same document comes back with its keys
-    // in different orders from different workers. The editor reads the canonical
-    // YAML text instead, because `plannedData()` is what an Apply at the root view
-    // writes back, and writing back an order nobody chose rewrites the file.
+    // `GET ...?format=json` renders the document as a native Perl hash, which has
+    // no order and no booleans. Order is not a value, but an Apply at the root view
+    // writes `plannedData()` back, and keeping the file's order is what stops that
+    // from churning it.
     const text = 'zebra: 1\nalpha: 2\nmiddle:\n  z: 1\n  a: 2\n';
     eq('parse keeps the document order', Object.keys(Codec.parse(text, 'yaml')), ['zebra', 'alpha', 'middle']);
     eq('... at every level', Object.keys(Codec.parse(text, 'yaml').middle), ['z', 'a']);
@@ -1186,8 +1184,8 @@ eq('same sees through the layout difference',
     Codec.same(parsed, SERVER_YAML), true);
 eq('same says no when a value really changed',
     Codec.same({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
-eq('same says no when only the key order changed (order is data)',
-    Codec.same({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), false);
+eq('same says yes when only the key order changed (order is not a value)',
+    Codec.same({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), true);
 eq('same on unparseable text is not a match',
     Codec.same({}, 'a:\n  - [\n'), false);
 
@@ -1595,14 +1593,10 @@ console.log('\n--- text is just another way to edit rows ---');
         [{ path: 'netbird.groups', op: 'set', value: ['lan', 'wan'] }],
     );
 
-    // The self-check: key order is data, and a pure reordering produces no per-key
-    // entries -- so the diff must notice it cannot express the change and replace the
-    // document whole rather than silently dropping it.
+    // Key order is not a value: a pure reordering is the same document and stages
+    // nothing (docs/decisions/007-key-order-is-kept-not-meaning.md).
     const reordered = { netbird: stored.netbird, homelab: stored.homelab };
-    const reorder = EditSet.between(stored, reordered);
-    eq('a pure reordering falls back to the whole document', reorder.length, 1);
-    eq('... at the document root', reorder.edits[0].path, '');
-    eq('... and it round trips', reorder.apply(stored), reordered);
+    eq('a pure reordering stages nothing', EditSet.between(stored, reordered).length, 0);
 
     // Whatever comes back, replaying it on the stored document must equal what was
     // typed -- that is the property the fallback exists to guarantee.

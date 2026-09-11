@@ -49,7 +49,7 @@ use pve_meta_core::path::{self, Path};
 use pve_meta_core::registry::{self, Permission, Rule, Selector};
 use pve_meta_core::scopes::{self, Effective, Mode, Scope};
 use pve_meta_core::shape::{self, Declared, Finding, Shape};
-use pve_meta_core::{model, view, Value};
+use pve_meta_core::{view, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -346,10 +346,13 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             let now = a.value()?;
             json!(pve_meta_core::edit::changed_paths(&was, &now))
         }
-        "same_ordered" => {
+        // Value equality: maps compare as sets, because key order is not a
+        // value (`docs/DESIGN.md` §2). What the editor's "is this still the
+        // loaded document" asks.
+        "same" => {
             let x = a.value()?;
             let y = a.value()?;
-            json!(model::same_ordered(&x, &y))
+            json!(x == y)
         }
 
         other => return Err(bad(format!("unknown function '{other}'"))),
@@ -698,7 +701,9 @@ mod tests {
             json!([{"path": "alpha", "op": "delete"}])
         );
         assert_eq!(ok("changed_paths", json!([stored, {"alpha": 2, "zebra": 1}])), json!([]));
-        assert_eq!(ok("same_ordered", json!([stored, {"alpha": 2, "zebra": 1}])), json!(false));
+        assert_eq!(ok("same", json!([stored, {"alpha": 2, "zebra": 1}])), json!(true));
+        assert_eq!(ok("same", json!([stored, {"alpha": 3, "zebra": 1}])), json!(false));
+        assert!(ok("edits_between", json!([stored, {"alpha": 2, "zebra": 1}])).as_array().unwrap().is_empty());
         assert_eq!(ok("edits_under", json!([set, "alpha"])).as_array().unwrap().len(), 1);
         assert_eq!(ok("edits_discard_under", json!([set, ""])), json!([]));
         let e = err("edits_apply", json!([{"a": [1]}, [{"path": "a.b", "op": "set", "value": 1}]]));

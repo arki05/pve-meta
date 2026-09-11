@@ -13,7 +13,7 @@ new record; the old one stays and is marked superseded.
 | [004](004-own-permissions-not-pve-acl-paths.md) | Permissions are pve-meta's own files, not PVE ACL paths | accepted, open to revisit |
 | [005](005-reads-never-fail-on-content.md) | A read never fails on a document's own content | accepted |
 | [006](006-yaml-on-disk-strict-and-canonical.md) | YAML on disk, read strictly, written canonically; JSON is a wire format | accepted |
-| [007](007-key-order-is-kept-not-meaning.md) | Key order is kept on disk and is not meaning | accepted; the editor's reorder diff is open |
+| [007](007-key-order-is-kept-not-meaning.md) | Key order is kept on disk and is not a value | accepted |
 | [008](008-lifecycle-is-one-patched-file.md) | The guest lifecycle is one patched file; clone and backup are not carried | accepted |
 | [009](009-no-sweeper.md) | No garbage collector: hooks on create and destroy, a CLI for orphans | accepted |
 | [010](010-staged-edits-one-model.md) | Edits are staged; the tree and the text editor are two views of one edit set | accepted |

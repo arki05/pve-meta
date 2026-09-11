@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::model::{self, Value};
+use crate::model::Value;
 use crate::patch::{self, Op};
 use crate::path::Path;
 use crate::view;
@@ -116,22 +116,20 @@ impl EditSet {
     /// so a one-key change stays a one-key edit. Lists are compared whole,
     /// because their members are not addressable (`docs/DESIGN.md` §2).
     ///
-    /// Checks itself: key order is data, and a pure reordering produces no
-    /// per-key edits, so the result is replayed and replaced by a single
-    /// whole-document set when the replay is not what was typed. A diff that
-    /// quietly loses something is worse than no diff at all.
+    /// Key order is not a value (`docs/DESIGN.md` §2, `decisions/007`): a
+    /// pure reordering stages nothing, and a key inserted in the middle is
+    /// one edit on that key, which lands at the end of its map.
     pub fn between(stored: &Value, edited: &Value) -> EditSet {
-        let whole = || EditSet(vec![Edit::set(Path::root(), edited.clone())]);
         let (Value::Object(_), Value::Object(_)) = (stored, edited) else {
-            return if model::same_ordered(stored, edited) { EditSet::new() } else { whole() };
+            return if stored == edited {
+                EditSet::new()
+            } else {
+                EditSet(vec![Edit::set(Path::root(), edited.clone())])
+            };
         };
         let mut out = Vec::new();
         walk(stored, edited, &Path::root(), &mut out);
-        let set = EditSet(out);
-        match set.apply(stored) {
-            Ok(replayed) if model::same_ordered(&replayed, edited) => set,
-            _ => whole(),
-        }
+        EditSet(out)
     }
 
     /// The narrowest view covering every staged path: the common prefix of
@@ -175,7 +173,7 @@ fn walk(was: &Value, now: &Value, path: &Path, out: &mut Vec<Edit>) {
         match wm.get(k) {
             None => out.push(Edit::set(at, nv.clone())),
             Some(wv) if wv.is_object() && nv.is_object() => walk(wv, nv, &at, out),
-            Some(wv) if !model::same_ordered(wv, nv) => out.push(Edit::set(at, nv.clone())),
+            Some(wv) if wv != nv => out.push(Edit::set(at, nv.clone())),
             Some(_) => {}
         }
     }
@@ -263,8 +261,6 @@ mod tests {
     #[test]
     fn between_produces_row_edits_and_replays_exactly() {
         let stored = json!({"a": {"b": 1, "c": 2}, "d": 4, "gone": 1, "list": [1, 2]});
-        // `new` appended at the end: a key inserted anywhere else is an order
-        // change, and the whole-document fallback below is the right answer.
         let edited = json!({"a": {"b": 10, "c": 2}, "d": 4, "list": [1, 2, 3], "new": 1});
         let set = EditSet::between(&stored, &edited);
         let shown: Vec<String> = set
@@ -273,26 +269,25 @@ mod tests {
             .map(|e| format!("{:?} {} {}", e.op, e.path, e.value.as_ref().map(ordered).unwrap_or_default()))
             .collect();
         assert_eq!(shown, ["Set a.b 10", "Set list [1,2,3]", "Set new 1", "Delete gone "]);
-        assert!(model::same_ordered(&set.apply(&stored).unwrap(), &edited));
+        assert_eq!(set.apply(&stored).unwrap(), edited);
     }
 
     #[test]
-    fn between_falls_back_to_the_whole_document_when_order_is_all_that_changed() {
-        // Key order is data: a reordering has no per-key expression, and
-        // rather than lose it the diff replaces the document whole.
+    fn a_pure_reordering_stages_nothing() {
+        // Key order is kept on disk as a courtesy and is not a value
+        // (`docs/DESIGN.md` §2): the same keys with the same values in another
+        // order are the same document, at any depth.
         let stored = json!({"b": 1, "a": 2});
-        let edited = json!({"a": 2, "b": 1});
-        let set = EditSet::between(&stored, &edited);
-        assert_eq!(set.edits(), &[Edit::set(Path::root(), edited.clone())]);
-        assert_eq!(ordered(&set.apply(&stored).unwrap()), ordered(&edited));
+        assert!(EditSet::between(&stored, &json!({"a": 2, "b": 1})).is_empty());
+        let nested = json!({"m": {"b": 1, "a": 2}});
+        assert!(EditSet::between(&nested, &json!({"m": {"a": 2, "b": 1}})).is_empty());
 
-        // ... at any depth, and for a key inserted anywhere but the end.
-        let stored = json!({"m": {"b": 1, "a": 2}});
-        assert_eq!(EditSet::between(&stored, &json!({"m": {"a": 2, "b": 1}})).edits()[0].path, Path::root());
+        // A key inserted in the middle is one edit on that key, and it lands at
+        // the end of its map; nothing else moves.
         let stored = json!({"a": 1, "c": 3});
-        assert_eq!(EditSet::between(&stored, &json!({"a": 1, "b": 2, "c": 3})).edits()[0].path, Path::root());
-        // Appending stays a one-key edit.
-        assert_eq!(EditSet::between(&stored, &json!({"a": 1, "c": 3, "d": 4})).edits()[0].path, p("d"));
+        let set = EditSet::between(&stored, &json!({"a": 1, "b": 2, "c": 3}));
+        assert_eq!(set.edits(), &[Edit::set(p("b"), json!(2))]);
+        assert_eq!(ordered(&set.apply(&stored).unwrap()), r#"{"a":1,"c":3,"b":2}"#);
 
         // Identical documents stage nothing; a non-map on either side is whole or nothing.
         assert!(EditSet::between(&stored, &stored).is_empty());

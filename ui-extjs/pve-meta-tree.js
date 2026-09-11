@@ -95,10 +95,18 @@ PVE.meta.Utils = {
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
 
-    // Two document values are the same value. Key order is data (DESIGN section 2)
-    // and JSON.stringify preserves insertion order, so encoding both and comparing
-    // the text is the right test rather than a shortcut.
-    sameValue: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+    // Two document values are the same value. Maps compare as sets: key order is
+    // kept on disk as a courtesy and is not a value (DESIGN §2), so the keys are
+    // sorted before the two are encoded and compared.
+    sameValue: (a, b) => PVE.meta.Utils.canonical(a) === PVE.meta.Utils.canonical(b),
+    canonical: (v) =>
+        JSON.stringify(v, (key, val) =>
+            val && typeof val === 'object' && !Array.isArray(val)
+                ? Object.keys(val)
+                      .sort()
+                      .reduce((o, k) => ((o[k] = val[k]), o), {})
+                : val,
+        ),
 
     // Why a key name is not one, or `null` if it is fine. A dotted path is
     // accepted and checked segment by segment, since the Key field takes one.
@@ -589,11 +597,12 @@ PVE.meta.Codec = {
         return PVE.meta.Codec.dump(value, lang);
     },
 
-    // True if `value` is the same document as `yamlText` parses to, key order
-    // included (key order is data, DESIGN §2).
+    // True if `value` is the same document as `yamlText` parses to. Key order is
+    // not a value (DESIGN §2), so a reordering is the same document -- and the
+    // loaded text, in its own order, is what a switch back to YAML shows.
     same: function (value, yamlText) {
         try {
-            return PVE.meta.Core.call('same_ordered', value, PVE.meta.Codec.parse(yamlText, 'yaml'));
+            return PVE.meta.Core.call('same', value, PVE.meta.Codec.parse(yamlText, 'yaml'));
         } catch (_err) {
             return false;
         }
@@ -870,9 +879,9 @@ PVE.meta.EditSet = function (edits) {
 
 PVE.meta.EditSet.empty = () => new PVE.meta.EditSet([]);
 
-// What would have to be staged to turn `stored` into `edited`, as row edits; one
-// whole-document set when the change has no per-key expression (a key
-// reordering -- key order is data and must not be lost).
+// What would have to be staged to turn `stored` into `edited`, as row edits. A
+// pure key reordering is not a change (key order is not a value, DESIGN §2) and
+// stages nothing.
 PVE.meta.EditSet.between = (stored, edited) =>
     new PVE.meta.EditSet(PVE.meta.Core.call('edits_between', stored, edited));
 
@@ -2283,17 +2292,11 @@ PVE.meta.Doc = {
     },
 
     // This panel's one document.
-    // Reads the document as YAML, and that is a correctness requirement, not a
-    // formatting preference.
-    //
-    // perlmod renders a document as a **native Perl hash**, and a Perl hash has no
-    // key order at all: two `GET`s of the same document come back with their keys
-    // in different orders, depending on which pvedaemon worker answered. Key order is
-    // data in this model (DESIGN section 2), and `plannedData()` is exactly what an
-    // Apply at the root view sends back, so reading JSON meant writing the document
-    // back in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
-    // its rows; the file changed anyway. The canonical YAML text is the one
-    // representation on this wire that carries the order the store actually holds.
+    // Reads the document as YAML, for two reasons. `format=json` renders it as a
+    // native Perl hash, which turns booleans into 1/0 and loses the file's key
+    // order; the YAML text keeps both. Order is not a value (DESIGN §2), but an
+    // Apply at the root view writes `plannedData()` back, and keeping the order
+    // the file already has is what stops that from churning it.
     //
     // The core is loaded first rather than assumed: it is lazy, and calling into it
     // before it is there is a bug this editor has already had once (with js-yaml).

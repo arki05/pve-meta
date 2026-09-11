@@ -70,7 +70,7 @@ New module. An `EditSet` is the list the editor's `me.pending` always was, given
 operations the editor performed on it by hand: `stage` (an edit at `p` drops everything
 staged under `p`; the root drops all), `under`/`discard_under`, `apply` (the planned
 document), `between` (recover the edits from a typed document, with the self-check that
-falls back to a whole-document set when key order changed), `write_view` (the narrowest
+a pure reordering stages nothing), `write_view` (the narrowest
 view covering every staged path, moved up one level when a delete sits exactly there),
 and `changed_paths`.
 
@@ -84,8 +84,8 @@ a path), and if it ever becomes reachable it will be an error rather than a sile
 rewrite.
 
 The self-check in `between` needed something `Value` lacked: `serde_json::Value`'s `==`
-compares maps as sets (which is right for `patch::diff` — a reordering touches no path),
-so `model::same_ordered` was added for "is this the document that was typed".
+compares maps as sets, which is the rule everywhere: a reordering touches no path and
+is the same document (`docs/decisions/007`); `same` on the wasm side is that equality.
 `JSON.stringify` equality was doing that job in JavaScript without anyone having said so.
 
 ### What the browser holds
