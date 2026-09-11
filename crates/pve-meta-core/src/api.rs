@@ -817,7 +817,16 @@ pub fn put_document(
     let new_digest = if dry_run || unchanged {
         crate::digest::digest(text.as_bytes())
     } else {
-        store.put_raw(&doc_id, &text, digest)?.document.digest
+        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        crate::audit(&format!(
+            "{} wrote {doc_id} (view '{}', mode {}): {} path(s) touched, digest {}",
+            acl.authid,
+            view_out(view),
+            if is_merge { "merge" } else { "replace" },
+            touched.len(),
+            &written[..12.min(written.len())],
+        ));
+        written
     };
 
     Ok(ApiPutResult {
@@ -871,7 +880,9 @@ pub fn delete_document(
     // request's own outcome, not a 500.
     let existed = !stored.digest.is_empty();
     let new_digest = if view_path.is_root() {
-        store.delete(&doc_id)?;
+        if store.delete(&doc_id)? {
+            crate::audit(&format!("{} removed {doc_id}", acl.authid));
+        }
         String::new()
     } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
@@ -880,7 +891,15 @@ pub fn delete_document(
         // grant is a `DELETE ?view=authid`, and the same rule has to hold on
         // this path as on `put_document`'s.
         check_registry_shape(&doc_id, &text)?;
-        store.put_raw(&doc_id, &text, digest)?.document.digest
+        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        crate::audit(&format!(
+            "{} removed view '{}' of {doc_id}: {} path(s) touched, digest {}",
+            acl.authid,
+            view_out(view),
+            touched.len(),
+            &written[..12.min(written.len())],
+        ));
+        written
     } else {
         String::new()
     };

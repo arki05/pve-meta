@@ -112,15 +112,41 @@
 /// on surfacing an unreadable registry file in the UI.
 pub fn warn(msg: &str) {
     eprintln!("pve-meta: {msg}");
-    syslog_warning(msg);
+    syslog_line(libc_priority::WARNING, msg);
+}
+
+/// Records a write: who changed which document, where, and how much. One
+/// line per `PUT`/`DELETE` that actually changed a file, at `info`, tagged
+/// `pve-meta audit:` so `journalctl | grep 'pve-meta audit'` is the history
+/// of the store. PVE's task log never sees these writes -- they are plain
+/// API calls, not tasks -- and nothing else recorded who did what.
+///
+/// syslog only, deliberately: the daemons have no other route out, and the
+/// CLI prints its own result, so a second line on its stderr would be noise.
+pub fn audit(msg: &str) {
+    syslog_line(libc_priority::INFO, msg);
+}
+
+/// The two syslog priorities this crate uses, named so the calls above read.
+/// Values are libc's on unix and unused elsewhere.
+mod libc_priority {
+    #[cfg(unix)]
+    pub const WARNING: i32 = libc::LOG_WARNING;
+    #[cfg(unix)]
+    pub const INFO: i32 = libc::LOG_INFO;
+    #[cfg(not(unix))]
+    pub const WARNING: i32 = 4;
+    #[cfg(not(unix))]
+    pub const INFO: i32 = 6;
 }
 
 #[cfg(unix)]
-fn syslog_warning(msg: &str) {
+fn syslog_line(priority: i32, msg: &str) {
     // An interior NUL would truncate the line at the C boundary; a warning is
     // often *about* a hostile or corrupt file name, so it is not a case that
     // can be assumed away.
-    let line: String = format!("pve-meta: {msg}")
+    let tag = if priority == libc_priority::INFO { "pve-meta audit" } else { "pve-meta" };
+    let line: String = format!("{tag}: {msg}")
         .chars()
         .map(|c| if c == '\0' { ' ' } else { c })
         .collect();
@@ -135,16 +161,12 @@ fn syslog_warning(msg: &str) {
     // valid NUL-terminated C strings that outlive the call, and the variadic
     // argument matches the `%s` in the format.
     unsafe {
-        libc::syslog(
-            libc::LOG_WARNING | libc::LOG_DAEMON,
-            c"%s".as_ptr(),
-            c.as_ptr(),
-        );
+        libc::syslog(priority | libc::LOG_DAEMON, c"%s".as_ptr(), c.as_ptr());
     }
 }
 
 #[cfg(not(unix))]
-fn syslog_warning(_msg: &str) {}
+fn syslog_line(_priority: i32, _msg: &str) {}
 
 /// Warns through [`warn`], formatting like `println!`.
 #[macro_export]
