@@ -5335,6 +5335,7 @@ Ext.define('PVE.meta.RegistryGrid', {
                         selector: '',
                         schema: '',
                         enforce: '',
+                        hidden: '',
                         origin: e.origin || 'cluster',
                         overrides: false,
                     };
@@ -5361,6 +5362,7 @@ Ext.define('PVE.meta.RegistryGrid', {
                     selector: U.selectorText(e.selector),
                     schema: e.schema ? gettext('yes') : '',
                     enforce: e.enforce && e.enforce !== '0' ? gettext('yes') : '',
+                    hidden: e.hidden && e.hidden !== '0' ? gettext('yes') : '',
                     origin: e.origin || 'cluster',
                     overrides: !!e.overrides,
                 };
@@ -5382,7 +5384,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         let me = this;
         let isPrefix = me.kind === 'prefixes';
         me.store = Ext.create('Ext.data.Store', {
-            fields: ['name', 'id', 'authid', 'description', 'selector', 'schema', 'enforce', 'summary', 'origin', 'overrides'],
+            fields: ['name', 'id', 'authid', 'description', 'selector', 'schema', 'enforce', 'hidden', 'summary', 'origin', 'overrides'],
             data: [],
             sorters: [{ property: 'name' }],
         });
@@ -5413,6 +5415,13 @@ Ext.define('PVE.meta.RegistryGrid', {
                     width: 90,
                     renderer: Ext.htmlEncode,
                     tooltip: gettext('A write that would not match the schema is refused unless saved anyway'),
+                },
+                {
+                    text: gettext('Hidden'),
+                    dataIndex: 'hidden',
+                    width: 80,
+                    renderer: Ext.htmlEncode,
+                    tooltip: gettext('Declared keys are not offered as rows until something is stored there'),
                 },
             );
         } else {

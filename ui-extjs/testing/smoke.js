@@ -887,6 +887,13 @@ console.log('\n--- a registry file that did not load is still a row ---');
     eq('the failure keeps its error', pfx[1].error, 'mapping values are not allowed here');
     eq('... and says so where it would say what it does', pfx[1].description, pfx[1].error);
     eq('... and is still addressable, which is how it gets repaired', pfx[1].id, 'prefixes/broken');
+    // The two flags as the grid shows them, in Perl's spelling and in JSON's.
+    const flagged = G.rowsFrom('prefixes', [
+        { prefix: 'p', selector: { all: true }, enforce: 1, hidden: true },
+        { prefix: 'q', selector: { all: true }, enforce: '0', hidden: 0 },
+    ]);
+    eq('enforced and hidden read as yes', [flagged[0].enforce, flagged[0].hidden], ['yes', 'yes']);
+    eq('... and 0 as nothing', [flagged[1].enforce, flagged[1].hidden], ['', '']);
     eq('... and keeps the origin, which is where to look for it', pfx[1].origin, 'packaged');
     eq('a file that loaded carries no error', pfx[0].error, undefined);
 
