@@ -2096,6 +2096,43 @@ eq('optional is never declared', D.schemaFrom({ type: 'string', optional: true }
 // leaving it out, and neither is a default.
 eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', enforce: 'inherit' }),
     { type: 'string' });
+
+// `valuesFrom` is `schemaFrom` backwards, and the pair has to agree about every
+// field: one the reverse forgot is a field that silently resets the moment somebody
+// edits a declaration rather than writing a new one.
+[
+    { type: 'string' },
+    { type: 'string', description: 'a host', format: 'dns-name', multiline: 1 },
+    { type: 'integer', minimum: 1, maximum: 65535, default: 80 },
+    { type: 'boolean', default: true },
+    { type: 'string', enum: ['http', 'https'], default: 'http' },
+    { type: 'object', hidden: true, enforce: false },
+    { type: 'string', hidden: false, enforce: true, description: 'x' },
+].forEach(function (decl, i) {
+    const back = D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom(decl, 'k')));
+    // Compared canonically: the form writes its fields in the order a reader wants
+    // them, which need not be the order the file had, and key order is not a value
+    // (decision 007). What has to survive is what it says.
+    eq('declaration ' + i + ' survives a trip through the form',
+        U.canonical(back), U.canonical(decl));
+});
+
+// The two flags are three-state in both directions: absent means inherit, and
+// `false` is a statement that has to come back as `false` rather than as absent.
+eq('an absent flag reads as inherit',
+    [D.valuesFrom({ type: 'string' }, 'k').hidden, D.valuesFrom({ type: 'string' }, 'k').enforce],
+    ['inherit', 'inherit']);
+eq('a false flag reads as false, not inherit',
+    D.valuesFrom({ type: 'string', hidden: false }, 'k').hidden, 'false');
+eq('the key is carried so the form can show it', D.valuesFrom({ type: 'string' }, 'host').key, 'host');
+
+// Which rows are declarations, and which only look like one.
+eq('a top-level declaration', U.declaredKeyAt('schema.properties.host'), 'host');
+eq('a nested one', U.declaredKeyAt('schema.properties.spec.properties.host'), 'host');
+eq('the properties map itself is not one', U.declaredKeyAt('schema.properties'), null);
+eq('nor is the schema node', U.declaredKeyAt('schema'), null);
+eq('nor a key inside a declaration', U.declaredKeyAt('schema.properties.host.format'), null);
+eq('nor anything outside the schema', U.declaredKeyAt('selector.tag'), null);
 eq('hidden writes true', D.schemaFrom({ type: 'string', hidden: 'true' }), { type: 'string', hidden: true });
 eq('shown writes false, which is not the same as unset',
     D.schemaFrom({ type: 'string', hidden: 'false' }), { type: 'string', hidden: false });

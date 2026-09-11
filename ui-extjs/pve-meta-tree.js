@@ -95,6 +95,18 @@ PVE.meta.Utils = {
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
 
+    // The key a path declares, if it is a declaration inside a prefix file's schema
+    // -- `schema.properties.host`, or `schema.properties.spec.properties.host` --
+    // and `null` otherwise. What makes one is the segment before the last: a
+    // declaration is always a child of some `properties`.
+    declaredKeyAt: function (path) {
+        let segs = String(path || '').split('.');
+        if (segs.length < 3 || segs[0] !== 'schema' || segs[segs.length - 2] !== 'properties') {
+            return null;
+        }
+        return segs[segs.length - 1];
+    },
+
     // Two document values are the same value. Maps compare as sets: key order is
     // kept on disk as a courtesy and is not a value (DESIGN §2), so the keys are
     // sorted before the two are encoded and compared.
@@ -1694,14 +1706,22 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
     extend: 'Ext.window.Window',
     xtype: 'pveMetaDeclareKeyWindow',
 
-    title: gettext('Declare Key'),
     modal: true,
     width: 520,
     layout: 'fit',
     prefix: '', // the prefix this declaration is for, shown in the header
+    // Editing an existing declaration rather than adding one: the key is fixed
+    // (renaming it is moving a key, not editing what it says) and every field
+    // starts from what the declaration holds.
+    declaration: null,
+    keyName: '',
 
     initComponent: function () {
         let me = this;
+        let editing = !!me.declaration;
+        me.title = editing
+            ? Ext.String.format(gettext('Edit declaration: {0}'), Ext.htmlEncode(me.keyName))
+            : gettext('Declare Key');
         let numeric = () => ['integer', 'number'].indexOf(me.down('[name=type]').getValue()) !== -1;
         let isString = () => me.down('[name=type]').getValue() === 'string';
         let sync = function () {
@@ -1846,15 +1866,46 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                 },
             ],
             buttons: [
-                { text: gettext('Declare'), handler: () => me.submit() },
+                { text: editing ? gettext('OK') : gettext('Declare'), handler: () => me.submit() },
                 { text: gettext('Cancel'), handler: () => me.close() },
             ],
         });
         me.callParent();
         me.on('show', function () {
+            if (editing) {
+                me.down('form').getForm().setValues(me.valuesFrom(me.declaration, me.keyName));
+                me.down('[name=key]').setReadOnly(true);
+            }
             sync();
-            me.down('[name=key]').focus(true, 50);
+            me.down(editing ? '[name=description]' : '[name=key]').focus(true, 50);
         });
+    },
+
+    // `schemaFrom` backwards: a declaration as the form's own fields, so editing
+    // one starts from what it says. The two have to agree about every field, which
+    // is why they sit next to each other -- a field one of them forgot is a field
+    // that silently resets the moment somebody edits the key.
+    valuesFrom: function (d, key) {
+        let out = {
+            key: key,
+            type: d.type || 'string',
+            description: d.description || '',
+            enum: (d.enum || []).join(', '),
+            minimum: d.minimum,
+            maximum: d.maximum,
+            format: d.format || 'none',
+            multiline: !!d.multiline,
+            hidden: d.hidden === undefined ? 'inherit' : String(!!d.hidden),
+            enforce: d.enforce === undefined ? 'inherit' : String(!!d.enforce),
+        };
+        if (d.default !== undefined) {
+            if (d.type === 'boolean') {
+                out.defaultBool = String(!!d.default);
+            } else {
+                out.default = String(d.default);
+            }
+        }
+        return out;
     },
 
     // The declaration, in the order a reader wants it, with every empty field left
@@ -4466,6 +4517,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // A value with structure inside it is edited as text, wherever the request came
         // from (button, double-click, Enter). Before this, all three simply did nothing
         // on a map row.
+        // A declaration in a prefix file is edited by the form that made it, not as
+        // text: it is the same thing Declare Key writes, so it is the same dialog
+        // prefilled. A row of YAML in a Monaco window is a worse way to change
+        // `type` than the dropdown that knows the types.
+        if (me.editDeclaration(rec)) {
+            return;
+        }
         if (PVE.meta.Utils.editorKind(rec.data) === 'text') {
             me.editAsText(rec);
             return;
@@ -4712,6 +4770,31 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // Declare one key of the selected prefix's schema: a view PUT into
     // `schema.properties.<key>` of that prefix document, with its digest. The
     // window builds the declaration; this only decides where it goes.
+    // Opens the declaration form on an existing declaration, prefilled. Returns
+    // whether it did, so `editRow` can fall through to its other editors.
+    editDeclaration: function (rec) {
+        let me = this;
+        let docId = me.docOf(rec);
+        if (me.docKind(docId) !== 'prefix') {
+            return false;
+        }
+        let key = PVE.meta.Utils.declaredKeyAt(rec.data.path);
+        if (!key) {
+            return false;
+        }
+        let current = PVE.meta.Utils.valueAt(me.plannedData(docId), rec.data.path);
+        if (current === null || typeof current !== 'object' || Array.isArray(current)) {
+            return false; // not a declaration after all; let the text editor have it
+        }
+        me.openEditor(
+            'PVE.meta.DeclareKeyWindow',
+            { prefix: me.docTitle(docId), declaration: current, keyName: key },
+            'declarekey',
+            (_key, schema) => me.stage(rec.data.path, 'set', schema),
+        );
+        return true;
+    },
+
     declareKey: function (rec) {
         let me = this;
         if (!rec || !rec.data.docId || me.docKind(rec.data.docId) !== 'prefix') {
