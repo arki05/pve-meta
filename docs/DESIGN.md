@@ -1,875 +1,307 @@
-# pve-meta — design (revision 6)
+# pve-meta — specification
 
-Revision 6 splits revision 5's "operator registration" into a **prefix** and a
-**permission** (§3, §12); everything else is revision 5's. Revision 5 superseded revision 4 and the
-review-driven decisions in its §8–§9. It follows `../DIRECTION.md` (2026-09-08) with two
-deviations recorded in §11. It is the single authority for the code; where code and this
-document disagree, the code is wrong.
+What is true of the code now. Where code and this document disagree, the code is wrong.
+The reasons behind the rules, and what was tried before them, live in
+[`decisions/`](decisions/README.md); this file does not repeat them.
 
 ## 1. Threat model
 
-This is a trusted, single-administrator environment: a homelab cluster. The principals
-are the administrator and the service API tokens that same administrator issued.
-pve-meta holds configuration intent, not secrets. Scopes are a **blast-radius limiter**,
-not an access-control system: their job is that an operator with a bug writes garbage
-into its own prefix instead of everyone's, and that a principal sees the part of a
-document it cares about. They must be correct; they are not adversarially hardened.
+A trusted, single-administrator environment: a homelab cluster. The principals are the
+administrator and the service API tokens that same administrator issued. pve-meta holds
+configuration intent, not secrets.
 
-In scope: a scoped principal does not read or write document content outside its
-granted prefixes; a concurrent write does not silently lose another's update.
-Out of scope: key-name disclosure through errors, digests or listings; any defence
-against a principal the administrator deliberately issued a token to. pve-meta gates
-nothing but access to metadata documents; it never restricts a PVE permission the
-platform itself grants.
+Scopes are a **blast-radius limiter**, not an adversarial boundary. In scope: a scoped
+principal does not read or write document content outside its granted prefixes; a
+concurrent write does not silently lose another's update. Out of scope: key-name
+disclosure through errors, digests or listings; any defence against a principal the
+administrator deliberately issued a token to. pve-meta gates nothing but access to
+metadata documents and never restricts a PVE permission the platform itself grants.
 
-## 2. The feature
+## 2. Documents
 
-Every guest (vmid) has one **document**: a nested key-value tree stored as YAML in
-`/etc/pve/meta/<vmid>.yaml`. There is no datacenter-level document: cluster-wide
-intent that is not about one guest belongs in the operator that acts on it, and a
-`datacenter.yaml` an earlier release left behind is a stray file the store ignores. A
-document is the JSON
-data model with ordered maps and no nulls. A key ending in `__` is a **comment key**: a
-string note about its sibling (`host__` documents `host`, a bare `__` documents the
-map). Comment keys are ordinary data; the UI renders them as the description of the
-row they document. No key is reserved in any document.
+Every guest (vmid) has one **document**: `/etc/pve/meta/<vmid>.yaml`, a nested
+key-value tree in the JSON data model — strings, numbers, booleans, arrays, maps — with
+two rules on top:
 
-A caller reads or writes a document through a **view**: a key-path prefix (dotted, any
-depth, through maps only). A view of `traefik` is the subtree under `traefik`, returned
-with the prefix stripped. Views are also the unit of access.
+* **Ordered maps, no nulls.** Key insertion order is kept on disk; absent means unset.
+  Order is preserved as a courtesy to whoever wrote the file, and the editor treats a
+  reordering as a change (`edit::EditSet::between`), but no lookup, selector or
+  permission depends on it.
+* **Comment keys.** A key ending in `__` is a string note about its sibling (`host__`
+  documents `host`; a bare `__` documents the containing map). Comment keys are
+  ordinary data; the UI shows them as the row's description.
 
-## 3. Prefixes and permissions
+Object keys match `^[A-Za-z0-9_@!-]+$`. No key is reserved. There is no datacenter-level
+document; a `datacenter.yaml` an earlier release left behind is a stray file the store
+ignores.
 
-Two concepts, in two drop directories. They were one — an "operator registration" —
-until revision 6; see §12 for why splitting them was the point.
+A **view** is a key-path prefix into a document (dotted, any depth, through maps only).
+A view of `traefik` is that subtree with the prefix stripped. Views are also the unit of
+access. Array members are not addressable.
 
-### 3.1 Prefixes — what a prefix is
+Snapshot copies are `<vmid>.<snapname>.yaml` beside the document; they are not documents
+and are never reachable through the API.
 
-`/etc/pve/meta.d/prefixes/<prefix>.yaml`, with packaged defaults in
-`/usr/share/pve-meta/prefixes/<prefix>.yaml` (a cluster file overrides the packaged
-file of the same name).
+## 3. Prefixes — what a prefix is
 
-**The filename is the prefix.** `traefik.yaml` declares `traefik`;
-`homelab.docker.yaml` declares `homelab.docker`. There is no `prefix:` field, so one
-prefix is exactly one prefix and "who declares `traefik`?" is `ls`. A prefix segment
-is `[A-Za-z0-9_@!-]+` and dots are only separators, so a prefix filename can never
-contain a slash, never start with a dot, and never escape its directory — the identity
-is safe by construction rather than by validation.
+`/etc/pve/meta.d/prefixes/<prefix>.yaml`, with packaged defaults under
+`/usr/share/pve-meta/prefixes/<prefix>.yaml`; a cluster file overrides the packaged file
+of the same name. **The file name is the prefix**: `homelab.docker.yaml` declares
+`homelab.docker`. Names are dotted segments of the key charset, at most 128 bytes.
 
 ```yaml
-# /etc/pve/meta.d/prefixes/traefik.yaml
-description: Traefik dynamic configuration
-selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
-schema:                      # optional, PVE::JSONSchema dialect for the subtree
+description: Traefik dynamic configuration   # optional
+selector: { tag: traefik }                   # required: { all: true } or { tag: <t> }
+enforce: true                                # optional, default false
+schema:                                      # optional, PVE::JSONSchema dialect
   type: object
   properties:
     spec:
       type: object
       properties:
-        host: { type: string, description: Public host name }
+        host: { type: string, format: dns-name, description: Public host name }
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A prefix names **no principal**. Declaring that a prefix exists and has a shape is
-useful with no operator, no token and no automation anywhere near it — a structured
-notes field with a schema is a complete use of this system.
+* A prefix names **no principal**. Declaring one is useful on its own.
+* The **selector** decides which guests the prefix reaches, and therefore where its
+  declared-but-unset rows appear and where `enforce` applies. Tag membership is the
+  guest's PVE tags from the cluster's cached guest properties.
+* **Most-specific wins; schemas never merge.** The governing prefix of a path is the
+  longest declared prefix that contains it. A parent's schema for a key a child prefix
+  owns is shadowed, silently. A prefix with no `schema` still governs its subtree.
+* The schema dialect the editor consumes: `type`, `properties`, `description`,
+  `default`, `enum`, `minimum`, `maximum`, `format` (a PVE::JSONSchema format name,
+  validated by proxmoxlib's own vtype in the editor), and `multiline` (an editor hint).
+  Nothing in pve-meta requires a key to be present; a `default` is written only by an
+  explicit action.
+* **`enforce: true`** makes the schema a rule for API writes (§7). Off, a schema is
+  advisory: the editor marks mismatches and asks for a tick.
 
-**Most-specific wins; schemas never merge.** For a document path, the governing
-prefix is the one with the **longest** declared prefix that covers it; no other
-prefix contributes to that path. So with both `homelab` and `homelab.docker`
-declared, `homelab.notes` is governed by `homelab` and `homelab.docker.compose` by
-`homelab.docker` — including `homelab`'s own `properties.docker`, which is shadowed
-rather than merged. Merging two schemas is a rabbit hole (it is what `allOf`/`$ref`
-exist for), and where a parent and child prefix have different owners it would mean
-two owners fighting over one key.
+## 4. Permissions — who may touch a prefix
 
-A parent that declares a key a child prefix owns is **not** rejected: files are
-parsed independently, and a cross-file check would trade that for nothing. It is shadowed silently: the UI shows the child's schema and never the parent's.
-
-The selector decides which guests a prefix reaches, and therefore where its
-declared-but-unset rows appear. Nowhere else.
-
-**A schema is advisory unless the prefix says `enforce: true`.** Then an API write that
-would leave the prefix's subtree not matching the schema — for the paths that write
-changed, never for what was already wrong elsewhere — is a 422 naming the paths, unless
-the request carries `force=1`. `force` is available to anyone who may write: enforcement
-makes a mismatch a deliberate act, not an impossible one, so a drifted schema can never
-lock an administrator out of a document (§4). The editor's "Save anyway" tick sends it.
-Format checks are never enforced: a `format:` is judged by proxmoxlib's validators in
-the editor, and the server must not refuse on a guess.
-
-**A prefix with no `schema` is still a declaration**, and the UI gives it a row like any
-other. Declaring the prefix says *something of mine lives at this key* — which is the
-statement permissions are written in terms of (§3.2) — and that is worth a row even
-before anyone has said what shape it has. Without a schema the row simply has less to
-offer: no declared children, no types, no defaults, just the key, the prefix's
-`description`, and whatever is stored under it. A prefix may also hold **a single
-value**: it is a key like any other, and one that needs to say nothing but `true` does
-not have to grow a subkey to say it. An absent prefix's row falls back to a map, because
-that is what nearly all of them turn out to be, but a stored scalar keeps its own type.
-
-### 3.2 Permissions — who may touch a prefix
-
-`/etc/pve/meta.d/permissions/<name>.yaml`. Cluster-only: **there is deliberately no packaged
-permissions directory.**
+`/etc/pve/meta.d/permissions/<name>.yaml`. **Cluster-only: there is no packaged
+permissions directory**, so an operator's package can declare a prefix but never grant
+itself access.
 
 ```yaml
-# /etc/pve/meta.d/permissions/traefik.yaml
-authid: svc@pve!traefik
-rules:
-  - prefix: traefik
-    mode: rw                 # ro | rw
-    selector: { tag: traefik }
+authid: svc@pve!traefik        # a PVE user or token id
+description: ...               # optional
+rules:                         # optional; a file with none grants nothing
+  - prefix: traefik            # non-empty
+    mode: rw                   # ro | rw
+    selector: { tag: traefik } # required
 ```
 
-That absence is a mechanism, not an omission. An operator's own `.deb` *should* be able
-to ship a prefix — a schema is a declaration. It must never be able to ship its own
-permission file, because that is self-registration, which is privilege escalation. dpkg cannot
-write into pmxcfs, so "an operator declares what it expects; only an administrator
-grants it" is enforced by where the files live rather than by a rule someone has to
-remember. For the same reason **nothing registers itself over the API**: writing either
-directory requires `Sys.Modify` on `/`.
+* **Permissions accumulate by containment.** A rule on `homelab` covers
+  `homelab.docker`. A rule on `p` also covers the sibling comment key `p__`; that is the
+  only comment-key access rule.
+* Permissions apply to **guest documents only**.
+* Both directories are parsed strictly (`deny_unknown_fields`) and independently. A
+  malformed file contributes nothing, is logged, and **is still listed** by `GET
+  /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, error }`, so it
+  can be found and repaired.
 
-**Permissions nest by containment, additively** — the opposite of schemas, deliberately. A
-rule on `homelab` covers `homelab.docker`, because "you may write `homelab`" not
-implying its subtree would be surprising. Schemas shadow because they describe shape and
-shape has one owner; permissions accumulate because they describe access and access is
-a union. Those two rules cannot both live on one object, which is the concrete reason
-this is two concepts and not one.
+## 5. Effective access for one request
 
-### 3.3 Rules common to both
+* `full_read` = `VM.Audit` on `/vms/<vmid>`; `full_write` = `VM.Config.Options`.
+* `scopes` = the union of rules whose `authid` is the caller and whose selector matches
+  the guest.
+* A read of view `P` needs full read or a scope covering `P`. A caller with no read
+  access at all gets 403. A view-less read returns the union of the caller's readable
+  subtrees, in document order.
+* **A write is authorized by what it changes.** The mutation is planned against a copy
+  of the stored document, and every path the plan touches — values changed, keys added,
+  keys removed — needs full write or an `rw` scope. Two request-shaped checks come
+  first: the caller must be able to read the view it names, and must hold some write
+  permission on the document. `full_write` short-circuits both. Key order is not a
+  path, so a pure reordering touches nothing.
+* A document that **cannot be read back** (§7) is repaired only by a root `replace` or a
+  root `DELETE`, and only with full write.
+* Registry documents (§6) get no scopes: read is open to every authenticated user,
+  write is `Sys.Modify` on `/`.
 
-* Files are parsed strictly and independently; a malformed file is skipped with a
-  warning and contributes nothing. It never affects another file.
-* **A skipped file is still listed.** Skipping it and saying nothing made a prefix that
-  stopped parsing — a hand-edit, a bad package upgrade, a half-finished replication —
-  simply cease to exist: absent from `GET /meta/prefixes`, absent from the grid, and its
-  name surviving only in `version?detail=1` or `pve-meta ls` on the node. That was the
-  one failure mode with no observable symptom. The two list endpoints therefore return
-  it as a named entry carrying an `error` and nothing else, the grid marks it, and Edit
-  opens it where it can be repaired. The loader only ever tries files whose *name* is
-  already valid, so a skipped file always has a name to be listed under.
-  It contributes nothing all the same: `load_prefixes` and `load_permissions` hand back
-  only what parsed, so a malformed permission file grants nothing and a malformed prefix
-  describes nothing. The listing is the only place the two halves meet.
-* **A document that does not parse is edited as text.** The tree has no rows to show for
-  one, and a tree showing none would be indistinguishable from an empty document — one
-  Apply away from replacing the file with nothing. So the editor opens it in Text mode
-  with the Tree view unavailable until it parses, which is also where §4's repair (a
-  root replace with a full document) is expressed. Monaco puts the parser's own
-  complaint on the offending line.
-* Prefixes are non-empty. `authid` is a PVE user or token id.
-* A **selector** restricts to guests: `all`, or `tag: <t>` (the guest carries the PVE
-  tag), read from the cluster's cached guest properties. Adding the tag is the
-  deliberate act of including that guest. It is *not* enforced by PVE — see §1: this is
-  a selector, not a permission boundary.
-* Grants apply to **guest documents only**; a registry file is governed by ACLs alone.
-* A rule on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
-  is the only comment-key rule.
+## 6. Registry files are documents
 
-### 3.4 Effective access for one request
+A prefix or permission file is addressed as a document with id `prefixes/<name>` or
+`permissions/<name>`, through the same `view`, `format`, `mode`, `digest`, `dry_run`
+machinery as a guest document. Four things are specific to them:
 
-* `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`.
-* `scopes` = the union of rules whose `authid` is the caller and whose selector
-  matches the guest.
-* Reading view `P` requires full read or a scope covering `P`. A read by a caller with
-  no rule at all is 403.
+* **Writes land in the cluster directory.** Editing a packaged prefix creates the
+  cluster override; deleting the override reverts to the packaged file.
+* **The result must parse as its kind**, using the loader's own parser
+  (`registry::parse_prefix` / `parse_permission`), on every write including `dry_run`
+  and a narrow `DELETE ?view=`. A 200 must never make a file the loader would skip.
+* **No permission reaches them** (§5).
+* **They move the version token** (§8), including a shadowed packaged file.
 
-**A write is authorized by what it changes, not by what it is addressed to.** The plan
-is computed against a copy of the stored document, and every path it touches — every
-value that changed, every key that appeared, every key that vanished — must be covered
-by full write or by a `rw` scope. The view named in the request is where the write is
-aimed, not what it is allowed to do.
+`GET /meta/schemas` returns the two file formats as schemas in the same dialect
+(`metaschema`), so the editor renders a registry document as a typed tree. It is an
+affordance, not the validator; a test keeps its required keys equal to the parser's.
 
-This used to be the other way round: the view itself had to sit inside a writable scope,
-and the root view demanded full write outright. That is coarser than the question anyone
-is asking, and it refused writes that violated nobody's permissions. A permission file
-has `rules`, plural, so holding `rw` on two prefixes and editing one key in each is
-ordinary — and the narrowest view covering both is the document root. A key reordering
-is the same story: it changes no path at all, so it can only be expressed as a
-whole-document write. Both were 403s for writes whose every change was permitted.
+## 7. Documents on the wire
 
-Two request-shaped refusals remain, and neither is about the content:
-
-* **You must be able to read the view you name.** Otherwise the content check is a read
-  oracle — replace a key you cannot read with a guess, and `200` versus `403` tells you
-  whether the guess was right. Requiring read access makes the oracle answer a question
-  you could have asked outright. It is also what keeps a scope-only principal out of the
-  root view, since `covers` never covers the root: it cannot replace a document it can
-  only see part of.
-* **You must have some write permission on this document** — full write, or at least one
-  `rw` scope. The content check measures changed *paths*, and key order is not one, so a
-  pure reordering touches nothing and would otherwise let a read-only auditor rewrite the
-  file.
-
-The consequence of that second rule is deliberate and worth stating plainly: **key order
-is not access-controlled.** Anyone who may write something in a document may reorder its
-keys, including keys they may not otherwise touch. Order is preserved because rewriting
-someone's file differently from how they wrote it is rude, not because anything reads it
-— no lookup, no precedence and no selector depends on it. The alternative is an editor
-where saving as text can fail for reasons nobody can see.
-
-`full_write` short-circuits both, and does not require being able to read: a PVE ACL can
-grant `VM.Config.Options` without `VM.Audit`.
-
-**The one exception is a document that cannot be read back** (§4). Its stored value *is*
-the empty document, so the diff has nothing to compare against: a scoped principal
-replacing the root with nothing but its own subtree would produce a touched list entirely
-inside its own scope, while destroying every other prefix's content in a file nobody can
-currently read. Content-based authorization needs content to authorize against, so the
-whole-document repair keeps requiring full write.
-
-**PVE ACLs cannot express this**, which is why permissions are ours and not
-`pveum acl modify /meta/traefik`. `PVE::AccessControl::check_path` is a hardcoded
-whitelist (`/`, `/access/*`, `/nodes/*`, `/pool/*`, `/sdn/*`, `/storage/*`,
-`/vms/[1-9][0-9]{2,}`, `/mapping/*`); `/meta/*` is not in it and the API refuses it
-(`400 invalid ACL path '/meta/traefik'`, verified live). The whitelist is enforced in
-exactly one place, `PVE::API2::ACL::update_acl`, and the `user.cfg` *parser* only calls
-`normalize_path` — so a hand-written entry would load and evaluate. That is a trap, not
-an opening: unsupported, invisible to the Permissions UI, and one upstream edit from
-breaking silently. Making it legitimate would mean patching a fourth package.
-
-### 3.5 The registry files are documents too
-
-A prefix definition or permission file is addressed as a document: `prefixes/<name>` and
-`permissions/<name>` are ids like `100`, reachable at
-`/meta/prefixes/{name}` and `/meta/permissions/{name}` with the same `view`, `format`,
-`mode`, `digest` and `dry_run` a guest document takes. That is not an aesthetic choice: the
-editor's tree, its markers, its diff, the digest compare-and-swap and the version poll
-are all written against *a document*, and the alternative was a second read/write path
-beside the first — the shape of every wrong-result bug this project has had.
-
-Four things are specific to them:
-
-* **Writes land in the cluster directory**, always. Editing a prefix that a package
-  shipped creates `/etc/pve/meta.d/prefixes/<name>.yaml` and leaves the packaged file
-  alone; a `DELETE` removes only the cluster file, so it is a *revert* to the packaged
-  prefix rather than a removal, and a following `GET` returns the packaged one again.
-  The compare-and-swap is checked against the file the caller actually read, so
-  overriding a packaged file is an ordinary write and not a spurious 409.
-* **The result must parse as what it claims to be.** The loader deliberately skips a
-  malformed file (§3.3), which is exactly why a write that produced one must not answer
-  200: the prefix would silently disappear. `parse_prefix`/`parse_permission` — the
-  loader's own parsers, not a copy — gate every write, including a `dry_run` and a
-  narrow `DELETE ?view=authid`. The ordinary document lint (§4) applies on top, to the
-  `schema:` subtree as much as anywhere else — a property name the lint refuses is a
-  property no document could ever hold — so a registry file that already contains
-  something it rejects is repaired the same way any document is: one whole-document
-  replace. (That is not hypothetical. The lab's `homelab.docker` prefix held
-  `compose: { type: string, description: The compose file, as text }`, where the unquoted
-  comma inside a flow mapping had silently made a second key `as text: null`. The loader
-  never looked inside `schema`, so nothing had complained.)
-* **No permission ever reaches them.** These documents get no scopes at all, so an operator
-  holding `rw` on a prefix cannot edit the permission file that gave it that prefix, nor the
-  prefix that declares it. Self-registration is refused by there being no way to
-  express it. Read is open to every authenticated user, matching the two list endpoints,
-  which return the same content; writing is `Sys.Modify` on `/`.
-* **They move the version token.** The poll walks the registry directories as well as
-  the store, so an editor open on a guest notices a prefix change within one tick.
-  A file shadowed by a higher-precedence one still moves the token while contributing no
-  document of its own: over-notifying a poll costs a reload, under-notifying it leaves a
-  stale UI.
-
-### 3.6 The meta-schema
-
-The two registry formats are themselves described as schemas, in the same
-`PVE::JSONSchema` dialect a prefix uses for a guest's subtree, and served by
-`GET /meta/schemas` as `{ prefix, permission }`. The editor renders a prefix or permission
-document with these exactly the way it renders a guest document with the prefixes
-that reach it: declared rows, hovers, markers, the same code.
-
-It is **not** the validator. `parse_prefix`/`parse_permission` decide what is storable,
-on the way in, in one place (§3.5); this is the affordance that says what to type
-*before* you try. What keeps the two honest is a test rather than a convention: every
-property the meta-schema marks required is dropped from a valid file, and the parser
-has to refuse exactly the ones the schema said it would. That test already earned its
-place — it caught the rule list being documented as required when the parser is happy
-without it (a permission file with no rules grants nothing, which is legal, if pointless).
-
-A prefix's own `schema:` is described as a **free-form object**: `type: object` with
-no `properties`. It is a schema in an open-ended dialect, and the honest offer for it is
-the text editor — a map row opens Monaco on its own subtree (§8) — rather than a form
-covering only the keywords we happened to think of. The small form that *does* exist
-(§8, "Declare Key") writes one property of it, which is the part with a fixed shape.
-
-## 4. Documents on the wire
-
-* Booleans in `data` are rendered as `1`/`0`, the PVE API convention (perlmod and PVE's JSON encoder both do this); a prefix schema's declared type disambiguates them in the UI, and `format=yaml` carries exact types for clients that need them.
-* Reads: `data` (JSON object, unordered) or `text` (YAML, the file's own text for the
-  root view, a canonical dump for a sub-view). Key order is preserved in the file and is
-  not a wire contract; the UI sorts.
-* Writes: `data` (JSON string) or `text` (YAML) with `mode=replace` (the view's subtree
-  is replaced; `{}` stores an empty map) or `mode=merge` (merge-patch, `null` deletes; a
-  write that touches nothing changes nothing — and rewrites nothing, so it does not move
-  `changed` either). One lint runs on the planned document;
-  the write is refused with a 400 that names the offending path. `digest` is the
-  optional expected file digest (409 on mismatch); `dry_run=1` plans and validates
-  without writing.
-* Unrecoverable file — it does not parse, it is above the store's 4 MiB read cap, or it
-  parses to something that is not a mapping (`null` from an empty or comment-only file, a
-  scalar, a list): `format=yaml` returns the raw text plus `parse_error` where the bytes
-  were read at all (so an administrator can repair it); everything else returns 422
-  naming the condition. It is always reported, never rendered as an empty document. A
-  root `replace` or a root `DELETE` by a full writer repairs it, and **nothing narrower
-  is allowed** — a narrower write plans against the empty document, so it would silently
-  discard the file. This is a per-document condition, never cluster-wide.
+* Reads: `format=json` returns `data`, a native structure (unordered, booleans as
+  `1`/`0` per PVE convention); `format=yaml` returns `text`, the file's own text for a
+  full reader's root view and a canonical dump otherwise. The editor reads YAML.
+* Writes: `data` (a JSON string) or `text` (YAML), with `mode=replace` (the view's
+  subtree replaced; `{}` stores an empty map) or `mode=merge` (RFC 7386 merge patch,
+  `null` deletes). `digest` is the compare-and-swap precondition (409 on mismatch;
+  `""` matches a missing document). `dry_run=1` plans and validates without writing. A
+  write that changes nothing rewrites nothing.
+* **One lint** runs on the planned document: top level is a map, no nulls, keys match
+  the charset, comment keys are strings. A failure is a 400 naming the path.
+* **Enforced schemas.** If a prefix that reaches the guest says `enforce: true`, a
+  write that would leave that prefix's subtree not matching its schema — for the
+  findings the write introduces or touches, never for what was already wrong elsewhere
+  — is a 422 naming the paths, unless the request carries `force=1`. Anyone who may
+  write may force. `format:` checks are never enforced.
+* **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
+  `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
+  else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
+  accepted. Per document, never cluster-wide.
+* YAML is read strictly — no anchors, aliases, explicit tags or complex keys; the YAML
+  1.1 words `yes`/`no`/`on`/`off` stay strings — and written canonically (block style,
+  two-space indent, key order kept). Free-form `#` comments survive only until a write.
+* Sizes: writes above 512 KiB are refused (pveproxy refuses a body of about that size
+  first); reads above 4 MiB are never parsed and are identified by a surrogate over size
+  and mtime.
 * Writes run under `PVE::Cluster::cfs_lock_domain("pve-meta-<id>")` with the digest
-  check inside the lock; files are written atomically with node/pid/seq-unique temp
-  names. Reads are unlocked, so a file can vanish under one: that is a 404 (or, in a
-  listing or a poll, a skipped entry), never a 500, and a `DELETE` of a document someone
-  else already removed succeeds. Errors name paths; there is no disclosure filtering.
-* YAML is read strictly: anchors, aliases, explicit tags and non-string keys are
-  refused, and the YAML 1.1 words `yes`/`no`/`on`/`off` stay strings — the store's
-  parser decides what a document can hold, and a client that wants a boolean writes
-  `true`. A document is always rewritten canonically from its value (block style,
-  two-space indent, key order kept), so a free-form `#` comment survives only until
-  something writes the file; comment *keys* are data and survive anything.
-* Sizes: a write above 512 KiB is refused, with a warning logged above 256 KiB. That is
-  a backstop for a hand-written or replicated file being rewritten, and for the pmxcfs
-  budget — not the operative limit for an API write, since pveproxy refuses a body of
-  about that size first (measured: 520 000 B through, 530 000 B → 501 "for data too
-  large"). Reads cap at 4 MiB, eight times the write cap, so nothing the store wrote
-  can hit it. A file above it is never parsed; `digest` and the version token identify
-  it by a surrogate over its size and mtime rather than its bytes, so a multi-megabyte
-  file dropped in out of band is not hashed by every poll, and it stays replaceable
-  against that identity.
+  check inside the lock; files are written atomically. Reads are unlocked: a file that
+  vanishes under one is a 404, never a 500.
+* Every write that changes a file logs one syslog line at `info`, tagged
+  `pve-meta audit:`, with the authid, document, view, mode, touched count and digest.
 
-## 5. API (native, `/api2/json/meta`, served by pveproxy/pvedaemon)
+## 8. API
+
+Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
+`protected`). No `proxyto`: any node answers.
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | `detail`, `id` | `{ token, changed }` — content hash over the store; poll it. With `detail`, also `documents: [{ id, digest }]` (sorted) so a caller that saw the token move knows which documents to re-read instead of re-listing. Snapshot copies move `token` but are not documents and are not listed. Digests are unfiltered (§1). With `id`, the token covers that one document plus the prefix and permission directories and nothing else — what an open editor watches, at a cost that does not grow with the number of guests — and `detail` then lists exactly those. Tokens of different scope are not comparable; poll with a fixed `id`. |
-| GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags: [..], digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
-| GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }`; 422 when the write breaks an enforcing prefix's schema without `force` (§3.1) |
-| DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
-| GET | `/meta/access` | `id` (any document id) | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document (selectors already resolved); `tags` are the guest's PVE tags, filtered exactly as `/meta/guests` filters them (`VM.Audit` only) and empty for any other document; without `id`, the caller's read/write on the registry (`read` always, `write` = `Sys.Modify` on `/`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
-| GET | `/meta/permissions` | — | `[{ name, authid, rules: [{ prefix, mode, selector }] }]` — every permission file, readable by every authenticated user |
-| GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
-| GET/PUT/DELETE | `/meta/permissions/{name}` | same | the permission file, `id: "permissions/<name>"`, same rules |
-| GET | `/meta/schemas` | — | `{ prefix, permission }` — the two registry file formats as schemas (§3.6), so the editor can show one as a typed tree. An affordance, not the validator |
+| GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only. Tokens of different scope are not comparable |
+| GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of; `node`/`name`/`tags` only with `VM.Audit` |
+| GET | `/meta/guests/{vmid}` | `view`, `format` | `{ id, view, digest, data \| text, parse_error? }` |
+| PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }` |
+| DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
+| GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, schema?, origin, overrides }]`, most-specific first, plus `{ prefix, origin, error }` for a file that did not load |
+| GET | `/meta/permissions` | — | `[{ name, authid, description?, rules, origin, overrides }]`, plus `{ name, origin, error }` rows |
+| GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>` |
+| GET | `/meta/schemas` | — | `{ prefix, permission }` |
 
-PUT and DELETE return 404 for a vmid that is not in the vmlist; GET of such a vmid is
-404 too. Reads run in pveproxy, writes are `protected` (pvedaemon). Parameters follow
-PVE conventions; `data` is a JSON-encoded string parameter.
+A vmid absent from the vmlist is 404 for GET, PUT and DELETE. Errors from Rust are
+`"NNN: message"`, re-raised by Perl as a `PVE::Exception`; there is no second error
+vocabulary. Everything crosses the Perl/Rust boundary as native structures except the
+client's `data` string.
 
-Implementation: `perl/PVE/API2/Ext/Meta.pm` is a thin `PVE::RESTHandler` over
-`pve_meta_core::api` through the perlmod bindings. **Grants, guest lists and results
-cross the Perl/Rust boundary as native hashes/arrays**, never as JSON strings; only the
-client-supplied `data` parameter is a JSON string, decoded once in Rust.
+Implementation: `perl/PVE/API2/Ext/Meta.pm` does parameters, PVE ACL checks, the
+vmlist, guest tags and the per-document lock, and calls `PVE::RS::Meta::api_*`;
+`pve_meta_core::api` does everything else. The three get/put/delete families are
+generated from one spec.
 
-Two conventions of that boundary are worth knowing before reading either side. perlmod
-converts a Perl scalar to a Rust `bool` by truthiness — `1`, `"1"` and any non-empty
-string are true; `0`, `""` and `undef` are false — which is the property that replaced
-a hand-built JSON string for the ACL answers (`encode_json` renders Perl's `1`/`0` as
-numbers, and serde wanted `true`/`false`); `test/basic.pl` asserts all six cases. An
-error from the Rust side is `die`d as `"NNN: message"`, an HTTP status prefix that
-`Meta.pm`'s `_call` turns into a `PVE::Exception`; there is no second error vocabulary.
-The bindings add nothing else: a store rooted at `$PVE_META_ROOT` (default
-`/etc/pve/meta`) and the two registry directories, with `PVE_META_PREFIX_DIRS` and
-`PVE_META_PERMISSION_DIRS` as colon-separated overrides for the tests, all opened per
-request — they are tiny, pmxcfs caches them, and a stale grant is a wrong answer about
-who may write.
+## 9. Guest lifecycle
 
-## 6. Guest lifecycle
+One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), managed by
+`pve-ext-patch`:
 
-* **Snapshots**: `pct/qm snapshot`, `rollback` and `delsnapshot` copy, restore and remove
-  `/etc/pve/meta/<vmid>.<snapname>.yaml` through one patched file,
-  `PVE/AbstractConfig.pm` (package libpve-guest-common-perl), calling
-  `PVE::RS::Meta::on_snapshot/on_rollback/on_delsnap`.
-* **Create and destroy**: two hooks in the same patched file. `create_and_lock_config`
-  calls `PVE::RS::Meta::on_create($vmid)` — but **only when `$allow_existing` is false**,
-  i.e. when the `PVE::Cluster::check_vmid_unused` inside it has just asserted the vmid was
-  free — which clears any document and snapshot copies left at that vmid. `destroy_config`
-  calls `PVE::RS::Meta::on_destroy($vmid)` after the config's own `unlink` succeeds, which
-  removes the document and its snapshot copies. Both are `eval`-wrapped and warn: metadata
-  never breaks a guest operation.
+* `create_and_lock_config` calls `on_create` when PVE has just asserted the vmid was
+  unused, clearing any document and snapshot copies left there.
+* `destroy_config` calls `on_destroy` after the config's own unlink, removing the
+  document and its snapshot copies. Every destroy path funnels through it.
+* `snapshot`, `rollback`, `delsnapshot` copy, restore and remove
+  `<vmid>.<snapname>.yaml`. Rollback to a snapshot that had no document removes the
+  live document.
 
-  Those two methods are the whole lifecycle. Every destroy path in `pve-container` and
-  `qemu-server` funnels through `destroy_config` (primary destroy, create/restore failure
-  cleanup, clone failure cleanup, remote-migration abort — 12 call sites), and every
-  creation path through `create_and_lock_config` (create, restore, clone target, CLI,
-  both remote-migration inbound paths — 6 call sites). Neither adds a patched *file*:
-  `AbstractConfig.pm` is already patched for the snapshot trio.
+All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation.
+Migration needs nothing (the document is cluster-wide). Clone and backup are not
+carried; back up `/etc/pve`.
 
-  **The create hook is what a periodic sweep cannot be.** A sweep nominates vmids missing
-  from the vmlist, so a guest destroyed and recreated at the same vmid between two sweeps
-  is never stale from its point of view, and the new guest inherits the old document
-  permanently. Clearing on create closes that window rather than narrowing it, and doubles
-  as the backstop for a destroy that never ran because its node was down.
+There is no sweeper. A guest config removed out of band leaves an orphan; `pve-meta ls
+--orphans` lists them and `pve-meta rm <vmid>` removes one under the document's lock
+with the vmlist re-read inside it.
 
-  Migration needs nothing: `/etc/pve/meta/<vmid>.yaml` is flat and cluster-wide, like
-  `/etc/pve/firewall/<vmid>.fw`; only the guest config is node-scoped and gets
-  `move_config_to_node`'d.
+## 10. The CLI
 
-  The one case the hooks cannot see is a guest config removed out of band, so
-  `destroy_config` never ran. That is an administrator's to notice and clean up:
-  `pve-meta ls --orphans` lists the vmids the store holds a file for that are not in the
-  vmlist, and `pve-meta rm <vmid>` removes one under `cfs_lock_domain("pve-meta-<vmid>")`
-  — the same lock every write holds — with the vmlist re-read inside the lock, refusing
-  a vmid that is live and an empty vmlist (which is what a process that skipped
-  `cfs_update` sees). **Nothing sweeps on a timer**, and there is no orphan concept in
-  the API: a periodic sweep was removed together with its two-phase locking, because
-  the create hook already closes the one hazard it existed for.
-* **Clone and backup**: not carried. Documented: "metadata lives in `/etc/pve`; back up
-  `/etc/pve`". The QEMU backup command cannot embed foreign blobs, so a partial guarantee
-  is not offered.
+`/usr/sbin/pve-meta`, for root on the node: no ticket, no pveproxy, so it works in a
+hook script during boot.
 
-## 7. Extension seams (`pve-ext`)
+| Command | Does |
+|---|---|
+| `get <id> [<view>] [--format yaml\|json]` | a scalar prints bare, structure prints YAML; exit 2 when not there |
+| `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force]` | the API's `PUT mode=replace`, under the document's lock |
+| `merge ...` | the same with `mode=merge` |
+| `delete <id> [<view>] [--digest]` | the API's `DELETE`; exit 2 when nothing was there |
+| `ls [--orphans] [--format plain\|json]` | document ids; with `--orphans`, vmids with files but no guest |
+| `rm <vmid>` | remove an orphan's files; refuses a live guest |
 
-Unchanged in substance: one `<script>` line in `index.html.tpl` loading the page loader,
-two lines at the end of `PVE/API2.pm` calling `PVE::API2::Ext->register_all`, the
-manifest-driven `pve-ext-patch`, and page manifests in `/usr/share/pve-ext/pages/`.
-**New:** a page manifest may declare either `url` (a same-origin iframe) or `script` +
-`xtype` (a native ExtJS panel class defined by that script and instantiated as the tab).
-Both substitute the same placeholders; `requires` gating applies to both. pve-meta ships
-**two** manifests over one script — a manifest carries a single `xtype`, and a guest tab
-(one document's editor) and the datacenter tab (the two registry lists) are
-different panels. The loader fetches a `script` once per URL, so the second manifest
-costs one file and no second download.
+Writes go through the same Rust functions as the API — lint, digest, enforced schemas,
+audit line — and skip only permissions, because root can already write the file.
 
-## 8. The UI: one tree of the document
+## 11. Extension seams (`pve-ext`)
 
-The page shows one tree of the document the caller can see. Rows are the union of the
-keys present and the keys the governing prefixes declare (declared-but-unset rows are
-greyed with their default and a "set" action). Rows carry a folder icon for maps and a
-leaf icon for values, next to the expander. Columns:
+A separate package with three generic seams, each a one-line patch of pve-manager
+applied by `pve-ext-patch`:
 
-* **Key**.
-* **Value**, edited through the row editor (textfield, number, checkbox, combobox for
-  enums); opened by Edit, double-click or Enter.
+* **API modules**: `PVE::API2::Ext` mounts every `PVE/API2/Ext/*.pm` at the path its
+  `ext_path` declares.
+* **UI pages**: `pve-ext-loader.js` fetches `GET /ext/pages` and adds one tab per
+  manifest, as an iframe (`url`) or a native panel (`script` + `xtype`), gated by
+  `requires`.
+* **Managed patches**: TOML manifests describing dpkg-diverted file patches, with
+  apply, verify, remove and status, re-applied by a trigger when the patched package
+  is reshipped.
 
-**A list is a container, like a map.** Its members are rows — one per element, whatever
-the elements are — because the tree exists to make a document something you can look at
-and act on one piece of, and a list was the one shape that stayed a blob of JSON in a
-cell. A member with structure of its own shows one readable line (a permission rule reads
-as `traefik (rw, tag: traefik)`; anything else falls back to JSON) and carries its real
-value along for whatever edits it.
+pve-meta ships two page manifests (guest, datacenter) over one script and one patch
+manifest (lifecycle).
 
-A staged list edit is one write of the whole list, but almost never a change to the
-whole list — so the mark goes on the members that actually differ, and the list itself
-carries only the dot that says something below it changed. A member the edit dropped
-comes back as a ghost, struck through, the same as a deleted key.
+## 12. The editor
 
-Member rows are **not addressable**: a view addresses through maps only, so there is no
-path to `groups[1]` (§2) and nothing may try to write one. They carry their index instead,
-and everything that acts on one — Edit, Remove, Add — rewrites the list it is in. That
-needs no new write path, because staging already turns any number of edits into one write
-(§8); a list rewrite is simply one more staged edit. Add on a list appends rather than
-adding a key beside it, since a list has no keys.
-  **The editor follows the value's shape**: a value with structure inside it — a map,
-  or an array of maps — is edited as *text*, in Monaco on that subtree, by the same
-  three gestures. A string with newlines in it gets a text box rather than a one-line
-  field, and the Value column shows its first line and how many more there are (the
-  row keeps the whole string; only the cell is a summary). There is deliberately no
-  "nested YAML" *type*: a map already is nested YAML, and a type that said so would be
-  the string blob wearing a hat — it costs the per-key rows, diffs and writes that
-  nesting is for. The one thing a declaration can say that the value cannot is
-  `multiline`, for a string that has no value yet; it is the only extension to the
-  dialect, an editor hint, and the server neither reads nor validates it (§4). A schema's
-  `minimum`/`maximum` bound the number editor and its `format` (a `PVE::JSONSchema`
-  format name) validates the field: `ip`, `ipv4`, `ipv6`, `CIDR`, `CIDRv4`, `CIDRv6`,
-  `mac-addr`, `dns-name`, `address`, `email` — wired to proxmoxlib's own vtypes in
-  `ui-extjs`; the core hands a `format` back unjudged (below) rather than carrying a
-  third implementation of what `ipv4` means. **A format the editor does not know
-  constrains nothing**: this is an affordance so a human is told before the round trip, never an
-  authority — the server's one lint is that (§4), and an operator writing through the
-  API is not policed by it. There is deliberately no `pattern`/regex: a format is a
-  name PVE already defines and validates, a regex is one more dialect to own.
-* **Description**: the row's comment key (`k__`) if present, else nothing; the schema's
-  description is the tooltip.
-A button that varies per *document* may hide — Declare Key is a missing concept on a
-guest, not a missing permission, and the toolbar is stable for as long as you are in that
-document. One that varies per *row* is disabled instead, never hidden: otherwise the
-buttons beside it shift under the pointer on every selection change, which is how you
-aim for Remove and hit something else.
+`ui-extjs/pve-meta-tree.js`: plain JavaScript, a native `Ext.tree.Panel`, no build
+step. The rules it needs — codec, key charset, coverage, governing prefix, schema
+findings, staged edits — are `pve-meta-core` compiled to wasm
+(`crates/pve-meta-wasm`, see `WASM-CORE.md`); the editor reimplements none of them.
 
-**Every key is optional, and a default is an offer.** Nothing in pve-meta ever requires
-a key to be present: no write is refused for a missing one and no read invents one. So
-`optional` says nothing about a guest document — it is not in the Declare Key form and
-not in the packaged example, because it would be a claim no code reads. A missing value
-is a legitimate state: an operator fills it in, or there is a reason it is not there.
-A declared `default` is shown on the greyed row and written **only** by the explicit
-**Set to default** button (or by opening the editor, which pre-fills it) — never behind
-your back, and never by merely looking at the document. That button is offered on **any**
-row that declares a default and is not already at it, not only on unset ones: a default
-is the answer to "what should this be", and the moment you most want that answer is when
-the value in front of you is wrong. It stages like every other edit, so it is one Revert
-away and writes nothing until Apply. It is hidden when the document declares no default
-anywhere, and disabled — never hidden — on a row that has none or is already at it. (`optional` survives in the
-meta-schema (§3.6), because those files really do have required fields: a permission file with no
-`authid` is refused on the way in.)
+* **Guest tab**: one tree of the document the caller can see. Rows are the union of
+  keys present and keys the governing prefixes declare; declared-but-unset rows are
+  greyed with their default and a **Set to default** action. Columns: key, value,
+  description (the row's comment key), access (every rule covering the row).
+* **Edits are staged** and one **Apply** writes them as a single `replace` at the
+  narrowest view covering every staged path (a single delete is a `DELETE`). Staged
+  rows render like a pending PVE config change. **Revert** drops them.
+* **Tree | Text** switches between the tree and a Monaco buffer of the same planned
+  document; switching back turns the typed text into staged edits. **Edit selection as
+  text** opens Monaco on one subtree. Both text editors share Format, a YAML/JSON view
+  toggle, Diff and Apply.
+* Schema findings mark rows amber, bubble up to ancestors, and squiggle the text buffer.
+  Apply stops to show the diff only when the edit introduces a finding; a **Save
+  anyway** tick then applies with `force=1`, and enforced findings are labelled.
+* A document that does not parse opens in Text mode only.
+* A version poll (`GET /meta/version?id=`) refreshes the tree, never while anything
+  is staged or an editor is open. Every write carries the digest; a 409 reloads.
+* **Datacenter tab**: two grids, Prefixes and Permissions, with origin, selector,
+  schema and enforced columns. Editing a row opens the file in the same document
+  editor. **New** creates the smallest file the loader accepts, or a service token
+  (a `pve` user with no password, one token with privilege separation off, and an
+  empty permission file naming the token). **Declare Key** writes one
+  `schema.properties.<key>`; **Add Rule** appends to `rules`.
+* The page manifest requires `VM.Audit` (`Sys.Audit` for the datacenter tab).
 
-**Edits are staged, and one Apply writes them.** A row edit used to be a write of
-that one key. That works until a document has a rule spanning two keys, and then it
-does not work at all: a prefix definition's selector is *exactly one of* `all` or `tag`
-(§3.1), so turning `{all: true}` into `{tag: web}` has **no legal single-key step** —
-dropping `all` is refused, adding `tag` is refused, and the row editor could only ever
-do one at a time. The field was uneditable from the tree, with nothing on screen saying
-why.
-
-So the tree works the way the text editor always has. Edits accumulate, the tree renders
-the document as it *would* be, and **Apply** sends them as one write: a `replace` at the
-narrowest view covering every staged path, carrying the planned subtree. For a single
-row that is exactly the one-key write it used to send immediately; for the selector
-change it is one `replace` at `selector`, which is the only thing the server will take.
-A staged delete moves the write one level up, since a key cannot be removed by replacing
-it. Narrow on purpose: a write that names less is a write that can collide with less, and
-a scope-only principal cannot name the root view at all (§3.4). It is no longer narrow
-for *permission* reasons — what a write may do is decided by what it changes — so a plan
-whose narrowest view is the document root is an ordinary write now, not a 403.
-
-A staged row is rendered the way proxmoxlib's own `PendingObjectGrid` renders a config
-change that has not taken effect yet — the stored value, then the pending one beneath it
-in `darkorange`, a pending removal struck through — because that is exactly what this is
-and PVE already has a vocabulary for it. **Revert** drops the lot; a reload or a poll
-never silently discards them (the poll simply holds off while anything is staged); and
-the text editors, which write immediately, are unavailable until the staged set is
-settled, since they would be showing the stored document while the tree shows the
-planned one.
-
-**Apply applies.** It stops to show the diff only when the planned document would not
-match the schema — the one case where seeing it changes what you decide — and the
-"Save anyway" tick keeps storing it anyway a deliberate act, because a mismatch must
-stay possible: the server's lint decides what is *storable* (§4), not a schema that may
-have drifted.
-
-**And only for what this edit did.** The banner lists the findings the edit
-*introduces*: the ones the stored document did not already have, plus any on a path the
-edit changed — so writing a differently-wrong value onto an already-wrong key still
-warns, but editing something else in the same document does not. One bad value used to
-put every later edit anywhere in that document behind the tick, forever, for something
-the edit had not done; a tick you pass every time is a tick you stop reading, which is
-the one thing that tick must not become. The row markers are unchanged and still show
-everything wrong with the document: they say what *is* wrong, the banner asks what you
-are answerable for. A pure key reordering therefore warns about nothing, since it
-changes no value at any path. Otherwise there is nothing to decide, and **Diff** is a button of its own
-in both text editors for whenever you want to look first.
-
-There is deliberately no `dry_run` pass before a write. It once existed to turn a server
-refusal into that same banner — but a refusal is not advisory: the server refuses the
-real write for the same reason, tick or no tick. Showing it as an error is honest;
-offering it as something you can override is not, and it cost every Apply a second
-request.
-
-A row whose value does not match its schema is marked in place: proxmoxlib's `warning`
-colour, a triangle, and the message in the tooltip ahead of the schema's description.
-**The mark bubbles up.** A marker that sits only on the offending row is one you cannot
-see: collapse `homelab` and the amber `port` goes with it, along with any sign that
-something is wrong. So every ancestor carries a triangle in its **Key** column — next to
-the thing you would collapse, and where a map's empty Value column has nothing to say —
-with a count and the first few messages in its tooltip. Staged edits bubble the same way
-and for the same reason, as a `darkorange` dot: the toolbar counter says *how many* are
-unapplied, and this says *where*.
-The text editor has squiggled these since revision 6, but the tree is the view people
-open, and a value the schema refuses looked exactly like one it liked. Both callers ask
-one function (`grammarSplit`) what describes the document, so they cannot disagree.
-Advisory like every other schema signal: the row is still editable and the value is
-still stored — the server's lint decides what is storable (§4).
-
-* **Access**: every rule whose prefix covers the row, `rw` ones by name, `ro` ones
-  muted with "(ro)"; tooltip with selectors. Several principals may read a subtree;
-  "access" is about who writes and who subscribes, not ownership.
-
-**One document, one edited document, two views of it.** Tree and Text are not two
-editors with two models kept apart by rules; they are two ways of looking at the same
-edited document. The buffer is rendered from the **planned** document, so staged row
-edits are visible in it; switching back parses the buffer and turns whatever was typed
-into staged edits *on rows*, so the tree shows which keys changed and to what, and a key
-you deleted shows struck through. Switching is therefore never a decision about your
-work — it used to ask you to discard it, and the Text card used to be refused outright
-while anything was staged.
-
-The core's `EditSet` is what makes that true (`edit.rs`; the editor reaches it as
-`PVE.meta.EditSet`, the object the panel's staged edits are). An edit set is the one model behind both views: a `set` is
-`view::replace` and a `delete` is `view::remove` — the same two operations a `PUT ?view=`
-and a `DELETE ?view=` perform on the server — so what the tree predicts and what the
-store does are one function. `EditSet::between` recovers the edits from a typed
-document and checks itself: key order is data (§2), so a pure reordering produces no
-per-key entries, and rather than lose it the diff replays its own result and falls back
-to replacing the document whole when the replay does not match what was typed. The one
-thing that can refuse the switch is a buffer that does not parse — there is no document
-to draw as a tree, and guessing at one would lose what was typed, so it says so and
-stays put.
-
-Applying **from text** still sends the buffer rather than a dump of the model, and that
-is deliberate: a `#` comment is not part of the document model, so it survives only for
-as long as nothing rewrites the file from the model. Sending the buffer keeps what was
-typed. It is one apply that spends the staged edits too, since the buffer already
-contains them.
-
-**One buffer grammar, two editors.** "How do I read this buffer, and how do I render
-it back" is one rule, and it lived twice: the Text card knew the toggle rule below and
-the subtree window, five hundred lines away, did not, so toggling to JSON and back there
-produced a whitespace-only diff with Apply enabled. Both now call
-`PVE.meta.Codec.parse`/`render`, and a test pins the round trip.
-
-**One footer, three editors.** There are three places you edit a document — the tree,
-the text card behind the Tree | Text toggle, and the text window over one subtree — and
-they had grown three different chromes: the subtree window put its view switch on *top*
-and had no Format button at all, the tree put Apply and Revert on top, and a document
-window's Close sat at the bottom while the Apply for the same document sat at the top of
-the panel inside it. So: **which view you are looking at goes bottom-left, what you can
-do about it goes bottom-right**, built from one place (`PVE.meta.Footer`). The top
-toolbar is left for acting on the document's *contents*, which is a different kind of
-thing from committing. In a window the secondary button is Close, and becomes **Discard**
-once there is something to lose — the way out and the way to abandon the edits are the
-same gesture; in a tab there is nothing to close, so it is Revert.
-
-Toolbar: Add, Edit, Remove (targeting the selection: Add into the selected map, or the
-parent of a selected leaf, or the root), **Set to default**, **Declare Key** (only on a
-prefix document, see below), **Edit selection as text** (enabled with a
-selection; Monaco on that subtree, YAML/JSON view toggle, diff-confirmed apply), Reload,
-and at the right end a **Tree | Text** toggle that swaps the panel body in place between
-the tree and a full-document Monaco editor with Apply (diff dialog, root replace with the
-digest) and Discard; leaving Text while dirty asks first. Text mode validates the buffer **as it is typed**: a
-YAML syntax error is one Error marker on the line the parser reports (Monaco's own JSON
-language service already does this for the JSON view), and every schema finding is a
-Warning marker on its key's line, with the key's declared type, format, range, default
-and description on hover. A document's own comment keys need no hover; they are ordinary
-lines in the YAML. Grammar markers are YAML-only — the line index is a YAML scan — so the
-JSON view keeps syntax validation and loses the schema squiggles. **Nothing here blocks
-anything**: markers are advisory, and a document that does not match the schema is applied
-through the same diff dialog as any other, with a warning banner listing what does not fit
-above the diff and Apply gated on an explicit "Save anyway" tick — one decision, taken with
-the diff it is about on screen, rather than an alert to dismiss before a second window. The server's one lint decides
-what is storable (§4); an operator whose schema has drifted from what a document
-legitimately holds must not be able to lock the administrator out of editing it.
-
-**Format** re-dumps the buffer canonically in whichever language is showing (two-space
-indent, no folding, key order preserved), and refuses a buffer that does not parse rather
-than mangling it. The **YAML | JSON** toggle is presentation only and says so: coming back
-to YAML restores the server's own text whenever the document is unchanged, because a
-hand-edited file keeps a layout no emitter would choose, and re-dumping it made a view
-toggle report unsaved changes. The diff dialog sets `ignoreTrimWhitespace: false` —
-Monaco defaults it to `true`, which hid exactly the indentation-only changes that shape
-produces, leaving a confirm dialog that showed nothing while Apply was enabled. A muted "Scoped write access"
-or "Read-only" label appears next to the toggle only when the caller is restricted. No
-per-row action icons. Editability is per row from `/meta/access`. Every write carries
-the digest and a 409 reloads. The version poll refreshes the tree and the registry
-grids, never while an editor is open or anything is staged.
-
-**Which ACL answers apply is a property of the document, not of the tab.** `GET
-/meta/access` takes the document's `id`, because the two kinds answer differently: a
-guest's read is `VM.Audit`, and a registry file's is **open to every authenticated
-user** while its write is `Sys.Modify` (§3.5). Asking the wrong question once greyed out
-Text mode on a file the caller could certainly read.
-
-**The datacenter tab has two sub-tabs.** A guest tab is one document's editor. The
-datacenter tab is a tab panel: **Prefixes** and **Permissions** (two grids). They are
-two different kinds of thing — a list of definitions, a list of permissions — and an
-earlier revision drew them as branches of a single tree, which claimed a relationship
-they do not have and hid the only columns worth reading. There is no datacenter
-document to edit there (§2). A grid shows what a tree could
-not: which guests a prefix reaches, whether it carries a schema, and **where the file
-came from** — `packaged`, `cluster`, or `cluster (overrides packaged)`, the last being
-the one where Remove does not remove the prefix but reverts to the package's copy. That
-third state is why `origin` and `overrides` are two fields and not one.
-
-Double-click or Edit on a grid row opens that file **in the ordinary document editor**,
-in a window: tree, row editors, markers, Tree | Text, the diff. A prefix definition is a
-document (§3.5), so "edit one" needed no editor of its own — which is the whole return on
-making them documents. Add creates the smallest file the loader will read back (a prefix:
-its name and a selector; a grant: an authid and no entries at all, so it grants nothing
-until an administrator says what) with `digest: ''` as the precondition, so two
-administrators creating the same name is a 409 rather than a silent overwrite, and then
-opens the editor on it. Editing a packaged definition is allowed and creates the cluster
-override; removing one is not, because there is nothing of ours to remove.
-
-The panel is one document's editor throughout, named by `docId`. Rows carry it even
-though there is only ever one: it is what every write threads through, and a panel that
-had to remember which document it was on top of which row was selected is how one
-document's digest ends up on a write to another.
-
-**Declare Key** appears only on a prefix document: a small form for the seven things
-the editor actually consumes (type, description, default, enum, minimum/maximum,
-format) plus `multiline`, writing one `schema.properties.<key>` with an ordinary view
-`PUT`. Anything with no field on that form — a nested `properties`, a
-keyword we did not anticipate — is what editing the schema as text is for. The key
-itself is not validated in the browser: `schema.properties.<key>` is a document path
-like any other, so the server's one lint decides what a key may be and says so. A
-*dotted* key is refused, because it would silently declare a nested property rather than
-the one the form is asking about.
-
-**Add is hidden where nothing can be added.** A permission file has three keys and the
-parser refuses a fourth (`deny_unknown_fields`), so an arbitrary Add there could only
-ever produce a file the loader would skip — the one thing you add to one is a rule, and
-**Add Rule** is that. A prefix definition's root keys are fixed the same way, so Add is
-disabled at its root and available inside `schema`, where you may declare anything.
-
-**Two forms behind the two registry lists.** A prefix definition's schema gets
-**Declare Key** (§8, above); a permission file's `rules` gets **Add Rule** — the same
-shape one document over, because the rules *are* the file and leaving them to the text
-editor made the interesting part the one part with no affordance. Its prefix field is a
-combobox of the declared prefixes but stays editable: a rule may name a prefix nobody has
-declared, since the two are independent files and neither waits for the other. It appends
-by writing `rules` whole, because a view addresses through maps only and there is no path
-to `rules[1]` (§2); changing or removing one is still the text editor.
-
-**One "New" dialog, not two.** Adding a permission file and creating a service token
-were the same act — write a file for a principal — differing only in whether the principal
-exists yet, which is a question the dialog can just ask. It offers an existing user or
-token (a combobox filled from `/access/users?full=1`, which returns users *and* their
-tokens in one call, and stays typable because a permission file may name a principal that
-does not exist yet) or a new service token, which makes the principal an operator needs
-and nothing more: a `pve`-realm user with **no password** (verified: `/access/ticket`
-answers "authentication failure" for it, while its token works — the closest thing PVE has
-to a service principal, since there is no userless API key), one token on it, and a
-permission file naming **the token**, with no rules. Naming the *user* instead would
-produce a file that parses, loads, and grants the token nothing.
-
-The token is created with **privilege separation off**, which is not the PVE default and
-is deliberate: with it on, a token's rights are the intersection of its own ACLs and its
-user's, so a role added to the user later would silently do nothing (verified on the lab —
-an ACL on the token alone is denied, and so is one on the user alone). This user exists
-only to carry this token, so they are one principal in practice.
-
-The optional **guest access** role goes on `/vms`, propagating: per-guest silently misses
-guests created later, and `PVEAuditor` on `/` would hand over far more than a metadata
-reader needs. The dialog says the part that is easy to
-miss — a role there lets the principal read *all* metadata on those guests, because
-`VM.Audit` is full read (§3.4); only writes stay inside its rules.
-
-**Who sees this page.** The manifest requires `VM.Audit` (`Sys.Audit` for the
-datacenter), and that is the whole audience: PVE's own resource tree lists a guest only
-to a caller holding `VM.Audit` on it (`PVE::API2::Cluster::resources`), so a principal
-holding nothing but permissions has no guest to open the tab on, whatever the manifest says.
-Tag selectors are therefore resolved against the server-supplied `tags` on
-`GET /meta/access` (§5) and nothing else, and no server-resolved fallback is needed for a
-caller this page can have. Those tags used to come from `GET /meta/guests`, which reads
-every document in the cluster to answer a question about one guest; they are the same
-tags, computed by the same ACL check, under the same `VM.Audit` filter -- the client
-still only *matches* tags it was given, and never learns one it could not have read. Grants
-lose nothing by that: they bind server-side, on the API a scope-only principal actually
-uses. Inside the tab a caller with `VM.Audit` but not `VM.Config.Options` still edits
-exactly the rows its `rw` rules cover -- that is the "Scoped write access" label.
-
-**The editor's YAML is the store's YAML — by construction.** It was once by agreement:
-two emitters wrote documents a user reads — `serde_yaml_ng` on the server, js-yaml in
-the browser — and every line they disagreed about was a line the editor showed
-differently from the file, and that its diff then attributed to whatever was actually
-being edited (js-yaml's YAML 1.1 compatibility quoted `25565:25565` and `yes` that the
-store writes bare, and indented block sequences the store writes flush). Two settings
-and a shared fixture held them together. There is one emitter now: the editor's codec
-*is* `pve-meta-core::format`, compiled for the browser (`crates/pve-meta-wasm`, §9), and
-`testdata/yaml-cases.json` has one job left — to notice when a `serde_yaml_ng` upgrade
-moves the bytes. (`Codec.render` still prefers the text the editor was handed while the
-document is unchanged — the toggle rule above — because a shared emitter does not cover
-a file somebody wrote by hand.)
-
-**The browser reimplements nothing.** That is the rule the Perl layer has always
-followed — `PVE::API2::Ext::Meta` calls the Rust through perlmod and restates none of it
-— and the editor now follows it the same way. Every rule the editor once held a
-JavaScript copy of is a type in the core, asked through the wasm: the codec
-(`format`), the key charset (`path`), who may touch a path (`scopes::Effective`),
-which prefixes reach a document and what governs a path in it (`shape::Shape`), and
-what staged edits do (`edit::EditSet`). The two opposite nesting rules are two types
-on purpose: a `Shape` answers "what describes this path" with the most specific prefix
-and plain containment; an `Effective` answers "who may touch it" with the union of
-every covering rule and the one comment-key alias. What stays JavaScript is what is
-genuinely presentation: the rows, the markers' line placement, the hover text, and the
-`format:` check, which the core hands back to be run through proxmoxlib's own vtype for
-that name rather than carrying a third implementation of what `ipv4` means.
-
-**The editor reads the document as YAML, never as JSON**, and that is a correctness
-requirement. perlmod renders a document as a native Perl hash on the way out, and a Perl
-hash has no key order: the same document comes back with its keys in different orders
-from different pvedaemon workers (verified on the lab). Key order is data (§2), and the
-planned document is exactly what an Apply at the root view writes back — so reading JSON
-meant writing the document back in an order nobody chose. Nothing looked wrong, because
-the tree sorts its rows; the file changed anyway. The canonical YAML text is the one
-representation on this wire that carries the order the store holds. This applies to every
-JSON consumer, not just the editor: `format=json` is a convenient view of a document's
-*content* and is not order-preserving.
-
-`ui-extjs/` is the implementation: plain JavaScript, `Ext.tree.Panel` with columns,
-mounted as a native tab through the `script`/`xtype` manifest form (§7). Session, CSRF,
-theme and i18n come from the PVE UI, so none of it is reimplemented; there is no iframe
-and no build step of the editor's own. The core arrives as `pve-meta-core.wasm`, a plain
-`cargo build` of `crates/pve-meta-wasm` for `wasm32-unknown-unknown` behind a
-five-export JSON-string ABI — no wasm-bindgen, no generated glue, no tool the Debian
-build would have to pin — loaded lazily like Monaco (`docs/WASM-CORE.md`). The server
-stays the authority: an Apply sends the buffer back as `text` or the planned subtree as
-`data`, and the server runs the same code again on the real write.
-
-A second implementation in pwt/Yew was built to the same specification and compared on
-the lab; it was removed once the choice was made (git tag `pwt-ui-removed`). It cost
-~4,900 lines of Rust and 259 crates against ~2,200 lines of JavaScript, measured at the
-time of the comparison. Its one structural advantage — that it never parsed YAML itself,
-or restated any other rule — was first answered by vendoring a parser with a property
-test, and is now simply taken: the rules run in the browser as the crate they are,
-without the UI framework that came with pwt. What pwt was genuinely better at, native
-unit tests, the crate keeps: the rules are tested in Rust, and `ui-extjs/testing/` tests
-the editor.
-
-## 9. Repository layout
+## 13. Repository layout
 
 ```
-crates/pve-meta-core     document model, views, prefixes+permissions+selectors, shape, edit set, lint, api layer, store
-crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, api exports (native perlmod conversion)
-crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
-perl/PVE/API2/Ext/Meta.pm
-bin/pve-meta             the local CLI: get/set/merge/delete for root on the node, ls/rm for orphans (Perl over PVE::RS::Meta; /usr/sbin)
-pages/                   the two page manifests: guest, and the registry lists on the Datacenter panel (§7)
-prefixes/                packaged example prefixes (none required)
-patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
+crates/pve-meta-core     model, paths, formats, patch, view, registry, scopes, shape, edit, store, api
+crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, stored_vmids, the api_* exports
+crates/pve-meta-wasm     the core for the browser, behind a JSON-string ABI
+perl/PVE/API2/Ext/Meta.pm  the REST module
+bin/pve-meta             the CLI
+pages/                   the two page manifests
+prefixes/                packaged example prefixes
+patches/                 the lifecycle patch manifest and diff
 pve-ext/                 the extension layer (own package)
-ui-extjs/                the editor tab (plain JS, native ExtJS panel)
-testdata/yaml-cases.json the canonical YAML bytes, pinned by both suites (§8)
-debian/, Makefile        packages: pve-ext, pve-meta, libpve-meta-rs-perl
+ui-extjs/                the editor and its offline and headless tests
+scripts/perl-stubs/      stub PVE modules so perl -c runs anywhere
+testdata/                the canonical YAML fixture both suites pin
+debian/, Makefile        packaging
+docs/decisions/          why the rules above are what they are
 ```
-
-## 10. What revision 5 deletes
-
-Reserved `scopes` key and every rule keyed on it (opaque-leaf addressing, touched-path
-collapsing, `check_scopes_write`, authid key lint); the strict/lenient scope parser
-split; the per-request datacenter read for permissions; `WriteGate`, `lint_at`/`lint_relaxed*`,
-the lint-finding subset check; `may_name` and all message redaction; the `keys` wire
-field and the UI's YAML key scanner; the comment-key access machinery (`covers` aliasing
-beyond the one sibling rule, bare-`__` prefix rule, mid-path rejection, `filter`'s comment
-pass); orphan listing/deletion/access rules; the clone and backup hooks and their diffs
-(destroy came back as a hook in `AbstractConfig`, §6, together with a new create
-hook — what went is the GC *timer*, not the destroy hook); JSON-string crossings for permissions, guest lists and results
-(`_grants_json`, `_inflate_view`, `parse_permissions`, `data_json`); the "View as" selector.
-
-## 11. Deviations from DIRECTION.md, with reasons
-
-* **Lifecycle is one patched file, not zero.** Rollback restoring metadata was an explicit
-  product decision; it costs one patched file in the least-churned package, and the
-  create and destroy hooks (§6) ride in the same file for nothing more.
-* **The pwt implementation was not dropped by fiat — it was compared first.** DIRECTION
-  §5.4 argued for switching on the premise that `Ext.tree.Panel` had no pwt equivalent;
-  it does (`DataTable` + `TreeStore`, used by PDM). Both were built to this §8 and judged
-  on the lab. ExtJS won on size and build surface, not on the doc's original argument,
-  and pwt was then removed (§8, git tag `pwt-ui-removed`).
-
-## 12. Why revision 6 splits the registration
-
-Revision 5 had one object doing two jobs, and the type said so: `authid` was
-**mandatory**, so a schema could not be declared without naming a principal. To say
-"a `hass` prefix exists and looks like this" you had to invent an operator to own it.
-
-Three pieces of evidence that it was one concept too few, all of them found in use
-rather than in review:
-
-* **The lab config had already split it by hand.** One file carried the *grammar* with
-  `selector: {all: true}`, another carried the *access* with `selector: {tag: traefik}` —
-  same prefix, two files, because one object could not express both cleanly.
-* **A real bug came out of it.** Declared-but-unset rows were driven by a *permission's*
-  grammar, so a broadly-scoped principal painted one operator's rows onto every guest in
-  the cluster. With the schema on the prefix, the selector that governs rows is the
-  prefix's and that bug is not expressible.
-* **Two files naming the same authid silently unioned their scopes.** Nobody decided
-  that; it is what happens when identity is a field rather than the file.
-
-And the rule that settles it: **schemas shadow, permissions accumulate** (§3.1, §3.2). Two
-opposite nesting semantics cannot live on one object. Revision 5's did — which is why
-overlapping grammars unioned their findings and why a path covered by two schemas got
-whichever the iteration reached last.
-
-What the split buys beyond correctness is that the store's vocabulary loses the word
-*operator* entirely. It knows prefixes and permissions. An operator is an installer — a
-package that drops a prefix, has an administrator issue a grant, and creates an LXC
-with credentials injected. Nothing at runtime needs the concept, so nothing in the core
-carries it.
