@@ -18,5 +18,5 @@ parsing YAML itself, was taken by 011 instead.
 
 ## Consequences
 
-One 5,000-line file that follows pve-manager's ExtJS. Design comparisons and screenshots
-from the evaluation are under `design/`.
+One 5,000-line file that follows pve-manager's ExtJS. The design notes from the
+evaluation are under `design/`; its screenshots were not kept.

@@ -200,27 +200,11 @@ first, which is what its `waitForXtype()` does.
 
 ## Screenshots
 
-In `docs/screenshots/`, taken on `pvemeta-node1` (pve-manager 9.2.11, ExtJS 7.0.0,
-proxmox-widget-toolkit 5.2.8) inside the real UI by `testing/headless-tab-check.js`,
-light and dark, with two permission files (`scoped`, `rw` on `traefik` for tag
-`traefik` and `ro` on `netbird` for all guests; `traefikbot`, `rw` on `traefik`). The
-`readme-*.png` set is what the top-level README shows: the guest tree with staged
-edits, Text mode with the diff, the enforced-schema warning, the Prefixes grid, and
-the declaration form.
+`docs/screenshots/` holds only what the top-level README shows, light and dark: the
+guest tree with staged edits, Text mode with the diff, the enforced-schema warning, the
+Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
+(pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
+Anything else -- the row editor, the JSON view, a read-only or scoped caller's tab --
+is a run of `testing/headless-tab-check.js` away, which writes a full set into the
+directory you give it; that set is not committed.
 
-| File | What it shows |
-|---|---|
-| `extjs-tree-light.png`, `extjs-tree-dark.png` | the Tree card: row icons, the Description column from a comment key, the Access column, a faded declared-but-unset row |
-| `extjs-access-tip-light.png`, `extjs-access-tip-dark.png` | the Access tooltip, one grant per line with its mode and selector |
-| `extjs-rowedit-light.png`, `extjs-rowedit-dark.png` | the row editor (opened by a double-click), with the comment key as its Description field |
-| `extjs-text-light.png`, `extjs-text-dark.png` | the Text card: the whole document in Monaco, YAML |
-| `extjs-text-json-light.png`, `extjs-text-json-dark.png` | the same after the JSON view toggle |
-| `extjs-text-dirty-light.png`, `extjs-text-dirty-dark.png` | leaving Text with an edited buffer, as it asked before staging replaced the question |
-| `extjs-selection-text-light.png`, `extjs-selection-text-dark.png` | *Edit selection as text* on the `traefik` subtree |
-| `extjs-selection-text-json-light.png`, `extjs-selection-text-json-dark.png` | the same value after the JSON toggle |
-| `extjs-diff-light.png`, `extjs-diff-dark.png` | the Monaco diff shown to confirm Apply |
-| `extjs-conflict-light.png`, `extjs-conflict-dark.png` | a 409 reported with the API's message verbatim |
-| `extjs-scoped-light.png` | a caller with one `rw` scope: "Scoped write access", rows outside `traefik` not editable |
-| `extjs-readonly-dark.png` | a caller with read but no write: "Read-only", every editing button disabled |
-| `extjs-addkey.png` | the Add Key window |
-| `extjs-datacenter.png` | the same panel over the datacenter document, which decision 013 has since removed |
