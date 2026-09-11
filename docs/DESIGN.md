@@ -810,7 +810,7 @@ crates/pve-meta-core     document model, views, prefixes+permissions+selectors, 
 crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, api exports (native perlmod conversion)
 crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
 perl/PVE/API2/Ext/Meta.pm
-bin/pve-meta             the local CLI for hook scripts and orphan cleanup (Perl over PVE::RS::Meta; /usr/sbin)
+bin/pve-meta             the local CLI: get/set/merge/delete for root on the node, ls/rm for orphans (Perl over PVE::RS::Meta; /usr/sbin)
 pages/                   the two page manifests: guest, and the registry lists on the Datacenter panel (§7)
 prefixes/                packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)

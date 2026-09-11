@@ -177,9 +177,12 @@ permission file naming that token with no rules — and nothing else; **Add Rule
 what it may touch.
 
 A **local CLI** for hook scripts, `pve-meta get <vmid> [<view>]`, reads `/etc/pve/meta`
-directly: no ticket, no token, no pveproxy, so it works during boot. `pve-meta ls`
-lists documents (`--orphans`: only those whose guest is gone), and `pve-meta rm <vmid>`
-removes an orphan's files under the document's write lock. A scalar prints bare,
+directly: no ticket, no token, no pveproxy, so it works during boot. `pve-meta set`,
+`merge` and `delete` are the API's PUT and DELETE for root on the node — the same Rust
+functions, lint, digest check, enforced schemas (`--force`) and per-document cluster
+lock, so an Ansible task or a cloud-init step can write without a token; every write
+still leaves the audit line. `pve-meta ls` lists documents (`--orphans`: only those
+whose guest is gone), and `pve-meta rm <vmid>` removes an orphan's files. A scalar prints bare,
 anything with structure prints YAML, and exit status 2 means "not there" — which is what
 lets a hook script tell "nothing configured" from "something is broken". See
 `examples/maintenance-hook.pl`, which refuses to start a guest its metadata says is under
