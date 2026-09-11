@@ -271,9 +271,14 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             let index: Vec<Value> = shape
                 .schema_index()
                 .into_iter()
-                .map(|(p, schema)| {
-                    let owner = shape.governing(&p).expect("indexed paths are governed");
-                    json!({"path": p, "prefix": owner.prefix, "schema": schema})
+                .map(|d| {
+                    let owner = shape.governing(&d.path).expect("indexed paths are governed");
+                    json!({
+                        "path": d.path,
+                        "prefix": owner.prefix,
+                        "schema": d.schema,
+                        "hidden": d.hidden,
+                    })
                 })
                 .collect();
             json!(index)

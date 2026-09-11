@@ -4063,6 +4063,20 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     //
     // A registry document's meta-schema is rooted at the document (DESIGN §6):
     // its "prefix" is the empty path, which is the root row itself and gets nothing.
+    // The entry at `path` if the document put one there, without creating it --
+    // the read-only half of `ensure`, for a declaration that may only decorate.
+    existing: function (root, path) {
+        let entry = root;
+        let segs = path ? path.split('.') : [];
+        for (let i = 0; i < segs.length; i++) {
+            entry = entry.children[segs[i]];
+            if (!entry) {
+                return null;
+            }
+        }
+        return entry;
+    },
+
     addShape: function (root, shape) {
         let me = this;
         let U = PVE.meta.Utils;
@@ -4101,7 +4115,17 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 return;
             }
             let ps = ix.schema || {};
-            let child = ensure(ix.path);
+            // A hidden declaration decorates a row that exists; it never creates
+            // one. That is the whole difference: a schema the size of Traefik's is
+            // mostly keys nobody sets on a given guest, and every one of them as a
+            // greyed row buries what the guest actually says. `addData` ran first,
+            // so a hidden key that *is* set already has its row here and still gets
+            // its type, enum, range and default -- hiding a declaration must never
+            // hide data, nor excuse it from its own schema.
+            let child = ix.hidden ? me.existing(root, ix.path) : ensure(ix.path);
+            if (!child) {
+                return;
+            }
             // The comment key stays the Description column; the grammar's own
             // description is the tooltip (DESIGN §12), so they are two fields.
             child.grammarDescription = child.grammarDescription || ps.description;
@@ -4132,8 +4156,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (ps.format !== undefined && child.format === undefined) {
                 child.format = ps.format;
             }
-            // The one extension to the PVE::JSONSchema dialect: "this string is
-            // a block of text". Only a declaration can say so before the key has
+            // One of two extensions to the PVE::JSONSchema dialect (`hidden` is the
+            // other): "this string is a block of text". Only a declaration can say so before the key has
             // a value, which is exactly what `Utils.editorKind` cannot see for
             // itself. It is an editor hint and nothing else -- the server neither
             // reads it nor validates against it, like `format` (DESIGN §7).

@@ -910,6 +910,53 @@ console.log('\n--- a registry file that did not load is still a row ---');
     eq('a failed permission file grants nothing, even carrying rules', p2.applicablePermissions().map((r) => r.name), ['ok']);
 }
 
+console.log('\n--- a hidden declaration decorates a row, it never creates one ---');
+{
+    // A vocabulary the size of Traefik's is mostly keys nobody sets on a given
+    // guest, and every one of them as a greyed row buries what the guest says.
+    // `hidden` suppresses the ghost. It must not suppress data: a hidden key that
+    // IS set still gets its row, its type and its default.
+    const d = Object.assign({}, panel, {
+        docId: '100',
+        pending: ctx.PVE.meta.EditSet.empty(),
+        docState: { 100: { digest: 'x', data: { t: { routers: { rule: 'Host(`a`)' } } } } },
+        prefixes: [
+            {
+                prefix: 't',
+                selector: { all: true },
+                schema: {
+                    type: 'object',
+                    properties: {
+                        host: { type: 'string' },
+                        routers: {
+                            type: 'object',
+                            hidden: true,
+                            properties: {
+                                rule: { type: 'string' },
+                                entrypoint: { type: 'string', hidden: false, default: 'web' },
+                                timeout: { type: 'integer' },
+                            },
+                        },
+                    },
+                },
+            },
+        ],
+    });
+    ['documentEntries', 'plannedData', 'dataOf', 'shapeFor', 'docKind', 'entry', 'addData',
+     'addShape', 'existing', 'applicablePrefixes', 'schemaKind'].forEach((m) => (d[m] = P[m]));
+    const root = d.documentEntries.call(d);
+    const routers = root.children.t.children.routers;
+
+    eq('a shown declaration still gets its ghost row', root.children.t.children.host.present, false);
+    eq('a hidden subtree is still a row, because the document has one', !!routers, true);
+    eq('a hidden key that is set keeps its row', routers.children.rule.present, true);
+    eq('... and is still typed by its schema', routers.children.rule.kind, 'string');
+    eq('a hidden key that is not set has no row', routers.children.timeout, undefined);
+    eq('an explicitly shown key inside a hidden subtree is offered',
+        [!!routers.children.entrypoint, routers.children.entrypoint.present], [true, false]);
+    eq('... with its default', routers.children.entrypoint.defaultValue, 'web');
+}
+
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
 {
     // A prefix is itself a statement about the document: something of mine

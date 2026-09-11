@@ -59,6 +59,20 @@ impl From<&PrefixDef> for Declared {
     }
 }
 
+/// One path a schema describes: where it is, what it says, and whether the
+/// editor should offer it as a row before anything is stored there.
+///
+/// `hidden` is an editor hint and nothing else, like `multiline` and `format`.
+/// It never reaches [`Shape::findings`] or enforcement: a hidden key that *is*
+/// set is typed, validated and refused exactly as a shown one, because hiding a
+/// declaration must never hide data or excuse it from its own schema.
+#[derive(Debug, Clone, Serialize)]
+pub struct Described<'a> {
+    pub path: Path,
+    pub schema: &'a Value,
+    pub hidden: bool,
+}
+
 /// One thing a schema says is wrong with a value, at a document path.
 /// Advisory unless `enforced`: the server's one lint ([`model::lint`])
 /// decides what is storable, a schema only describes what was meant
@@ -188,11 +202,11 @@ impl Shape {
     /// editor's row builder and its hover index walk. Each prefix's tree is
     /// pruned where another prefix governs, so a path covered by two of them
     /// appears once, under the more specific one.
-    pub fn schema_index(&self) -> Vec<(Path, &Value)> {
+    pub fn schema_index(&self) -> Vec<Described<'_>> {
         let mut out = Vec::new();
         for owner in &self.prefixes {
             if let Some(schema) = &owner.schema {
-                self.collect(owner, schema, owner.prefix.clone(), &mut out);
+                self.collect(owner, schema, owner.prefix.clone(), false, &mut out);
             }
         }
         out
@@ -205,15 +219,25 @@ impl Shape {
         owner: &Declared,
         schema: &'a Value,
         path: Path,
-        out: &mut Vec<(Path, &'a Value)>,
+        inherited_hidden: bool,
+        out: &mut Vec<Described<'a>>,
     ) {
         if self.governing(&path).map(|d| &d.prefix) != Some(&owner.prefix) {
             return;
         }
-        out.push((path.clone(), schema));
+        // Inherited, with an explicit setting winning at any depth. Hiding a
+        // subtree is the common case -- a vocabulary the size of Traefik's is
+        // mostly keys nobody sets on a given guest -- and un-hiding one key
+        // inside it is how you keep the two or three that matter. The walk
+        // always descends, so that override needs no lookahead.
+        let hidden = schema
+            .get("hidden")
+            .and_then(Value::as_bool)
+            .unwrap_or(inherited_hidden);
+        out.push(Described { path: path.clone(), schema, hidden });
         if let Some(props) = schema.get("properties").and_then(Value::as_object) {
             for (k, sub) in props {
-                self.collect(owner, sub, path.join(k.clone()), out);
+                self.collect(owner, sub, path.join(k.clone()), hidden, out);
             }
         }
     }
@@ -454,6 +478,46 @@ mod tests {
         assert_eq!(shape.schema_at(&p("nope")), None);
     }
 
+    /// `hidden` is inherited, and an explicit setting wins at any depth: a
+    /// vocabulary is hidden wholesale and the two keys that matter are named.
+    #[test]
+    fn hidden_is_inherited_and_overridden_explicitly() {
+        let shape = Shape::new(
+            [decl(
+                "t",
+                Selector::All,
+                Some(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "host": { "type": "string" },
+                        "routers": {
+                            "type": "object",
+                            "hidden": true,
+                            "properties": {
+                                "rule": { "type": "string" },
+                                "entrypoint": { "type": "string", "hidden": false },
+                            },
+                        },
+                    },
+                })),
+            )],
+            &tags(&[]),
+        );
+        let hidden_at = |path: &str| {
+            shape
+                .schema_index()
+                .into_iter()
+                .find(|d| d.path.to_string() == path)
+                .unwrap_or_else(|| panic!("{path} is described"))
+                .hidden
+        };
+        assert!(!hidden_at("t"), "the prefix itself is not hidden");
+        assert!(!hidden_at("t.host"));
+        assert!(hidden_at("t.routers"), "hidden at the subtree's root");
+        assert!(hidden_at("t.routers.rule"), "and inherited below it");
+        assert!(!hidden_at("t.routers.entrypoint"), "an explicit setting wins");
+    }
+
     #[test]
     fn schema_at_walks_properties_from_the_governing_prefix_and_never_across_one() {
         let parent = json!({"type": "object", "properties": {
@@ -473,7 +537,7 @@ mod tests {
         assert_eq!(shape.schema_at(&p("homelab.docker.compose")), Some(&json!({"type": "string"})));
         assert_eq!(shape.schema_at(&p("homelab.other")), None);
 
-        let index: Vec<String> = shape.schema_index().iter().map(|(p, _)| p.to_string()).collect();
+        let index: Vec<String> = shape.schema_index().iter().map(|d| d.path.to_string()).collect();
         let mut sorted = index.clone();
         sorted.sort();
         sorted.dedup();
@@ -482,8 +546,8 @@ mod tests {
         assert!(index.contains(&"homelab.notes".to_string()));
         assert!(!index.iter().any(|p| p.starts_with("homelab.docker") && p != "homelab.docker" && p != "homelab.docker.compose"));
         // `homelab.docker` itself appears once, under the child (whose schema it is).
-        let docker = shape.schema_index().into_iter().find(|(p, _)| p.to_string() == "homelab.docker").unwrap();
-        assert_eq!(docker.1["properties"]["compose"]["type"], "string");
+        let docker = shape.schema_index().into_iter().find(|d| d.path.to_string() == "homelab.docker").unwrap();
+        assert_eq!(docker.schema["properties"]["compose"]["type"], "string");
     }
 
     #[test]
