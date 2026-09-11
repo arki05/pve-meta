@@ -3,7 +3,7 @@
 //
 // Usage: node headless-tab-check.js <host> <vmid> <theme: light|dark>
 //            [--stub-registry] [--readonly] [--scoped]
-// --stub-registry stubs GET /meta/prefixes and GET /meta/grants, for a lab
+// --stub-registry stubs GET /meta/prefixes and GET /meta/permissions, for a lab
 //   whose real files do not exercise every schema shape.
 // --readonly skips everything that writes.
 // --scoped / --ro stub GET /meta/access with a restricted answer (an rw scope on
@@ -48,24 +48,24 @@ const PREFIXES = [
     { prefix: 'netbird', description: 'NetBird peer groups', selector: { tag: 'netbird' } },
 ];
 
-const GRANTS = [
+const PERMISSIONS = [
     {
         name: 'traefik',
         authid: 'svc@pve!traefik',
         description: 'Traefik dynamic-configuration provider',
-        grants: [{ prefix: 'traefik', mode: 'rw', selector: { all: true } }],
+        rules: [{ prefix: 'traefik', mode: 'rw', selector: { all: true } }],
     },
     {
         name: 'netbird',
         authid: 'svc@pve!netbird',
         description: 'NetBird peer group assignment',
-        grants: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
+        rules: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
     },
     {
         name: 'audit',
         authid: 'svc@pve!audit',
         description: 'Read-only observer of every guest',
-        grants: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
+        rules: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
     },
 ];
 
@@ -169,8 +169,8 @@ async function main() {
                         reply(PREFIXES);
                         return;
                     }
-                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/grants/.test(req.url())) {
-                        reply(GRANTS);
+                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/permissions/.test(req.url())) {
+                        reply(PERMISSIONS);
                         return;
                     }
                     if ((scoped || roOnly) && /\/api2\/(extjs|json)\/meta\/access/.test(req.url())) {
@@ -289,7 +289,7 @@ async function main() {
                 digest: p.digest,
                 access: p.access,
                 prefixes: (p.prefixes || []).length,
-                grants: (p.grants || []).length,
+                permissions: (p.permissions || []).length,
                 columns: p.tree.getColumns().map((c) => c.text),
                 rows,
                 toolbar: tb ? tb.items.items.map((i) => i.text || i.xtype) : [],
