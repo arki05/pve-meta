@@ -2,8 +2,8 @@
 
 Structured metadata for Proxmox VE guests. One YAML document per VM or container,
 stored in `/etc/pve` and replicated with the cluster, with a native API, an editor tab
-in the PVE UI, and a CLI for hook scripts. Schemas describe parts of a document;
-API tokens can be scoped to parts of it.
+in the PVE UI, and a CLI for hook scripts. Optionally, a schema can describe part of a
+document and an API token can be scoped to part of it.
 
 ![The Metadata tab on a guest](ui-extjs/docs/screenshots/readme-tree-light.png)
 
@@ -32,7 +32,14 @@ backup:
   retention__: days; read by the nightly job     # a comment key documents its sibling
 ```
 
-A **prefix** file says what a prefix is (the file name is the prefix):
+That is all a document is, and it works with nothing else in place: no prefix, no
+schema, no permission file. Any key, any depth, edited in the tab or written by a
+script. Everything below is opt-in, layered on where you want a guarantee.
+
+A **prefix** file says what a prefix is (the file name is the prefix). Declare one to
+give the editor typed rows and defaults for that part of a document, or to say which
+guests it belongs on; add `enforce: true` only where a broken write should be refused,
+and even then `force=1` (the editor's "Save anyway") stores it:
 
 ```yaml
 # /etc/pve/meta.d/prefixes/traefik.yaml
@@ -49,8 +56,9 @@ schema:                           # PVE::JSONSchema dialect; drives the editor's
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A **permission** file says who may touch one, and is cluster-only, so a package can
-declare a prefix but never grant itself access:
+A **permission** file gives a token a prefix, on the guests its selector matches, so
+one document can be shared by several tools that cannot step on each other. Cluster-only,
+so a package can declare a prefix but never grant itself access:
 
 ```yaml
 # /etc/pve/meta.d/permissions/traefik.yaml
