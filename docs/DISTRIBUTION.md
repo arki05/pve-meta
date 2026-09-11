@@ -6,7 +6,7 @@ This document covers everything under `.github/workflows/`, `scripts/apt-repo/`,
 patched upstream Proxmox packages stays current.
 
 The design rationale in one paragraph: pve-meta patches stock Proxmox VE files it does
-not control the release cadence of (see `docs/DESIGN.md` §7, "Extension seams"). A
+not control the release cadence of (see `docs/DESIGN.md` §11, "Extension seams"). A
 signed, static apt repo (§1-§5 below) is the simplest way to distribute the resulting
 `.deb`s without asking every install to build from source; a scheduled "ceiling
 watcher" (§6) is the cheapest way to find out *before* a user's `apt dist-upgrade` that
@@ -374,7 +374,7 @@ PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
   ran the real `pve-ext-patch verify` checks -- observed an actual **pass** for
   `qemu-server` 9.0.10, `libpve-guest-common-perl` 6.0.2, and an older `pve-manager`
   9.0.0~10 (against pve-ext's own `pve-manager.toml` manifest -- the `PVE::API2::Ext`
-  registration-ordering diff from §7 of `docs/DESIGN.md` still applies cleanly even
+  registration-ordering diff from §11 of `docs/DESIGN.md` still applies cleanly even
   that far back), and an actual **fail** for `pve-container` 6.0.10, whose
   `API2/LXC.pm` hunk #1 no longer applies against that older release (the repo still
   patched `pve-container` then, with diffs generated against 6.1.13/6.1.14; that

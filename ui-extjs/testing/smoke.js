@@ -285,7 +285,7 @@ eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
 
 // A grammar's `minimum`/`maximum` reach the number editor, and its `format` is
-// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §12).
+// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §3).
 let numEd = U.editorFor({ kind: 'number', minimum: 1, maximum: 65535 });
 eq('editor number honours minimum', numEd.minValue, 1);
 eq('editor number honours maximum', numEd.maxValue, 65535);
@@ -303,7 +303,7 @@ console.log('\n--- selector text (the Access tooltip) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
 eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');
 
-console.log('\n--- row icons (DESIGN §8) ---');
+console.log('\n--- row icons (DESIGN §12) ---');
 eq('icons', ctx.PVE.meta.Icons, {
     map: 'fa fa-folder',
     mapExpanded: 'fa fa-folder-open',

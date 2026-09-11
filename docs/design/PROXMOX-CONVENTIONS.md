@@ -1085,5 +1085,5 @@ comment and `pve-ext/README.md`, "UI pages").
 - [ ] Keep version data flowing from `debian/changelog` (`pkg-info.mk`/`default.mk`), never hand-set.
 - [x] Add the `Cargo.toml` ⇄ `changelog` version cross-check to `override_dh_auto_configure`, guarded on `DEB_DISTRIBUTION != UNRELEASED`.
 - [ ] `install -Dm644` / `find … -exec install -Dm644` for file installation.
-- [x] Run `lintian` from the `deb`/`dsc` targets (both `Makefile:deb` and `pve-ext/Makefile:deb`; fatal when `$CI` is set, `|| true` locally — see `pve-ext/README.md`, "Managed patches" build notes, and `docs/DESIGN.md` §9).
+- [x] Run `lintian` from the `deb`/`dsc` targets (both `Makefile:deb` and `pve-ext/Makefile:deb`; fatal when `$CI` is set, `|| true` locally — see `pve-ext/README.md`, "Managed patches" build notes, and `docs/DESIGN.md` §13).
 - [ ] `upload` guarded by `git diff --exit-code`.

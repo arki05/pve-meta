@@ -3,8 +3,8 @@
 pve-meta carries guest metadata through five lifecycle events — create, destroy,
 snapshot, rollback and delete-snapshot — all hooked in one file, `PVE/AbstractConfig.pm`.
 Clone and backup are not carried, and nothing runs on a timer. This is deliberate
-(`docs/DESIGN.md` §6, §10, §11) — a smaller, honestly documented guarantee beats a wide
-one with a silent gap.
+(`docs/DESIGN.md` §9; decisions 008 and 009) — a smaller, honestly documented guarantee
+beats a wide one with a silent gap.
 
 ## The snapshot trio
 
@@ -34,7 +34,7 @@ The patch, its manifest (`patches/lifecycle.toml`) and the one diff
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
 `pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst` — see
 `pve-ext/README.md` ("Managed patches") for the tool itself. What each hook does is
-`docs/DESIGN.md` §6; the exports themselves, with their arguments and return values,
+`docs/DESIGN.md` §9; the exports themselves, with their arguments and return values,
 are documented where they are defined, in `crates/pve-meta-perl/src/lib.rs`.
 
 One caveat worth knowing, not fixing: vzdump's own transient `'vzdump'` snapshot for LXC
@@ -96,5 +96,5 @@ and `pve-meta rm <vmid>` are the manual cleanup; no timer sweeps.
 
 Superseded design history (seven diffs across three packages, an `on_clone`/`on_destroy`
 hook pair, `export_for_backup`/`import_from_backup`) is not reproduced here; see
-`docs/DESIGN.md` §11 for the one-line reasoning and the repository's git history if the
+`docs/decisions/008` for the reasoning and the repository's git history if the
 old diffs themselves are ever needed for reference.

@@ -118,13 +118,13 @@ install:
 	#
 	# There is deliberately no packaged *permissions* directory: an operator's
 	# package may ship a prefix (a declaration) but must never ship its
-	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md 3.2).
+	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md section 4).
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes
 	if [ -d prefixes ] && ls prefixes/*.yaml >/dev/null 2>&1; then \
 		cp prefixes/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/; \
 	fi
 	# pve-ext UI-page manifests for the editor (see pages/, docs/DESIGN.md
-	# section 8) and its static files. Both are the `script`+`xtype` form: pve-ext's
+	# section 11) and its static files. Both are the `script`+`xtype` form: pve-ext's
 	# loader defines the class and puts a native ExtJS panel in the tab, so there is
 	# no iframe. Two manifests, one file: they name different `xtype`s
 	# (a guest's document editor, and the datacenter's three sub-tabs) out of the

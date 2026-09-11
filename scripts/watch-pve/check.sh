@@ -15,7 +15,7 @@
 #      filtered down to that package's own entries (the whole lifecycle
 #      is one file in one package, but the
 #      filter step is kept so a future entry doesn't require re-deriving
-#      this logic; see docs/DESIGN.md section 6 and
+#      this logic; see docs/DESIGN.md section 9 and
 #      docs/LIFECYCLE-PATCHES.md).
 #
 # A package with a clean verify on every applicable check gets its ceiling

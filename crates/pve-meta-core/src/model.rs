@@ -195,7 +195,7 @@ mod tests {
     fn no_key_is_reserved_in_any_document() {
         // No key is reserved (`docs/DESIGN.md` §2): `scopes` is ordinary data,
         // and an authid-shaped key (`user@realm!token`) is unrestricted, but a
-        // dotted key still fails the ordinary key charset (§4).
+        // dotted key still fails the ordinary key charset (§2).
         assert!(lint(&json!({"scopes": {"a": 1}})).is_empty());
         assert_eq!(lint(&json!({"scopes": {"john.doe@pve": 1}})).len(), 1);
         assert!(lint(&json!({"scopes": {"svc@pve!traefik": 1}})).is_empty());

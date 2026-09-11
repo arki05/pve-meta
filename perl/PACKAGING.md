@@ -1,7 +1,7 @@
 # Packaging notes for `PVE::API2::Ext::Meta` (package `pve-meta`)
 
 This directory (`perl/`) holds `PVE::API2::Ext::Meta` (`perl/PVE/API2/Ext/Meta.pm`),
-the native `/meta/...` API module described in `docs/DESIGN.md` §5. It ships in the
+the native `/meta/...` API module described in `docs/DESIGN.md` §8. It ships in the
 `pve-meta` binary package (the same one as the UI dist), **not** as its own package and
 **not** as part of `libpve-meta-rs-perl` (that package is `PVE::RS::Meta` only, see
 `crates/pve-meta-perl/PACKAGING.md`).
@@ -26,11 +26,11 @@ same source package here, so an exact match is simplest) alongside its existing
 
 ## The prefix and grant drop-directories
 
-`docs/DESIGN.md` §3 puts prefixes (what a prefix is) and permissions (who may touch one)
-outside the documents, in three directories:
+`docs/DESIGN.md` §3 and §4 put prefixes (what a prefix is) and permissions (who may touch
+one) outside the documents, in three directories:
 
 * `/usr/share/pve-meta/prefixes/` — packaged prefixes, one file per prefix; **the
-  file name is the prefix** (`docs/DESIGN.md` §3.1). The root `Makefile`'s `install:`
+  file name is the prefix** (`docs/DESIGN.md` §3). The root `Makefile`'s `install:`
   target already creates this directory and copies `prefixes/*.yaml` into it, tolerating
   an empty checkout (a missing directory is not an error). This repository's
   `prefixes/traefik.yaml` documents the format rather than granting anything — a
@@ -41,7 +41,7 @@ outside the documents, in three directories:
   creates it (guarded on `/etc/pve/local`, i.e. only on a node that has joined a cluster);
   nothing packages files into it.
 * `/etc/pve/meta.d/permissions/` — permissions, created by the same postinst. **Cluster-only: there
-  is deliberately no packaged permissions directory** (`docs/DESIGN.md` §3.2). An operator's
+  is deliberately no packaged permissions directory** (`docs/DESIGN.md` §4). An operator's
   `.deb` may ship a prefix, which is a declaration, but must never ship its own grant,
   which would be self-registration; dpkg cannot write into pmxcfs, so that rule is
   enforced by where the files live rather than by a check.
@@ -51,7 +51,7 @@ read per request and none is required to exist.
 
 ## Registration (handled by pve-ext, not this file)
 
-`docs/DESIGN.md` §7: `pve-meta` depends on `pve-ext`. `PVE::API2::Ext` (package
+`docs/DESIGN.md` §11: `pve-meta` depends on `pve-ext`. `PVE::API2::Ext` (package
 `pve-ext`, loaded via one dpkg-diverted `use PVE::API2::Ext;` line in
 `/usr/share/perl5/PVE/API2.pm`) scans `/usr/share/perl5/PVE/API2/Ext/*.pm` at
 pvedaemon/pveproxy startup, `require`s each file, and registers it in the API root at

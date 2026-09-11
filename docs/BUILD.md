@@ -16,8 +16,8 @@ ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && car
 ### The `wasm32-unknown-unknown` target
 
 The editor's rules are `pve-meta-core` compiled for the browser (`crates/pve-meta-wasm`,
-`docs/DESIGN.md` §8), and `make build` and `make check` both depend on `make wasm`, so the
-toolchain needs the wasm32 standard library as well as the host's. rustup's
+`docs/DESIGN.md` §12), and `make build` and `make check` both depend on `make wasm`, so
+the toolchain needs the wasm32 standard library as well as the host's. rustup's
 `--profile minimal` (and a fresh `rustup-init`) installs the host target only, and building
 for a target that is not installed is a hard error, not a skip:
 

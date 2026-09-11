@@ -77,7 +77,7 @@ sub _guest_acl {
     };
 }
 
-# A registry document -- one prefix definition or permission file (docs/DESIGN.md §5) --
+# A registry document -- one prefix definition or permission file (docs/DESIGN.md §6) --
 # is an administrator's to edit and nobody else's.
 #
 # Read is open to every authenticated user, because it has to agree with the
@@ -860,7 +860,7 @@ _register_document_methods({
             . "it may do, so one write may span two granted prefixes even though the "
             . "view covering both is the whole document. On top of that the caller "
             . "must be able to read the named view and must hold some write permission "
-            . "on the document (docs/DESIGN.md 3.4). A document that cannot be read "
+            . "on the document (docs/DESIGN.md §5). A document that cannot be read "
             . "back is the exception: repairing it as a whole requires "
             . "VM.Config.Options, since there is no stored content to check the change "
             . "against. Unknown vmids are 404, not created.",
