@@ -217,6 +217,12 @@ pub struct PrefixDef {
     /// changed (`api::put_document`; `force=1` stores it anyway). Off by
     /// default: a schema is advisory unless the prefix says otherwise.
     pub enforce: bool,
+    /// The root default for the schema's per-node `hidden` (`shape::Described`):
+    /// with it set this prefix contributes no declared-but-unset rows unless a
+    /// node asks to be shown. A prefix with a vocabulary rather than a handful of
+    /// keys wants this; one with five keys does not.
+    #[serde(default)]
+    pub hidden: bool,
     /// Which directory this one was read from. Not part of the file.
     pub origin: Origin,
     /// `true` when a lower-precedence directory holds a file of the same name that
@@ -307,6 +313,8 @@ struct RawPrefixDef {
     selector: Option<RawSelector>,
     #[serde(default)]
     enforce: Option<bool>,
+    #[serde(default)]
+    hidden: Option<bool>,
     #[serde(default)]
     schema: Option<Value>,
 }
@@ -466,6 +474,7 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
         description: raw.description,
         selector,
         enforce: raw.enforce.unwrap_or(false),
+        hidden: raw.hidden.unwrap_or(false),
         schema: raw.schema,
     })
 }

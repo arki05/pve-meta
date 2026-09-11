@@ -34,6 +34,24 @@ It never reaches validation. Findings and `enforce` (014) ignore it entirely, th
 way `multiline` and `format` are ignored: a hidden declaration is still a
 declaration, and a value under it is refused exactly as a shown one would be.
 
+## `enforce` follows the same rule
+
+`enforce` was a prefix-level flag: the whole subtree was refused on, or none of
+it. The case that breaks is the one a real vocabulary has -- a modelled part
+worth refusing bad writes into, and a passthrough subtree that by definition has
+no shape to check. Those two cannot coexist under one flag, and a partial schema
+without an escape hatch is not honest.
+
+So a schema node may carry `enforce` too, inherited the same way, with the
+prefix's own flag as the root default. `enforce: true` on the prefix and
+`enforce: false` on the passthrough subtree says exactly what an operator means.
+The anti-lockout property is unchanged: `force=1` remains available to anyone who
+may write, so enforcement is still a deliberate act rather than an impossible one.
+
+Both flags also exist at the prefix level, which is just the root default of the
+inherited value -- `hidden: true` there is "this prefix offers no declared-but-unset
+rows at all", which is what a vocabulary wants and what five keys do not.
+
 ## Consequences
 
 The second extension to the PVE::JSONSchema dialect, after `multiline`. Both are

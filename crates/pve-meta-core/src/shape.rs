@@ -43,8 +43,14 @@ pub struct Declared {
     pub description: Option<String>,
     pub schema: Option<Value>,
     /// The server refuses a write that leaves this subtree not matching
-    /// `schema` (`crate::registry::PrefixDef::enforce`).
+    /// `schema` (`crate::registry::PrefixDef::enforce`). The root default for
+    /// the per-node `enforce`, which is inherited from here down.
     pub enforce: bool,
+    /// The root default for the per-node `hidden`: with it set, this prefix
+    /// offers no declared-but-unset rows at all unless a node asks to be shown.
+    /// For a vocabulary large enough that the useful default is "show what is
+    /// set, and nothing else".
+    pub hidden: bool,
 }
 
 impl From<&PrefixDef> for Declared {
@@ -55,6 +61,7 @@ impl From<&PrefixDef> for Declared {
             description: p.description.clone(),
             schema: p.schema.clone(),
             enforce: p.enforce,
+            hidden: p.hidden,
         }
     }
 }
@@ -164,6 +171,7 @@ impl Shape {
                 description: None,
                 schema: Some(schema),
                 enforce: false,
+                hidden: false,
             }],
         }
     }
@@ -206,7 +214,7 @@ impl Shape {
         let mut out = Vec::new();
         for owner in &self.prefixes {
             if let Some(schema) = &owner.schema {
-                self.collect(owner, schema, owner.prefix.clone(), false, &mut out);
+                self.collect(owner, schema, owner.prefix.clone(), owner.hidden, &mut out);
             }
         }
         out
@@ -253,7 +261,7 @@ impl Shape {
         for owner in &self.prefixes {
             let Some(schema) = &owner.schema else { continue };
             let Some(value) = model::get_path(doc, &owner.prefix) else { continue };
-            self.walk(owner, schema, value, owner.prefix.clone(), &mut out);
+            self.walk(owner, schema, value, owner.prefix.clone(), owner.enforce, &mut out);
         }
         out.sort_by(|a, b| a.path().cmp(b.path()));
         out
@@ -273,9 +281,30 @@ impl Shape {
             .collect()
     }
 
-    fn walk(&self, owner: &Declared, schema: &Value, value: &Value, path: Path, out: &mut Vec<Report>) {
+    fn walk(
+        &self,
+        owner: &Declared,
+        schema: &Value,
+        value: &Value,
+        path: Path,
+        inherited_enforce: bool,
+        out: &mut Vec<Report>,
+    ) {
+        // Inherited with an explicit setting winning at any depth, the same rule
+        // `hidden` follows and the prefix's own `enforce` as the root default.
+        //
+        // A prefix that enforces almost everything is the case this exists for: a
+        // vocabulary with a modelled part worth refusing bad writes into, and a
+        // passthrough subtree that by definition has no shape to check. Without a
+        // way to say `enforce: false` on that subtree, the escape hatch and the
+        // enforcement cannot both exist -- and the escape hatch is what makes a
+        // partial schema honest.
+        let enforce = schema
+            .get("enforce")
+            .and_then(Value::as_bool)
+            .unwrap_or(inherited_enforce);
         if let Some(msg) = check_value(schema, value) {
-            out.push(Report::Finding(Finding { path, msg, enforced: owner.enforce }));
+            out.push(Report::Finding(Finding { path, msg, enforced: enforce }));
             return; // a value of the wrong shape says nothing useful about its children
         }
         if let (Value::String(s), Some(format)) = (value, schema.get("format").and_then(Value::as_str))
@@ -297,7 +326,7 @@ impl Shape {
             if self.governing(&child_path).map(|d| &d.prefix) != Some(&owner.prefix) {
                 continue; // a more specific prefix owns this subtree
             }
-            self.walk(owner, sub, child, child_path, out);
+            self.walk(owner, sub, child, child_path, enforce, out);
         }
     }
 }
@@ -391,7 +420,7 @@ mod tests {
     }
 
     fn decl(prefix: &str, selector: Selector, schema: Option<Value>) -> Declared {
-        Declared { prefix: p(prefix), selector, description: None, schema, enforce: false }
+        Declared { prefix: p(prefix), selector, description: None, schema, enforce: false, hidden: false }
     }
 
     fn all(prefix: &str) -> Declared {
@@ -476,6 +505,42 @@ mod tests {
         assert_eq!(shape.governing(&p("rules.0")).unwrap().prefix, Path::root());
         assert_eq!(shape.schema_at(&p("authid")), Some(&json!({"type": "string"})));
         assert_eq!(shape.schema_at(&p("nope")), None);
+    }
+
+    /// `enforce` follows the same rule, with the prefix's own flag as the root
+    /// default -- the case being a vocabulary whose modelled part is worth
+    /// refusing bad writes into and whose passthrough subtree has no shape to
+    /// check. Without the override those two cannot coexist.
+    #[test]
+    fn enforce_is_inherited_and_overridden_explicitly() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "port": { "type": "integer" },
+                "extra": {
+                    "type": "object",
+                    "enforce": false,
+                    "properties": { "n": { "type": "integer" } },
+                },
+            },
+        });
+        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema)) };
+        let shape = Shape::new([strict], &tags(&[]));
+        let doc = serde_json::json!({ "t": { "port": "no", "extra": { "n": "also no" } } });
+
+        let enforced: Vec<String> =
+            shape.enforced_findings(&doc).into_iter().map(|f| f.path.to_string()).collect();
+        assert_eq!(enforced, ["t.port"], "the opted-out subtree is not enforced");
+        // Still reported, just not refused: advisory is the default everywhere else.
+        let all: Vec<String> = shape
+            .findings(&doc)
+            .into_iter()
+            .filter_map(|r| match r {
+                Report::Finding(f) => Some(f.path.to_string()),
+                Report::Format(_) => None,
+            })
+            .collect();
+        assert!(all.contains(&"t.extra.n".to_string()), "{all:?}");
     }
 
     /// `hidden` is inherited, and an explicit setting wins at any depth: a

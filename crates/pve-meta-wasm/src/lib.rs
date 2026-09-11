@@ -461,6 +461,8 @@ struct WirePrefix {
     #[serde(default)]
     enforce: Option<Value>,
     #[serde(default)]
+    hidden: Option<Value>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -476,6 +478,7 @@ impl WirePrefix {
             schema: self.schema,
             // Perl's `1`/`0` on the wire, like `read`/`write` in an access answer.
             enforce: self.enforce.as_ref().is_some_and(truthy),
+            hidden: self.hidden.as_ref().is_some_and(truthy),
         })
     }
 }

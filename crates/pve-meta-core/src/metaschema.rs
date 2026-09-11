@@ -66,14 +66,29 @@ properties:
       Refuse an API write that would leave this prefix's subtree not matching its
       schema, for the paths the write changed; 'force=1' stores it anyway (the
       editor's "Save anyway" tick). Off by default: a schema is advisory unless the
-      prefix says otherwise. Format checks are never enforced.
+      prefix says otherwise. Format checks are never enforced. This is the default
+      for the whole subtree; any schema node may set its own 'enforce' and every
+      node below inherits that instead.
+  hidden:
+    type: boolean
+    optional: 1
+    description: >-
+      Do not offer this prefix's declared-but-unset keys as rows. For a prefix whose
+      schema is a vocabulary rather than a handful of keys, where the useful default
+      is to show what a guest actually set. This is the default for the whole
+      subtree; any schema node may set its own 'hidden' and every node below
+      inherits that instead. It never hides a key that IS set, and never affects
+      validation.
   schema:
     type: object
     optional: 1
     description: >-
       What the subtree under this prefix looks like, in the PVE::JSONSchema dialect:
       type, properties, description, default, optional, enum, minimum, maximum,
-      format, plus 'multiline' as an editor hint. Free-form, so it is edited as text.
+      format, plus two editor hints of our own -- 'multiline' (this string is a block
+      of text) and 'hidden' (do not offer this as a row until it is set). A node may
+      also carry 'enforce'. All three are inherited by everything below the node that
+      sets them. Free-form, so it is edited as text.
 "#;
 
 /// The permission file format (`docs/DESIGN.md` §4).
@@ -222,7 +237,17 @@ mod tests {
     #[test]
     fn no_property_is_invented() {
         let ns: Vec<String> = properties(&prefix()).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(ns, ["description", "selector", "enforce", "schema"]);
+        assert_eq!(ns, ["description", "selector", "enforce", "hidden", "schema"]);
+        // The list is the point: a property here that the parser refuses would be a
+        // row the editor paints and a file that then fails to load. The two booleans
+        // are the ones added late, so check them against the parser directly.
+        for flag in ["enforce", "hidden"] {
+            let text = format!("selector: {{all: true}}\n{flag}: true\n");
+            assert!(
+                registry::parse_prefix("x", &text).is_ok(),
+                "the meta-schema offers '{flag}', which the parser refuses"
+            );
+        }
         let g: Vec<String> = properties(&permission()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(g, ["authid", "description", "rules"]);
     }
