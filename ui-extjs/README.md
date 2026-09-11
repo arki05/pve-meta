@@ -201,11 +201,12 @@ first, which is what its `waitForXtype()` does.
 ## Screenshots
 
 In `docs/screenshots/`, taken on `pvemeta-node1` (pve-manager 9.2.11, ExtJS 7.0.0,
-proxmox-widget-toolkit 5.2.8) inside the real UI, against the revision-5 API, with two
-live grants (`example-traefik`, `rw` on `traefik` for all guests, with a schema;
-`scoped`, `rw` on `traefik` for tag `traefik` and `ro` on `netbird` for all guests).
-The columns and the row editor are as shown; the chrome has moved since (Apply, Revert
-and the Tree | Text toggle are in the footer now, and edits stage rather than write).
+proxmox-widget-toolkit 5.2.8) inside the real UI by `testing/headless-tab-check.js`,
+light and dark, with two permission files (`scoped`, `rw` on `traefik` for tag
+`traefik` and `ro` on `netbird` for all guests; `traefikbot`, `rw` on `traefik`). The
+`readme-*.png` set is what the top-level README shows: the guest tree with staged
+edits, Text mode with the diff, the enforced-schema warning, the Prefixes grid, and
+the declaration form.
 
 | File | What it shows |
 |---|---|
