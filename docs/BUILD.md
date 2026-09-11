@@ -62,10 +62,10 @@ no guaranteed network for crates.io), so these run by hand and in CI, before the
 packages are built:
 
 ```sh
-cargo test -p pve-meta-core                      # 268 across the crate's binaries; runs on macOS
-make test                                        # that plus pve-meta-wasm's own
+make test                                        # every pve-meta-core and pve-meta-wasm test; runs on macOS
+cargo test -p pve-meta-core                      # the core crate alone
 make check                                       # rustdoc -D warnings, clippy, make wasm, the smoke suite
-node ui-extjs/testing/smoke.js                   # 416 checks against the built .wasm (after make wasm)
+node ui-extjs/testing/smoke.js                   # the editor's offline suite against the built .wasm (after make wasm)
 make -C crates/pve-meta-perl check               # test/basic.pl over the built .so (Linux only)
 ```
 
