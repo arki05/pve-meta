@@ -1816,7 +1816,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                         // what the values mean. PVE's own UI uses them.
                         {
                             xtype: 'radiogroup',
-                            fieldLabel: gettext('When unset'),
+                            fieldLabel: gettext('Visibility'),
                             items: [
                                 {
                                     boxLabel: gettext('Inherit'),
@@ -1830,7 +1830,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                         },
                         {
                             xtype: 'radiogroup',
-                            fieldLabel: gettext('If it does not match'),
+                            fieldLabel: gettext('Validation'),
                             items: [
                                 {
                                     boxLabel: gettext('Inherit'),
@@ -1838,8 +1838,8 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                                     inputValue: 'inherit',
                                     checked: true,
                                 },
-                                { boxLabel: gettext('Warn'), name: 'enforce', inputValue: 'false' },
-                                { boxLabel: gettext('Refuse'), name: 'enforce', inputValue: 'true' },
+                                { boxLabel: gettext('Advisory'), name: 'enforce', inputValue: 'false' },
+                                { boxLabel: gettext('Enforced'), name: 'enforce', inputValue: 'true' },
                             ],
                         },
                     ],
