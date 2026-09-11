@@ -654,13 +654,15 @@ PVE.meta.Buffer = {
         }
     },
 
-    // True -- and says so -- when the buffer holds exactly what was loaded.
+    // True when the buffer holds exactly what was loaded.
+    //
+    // A predicate, and only that. It used to raise "No changes." itself, which is
+    // how a dialog appeared in editors that never asked for one: a function that
+    // answers a question and interrupts the user is two functions, and only one of
+    // them was in its name. Applying an unchanged buffer resolves to nothing to
+    // write, which is the honest outcome and not something to stop for.
     unchanged: function (buffer) {
-        if (buffer.editor.getValue() !== PVE.meta.Buffer.baseline(buffer).text) {
-            return false;
-        }
-        Ext.Msg.alert(gettext('Notice'), gettext('No changes.'));
-        return true;
+        return buffer.editor.getValue() === PVE.meta.Buffer.baseline(buffer).text;
     },
 
     // The buffer against what was loaded, without committing to it.
@@ -2247,25 +2249,13 @@ Ext.define('PVE.meta.TextWindow', {
             Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             return;
         }
-        let changed = me.tree.stageFromView(me.view, value);
-
-        // Typed something, changed nothing: a reorder or a reindent parses to the
-        // document it started as (decision 007), so there is nothing to stage and no
-        // row to mark. Closing on that would look exactly like it had worked. The same
-        // thing the Tree|Text switch says, for the same reason.
-        if (!changed && !PVE.meta.Buffer.unchanged(me.buffer())) {
-            Ext.Msg.alert(
-                gettext('Nothing to stage'),
-                Ext.htmlEncode(
-                    gettext(
-                        'This changes how the subtree is laid out, not what it says -- ' +
-                            'key order, indentation. The tree shows the document, so there ' +
-                            'is nothing for it to carry.',
-                    ),
-                ),
-            );
-            return;
-        }
+        // Nothing to say when there is nothing to stage. An edit that changes no
+        // value -- because nothing was typed, or because what was typed was layout
+        // (decision 007) -- resolves to no staged edit, and closing on that is the
+        // honest outcome rather than something to interrupt for. The tree behind
+        // this window shows what is staged and offers the per-row undo, so a user
+        // who wants to know what happened is already looking at it.
+        me.tree.stageFromView(me.view, value);
         me.close();
     },
 });
@@ -3669,11 +3659,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // 007), and the subtree editor says so rather than closing on nothing.
     setPlanned: function (doc) {
         let me = this;
-        let before = me.plannedData();
         me.pending = PVE.meta.EditSet.between(me.dataOf(me.docId), doc);
         me.buildTree();
         me.syncButtons();
-        return !PVE.meta.Core.call('same', before, doc);
     },
 
     // Records one edit: a `set` is `view::replace` at `path` and a `delete` is
@@ -3686,7 +3674,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (op === 'set') {
             edit.value = value;
         }
-        return this.setPlanned(new PVE.meta.EditSet([edit]).apply(this.plannedData()));
+        this.setPlanned(new PVE.meta.EditSet([edit]).apply(this.plannedData()));
     },
 
     isDirty: function () {
@@ -3740,10 +3728,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The one way a text buffer becomes staged edits at a view -- what "Edit selection
     // as text" ends with, and the reason that window no longer needs a write path of
     // its own.
-    // Returns whether it changed anything, which is not the same as whether the user
-    // typed: a reorder or a reindent parses to the document it started as.
     stageFromView: function (view, value) {
-        return this.stage(view || '', 'set', value);
+        this.stage(view || '', 'set', value);
     },
 
     // Revert: the document you are looking at is the stored one.

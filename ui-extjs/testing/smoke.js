@@ -474,7 +474,11 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
 
     // unchanged
     eq('unchanged: the loaded text, untouched', Buffer.unchanged({ editor: editor(handWritten), lang: 'yaml', original: handWritten }), true);
-    eq('... says so', alerts(), [['Notice', 'No changes.']]);
+    // Silently, both ways. This used to raise "No changes." from inside the
+    // predicate, which is how a dialog appeared in editors that never asked for
+    // one: answering a question and interrupting the user are two jobs, and only
+    // one of them was in the name.
+    eq('... and says nothing', alerts(), []);
     eq('unchanged: an edit', Buffer.unchanged({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }), false);
     eq('... silently', alerts(), []);
     eq('unchanged: the same document toggled to JSON is still unchanged', Buffer.unchanged({ editor: editor(Codec.dump({ b: 1, a: ['x', 'y'] }, 'json')), lang: 'json', original: handWritten }), true);
@@ -1761,11 +1765,6 @@ console.log('\n--- text is just another way to edit rows ---');
     eq('a delete is staged without a value', noop.pending.edits, [{ path: 'netbird', op: 'delete' }]);
     eq('... and removes the key from the planned document', noop.pending.apply(stored).netbird, undefined);
 
-    // `stage` reports whether it changed the document, which is what tells the subtree
-    // editor that a reorder had nothing to stage.
-    eq('staging a real change reports true', noop.stage('homelab.owner', 'set', 'again'), true);
-    eq('staging what is already there reports false',
-        noop.stage('homelab.owner', 'set', 'again'), false);
 }
 
 console.log('\n--- a single delete has to stay a DELETE ---');
