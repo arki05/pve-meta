@@ -353,11 +353,11 @@ console.log('\n--- the footer keeps the word its caller chose ---');
     };
     const owner = (b) => ({ down: (sel) => (sel === '#metaApply' ? b : null) });
 
-    const ok = btn('metaApply', { metaApplyText: 'OK' });
-    F.sync(owner(ok), { canApply: true, count: 0 });
+    const ok = btn('metaApply', {});
+    F.sync(owner(ok), { canApply: true, count: 0, applyText: 'OK' });
     eq('a modal keeps OK through a sync', ok.text, 'OK');
 
-    const apply = btn('metaApply', { metaApplyText: 'Apply' });
+    const apply = btn('metaApply', {});
     F.sync(owner(apply), { canApply: true, count: 3 });
     eq('the panel still counts its staged edits', apply.text, 'Apply (3)');
 
@@ -398,11 +398,13 @@ console.log('\n--- leaving Text only asks when the tree cannot carry the change 
     const E = ctx.PVE.meta.EditSet;
     eq('a reordering stages nothing', E.between(stored, { a: 2, b: 1 }).isEmpty(), true);
     eq('a real edit still stages', E.between(stored, { b: 9, a: 2 }).length, 1);
-    // The condition the dialog fires on: nothing staged, but the text did change.
-    const asks = (set, textDirty) => set.isEmpty() && textDirty;
-    eq('reorder: nothing staged, text dirty -> ask', asks(E.between(stored, { a: 2, b: 1 }), true), true);
-    eq('a real edit -> no dialog', asks(E.between(stored, { b: 9, a: 2 }), true), false);
-    eq('untouched buffer -> no dialog', asks(E.empty(), false), false);
+    // The predicate the dialog fires on, as the panel asks it: the document is the
+    // stored one and the buffer still differs.
+    const P0 = ctx.PVE.meta.TreePanel;
+    const card = (textDirty) => ({ docId: '1', dataOf: () => stored, textIsDirty: () => textDirty, layoutOnlyChange: P0.layoutOnlyChange });
+    eq('reorder: nothing staged, text dirty -> ask', card(true).layoutOnlyChange({ a: 2, b: 1 }), true);
+    eq('a real edit -> no dialog', card(true).layoutOnlyChange({ b: 9, a: 2 }), false);
+    eq('untouched buffer -> no dialog', card(false).layoutOnlyChange({ b: 1, a: 2 }), false);
 }
 
 console.log('\n--- request: the destroyed-component guard around API2Request ---');
@@ -1925,6 +1927,16 @@ console.log('\n--- discarding one member puts that member back, not the list ---
     eq('discarding an appended member removes it', groups(), ['lan', 'WAN']);
     s.discardListMember('netbird.groups', 1);
     eq('once every member matches, nothing is staged', s.pending.edits, []);
+
+    // A member the staged list dropped is a ghost row that remembers its stored
+    // index; discarding it puts that member back, and only that member.
+    s.stageListMember('netbird.groups', 0, 'LAN');
+    s.stageListMember('netbird.groups', 1, undefined);
+    eq('member 0 edited, member 1 dropped', groups(), ['LAN']);
+    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: null, storedIndex: 1 } });
+    eq('the ghost goes back, the other edit stays', groups(), ['LAN', 'wan']);
+    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: 0 } });
+    eq('and the list is clean again', s.pending.edits, []);
 
     // Revert: the document you are looking at is the stored one.
     s.stage('netbird.groups', 'set', ['x']);

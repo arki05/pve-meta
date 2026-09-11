@@ -1223,22 +1223,16 @@ PVE.meta.Monaco = {
                 },
             ],
             buttons: [
-                {
-                    // The same YAML|JSON switch the editors have, here rather than
-                    // before here: wanting to read a diff in the other syntax is not a
-                    // reason to close it, change the editor's language and open it
-                    // again. Hidden when a side did not parse, because then there is
-                    // nothing to re-render from.
-                    xtype: 'segmentedbutton',
+                // The same switch the editors have, here rather than before here:
+                // wanting to read a diff in the other syntax is not a reason to close
+                // it, change the editor's language and open it again. Only for
+                // documents; a buffer is shown as it is (above).
+                PVE.meta.Footer.langToggle({
                     itemId: 'diffLangBtn',
                     hidden: !values,
                     value: lang,
-                    items: [
-                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
-                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
-                    ],
-                    listeners: { change: (btn, value) => state.render(value) },
-                },
+                    onChange: (value) => state.render(value),
+                }),
                 {
                     xtype: 'proxmoxcheckbox',
                     itemId: 'diffAckBox',
@@ -1366,12 +1360,9 @@ Ext.define('PVE.meta.Footer', {
             // footer Apply *writes*, and a modal editor's button only hands its result
             // back -- the same OK the row editor and Add Key use. One word for both was
             // how the subtree window came to write directly and see nothing staged.
-            //
-            // Carried on the button, because `sync` rewrites this text on every
-            // keystroke: setting it once here and not there left the word to be
-            // overwritten by the next thing the user typed.
+            // `sync` rewrites this text on every keystroke, so the caller says the
+            // word there too (`state.applyText`).
             text: cfg.applyText || gettext('Apply'),
-            metaApplyText: cfg.applyText || gettext('Apply'),
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
             // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
@@ -1395,11 +1386,13 @@ Ext.define('PVE.meta.Footer', {
     // `count` on the button it acts on rather than in a label beside it: a label is
     // the first thing clipped when an editor opens in a window, and a counter you
     // cannot read is not one.
+    // state: { canApply, count, applyText?, dirty, dirtyText?, cleanText,
+    //          secondaryOnlyWhenDirty? }
     sync: function (owner, state) {
         let apply = owner.down('#metaApply');
         if (apply) {
             apply.setDisabled(!state.canApply);
-            let word = apply.metaApplyText || gettext('Apply');
+            let word = state.applyText || gettext('Apply');
             apply.setText(
                 state.count ? Ext.String.format(gettext('{0} ({1})'), word, state.count) : word,
             );
@@ -1411,9 +1404,33 @@ Ext.define('PVE.meta.Footer', {
             second.setIconCls(state.dirty ? 'fa fa-undo' : 'fa fa-times');
             // A window's Close becomes Discard once there is something to lose, which
             // is the one moment the difference matters.
-            second.setText(state.dirty ? state.dirtyText : state.cleanText);
+            second.setText(state.dirty ? state.dirtyText || state.cleanText : state.cleanText);
             second.setDisabled(!!state.secondaryOnlyWhenDirty && !state.dirty);
         }
+    },
+
+    // The YAML | JSON view switch every text editor and the diff window carry.
+    // `ui` per item, not the container's `defaultUI`: the latter only reaches a
+    // child that has no `ui` of its own, and the theme's plain `default` is PVE's
+    // blue primary button -- far too loud for a view switch in a bar of grey ones.
+    // cfg: { onChange(lang), value?, itemId?, reference?, hidden? }
+    langToggle: function (cfg) {
+        let out = {
+            xtype: 'segmentedbutton',
+            value: cfg.value || 'yaml',
+            hidden: !!cfg.hidden,
+            items: [
+                { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                { text: 'JSON', value: 'json', ui: 'default-toolbar' },
+            ],
+            listeners: { change: (btn, value) => cfg.onChange(value) },
+        };
+        ['itemId', 'reference'].forEach(function (k) {
+            if (cfg[k]) {
+                out[k] = cfg[k];
+            }
+        });
+        return out;
     },
 });
 
@@ -1433,6 +1450,7 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'stagedBelow', type: 'int' }, // staged edits somewhere beneath this row
         { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
         { name: 'arrayIndex' }, // this row is member N of the list at `path`
+        { name: 'storedIndex' }, // a ghost member: the index it had in the stored list
         { name: 'addressable', type: 'boolean' }, // false: no view path names this row
         { name: 'rawItem' }, // a list member's real value, whatever it is
         { name: 'valueText', type: 'string' },
@@ -1743,6 +1761,17 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
     initComponent: function () {
         let me = this;
         let editing = !!me.declaration;
+        // One inherited flag as a radio group: Inherit (writes nothing), then the
+        // word for `false` and the word for `true`.
+        let tristate = (name, label, whenFalse, whenTrue) => ({
+            xtype: 'radiogroup',
+            fieldLabel: label,
+            items: [
+                { boxLabel: gettext('Inherit'), name: name, inputValue: 'inherit', checked: true },
+                { boxLabel: whenFalse, name: name, inputValue: 'false' },
+                { boxLabel: whenTrue, name: name, inputValue: 'true' },
+            ],
+        });
         me.title = editing
             ? Ext.String.format(gettext('Edit declaration: {0}'), Ext.htmlEncode(me.keyName))
             : gettext('Declare Key');
@@ -1858,34 +1887,8 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                         // Radios rather than a dropdown, so all three states are
                         // readable at once and the label does not have to explain
                         // what the values mean. PVE's own UI uses them.
-                        {
-                            xtype: 'radiogroup',
-                            fieldLabel: gettext('Visibility'),
-                            items: [
-                                {
-                                    boxLabel: gettext('Inherit'),
-                                    name: 'hidden',
-                                    inputValue: 'inherit',
-                                    checked: true,
-                                },
-                                { boxLabel: gettext('Show'), name: 'hidden', inputValue: 'false' },
-                                { boxLabel: gettext('Hide'), name: 'hidden', inputValue: 'true' },
-                            ],
-                        },
-                        {
-                            xtype: 'radiogroup',
-                            fieldLabel: gettext('Validation'),
-                            items: [
-                                {
-                                    boxLabel: gettext('Inherit'),
-                                    name: 'enforce',
-                                    inputValue: 'inherit',
-                                    checked: true,
-                                },
-                                { boxLabel: gettext('Advisory'), name: 'enforce', inputValue: 'false' },
-                                { boxLabel: gettext('Enforced'), name: 'enforce', inputValue: 'true' },
-                            ],
-                        },
+                        tristate('hidden', gettext('Visibility'), gettext('Show'), gettext('Hide')),
+                        tristate('enforce', gettext('Validation'), gettext('Advisory'), gettext('Enforced')),
                     ],
                 },
             ],
@@ -2138,20 +2141,7 @@ Ext.define('PVE.meta.TextWindow', {
         Ext.apply(me, {
             items: [{ xtype: 'component', reference: 'mount', style: 'height:100%;width:100%' }],
             bbar: [
-                {
-                    xtype: 'segmentedbutton',
-                    reference: 'langbtn',
-                    value: 'yaml',
-                    // `ui` per item, not the container's `defaultUI`: the latter only
-                    // reaches a child that has no `ui` of its own, and the theme's
-                    // plain `default` is PVE's blue primary button - far too loud for
-                    // a view switch sitting in a toolbar of grey buttons.
-                    items: [
-                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
-                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
-                    ],
-                    listeners: { change: (btn, value) => me.switchLang(value) },
-                },
+                PVE.meta.Footer.langToggle({ reference: 'langbtn', onChange: (value) => me.switchLang(value) }),
             ].concat(
                 PVE.meta.Footer.actions({
                     // Stated, like the panel states its own: there is no buffer until
@@ -2218,8 +2208,8 @@ Ext.define('PVE.meta.TextWindow', {
         PVE.meta.Footer.sync(me, {
             canApply: !!me.editor,
             count: 0,
+            applyText: gettext('OK'),
             dirty: false,
-            dirtyText: gettext('Cancel'),
             cleanText: gettext('Cancel'),
         });
     },
@@ -2668,7 +2658,7 @@ PVE.meta.TextCard = {
     // In Text that is the buffer; in the tree it is the planned document, which is the
     // same question asked of the other view. It used to be offered in Text only, which
     // made "check before you commit" a thing you could do only after switching views.
-    showTextDiff: function () {
+    showDiff: function () {
         let me = this;
         let title = Ext.String.format(gettext('Changes: {0}'), me.docId);
         if (me.mode === 'text') {
@@ -2838,19 +2828,10 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        let unchanged = PVE.meta.Core.call('same', me.dataOf(me.docId), parsed);
-
         // Whatever you typed becomes staged rows, and the tree then shows it -- so
         // switching needs no confirmation and gets none. The exception is a change
-        // the tree has no way to show: key order and layout are text, not document
-        // (decision 007), so a buffer that reorders keys or reindents them parses to
-        // the document it started as and stages nothing. Switching would drop it with
-        // no row to mark and nothing to say what happened.
-        //
-        // Apply *from* Text keeps it, because that path sends the buffer rather than
-        // the model. So this is the one place that has to ask, and only here: the
-        // edit is real, it is just not one the other view can hold.
-        if (unchanged && me.textIsDirty()) {
+        // the tree has no way to show, and that one asks.
+        if (me.layoutOnlyChange(parsed)) {
             Ext.Msg.show({
                 title: gettext('Switch to the tree?'),
                 message: gettext(
@@ -2873,6 +2854,17 @@ PVE.meta.TextCard = {
             return;
         }
         me.finishLeavingTextMode(parsed);
+    },
+
+    // The buffer changed and the document did not: key order and layout are text,
+    // not document (decision 007), so a buffer that reorders keys or reindents them
+    // parses to the document it started as and stages nothing. Switching to the
+    // tree would drop it with no row to mark and nothing to say what happened.
+    // Apply *from* Text keeps it, because that path sends the buffer rather than
+    // the model. The edit is real; it is just not one the other view can hold.
+    layoutOnlyChange: function (parsed) {
+        let me = this;
+        return PVE.meta.Core.call('same', me.dataOf(me.docId), parsed) && me.textIsDirty();
     },
 
     // The mode first, then the document: `setPlanned` syncs the buttons, and they
@@ -3388,21 +3380,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 ],
                 listeners: { change: (btn, value) => me.onModeChange(value) },
             },
-            {
-                xtype: 'segmentedbutton',
+            PVE.meta.Footer.langToggle({
                 itemId: 'textLangBtn',
                 hidden: true,
-                value: 'yaml',
-                items: [
-                    { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
-                    { text: 'JSON', value: 'json', ui: 'default-toolbar' },
-                ],
-                listeners: { change: (btn, value) => me.switchTextLang(value) },
-            },
+                onChange: (value) => me.switchTextLang(value),
+            }),
         ].concat(
             PVE.meta.Footer.actions({
                 applyDisabled: true, // nothing staged yet; `syncFooter` decides after
-                diff: () => me.showTextDiff(),
+                diff: () => me.showDiff(),
                 format: () => me.formatText(),
                 apply: () => (me.mode === 'text' ? me.applyText() : me.applyPending()),
                 secondary: () => me.footerSecondary(),
@@ -3679,10 +3665,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // It also makes every staged edit minimal, which the Text card already did on the
     // way out: replacing a whole subtree marks the rows that actually differ, not the
     // whole subtree.
-    //
-    // Returns whether the document changed, which is not the same as whether the user
-    // typed: a reorder or a reindent parses to the document it started as (decision
-    // 007), and the subtree editor says so rather than closing on nothing.
     setPlanned: function (doc) {
         let me = this;
         me.pending = PVE.meta.EditSet.between(me.dataOf(me.docId), doc);
@@ -3750,6 +3732,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.discardListMember(d.path, d.arrayIndex);
             return;
         }
+        if (d.storedIndex !== undefined && d.storedIndex !== null) {
+            // A member the staged list dropped: put it back where it was, or at the
+            // end if the list is shorter than that now. Restoring the whole stored
+            // list here would throw away every other member's change.
+            me.discardListMember(d.path, d.storedIndex);
+            return;
+        }
         let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), d.path);
         me.stage(d.path, stored === undefined ? 'delete' : 'set', stored);
     },
@@ -3760,8 +3749,18 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!Array.isArray(stored)) {
             return;
         }
-        // An appended member has nothing stored to go back to: it goes.
-        me.stageListMember(path, index, index < stored.length ? stored[index] : undefined);
+        let list = me.listAt(path);
+        if (index >= stored.length) {
+            // An appended member has nothing stored to go back to: it goes.
+            me.stageListMember(path, index, undefined);
+        } else if (index >= list.length) {
+            // A dropped member, on a list now shorter than where it was: back on
+            // the end. The only place a member is ever added past the end.
+            list.push(stored[index]);
+            me.stage(path, 'set', list);
+        } else {
+            me.stageListMember(path, index, stored[index]);
+        }
     },
 
     // The document as it would be. Everything the tree shows is computed from this,
@@ -4345,6 +4344,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 row.present = false;
                 row.pendingDelete = true;
                 row.arrayIndex = null; // gone: there is no member to act on
+                row.storedIndex = e.value.length + i; // but there is one to put back
                 row.addressable = false;
                 row.kind = 'string';
                 row.value = PVE.meta.Utils.itemSummary(item);
@@ -4438,6 +4438,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         multiline: c.multiline,
                         rawValue: c.value,
                         arrayIndex: c.arrayIndex,
+                        storedIndex: c.storedIndex,
                         addressable: c.addressable !== false,
                         rawItem: c.rawItem,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
