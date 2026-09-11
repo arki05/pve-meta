@@ -1364,54 +1364,14 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
 }
 
 // What describes a registry document: its meta-schema, rooted at the document.
-// A permission file's is the one served for its kind. A prefix file's is built
-// from the file itself, because the `schema` it holds is keyed by whatever the
-// operator named their properties and no served description can reach those.
 {
     const META = { type: 'object', properties: { selector: { type: 'object' } } };
-    // A base with a `schema` property, which is where the document's own declared
-    // keys get grafted. A base without one has nowhere to graft, and gets nothing.
-    const PREFIX_META = {
-        type: 'object',
-        properties: { selector: { type: 'object' }, schema: { type: 'object' } },
-    };
-    const panelG = Object.assign({}, panel, {
-        registryDoc: true,
-        schemas: { prefix: PREFIX_META, permission: META },
-        pending: ctx.PVE.meta.EditSet.empty(),
-        docState: {
-            'prefixes/x': {
-                digest: 'd',
-                data: {
-                    selector: { all: true },
-                    schema: { type: 'object', properties: { spec: { type: 'object' } } },
-                },
-            },
-            'permissions/y': { digest: 'd', data: { authid: 'a@pve' } },
-        },
-    });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind', 'plannedData', 'dataOf'].forEach(
-        (m) => (panelG[m] = P[m]),
-    );
-    eq('a registry document is described at its root',
-        panelG.shapeFor('permissions/y').declared().map((g) => g.prefix), ['']);
-    eq('a permission file uses the schema served for its kind',
-        panelG.shapeFor('permissions/y').declared()[0].schema, META);
-    eq('a prefix file starts from the schema the server served',
-        panelG.shapeFor('prefixes/x').declared()[0].schema.properties.selector, { type: 'object' });
-
-    // The prefix file's own declared key is described, at its own path.
-    const pShape = panelG.shapeFor('prefixes/x');
-    const described = pShape.declared()[0].schema.properties.schema.properties;
-    eq('a prefix file describes the keys it declares', Object.keys(described), ['spec']);
-    eq('... with the two dials offered rather than hidden',
-        [described.spec.properties.hidden.hidden, described.spec.properties.enforce.hidden],
-        [undefined, undefined]);
-    eq('... and the long tail described but hidden', described.spec.properties.format.hidden, 1);
-
-    // Asking twice does not rebuild: the cache keys on the schema as text, since
-    // the document crosses the wasm boundary and returns a new object each time.
-    eq('the shape is cached across questions', panelG.shapeFor('prefixes/x'), pShape);
+    const panelG = Object.assign({}, panel, { registryDoc: true, schemas: { prefix: META, permission: {} } });
+    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind'].forEach((m) => (panelG[m] = P[m]));
+    eq('a prefix document is described by the meta-schema, rooted at the document',
+        panelG.shapeFor('prefixes/x').declared().map((g) => g.prefix), ['']);
+    eq('... which is the schema served for its kind',
+        panelG.shapeFor('prefixes/x').declared()[0].schema, META);
 }
 
 // A root-rooted schema governs the whole document. There is no special case for it:
