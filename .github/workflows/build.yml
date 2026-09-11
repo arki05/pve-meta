@@ -34,6 +34,11 @@ jobs:
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     container: debian:trixie
+    # Inside a container GitHub runs `run` steps with sh unless told otherwise,
+    # and the steps below use bash (arrays, shopt).
+    defaults:
+      run:
+        shell: bash
     env:
       DEBIAN_FRONTEND: noninteractive
     steps:
@@ -116,6 +121,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
