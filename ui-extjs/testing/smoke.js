@@ -945,7 +945,7 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
         ],
     });
     ['documentEntries', 'plannedData', 'dataOf', 'shapeFor', 'docKind', 'entry', 'addData',
-     'addShape', 'existing', 'applicablePrefixes', 'schemaKind'].forEach((m) => (d[m] = P[m]));
+     'addShape', 'applicablePrefixes', 'schemaKind'].forEach((m) => (d[m] = P[m]));
     const root = d.documentEntries.call(d);
     const routers = root.children.t.children.routers;
 
@@ -957,6 +957,15 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
     eq('an explicitly shown key inside a hidden subtree is offered',
         [!!routers.children.entrypoint, routers.children.entrypoint.present], [true, false]);
     eq('... with its default', routers.children.entrypoint.defaultValue, 'web');
+
+    // Nothing stored under the hidden subtree at all: the shown key still creates
+    // the rows above it, and the subtree's own row -- which its hidden declaration
+    // would not have created -- is still decorated by it once it exists.
+    d.docState[100].data = { t: {} };
+    const bare = d.documentEntries.call(d).children.t.children.routers;
+    eq('a shown child creates its hidden parent\'s row', [!!bare, bare.present], [true, false]);
+    eq('... and the parent is still typed as the map its declaration says', bare.kind, 'map');
+    eq('... offering only the shown child', Object.keys(bare.children), ['entrypoint']);
 }
 
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
@@ -1341,6 +1350,7 @@ eq('originalInLang is the identity for yaml -- no reparse, so it never throws',
 
 console.log('\n--- many documents in one panel ---');
 const D = ctx.PVE.meta.DeclareKeyWindow;
+D.FORM_KEYS = D.statics.FORM_KEYS; // the shim does not hoist statics; Ext does
 // An id is an address: the path it is served at, for every kind of document.
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
@@ -2150,12 +2160,12 @@ eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', e
         properties: { host: { type: 'string' }, port: { type: 'integer' } },
     };
     const edited = D.schemaFrom(Object.assign({}, D.valuesFrom(existing, 'spec'), { description: 'new' }));
-    const merged = D.merged(existing, edited);
+    const merged = D.statics.merged(existing, edited);
     eq('the edited field changed', merged.description, 'new');
     eq('nested declarations survive an edit of their parent', merged.properties, existing.properties);
     eq('and so does a keyword the form does not show', merged.optional, 1);
     eq('a field the form owns and now leaves empty is gone, not kept',
-        D.merged({ type: 'string', description: 'x' }, { type: 'string' }).description, undefined);
+        D.statics.merged({ type: 'string', description: 'x' }, { type: 'string' }).description, undefined);
     eq('the form keys come first, the kept ones after', Object.keys(merged), ['type', 'description', 'optional', 'properties']);
 }
 // Members of an enum are typed like the key: an integer key's values must not come
@@ -2163,8 +2173,9 @@ eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', e
 eq('an integer enum stays integers', D.schemaFrom({ type: 'integer', enum: '80, 443' }).enum, [80, 443]);
 eq('a string enum stays strings', D.schemaFrom({ type: 'string', enum: '80, 443' }).enum, ['80', '443']);
 eq('... and an integer declaration survives the round trip',
-    U.canonical(D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom({ type: 'integer', enum: [80, 443] }, 'k')))),
-    U.canonical({ type: 'integer', enum: [80, 443] }));
+    U.sameValue(D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom({ type: 'integer', enum: [80, 443] }, 'k'))),
+        { type: 'integer', enum: [80, 443] }),
+    true);
 
 // The two flags are three-state in both directions: absent means inherit, and
 // `false` is a statement that has to come back as `false` rather than as absent.

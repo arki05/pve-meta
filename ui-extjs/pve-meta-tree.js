@@ -1709,6 +1709,31 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
     width: 520,
     layout: 'fit',
     prefix: '', // the prefix this declaration is for, shown in the header
+
+    statics: {
+        // The keys the form owns. Everything else in an existing declaration -- a
+        // nested `properties`, a keyword this dialect has and the form does not
+        // show, such as `optional` -- is kept as it was when the declaration is
+        // edited: the form rewrites what it asks about and nothing more. Without
+        // this, editing the description of a map declaration dropped every key
+        // declared inside it.
+        FORM_KEYS: ['type', 'description', 'default', 'enum', 'minimum', 'maximum', 'format', 'multiline', 'hidden', 'enforce'],
+
+        // An edited declaration: the form's fields laid over what the declaration
+        // already held outside them. The form's keys come first, in the order a
+        // reader wants, and the kept ones after -- `properties` naturally last.
+        merged: function (existing, fresh) {
+            let out = Object.assign({}, fresh);
+            let owned = PVE.meta.DeclareKeyWindow.FORM_KEYS;
+            Object.keys(existing || {}).forEach(function (k) {
+                if (owned.indexOf(k) === -1) {
+                    out[k] = existing[k];
+                }
+            });
+            return out;
+        },
+    },
+
     // Editing an existing declaration rather than adding one: the key is fixed
     // (renaming it is moving a key, not editing what it says) and every field
     // starts from what the declaration holds.
@@ -1878,26 +1903,6 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
             sync();
             me.down(editing ? '[name=description]' : '[name=key]').focus(true, 50);
         });
-    },
-
-    // The keys the form owns. Everything else in an existing declaration -- a nested
-    // `properties`, a keyword this dialect has and the form does not show, such as
-    // `optional` -- is kept as it was when the declaration is edited: the form
-    // rewrites what it asks about and nothing more. Without this, editing the
-    // description of a map declaration dropped every key declared inside it.
-    FORM_KEYS: ['type', 'description', 'default', 'enum', 'minimum', 'maximum', 'format', 'multiline', 'hidden', 'enforce'],
-
-    // An edited declaration: the form's fields laid over what the declaration
-    // already held outside them. The form's keys come first, in the order a reader
-    // wants, and the kept ones after -- `properties` naturally last.
-    merged: function (existing, fresh) {
-        let out = Object.assign({}, fresh);
-        Object.keys(existing || {}).forEach(function (k) {
-            if (PVE.meta.DeclareKeyWindow.prototype.FORM_KEYS.indexOf(k) === -1) {
-                out[k] = existing[k];
-            }
-        });
-        return out;
     },
 
     // `schemaFrom` backwards: a declaration as the form's own fields, so editing
@@ -4193,20 +4198,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     //
     // A registry document's meta-schema is rooted at the document (DESIGN §6):
     // its "prefix" is the empty path, which is the root row itself and gets nothing.
-    // The entry at `path` if the document put one there, without creating it --
-    // the read-only half of `ensure`, for a declaration that may only decorate.
-    existing: function (root, path) {
-        let entry = root;
-        let segs = path ? path.split('.') : [];
-        for (let i = 0; i < segs.length; i++) {
-            entry = entry.children[segs[i]];
-            if (!entry) {
-                return null;
-            }
-        }
-        return entry;
-    },
-
     addShape: function (root, shape) {
         let me = this;
         let U = PVE.meta.Utils;
@@ -4218,6 +4209,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     at = U.joinPath(at, seg);
                     entry = me.entry(entry, seg, at);
                 });
+            }
+            return entry;
+        };
+        // The entry at `path` if something put one there, without creating it: the
+        // read-only half of `ensure`, for a declaration that may only decorate.
+        let existing = function (path) {
+            let entry = root;
+            let segs = path ? path.split('.') : [];
+            for (let i = 0; i < segs.length; i++) {
+                entry = entry.children[segs[i]];
+                if (!entry) {
+                    return null;
+                }
             }
             return entry;
         };
@@ -4237,22 +4241,27 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // the only thing its row can say about itself.
             entry.grammarDescription = entry.grammarDescription || d.description;
         });
-        shape.schemaIndex().forEach(function (ix) {
-            if (ix.path === ix.prefix) {
-                // The prefix's own node: its row exists from the loop above, and
-                // its type is the value's (or a map). A schema with `properties`
-                // says it is a map, which it already is.
-                return;
+        // Two passes over the index. A hidden declaration decorates a row that
+        // exists; it never creates one. That is the whole difference: a schema the
+        // size of Traefik's is mostly keys nobody sets on a given guest, and every
+        // one of them as a greyed row buries what the guest actually says. `addData`
+        // ran first, so a hidden key that *is* set already has its row and still
+        // gets its type, enum, range and default -- hiding a declaration must never
+        // hide data, nor excuse it from its own schema.
+        //
+        // Rows first, then decoration, because a shown key inside a hidden subtree
+        // creates the rows above it on its way in, and the subtree's own node --
+        // visited earlier, hidden, with nothing stored there -- would have found no
+        // row to decorate and left a bare shell where a typed map should be.
+        let index = shape.schemaIndex().filter((ix) => ix.path !== ix.prefix);
+        index.forEach(function (ix) {
+            if (!ix.hidden) {
+                ensure(ix.path);
             }
+        });
+        index.forEach(function (ix) {
             let ps = ix.schema || {};
-            // A hidden declaration decorates a row that exists; it never creates
-            // one. That is the whole difference: a schema the size of Traefik's is
-            // mostly keys nobody sets on a given guest, and every one of them as a
-            // greyed row buries what the guest actually says. `addData` ran first,
-            // so a hidden key that *is* set already has its row here and still gets
-            // its type, enum, range and default -- hiding a declaration must never
-            // hide data, nor excuse it from its own schema.
-            let child = ix.hidden ? me.existing(root, ix.path) : ensure(ix.path);
+            let child = existing(ix.path);
             if (!child) {
                 return;
             }
@@ -4824,8 +4833,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             'declarekey',
             // Laid over the declaration as it is: the form rewrites the fields it
             // asks about and keeps the rest -- a map's nested `properties` above all.
-            (_key, schema) =>
-                me.stage(rec.data.path, 'set', PVE.meta.DeclareKeyWindow.prototype.merged(current, schema)),
+            (_key, schema) => me.stage(rec.data.path, 'set', PVE.meta.DeclareKeyWindow.merged(current, schema)),
         );
         return true;
     },
