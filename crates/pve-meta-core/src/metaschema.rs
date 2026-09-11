@@ -83,12 +83,74 @@ properties:
     type: object
     optional: 1
     description: >-
-      What the subtree under this prefix looks like, in the PVE::JSONSchema dialect:
-      type, properties, description, default, optional, enum, minimum, maximum,
-      format, plus two editor hints of our own -- 'multiline' (this string is a block
-      of text) and 'hidden' (do not offer this as a row until it is set). A node may
-      also carry 'enforce'. All three are inherited by everything below the node that
-      sets them. Free-form, so it is edited as text.
+      What the subtree under this prefix looks like, in the PVE::JSONSchema dialect.
+      The node's own keywords are described below; everything under 'properties' is
+      not, and cannot be -- those keys are whatever an operator names them, and this
+      dialect has no way to say "every child here is another schema node". Declare Key
+      is how a property is added at any depth.
+    properties:
+      type:
+        type: string
+        enum: [object, string, integer, number, boolean, array]
+        description: What a value here must be.
+      description:
+        type: string
+        optional: 1
+        description: Shown as the tooltip on this key's row.
+      properties:
+        type: object
+        optional: 1
+        description: >-
+          The keys this node describes, each mapped to another schema node. Add one
+          with Declare Key rather than by hand.
+      default:
+        type: string
+        optional: 1
+        hidden: 1
+        description: >-
+          Offered by "Set to default" and pre-filled by the row editor. Never written
+          on its own.
+      enum:
+        type: array
+        optional: 1
+        hidden: 1
+        description: The only accepted values; the row editor becomes a dropdown.
+      minimum:
+        type: integer
+        optional: 1
+        hidden: 1
+        description: For integer and number keys.
+      maximum:
+        type: integer
+        optional: 1
+        hidden: 1
+        description: For integer and number keys.
+      format:
+        type: string
+        optional: 1
+        hidden: 1
+        description: >-
+          A PVE format name (dns-name, ipv4, ...). Checked by the editor, which has
+          proxmoxlib's validators; never enforced by the server, which does not.
+      multiline:
+        type: boolean
+        optional: 1
+        hidden: 1
+        description: Edit this string in a text box rather than on one line.
+      hidden:
+        type: boolean
+        optional: 1
+        hidden: 1
+        description: >-
+          Do not offer this key as a row until it is set. Inherited by everything
+          below this node unless that node says otherwise.
+      enforce:
+        type: boolean
+        optional: 1
+        hidden: 1
+        description: >-
+          Refuse a write that leaves this subtree not matching its schema. Inherited
+          by everything below this node unless that node says otherwise.
 "#;
 
 /// The permission file format (`docs/DESIGN.md` §4).
@@ -232,6 +294,33 @@ mod tests {
         assert!(!with("{}"), "neither is not");
         assert!(!with("{all: true, tag: web}"), "and both is not");
         assert!(!with("{all: false}"), "nor is 'all: false', which selects nothing");
+    }
+
+    /// The meta-schema describes a schema node's own keywords, so the prefix
+    /// editor offers them as rows. It stops at `properties`, and that is a hard
+    /// stop rather than a depth choice: those keys are whatever an operator names
+    /// them, and this dialect has no `$ref` with which to say "every child here is
+    /// another schema node". Declare Key is how a property is added at any depth.
+    #[test]
+    fn the_schema_node_is_described_but_its_properties_cannot_be() {
+        let schema = &prefix()["properties"]["schema"];
+        let props = schema["properties"].as_object().expect("the node's keywords");
+        assert!(props.contains_key("type"));
+        assert!(props.contains_key("properties"));
+        assert!(props.contains_key("hidden") && props.contains_key("enforce"));
+
+        // The common three are offered; the long tail is there and hidden, which is
+        // the feature being used on itself.
+        for shown in ["type", "description", "properties"] {
+            assert!(props[shown].get("hidden").is_none(), "{shown} should be offered");
+        }
+        for rare in ["default", "enum", "minimum", "maximum", "format", "multiline"] {
+            assert_eq!(props[rare]["hidden"], 1, "{rare} should be hidden");
+        }
+
+        // The stop: `properties` is an object with nothing described inside it.
+        assert_eq!(props["properties"]["type"], "object");
+        assert!(props["properties"].get("properties").is_none());
     }
 
     #[test]
