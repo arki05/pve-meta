@@ -1153,26 +1153,19 @@ PVE.meta.Monaco = {
         let state = {};
         cfg = Ext.apply({}, cfg);
 
-        // Both sides as *documents* where we can have them, because that is what lets
-        // this window switch syntax on its own. A caller that passes documents says so;
-        // a caller that passes a buffer gets them parsed here, and if either side will
-        // not parse there is no toggle -- a diff of text that is not a document is
-        // still worth seeing, it just cannot be re-rendered.
+        // Two kinds of caller. The tree passes *documents* (`originalValue`,
+        // `modifiedValue`): they are rendered here, and the window can re-render
+        // them in the other syntax, so it gets the YAML|JSON switch. Text mode
+        // passes *buffers*, and those are shown exactly as given -- never parsed and
+        // re-dumped -- because the buffer is what Apply from Text writes: a `#`
+        // comment or a reordering is in the file after the write, and a diff that
+        // canonicalised it away would show the user something other than what
+        // they are about to store. No switch for a buffer, then; re-rendering is
+        // exactly what it must not do.
         let values = null;
+        let lang = cfg.lang || 'yaml';
         if (cfg.originalValue !== undefined || cfg.modifiedValue !== undefined) {
             values = { original: cfg.originalValue, modified: cfg.modifiedValue };
-        } else {
-            try {
-                values = {
-                    original: PVE.meta.Codec.parse(cfg.original, cfg.lang || 'yaml'),
-                    modified: PVE.meta.Codec.parse(cfg.modified, cfg.lang || 'yaml'),
-                };
-            } catch (_err) {
-                values = null;
-            }
-        }
-        let lang = cfg.lang || 'yaml';
-        if (values) {
             cfg.original = PVE.meta.Codec.dump(values.original, lang);
             cfg.modified = PVE.meta.Codec.dump(values.modified, lang);
         }
