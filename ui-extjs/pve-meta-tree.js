@@ -1811,30 +1811,35 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                         // subtree that wants to be shown has to be able to say so,
                         // and a checkbox can only say "hidden" or "not stated".
                         //
-                        // `'inherit'` rather than `''` as the unset value: a
-                        // `proxmoxKVComboBox` with an empty-string key returns the
-                        // store record's id, which is how `format: KeyValue-1` once
-                        // got written into a schema.
+                        // Radios rather than a dropdown, so all three states are
+                        // readable at once and the label does not have to explain
+                        // what the values mean. PVE's own UI uses them.
                         {
-                            xtype: 'proxmoxKVComboBox',
-                            name: 'hidden',
-                            fieldLabel: gettext('In the tree'),
-                            value: 'inherit',
-                            comboItems: [
-                                ['inherit', gettext('inherit')],
-                                ['false', gettext('always offer this key')],
-                                ['true', gettext('only once it is set')],
+                            xtype: 'radiogroup',
+                            fieldLabel: gettext('When unset'),
+                            items: [
+                                {
+                                    boxLabel: gettext('Inherit'),
+                                    name: 'hidden',
+                                    inputValue: 'inherit',
+                                    checked: true,
+                                },
+                                { boxLabel: gettext('Show'), name: 'hidden', inputValue: 'false' },
+                                { boxLabel: gettext('Hide'), name: 'hidden', inputValue: 'true' },
                             ],
                         },
                         {
-                            xtype: 'proxmoxKVComboBox',
-                            name: 'enforce',
-                            fieldLabel: gettext('Enforced'),
-                            value: 'inherit',
-                            comboItems: [
-                                ['inherit', gettext('inherit')],
-                                ['false', gettext('advisory: a bad value is only marked')],
-                                ['true', gettext('refuse a write that does not match')],
+                            xtype: 'radiogroup',
+                            fieldLabel: gettext('If it does not match'),
+                            items: [
+                                {
+                                    boxLabel: gettext('Inherit'),
+                                    name: 'enforce',
+                                    inputValue: 'inherit',
+                                    checked: true,
+                                },
+                                { boxLabel: gettext('Warn'), name: 'enforce', inputValue: 'false' },
+                                { boxLabel: gettext('Refuse'), name: 'enforce', inputValue: 'true' },
                             ],
                         },
                     ],
