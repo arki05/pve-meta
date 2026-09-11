@@ -1679,14 +1679,39 @@ console.log('\n--- text is just another way to edit rows ---');
 
     // A root-level edit subsumes narrower ones: it replaces the whole document, so a
     // staged edit under a key it does not have would otherwise be re-applied on top.
+    // `stage` compares the planned document against the stored one, so the stub needs
+    // both -- that check is what keeps "dirty" from meaning "an edit object exists".
     const stub = { pending: new EditSet([{ path: 'homelab.owner', op: 'set', value: 'x' }]), docId: '1' };
-    ['stage'].forEach((m) => (stub[m] = P[m]));
+    ['stage', 'plannedData'].forEach((m) => (stub[m] = P[m]));
+    stub.docState = { 1: { digest: 'd', data: stored } };
+    stub.dataOf = (id) => (stub.docState[id] || {}).data || {};
     stub.buildTree = () => {};
     stub.syncButtons = () => {};
     stub.stage('', 'set', { a: 1 });
     eq('the document replaces everything under it', stub.pending.edits, [{ path: '', op: 'set', value: { a: 1 } }]);
     stub.stage('b', 'delete');
     eq('a delete is staged without a value', stub.pending.edits[1], { path: 'b', op: 'delete' });
+
+    // Dirty means the document differs, not that an edit exists. Staging the value a
+    // row already has -- which is what the subtree editor's OK does when you typed
+    // nothing -- must leave nothing staged, or Revert appears with no row marked.
+    const noop = { pending: EditSet.empty(), docId: '1' };
+    ['stage', 'plannedData'].forEach((m) => (noop[m] = P[m]));
+    noop.docState = { 1: { digest: 'd', data: stored } };
+    noop.dataOf = (id) => (noop.docState[id] || {}).data || {};
+    noop.buildTree = () => {};
+    noop.syncButtons = () => {};
+    noop.stage('', 'set', JSON.parse(JSON.stringify(stored)));
+    eq('staging the document it already is stages nothing', noop.pending.edits, []);
+    noop.stage('homelab.owner', 'set', stored.homelab.owner);
+    eq('... and so does staging a value a row already has', noop.pending.edits, []);
+
+    // And the round trip: A to B and back to A cancels, rather than leaving two edits
+    // that together describe no change.
+    noop.stage('homelab.owner', 'set', 'changed');
+    eq('a real change still stages', noop.pending.length, 1);
+    noop.stage('homelab.owner', 'set', stored.homelab.owner);
+    eq('changing it back cancels the edit', noop.pending.edits, []);
 }
 
 console.log('\n--- a single delete has to stay a DELETE ---');

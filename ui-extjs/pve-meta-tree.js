@@ -1149,13 +1149,30 @@ PVE.meta.Monaco = {
 
     showDiffWindow: function (cfg) {
         let state = {};
-        // Rendering a document rather than a buffer: only reachable from here, which
-        // is after the core is loaded.
+        cfg = Ext.apply({}, cfg);
+
+        // Both sides as *documents* where we can have them, because that is what lets
+        // this window switch syntax on its own. A caller that passes documents says so;
+        // a caller that passes a buffer gets them parsed here, and if either side will
+        // not parse there is no toggle -- a diff of text that is not a document is
+        // still worth seeing, it just cannot be re-rendered.
+        let values = null;
         if (cfg.originalValue !== undefined || cfg.modifiedValue !== undefined) {
-            cfg = Ext.apply({}, cfg);
-            cfg.original = PVE.meta.Codec.dump(cfg.originalValue, 'yaml');
-            cfg.modified = PVE.meta.Codec.dump(cfg.modifiedValue, 'yaml');
-            cfg.lang = 'yaml';
+            values = { original: cfg.originalValue, modified: cfg.modifiedValue };
+        } else {
+            try {
+                values = {
+                    original: PVE.meta.Codec.parse(cfg.original, cfg.lang || 'yaml'),
+                    modified: PVE.meta.Codec.parse(cfg.modified, cfg.lang || 'yaml'),
+                };
+            } catch (_err) {
+                values = null;
+            }
+        }
+        let lang = cfg.lang || 'yaml';
+        if (values) {
+            cfg.original = PVE.meta.Codec.dump(values.original, lang);
+            cfg.modified = PVE.meta.Codec.dump(values.modified, lang);
         }
         // `cfg.warnings` (grammar findings) turns this into the warned form: a banner
         // above the diff and an Apply gated on an explicit tick.
@@ -1212,6 +1229,22 @@ PVE.meta.Monaco = {
             ],
             buttons: [
                 {
+                    // The same YAML|JSON switch the editors have, here rather than
+                    // before here: wanting to read a diff in the other syntax is not a
+                    // reason to close it, change the editor's language and open it
+                    // again. Hidden when a side did not parse, because then there is
+                    // nothing to re-render from.
+                    xtype: 'segmentedbutton',
+                    itemId: 'diffLangBtn',
+                    hidden: !values,
+                    value: lang,
+                    items: [
+                        { text: 'YAML', value: 'yaml', ui: 'default-toolbar' },
+                        { text: 'JSON', value: 'json', ui: 'default-toolbar' },
+                    ],
+                    listeners: { change: (btn, value) => state.render(value) },
+                },
+                {
                     xtype: 'proxmoxcheckbox',
                     itemId: 'diffAckBox',
                     hidden: !warnings.length,
@@ -1254,10 +1287,27 @@ PVE.meta.Monaco = {
                 // dialog, so show them.
                 ignoreTrimWhitespace: false,
             });
-            state.editor.setModel({
-                original: monaco.editor.createModel(cfg.original, cfg.lang),
-                modified: monaco.editor.createModel(cfg.modified, cfg.lang),
-            });
+            // One place that builds the models, so the toggle and the first draw
+            // cannot disagree. The previous pair is disposed *after* the new one is
+            // in, never while the widget still holds it.
+            state.render = function (to) {
+                let old = state.editor.getModel();
+                state.editor.setModel({
+                    original: monaco.editor.createModel(
+                        values ? PVE.meta.Codec.dump(values.original, to) : cfg.original,
+                        to,
+                    ),
+                    modified: monaco.editor.createModel(
+                        values ? PVE.meta.Codec.dump(values.modified, to) : cfg.modified,
+                        to,
+                    ),
+                });
+                if (old) {
+                    old.original.dispose();
+                    old.modified.dispose();
+                }
+            };
+            state.render(lang);
         });
         win.on('destroy', function () {
             PVE.meta.Monaco.dispose(state.editor);
@@ -1300,16 +1350,22 @@ Ext.define('PVE.meta.Footer', {
                 handler: cfg.format,
             });
         }
+        out.push('->');
+        // Diff belongs with Apply and Revert, not with the view switches on the left:
+        // it answers the same question they do -- what am I about to do to this
+        // document -- and it answers it without committing. It is also not a text-mode
+        // button. What is staged is a property of the document, so the tree has a diff
+        // to show as much as the buffer does, and checking before Apply is exactly when
+        // you want it.
         if (cfg.diff) {
             out.push({
                 text: gettext('Diff'),
                 itemId: 'metaDiff',
                 iconCls: 'fa fa-exchange',
-                tooltip: gettext('Show this buffer against the stored document'),
+                tooltip: gettext('Show what Apply would write, against the stored document'),
                 handler: cfg.diff,
             });
         }
-        out.push('->');
         out.push({
             // Named by the caller, because the two mean different things: the panel's
             // footer Apply *writes*, and a modal editor's button only hands its result
@@ -2492,15 +2548,26 @@ PVE.meta.TextCard = {
     // The buffer against the file, without committing to anything. Text mode's Apply
     // shows the same diff, but only as the last step before writing -- and wanting to
     // see what you changed is not the same as wanting to write it.
+    // What Apply would write, against what is stored -- in whichever view you are in.
+    // In Text that is the buffer; in the tree it is the planned document, which is the
+    // same question asked of the other view. It used to be offered in Text only, which
+    // made "check before you commit" a thing you could do only after switching views.
     showTextDiff: function () {
         let me = this;
-        if (!me.textEditor) {
+        let title = Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId);
+        if (me.mode === 'text') {
+            if (!me.textEditor) {
+                return;
+            }
+            PVE.meta.Buffer.diff(me.textBuffer(), title);
             return;
         }
-        PVE.meta.Buffer.diff(
-            me.textBuffer(),
-            Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId),
-        );
+        PVE.meta.Monaco.confirmDiff({
+            title: Ext.String.format(gettext('Changes: {0}'), me.docId),
+            originalValue: me.dataOf(me.docId),
+            modifiedValue: me.plannedData(),
+            // No `apply`: this is the view, not the decision.
+        });
     },
 
     setModeButton: function (value) {
@@ -3490,6 +3557,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // for everything under it: staging `selector` after `selector.tag` means the
     // subtree was replaced wholesale, and keeping the older, narrower entry would
     // re-apply it on top of the new value.
+    // The one door every editor stages through: the row editor, Add Key, Add Rule,
+    // Declare Key, Set to Default, the list helpers and the subtree text editor.
+    //
+    // Dirty has to mean *the document differs from what is stored*, not that an edit
+    // object exists. Two ways it came to lie, both reported: opening the subtree
+    // editor and pressing OK without typing staged a set of the value already there,
+    // and editing a row from A to B and back to A left two edits describing no change.
+    // Either way Revert appeared and Apply lit up while no row was marked, because
+    // nothing had in fact changed. Checking the *result* rather than each edit catches
+    // both, and anything else that reaches the same place by a route nobody thought of.
     stage: function (path, op, value) {
         let me = this;
         let edit = { path: path, op: op };
@@ -3497,6 +3574,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             edit.value = value;
         }
         me.pending.stage(edit);
+        if (PVE.meta.Core.call('same', me.plannedData(), me.dataOf(me.docId))) {
+            me.pending = PVE.meta.EditSet.empty();
+        }
         me.buildTree();
         me.syncButtons();
     },
@@ -3573,10 +3653,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // as text" ends with, and the reason that window no longer needs a write path of
     // its own.
     stageFromView: function (view, value) {
-        let me = this;
-        me.pending.stage({ path: view || '', op: 'set', value: value });
-        me.buildTree();
-        me.syncButtons();
+        this.stage(view || '', 'set', value);
     },
 
     revertPending: function () {
@@ -3769,7 +3846,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncFooter: function () {
         let me = this;
         let textMode = me.mode === 'text';
-        ['textLangBtn', 'metaFormat', 'metaDiff'].forEach(function (id) {
+        // `metaDiff` is deliberately not in this list: it is not a text-mode button.
+        ['textLangBtn', 'metaFormat'].forEach(function (id) {
             let c = me.down('#' + id);
             if (c) {
                 c.setHidden(!textMode);
