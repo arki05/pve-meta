@@ -59,6 +59,14 @@ properties:
         description: >-
           Only guests carrying this PVE tag. Adding the tag to a guest is the
           deliberate act of including it.
+  enforce:
+    type: boolean
+    optional: 1
+    description: >-
+      Refuse an API write that would leave this prefix's subtree not matching its
+      schema, for the paths the write changed; 'force=1' stores it anyway (the
+      editor's "Save anyway" tick). Off by default: a schema is advisory unless the
+      prefix says otherwise. Format checks are never enforced.
   schema:
     type: object
     optional: 1
@@ -216,7 +224,7 @@ mod tests {
     #[test]
     fn no_property_is_invented() {
         let ns: Vec<String> = properties(&prefix()).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(ns, ["description", "selector", "schema"]);
+        assert_eq!(ns, ["description", "selector", "enforce", "schema"]);
         let g: Vec<String> = properties(&permission()).into_iter().map(|(k, _)| k).collect();
         assert_eq!(g, ["authid", "description", "rules"]);
     }

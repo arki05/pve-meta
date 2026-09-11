@@ -468,6 +468,8 @@ struct WirePrefix {
     #[serde(default)]
     schema: Option<Value>,
     #[serde(default)]
+    enforce: Option<Value>,
+    #[serde(default)]
     error: Option<String>,
 }
 
@@ -481,6 +483,8 @@ impl WirePrefix {
             selector: Selector::from_wire(self.selector.as_ref()?).ok()?,
             description: self.description,
             schema: self.schema,
+            // Perl's `1`/`0` on the wire, like `read`/`write` in an access answer.
+            enforce: self.enforce.as_ref().is_some_and(truthy),
         })
     }
 }
@@ -644,6 +648,12 @@ mod tests {
         assert_eq!(index[1], json!({"path": "homelab.notes", "prefix": "homelab", "schema": {"type": "string"}}));
         let findings = ok("shape_findings", json!([listing, [], {"homelab": {"notes": 5}}]));
         assert_eq!(findings, json!([{"path": "homelab.notes", "msg": "expected string"}]));
+        // An enforcing prefix's findings say so, in Perl's spelling of true.
+        let strict = json!([{"prefix": "homelab", "selector": {"all": 1}, "enforce": 1, "schema": {"type": "object", "properties": {"notes": {"type": "string"}}}}]);
+        assert_eq!(
+            ok("shape_findings", json!([strict, [], {"homelab": {"notes": 5}}])),
+            json!([{"path": "homelab.notes", "msg": "expected string", "enforced": true}])
+        );
 
         // A registry document: its meta-schema rooted at the document.
         let rooted = json!([{"prefix": "", "selector": {"all": true}, "schema": {"type": "object", "properties": {"authid": {"type": "string"}}}}]);

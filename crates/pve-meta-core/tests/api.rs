@@ -7,7 +7,7 @@ use pve_meta_core::api::{
     ApiViewDocument, CallerAcl, GuestInput, PermissionEntry,
 };
 use pve_meta_core::path::Path as DocPath;
-use pve_meta_core::registry::{self, Origin, Permission, RegistryFailure};
+use pve_meta_core::registry::{self, Origin, Permission, PrefixDef, RegistryFailure};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind};
 use serde_json::json;
 
@@ -124,13 +124,14 @@ fn put(
     dry_run: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    put_with(store, &regs(), id, view, fmt, payload, mode, digest, dry_run, acl)
+    put_with(store, &regs(), &[], id, view, fmt, payload, mode, digest, dry_run, false, acl)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn put_with(
     store: &MetaStore,
     permission_files: &[Permission],
+    prefixes: &[PrefixDef],
     id: &str,
     view: Option<&str>,
     fmt: &str,
@@ -138,9 +139,79 @@ fn put_with(
     mode: &str,
     digest: Option<&str>,
     dry_run: bool,
+    force: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    put_document(store, permission_files, id, view, fmt, payload, mode, digest, dry_run, acl)
+    put_document(
+        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, acl,
+    )
+}
+
+/// The enforcing prefix the schema-gate tests use: `traefik`, reaching every
+/// guest, with a typed `port` and a `format`-checked `host`.
+fn enforcing(enforce: bool) -> Vec<PrefixDef> {
+    let text = format!(
+        "selector: {{all: true}}\nenforce: {enforce}\nschema:\n  type: object\n  properties:\n    port: {{type: integer}}\n    host: {{type: string, format: dns-name}}\n"
+    );
+    vec![pve_meta_core::registry::parse_prefix("traefik", &text).unwrap()]
+}
+
+#[test]
+fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
+    let (_dir, store) = store();
+    let strict = enforcing(true);
+    let wrong = r#"{"port": "eighty"}"#;
+
+    // Refused, naming the path, for a full writer too: enforcement is about the
+    // write, not the writer.
+    let err = put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, false, &full())
+        .unwrap_err();
+    assert_eq!(status(&err), 422, "{err}");
+    assert!(err.msg.contains("traefik.port") && err.msg.contains("force=1"), "{err}");
+    assert!(read_raw(&store, "100").is_none(), "nothing was written");
+    // A dry run answers the same.
+    let err = put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, true, false, &full())
+        .unwrap_err();
+    assert_eq!(status(&err), 422);
+
+    // `force` stores it anyway -- the deliberate act.
+    put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, true, &full()).unwrap();
+    assert_eq!(read_raw(&store, "100").as_deref(), Some("traefik:\n  port: eighty\n"));
+
+    // The document is now wrong under `traefik`; a write elsewhere is not
+    // answerable for that and goes through.
+    put_with(&store, &regs(), &strict, "100", Some("other"), "json", r#"{"k": 1}"#, "replace", None, false, false, &full()).unwrap();
+    // ... but writing a differently-wrong value onto the wrong key still is.
+    let err = put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", r#""ninety""#, "replace", None, false, false, &full())
+        .unwrap_err();
+    assert_eq!(status(&err), 422);
+    // Fixing it is fine, of course.
+    put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", "80", "replace", None, false, false, &full()).unwrap();
+
+    // A format check is never enforced: the server cannot judge a dns-name.
+    put_with(&store, &regs(), &strict, "100", Some("traefik.host"), "json", r#""not a host!!""#, "replace", None, false, false, &full()).unwrap();
+
+    // Without `enforce`, the same schema is advisory and the same write goes through.
+    put_with(&store, &regs(), &enforcing(false), "100", Some("traefik.port"), "json", r#""eighty""#, "replace", None, false, false, &full()).unwrap();
+
+    // A prefix that does not reach this guest enforces nothing on it.
+    let tagged = vec![pve_meta_core::registry::parse_prefix(
+        "traefik",
+        "selector: {tag: web}\nenforce: true\nschema: {type: object, properties: {port: {type: integer}}}\n",
+    )
+    .unwrap()];
+    put_with(&store, &regs(), &tagged, "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
+    let mut web = full();
+    web.tags = vec!["web".to_string()];
+    assert_eq!(
+        status(&put_with(&store, &regs(), &tagged, "100", Some("traefik.port"), "json", r#""y""#, "replace", None, false, false, &web).unwrap_err()),
+        422
+    );
+
+    // A scoped principal writing inside its own prefix meets the same gate.
+    let err = put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", r#""z""#, "replace", None, false, false, &scoped(&["traefik"]))
+        .unwrap_err();
+    assert_eq!(status(&err), 422);
 }
 
 fn del(
@@ -341,8 +412,7 @@ fn one_write_may_span_two_granted_prefixes() {
     seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
     let doc = r#"{"traefik":{"host":"b"},"netbird":{"groups":["wan"]}}"#;
     let res = put_with(
-        &store, &two_rw(), "100", None, "json", doc, "replace", None, false, &auditor(&[]),
-    )
+        &store, &two_rw(), &[], "100", None, "json", doc, "replace", None, false, false, &auditor(&[]))
     .expect("every change is inside a granted prefix");
     assert_eq!(
         res.touched.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(),
@@ -365,8 +435,7 @@ fn a_whole_document_write_still_answers_for_every_key_it_changes() {
     ] {
         seed(&store, "100", stored);
         let err = put_with(
-            &store, &two_rw(), "100", None, "json", doc, "replace", None, false, &auditor(&[]),
-        )
+            &store, &two_rw(), &[], "100", None, "json", doc, "replace", None, false, false, &auditor(&[]))
         .unwrap_err();
         assert_eq!(status(&err), 403, "{label}: {err}");
         assert!(err.to_string().contains("homelab") || err.to_string().contains("new"), "{label}: {err}");
@@ -384,9 +453,8 @@ fn reordering_keys_is_a_write_a_scoped_principal_may_make() {
     seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
     let res = put_with(
-        &store, &two_rw(), "100", None, "json", reordered, "replace", None, false,
-        &auditor(&[]),
-    )
+        &store, &two_rw(), &[], "100", None, "json", reordered, "replace", None, false, false,
+        &auditor(&[]))
     .expect("a reordering changes no path");
     assert!(res.touched.is_empty(), "{:?}", res.touched);
     assert_eq!(
@@ -418,8 +486,7 @@ fn a_reader_with_no_write_permission_cannot_cause_a_write() {
     )
     .unwrap()];
     let err = put_with(
-        &store, &ro_only, "100", None, "json", reordered, "replace", None, false, &readonly,
-    )
+        &store, &ro_only, &[], "100", None, "json", reordered, "replace", None, false, false, &readonly)
     .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
     assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
@@ -436,9 +503,8 @@ fn a_write_you_may_not_read_is_refused_before_it_can_answer_anything() {
     // principal has no full read.
     for guess in ["\"hunter2\"", "\"wrong\""] {
         let err = put_with(
-            &store, &two_rw(), "100", Some("secret.token"), "json", guess, "replace", None,
-            false, &scoped(&[]),
-        )
+            &store, &two_rw(), &[], "100", Some("secret.token"), "json", guess, "replace", None,
+            false, false, &scoped(&[]))
         .unwrap_err();
         assert_eq!(status(&err), 403, "{guess}: {err}");
         // The refusal must not depend on the guess, or it is the oracle again.
@@ -461,9 +527,8 @@ fn an_unreadable_document_is_repaired_only_by_full_write() {
     std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
     let before = std::fs::read_to_string(dir.path().join("100.yaml")).unwrap();
     let err = put_with(
-        &store, &two_rw(), "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace",
-        None, false, &auditor(&[]),
-    )
+        &store, &two_rw(), &[], "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace",
+        None, false, false, &auditor(&[]))
     .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
     assert!(err.to_string().contains("cannot be read back"), "{err}");

@@ -44,6 +44,7 @@ there is no `prefix:` field for the two to disagree about.
 # /usr/share/pve-meta/prefixes/traefik.yaml
 description: Traefik dynamic configuration
 selector: { tag: traefik }   # or { all: true }; room for { pool: name } later
+enforce: true                # optional: refuse a write that breaks the schema below
 schema:                      # optional, PVE::JSONSchema dialect for the subtree
   type: object
   properties:
@@ -121,10 +122,10 @@ are `protected` and run in pvedaemon.
 | GET | `/meta/version` | `detail`, `id` | `{ token, changed }` — content hash over the store; poll it. With `id`, over that one document plus the registry directories instead |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags, digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's permissions, 400 on invalid content |
+| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's permissions, 400 on invalid content, 422 when the write would break a prefix's schema that says `enforce: true` and `force` is not set |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET | `/meta/access` | `id` (any document id) | `{ read, write, scopes, tags }` for that document, selectors already resolved; `tags` are the guest's PVE tags (`VM.Audit` only, empty otherwise); without `id`, the caller's read/write on the registry (`read` always, `write` = `Sys.Modify` on `/`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies. A file that did not parse is listed too, as `{ prefix, origin, error }` and nothing else, so it can be found and repaired instead of silently ceasing to exist |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, schema? }]`, most-specific prefix first — what each prefix is and where it applies. A file that did not parse is listed too, as `{ prefix, origin, error }` and nothing else, so it can be found and repaired instead of silently ceasing to exist |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column. A file that did not parse is listed as `{ name, origin, error }`; it grants nothing |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/permissions/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix definition/permission file. `Sys.Modify` on `/` to write |
 | GET | `/meta/schemas` | — | `{ prefix, permission }` — the two registry file formats described as schemas, which is what lets the editor show a prefix file as a typed tree |
@@ -148,6 +149,15 @@ that ever writes one. Columns: key, value (an editor chosen by the value's shape
 for a scalar, a text box for a string with newlines, Monaco for a map or an array of
 maps), description (the row's own `k__` comment key) and access (every rule whose prefix
 covers the row). A row whose value does not match its schema is marked amber in place.
+
+A schema is advisory: the editor marks a value that does not match it and asks for a
+"Save anyway" tick before applying, but the server stores whatever passes its one lint.
+A prefix that says `enforce: true` turns that tick into the rule: an API write that would
+leave the prefix's subtree not matching its schema, for the paths the write changed, is
+refused with a 422 unless the request carries `force=1`, which is what the tick sends.
+It is available to anyone who may write, so a drifted schema never locks anyone out; it
+makes a mismatch a deliberate act. Format checks (`ipv4`, `dns-name`, ...) are never
+enforced, since only the editor has PVE's validators for them.
 
 Edits are **staged**, not written one key at a time: the tree shows the document as it
 would be, a staged row renders like a pending PVE config change (the stored value, then

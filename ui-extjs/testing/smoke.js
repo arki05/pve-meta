@@ -347,6 +347,18 @@ console.log('\n--- request: the destroyed-component guard around API2Request ---
     delete ctx.Proxmox.Utils.API2Request;
 }
 
+console.log('\n--- enforce: an enforcing prefix\'s findings say so ---');
+{
+    const S = { type: 'object', properties: { port: { type: 'integer' } } };
+    const strict = new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 1, schema: S }], []);
+    const lax = new Shape([{ prefix: 't', selector: { all: 1 }, schema: S }], []);
+    eq('an enforcing prefix flags its findings', strict.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer', enforced: true }]);
+    eq('an ordinary one does not', lax.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer' }]);
+    eq('Perl\'s 0 is not enforce', new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 0, schema: S }], []).findings({ t: { port: 'x' } })[0].enforced, undefined);
+    eq('the banner line says which', U.findingText({ path: 't.port', msg: 'expected integer', enforced: true }), 'enforced: t.port: expected integer');
+    eq('... and stays plain otherwise', U.findingText({ path: 't.port', msg: 'expected integer' }), 't.port: expected integer');
+}
+
 console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
 // The Text card and the subtree window used to hold one copy each of Format, the
 // YAML | JSON switch, Diff and "did anything change", and the copies drifted.

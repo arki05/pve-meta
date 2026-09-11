@@ -225,6 +225,16 @@ my $DRY_RUN_SCHEMA = {
     description => "Validate and diff without writing.",
 };
 
+my $FORCE_SCHEMA = {
+    type => 'boolean',
+    optional => 1,
+    default => 0,
+    description => "Store the result even where a prefix declares 'enforce: true' and "
+        . "the write would leave its subtree not matching that prefix's schema "
+        . "(docs/DESIGN.md §4). Without it such a write is a 422 naming the paths. "
+        . "This is what the editor's \"Save anyway\" tick sends.",
+};
+
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
@@ -295,7 +305,7 @@ my $put_view = sub {
     return _call(
         \&PVE::RS::Meta::api_put,
         $id, $param->{view}, $format, $payload, $param->{mode} // 'replace',
-        $param->{digest}, ($param->{dry_run} ? 1 : 0), $acl,
+        $param->{digest}, ($param->{dry_run} ? 1 : 0), $acl, ($param->{force} ? 1 : 0),
     );
 };
 
@@ -666,6 +676,7 @@ sub _register_document_methods {
                 mode => $MODE_SCHEMA,
                 digest => get_standard_option('pve-config-digest'),
                 dry_run => $DRY_RUN_SCHEMA,
+                force => $FORCE_SCHEMA,
             },
         },
         returns => $PUT_RETURNS,

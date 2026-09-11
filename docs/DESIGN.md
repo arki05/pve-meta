@@ -89,6 +89,15 @@ parsed independently, and a cross-file check would trade that for nothing. It is
 The selector decides which guests a prefix reaches, and therefore where its
 declared-but-unset rows appear. Nowhere else.
 
+**A schema is advisory unless the prefix says `enforce: true`.** Then an API write that
+would leave the prefix's subtree not matching the schema — for the paths that write
+changed, never for what was already wrong elsewhere — is a 422 naming the paths, unless
+the request carries `force=1`. `force` is available to anyone who may write: enforcement
+makes a mismatch a deliberate act, not an impossible one, so a drifted schema can never
+lock an administrator out of a document (§4). The editor's "Save anyway" tick sends it.
+Format checks are never enforced: a `format:` is judged by proxmoxlib's validators in
+the editor, and the server must not refuse on a guess.
+
 **A prefix with no `schema` is still a declaration**, and the UI gives it a row like any
 other. Declaring the prefix says *something of mine lives at this key* — which is the
 statement permissions are written in terms of (§3.2) — and that is worth a row even
@@ -332,10 +341,10 @@ covering only the keywords we happened to think of. The small form that *does* e
 | GET | `/meta/version` | `detail`, `id` | `{ token, changed }` — content hash over the store; poll it. With `detail`, also `documents: [{ id, digest }]` (sorted) so a caller that saw the token move knows which documents to re-read instead of re-listing. Snapshot copies move `token` but are not documents and are not listed. Digests are unfiltered (§1). With `id`, the token covers that one document plus the prefix and permission directories and nothing else — what an open editor watches, at a cost that does not grow with the number of guests — and `detail` then lists exactly those. Tokens of different scope are not comparable; poll with a fixed `id`. |
 | GET | `/meta/guests` | `has` (prefix) | `[{ vmid, node, type, name, tags: [..], digest }]` for every guest in the vmlist the caller can read something of; `node`/`name`/`tags` only with `VM.Audit`; `digest: ""` when no document |
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |
+| PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }`; 422 when the write breaks an enforcing prefix's schema without `force` (§3.1) |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
 | GET | `/meta/access` | `id` (any document id) | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document (selectors already resolved); `tags` are the guest's PVE tags, filtered exactly as `/meta/guests` filters them (`VM.Audit` only) and empty for any other document; without `id`, the caller's read/write on the registry (`read` always, `write` = `Sys.Modify` on `/`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
 | GET | `/meta/permissions` | — | `[{ name, authid, rules: [{ prefix, mode, selector }] }]` — every permission file, readable by every authenticated user |
 | GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
 | GET/PUT/DELETE | `/meta/permissions/{name}` | same | the permission file, `id: "permissions/<name>"`, same rules |

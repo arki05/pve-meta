@@ -273,7 +273,9 @@ mod pve_rs_meta {
     /// `PUT /meta/guests/{vmid}` and the registry documents' `PUT`.
     ///
     /// `$payload` is the only string crossing: the client's `data` (JSON) or
-    /// `text` (YAML) parameter, decoded once in Rust.
+    /// `text` (YAML) parameter, decoded once in Rust. `$force` (optional,
+    /// trailing) stores the result even where a prefix declares
+    /// `enforce: true` and it would not match that prefix's schema.
     ///
     /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
     /// `cfs_lock_domain` lock: the digest precondition is re-checked inside
@@ -290,11 +292,13 @@ mod pve_rs_meta {
         digest: Option<&str>,
         dry_run: bool,
         acl: CallerAcl,
+        force: Option<bool>,
     ) -> Result<api::ApiPutResult, api::ApiError> {
         let store = open_store();
         api::put_document(
             &store,
             &open_permissions(&store),
+            &store.registry().load_prefixes(),
             id,
             view,
             format,
@@ -302,6 +306,7 @@ mod pve_rs_meta {
             mode,
             digest,
             dry_run,
+            force.unwrap_or(false),
             &acl,
         )
     }

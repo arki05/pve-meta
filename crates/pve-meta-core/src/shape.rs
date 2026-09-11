@@ -43,6 +43,9 @@ pub struct Declared {
     pub selector: Selector,
     pub description: Option<String>,
     pub schema: Option<Value>,
+    /// The server refuses a write that leaves this subtree not matching
+    /// `schema` (`crate::registry::PrefixDef::enforce`).
+    pub enforce: bool,
 }
 
 impl From<&PrefixDef> for Declared {
@@ -52,17 +55,24 @@ impl From<&PrefixDef> for Declared {
             selector: p.selector.clone(),
             description: p.description.clone(),
             schema: p.schema.clone(),
+            enforce: p.enforce,
         }
     }
 }
 
 /// One thing a schema says is wrong with a value, at a document path.
-/// Advisory: the server's one lint ([`model::lint`]) decides what is
-/// storable, a schema only describes what was meant (`docs/DESIGN.md` §4).
+/// Advisory unless `enforced`: the server's one lint ([`model::lint`])
+/// decides what is storable, a schema only describes what was meant
+/// (`docs/DESIGN.md` §4) -- except where its prefix says `enforce: true`,
+/// and then a write that introduces such a finding is refused without
+/// `force` ([`Shape::enforced_findings`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     pub path: Path,
     pub msg: String,
+    /// The governing prefix declares `enforce: true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub enforced: bool,
 }
 
 /// A `format:` the schema asks for on a string, which this crate cannot
@@ -140,6 +150,7 @@ impl Shape {
                 selector: Selector::All,
                 description: None,
                 schema: Some(schema),
+                enforce: false,
             }],
         }
     }
@@ -225,9 +236,23 @@ impl Shape {
         out
     }
 
+    /// The findings a write may be refused for: those under a prefix that
+    /// says `enforce: true`. Format checks are never among them, because the
+    /// server cannot judge a `format:` (that is proxmoxlib's job in the
+    /// editor) and must not refuse on a guess.
+    pub fn enforced_findings(&self, doc: &Value) -> Vec<Finding> {
+        self.findings(doc)
+            .into_iter()
+            .filter_map(|r| match r {
+                Report::Finding(f) if f.enforced => Some(f),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn walk(&self, owner: &Declared, schema: &Value, value: &Value, path: Path, out: &mut Vec<Report>) {
         if let Some(msg) = check_value(schema, value) {
-            out.push(Report::Finding(Finding { path, msg }));
+            out.push(Report::Finding(Finding { path, msg, enforced: owner.enforce }));
             return; // a value of the wrong shape says nothing useful about its children
         }
         if let (Value::String(s), Some(format)) = (value, schema.get("format").and_then(Value::as_str))
@@ -343,7 +368,7 @@ mod tests {
     }
 
     fn decl(prefix: &str, selector: Selector, schema: Option<Value>) -> Declared {
-        Declared { prefix: p(prefix), selector, description: None, schema }
+        Declared { prefix: p(prefix), selector, description: None, schema, enforce: false }
     }
 
     fn all(prefix: &str) -> Declared {
@@ -517,7 +542,7 @@ mod tests {
 
     #[test]
     fn an_edit_answers_for_what_it_introduced_or_touched() {
-        let f = |path: &str, msg: &str| Finding { path: p(path), msg: msg.into() };
+        let f = |path: &str, msg: &str| Finding { path: p(path), msg: msg.into(), enforced: false };
         let before = vec![f("a.old", "expected integer"), f("b", "expected string")];
         let after = vec![
             f("a.old", "expected integer"), // pre-existing, untouched: not ours
@@ -532,6 +557,33 @@ mod tests {
         assert_eq!(introduced(&before, &before[..1], &[p("a.old.deeper")]).len(), 1);
         // A pure reordering changes nothing, so it introduces nothing.
         assert!(introduced(&before, &before, &[]).is_empty());
+    }
+
+    #[test]
+    fn enforced_findings_are_the_enforcing_prefixes_type_enum_and_range_findings_only() {
+        let schema = json!({"type": "object", "properties": {
+            "port": {"type": "integer"},
+            "host": {"type": "string", "format": "dns-name"},
+        }});
+        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema.clone())) };
+        let lax = decl("u", Selector::All, Some(schema));
+        let shape = Shape::new(vec![strict, lax], &[]);
+        let doc = json!({"t": {"port": "x", "host": "not a host"}, "u": {"port": "x"}});
+        let enforced = shape.enforced_findings(&doc);
+        assert_eq!(enforced.len(), 1, "{enforced:?}");
+        assert_eq!(enforced[0].path.to_string(), "t.port");
+        assert!(enforced[0].enforced);
+        // The full report still carries everything, flagged.
+        let all: Vec<(String, bool)> = shape
+            .findings(&doc)
+            .iter()
+            .filter_map(|r| r.finding().map(|f| (f.path.to_string(), f.enforced)))
+            .collect();
+        assert_eq!(all, [("t.port".to_string(), true), ("u.port".to_string(), false)]);
+        // A rooted (meta-schema) shape never enforces.
+        assert!(Shape::rooted(json!({"type": "object", "properties": {"a": {"type": "integer"}}}))
+            .enforced_findings(&json!({"a": "x"}))
+            .is_empty());
     }
 
     #[test]

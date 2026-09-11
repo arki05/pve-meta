@@ -82,6 +82,14 @@ PVE.meta.Icons = {
 };
 
 PVE.meta.Utils = {
+    // One finding as the warning banner lists it. An enforced one -- its prefix says
+    // `enforce: true`, so the server refuses the write unless saved anyway -- says so
+    // first, since that is the difference between "you have been told" and "it will
+    // not go through".
+    findingText: function (f) {
+        return (f.enforced ? gettext('enforced') + ': ' : '') + f.path + ': ' + f.msg;
+    },
+
     // A key ending in `__` documents its sibling; a bare `__` documents the map.
     isComment: (key) => key.length >= 2 && key.slice(-2) === '__',
     commentTarget: (key) => key.slice(0, -2),
@@ -2701,9 +2709,12 @@ PVE.meta.TextCard = {
         // The buffer already contains whatever was staged in the tree -- it is rendered
         // from the planned document -- so this applies all of it, and the staged edits
         // are spent.
-        let write = function () {
+        let write = function (force) {
             let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
             params[me.textLang === 'json' ? 'data' : 'text'] = edited;
+            if (force) {
+                params.force = 1; // the "Save anyway" tick, see the tree's Apply
+            }
             me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
                 me.pending = PVE.meta.EditSet.empty();
                 me.refreshText();
@@ -2727,7 +2738,7 @@ PVE.meta.TextCard = {
             modified: edited,
             lang: base.lang,
             warnings: warnings,
-            apply: write,
+            apply: () => write(true),
         });
     },
 
@@ -2864,7 +2875,7 @@ PVE.meta.TextCard = {
                 shape.findings(stored),
                 shape.findings(value),
                 PVE.meta.EditSet.changedPaths(stored, value),
-            ).map((f) => f.path + ': ' + f.msg);
+            ).map(PVE.meta.Utils.findingText);
         } catch (_err) {
             return [];
         }
@@ -4321,7 +4332,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // require the caller to be able to send back every key it did not touch.
         let onlyDelete =
             me.pending.length === 1 && me.pending.edits[0].op === 'delete' && me.pending.edits[0].path;
-        let write = function () {
+        // `force` is what the warned dialog's Apply sends: the "Save anyway" tick.
+        // A prefix with `enforce: true` refuses the write without it (DESIGN §4).
+        let write = function (force) {
             if (onlyDelete) {
                 let q = Ext.Object.toQueryString({
                     view: me.pending.edits[0].path,
@@ -4334,6 +4347,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     },
                 );
                 return;
+            }
+            if (force) {
+                params.force = 1;
             }
             me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
                 me.pending = PVE.meta.EditSet.empty();
@@ -4379,7 +4395,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             originalValue: stored === undefined ? {} : stored,
             modifiedValue: subtree,
             warnings: warnings,
-            apply: write,
+            apply: () => write(true),
         });
     },
 
@@ -4400,7 +4416,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             shape.findings(stored),
             shape.findings(planned),
             PVE.meta.EditSet.changedPaths(stored, planned),
-        ).map((f) => f.path + ': ' + f.msg);
+        ).map(PVE.meta.Utils.findingText);
     },
 
     // Stage a declared default, because someone asked for it. Never on its own: an
@@ -4991,6 +5007,7 @@ Ext.define('PVE.meta.RegistryGrid', {
                         summary: '',
                         selector: '',
                         schema: '',
+                        enforce: '',
                         origin: e.origin || 'cluster',
                         overrides: false,
                     };
@@ -5016,6 +5033,7 @@ Ext.define('PVE.meta.RegistryGrid', {
                     description: e.description || '',
                     selector: U.selectorText(e.selector),
                     schema: e.schema ? gettext('yes') : '',
+                    enforce: e.enforce && e.enforce !== '0' ? gettext('yes') : '',
                     origin: e.origin || 'cluster',
                     overrides: !!e.overrides,
                 };
@@ -5037,7 +5055,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         let me = this;
         let isPrefix = me.kind === 'prefixes';
         me.store = Ext.create('Ext.data.Store', {
-            fields: ['name', 'id', 'authid', 'description', 'selector', 'schema', 'summary', 'origin', 'overrides'],
+            fields: ['name', 'id', 'authid', 'description', 'selector', 'schema', 'enforce', 'summary', 'origin', 'overrides'],
             data: [],
             sorters: [{ property: 'name' }],
         });
@@ -5062,6 +5080,13 @@ Ext.define('PVE.meta.RegistryGrid', {
             columns.push(
                 { text: gettext('Applies to'), dataIndex: 'selector', flex: 1, renderer: Ext.htmlEncode },
                 { text: gettext('Schema'), dataIndex: 'schema', width: 90, renderer: Ext.htmlEncode },
+                {
+                    text: gettext('Enforced'),
+                    dataIndex: 'enforce',
+                    width: 90,
+                    renderer: Ext.htmlEncode,
+                    tooltip: gettext('A write that would not match the schema is refused unless saved anyway'),
+                },
             );
         } else {
             columns.push(

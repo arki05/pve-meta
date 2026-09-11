@@ -59,6 +59,7 @@ use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
 use crate::registry::{self, Permission, PrefixDef, RegistryFailure, RegistryKind};
 use crate::scopes::Effective;
+use crate::shape::{self, Shape};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
 use crate::view;
 
@@ -742,14 +743,25 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// `payload` wholesale — an empty object stores an empty map) or `"merge"`
 /// (RFC 7386-style merge-patch relative to the view, where `null` deletes).
 ///
+/// `prefixes` are the declared prefixes: the ones that reach this guest and
+/// say `enforce: true` refuse a write that would leave their subtree not
+/// matching their schema -- for the paths the write changed, never for
+/// what was already wrong elsewhere in the document -- unless `force`. That
+/// is the editor's "Save anyway" tick, and it is available to anyone who may
+/// write: enforcement makes a mismatch a deliberate act, not an impossible
+/// one, so a drifted schema can never lock an administrator out (§4).
+///
 /// # Errors
 /// `400:` invalid id/view/format/mode/payload, or the planned document fails
 /// the lint. `409:` digest mismatch. `403:` the view is not writable, or a
-/// planned touched path is outside the caller's write permissions.
+/// planned touched path is outside the caller's write permissions. `422:`
+/// the write introduces a finding under an enforcing prefix and `force` is
+/// not set.
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
 pub fn put_document(
     store: &MetaStore,
     permission_files: &[Permission],
+    prefixes: &[PrefixDef],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -757,6 +769,7 @@ pub fn put_document(
     mode: &str,
     digest: Option<&str>,
     dry_run: bool,
+    force: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id)?;
@@ -801,6 +814,9 @@ pub fn put_document(
 
     let text = format::dump(DISK_FORMAT, &planned);
     check_registry_shape(&doc_id, &text)?;
+    if !force {
+        check_enforced(prefixes, &doc_id, &stored.value, &planned, &touched, acl)?;
+    }
 
     // (3) Apply — unless there is nothing to apply. A write that changes no
     //     path *and* would put back the bytes already on disk is skipped
@@ -834,6 +850,50 @@ pub fn put_document(
         view: view_out(view),
         digest: new_digest,
         touched: touched_out(&touched),
+    })
+}
+
+/// The opt-in schema gate: of the prefixes that reach this guest, those with
+/// `enforce: true` refuse a write that *introduces* a finding under them
+/// ([`shape::introduced`]: new since the stored document, or on a path the
+/// write changed). A guest whose document was already wrong elsewhere is
+/// still editable elsewhere; a scoped principal cannot be locked out of its
+/// own prefix by another prefix's schema, because it can only ever change
+/// paths inside its own. Format checks are never enforced
+/// ([`Shape::enforced_findings`]). Registry documents have their own gate
+/// ([`check_registry_shape`]).
+fn check_enforced(
+    prefixes: &[PrefixDef],
+    doc_id: &DocId,
+    stored: &Value,
+    planned: &Value,
+    touched: &[Touched],
+    acl: &CallerAcl,
+) -> Result<(), ApiError> {
+    let DocId::Guest(_) = doc_id else {
+        return Ok(());
+    };
+    let shape = Shape::of_guest(prefixes, &acl.tags);
+    let changed: Vec<DocPath> = touched.iter().map(|t| t.path.clone()).collect();
+    let refused = shape::introduced(
+        &shape.enforced_findings(stored),
+        &shape.enforced_findings(planned),
+        &changed,
+    );
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let detail = refused
+        .iter()
+        .map(|f| format!("{}: {}", f.path, f.msg))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ApiError {
+        status: 422,
+        msg: format!(
+            "the result does not match an enforced schema: {detail} \
+             (the prefix declares enforce: true; pass force=1 to store it anyway)"
+        ),
     })
 }
 

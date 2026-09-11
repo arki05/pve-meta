@@ -211,6 +211,11 @@ pub struct PrefixDef {
     /// through verbatim for the UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<Value>,
+    /// `true` when the server refuses an API write that would leave this
+    /// prefix's subtree not matching `schema`, for the paths that write
+    /// changed (`api::put_document`; `force=1` stores it anyway). Off by
+    /// default: a schema is advisory unless the prefix says otherwise.
+    pub enforce: bool,
     /// Which directory this one was read from. Not part of the file.
     pub origin: Origin,
     /// `true` when a lower-precedence directory holds a file of the same name that
@@ -299,6 +304,8 @@ struct RawPrefixDef {
     description: Option<String>,
     #[serde(default)]
     selector: Option<RawSelector>,
+    #[serde(default)]
+    enforce: Option<bool>,
     #[serde(default)]
     schema: Option<Value>,
 }
@@ -457,6 +464,7 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
         prefix,
         description: raw.description,
         selector,
+        enforce: raw.enforce.unwrap_or(false),
         schema: raw.schema,
     })
 }
@@ -925,6 +933,14 @@ rules:
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: rw}]\n").is_err());
+    }
+
+    #[test]
+    fn enforce_is_off_unless_the_prefix_says_so() {
+        assert!(!parse_prefix("x", "selector: {all: true}\n").unwrap().enforce);
+        assert!(parse_prefix("x", "selector: {all: true}\nenforce: true\n").unwrap().enforce);
+        assert!(!parse_prefix("x", "selector: {all: true}\nenforce: false\n").unwrap().enforce);
+        assert!(parse_prefix("x", "selector: {all: true}\nenforce: nope\n").is_err());
     }
 
     #[test]
