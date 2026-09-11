@@ -471,14 +471,25 @@ async function main() {
             await sleep(1200);
             await page.screenshot({ path: `${out}/extjs-selection-text-json-${theme}.png` });
 
+            // OK stages the subtree on the panel and closes; nothing is written and
+            // no diff opens here (the panel's own Diff shows what is staged).
             await page.evaluate(() => {
                 const w = Ext.ComponentQuery.query('pveMetaTextWindow')[0];
                 const v = JSON.parse(w.editor.getValue());
                 v.spec.port = 9999;
                 v.newkey = 'added in the text editor';
                 w.editor.setValue(JSON.stringify(v, null, 2));
-                w.showDiff();
+                w.submit();
             });
+            await sleep(1500);
+            result.checks.subtreeStaged = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                return {
+                    windowClosed: Ext.ComponentQuery.query('pveMetaTextWindow').length === 0,
+                    staged: p.pending.edits.map((e) => e.path + ':' + e.op).sort(),
+                };
+            });
+            await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].showDiff());
             await sleep(4000);
             result.checks.diffOpen = await page.evaluate(
                 () => !!document.querySelector('.monaco-diff-editor'),

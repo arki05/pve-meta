@@ -135,6 +135,14 @@ console.log('--- before the core has loaded: everything that asks it fails close
     early.editableFor = P0.editableFor;
     eq('nothing is editable before the core arrives', early.editableFor('traefik.spec.host'), false);
     eq('... not even with full write access', early.editableFor(''), false);
+    // The whole access face fails closed, not just the one caller that remembered
+    // to check: the panel syncs its buttons on render, before the core is there,
+    // and an answer that threw aborted the render hook before the first load.
+    const Access0 = ctx.PVE.meta.Access;
+    eq('hasAnyWrite fails closed', Access0.hasAnyWrite({ write: 1, scopes: [] }), false);
+    eq('canWrite fails closed', Access0.canWrite({ write: 1 }, 'a'), false);
+    eq('covers fails closed', Access0.covers('a', 'a.b'), false);
+    eq('no rule reaches yet', Access0.rulesReaching([{ name: 'x', authid: 'a@pve', rules: [{ prefix: 'a', mode: 'rw', selector: { all: 1 } }] }], []), []);
     // The two name validators fail OPEN, deliberately: they only refuse early and in
     // words, and the server refuses the same names on its own. An unloaded core
     // means no early answer, not a field that cannot be typed into.
