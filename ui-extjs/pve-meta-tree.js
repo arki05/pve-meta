@@ -1806,6 +1806,37 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
                             fieldLabel: gettext('Multi-line'),
                             boxLabel: gettext('edit this string in a text box'),
                         },
+                        // Three states, not a checkbox, because the rule is inherit
+                        // unless this node says otherwise: a key inside a hidden
+                        // subtree that wants to be shown has to be able to say so,
+                        // and a checkbox can only say "hidden" or "not stated".
+                        //
+                        // `'inherit'` rather than `''` as the unset value: a
+                        // `proxmoxKVComboBox` with an empty-string key returns the
+                        // store record's id, which is how `format: KeyValue-1` once
+                        // got written into a schema.
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'hidden',
+                            fieldLabel: gettext('In the tree'),
+                            value: 'inherit',
+                            comboItems: [
+                                ['inherit', gettext('inherit')],
+                                ['false', gettext('always offer this key')],
+                                ['true', gettext('only once it is set')],
+                            ],
+                        },
+                        {
+                            xtype: 'proxmoxKVComboBox',
+                            name: 'enforce',
+                            fieldLabel: gettext('Enforced'),
+                            value: 'inherit',
+                            comboItems: [
+                                ['inherit', gettext('inherit')],
+                                ['false', gettext('advisory: a bad value is only marked')],
+                                ['true', gettext('refuse a write that does not match')],
+                            ],
+                        },
                     ],
                 },
             ],
@@ -1851,6 +1882,17 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
         if (v.type === 'string' && v.multiline) {
             out.multiline = 1;
         }
+        // Omitted when inherited, which is what "inherit" means: the value comes
+        // from the node above, or from the prefix. Writing `false` here would say
+        // something different -- stop inheriting, and be visible/advisory -- so the
+        // two are not interchangeable and neither is a default.
+        ['hidden', 'enforce'].forEach(function (flag) {
+            if (v[flag] === 'true') {
+                out[flag] = true;
+            } else if (v[flag] === 'false') {
+                out[flag] = false;
+            }
+        });
         return out;
     },
 

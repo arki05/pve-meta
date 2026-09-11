@@ -2089,6 +2089,20 @@ eq(
 // There is no Optional field, and a stray one is not written: every key of a guest
 // document is optional, so `optional` would be a claim nothing reads or enforces.
 eq('optional is never declared', D.schemaFrom({ type: 'string', optional: true }), { type: 'string' });
+
+// Visibility and enforcement are three-state, because the rule is inherit unless
+// this node says otherwise. "Inherit" writes nothing; `false` is a real statement
+// -- stop inheriting and be visible, or be advisory -- so it is not the same as
+// leaving it out, and neither is a default.
+eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', enforce: 'inherit' }),
+    { type: 'string' });
+eq('hidden writes true', D.schemaFrom({ type: 'string', hidden: 'true' }), { type: 'string', hidden: true });
+eq('shown writes false, which is not the same as unset',
+    D.schemaFrom({ type: 'string', hidden: 'false' }), { type: 'string', hidden: false });
+eq('enforced writes true', D.schemaFrom({ type: 'string', enforce: 'true' }), { type: 'string', enforce: true });
+eq('advisory writes false', D.schemaFrom({ type: 'string', enforce: 'false' }), { type: 'string', enforce: false });
+eq('both at once', D.schemaFrom({ type: 'integer', hidden: 'true', enforce: 'false' }),
+    { type: 'integer', hidden: true, enforce: false });
 eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'always, no ,unless-stopped' }),
     { type: 'string', enum: ['always', 'no', 'unless-stopped'] });
 // A range on a string, or a format on a number, would be a declaration nothing reads.
