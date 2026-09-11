@@ -324,6 +324,34 @@ eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
 
+console.log('\n--- the footer keeps the word its caller chose ---');
+{
+    // `sync` rewrites the primary button's text on every keystroke. Setting the word
+    // only where the button is built left it to be overwritten by the next thing the
+    // user typed -- so a modal's OK silently became the panel's Apply.
+    const F = ctx.PVE.meta.Footer;
+    const btn = (itemId, cfg) => {
+        const b = Object.assign({ itemId: itemId, text: '', disabled: false }, cfg);
+        b.setText = (t) => (b.text = t);
+        b.setDisabled = (d) => (b.disabled = d);
+        b.setIconCls = () => {};
+        return b;
+    };
+    const owner = (b) => ({ down: (sel) => (sel === '#metaApply' ? b : null) });
+
+    const ok = btn('metaApply', { metaApplyText: 'OK' });
+    F.sync(owner(ok), { canApply: true, count: 0 });
+    eq('a modal keeps OK through a sync', ok.text, 'OK');
+
+    const apply = btn('metaApply', { metaApplyText: 'Apply' });
+    F.sync(owner(apply), { canApply: true, count: 3 });
+    eq('the panel still counts its staged edits', apply.text, 'Apply (3)');
+
+    const bare = btn('metaApply', {});
+    F.sync(owner(bare), { canApply: true, count: 0 });
+    eq('a caller that named nothing gets Apply', bare.text, 'Apply');
+}
+
 console.log('\n--- Edit selection as text stages, like every other modal ---');
 {
     const E = ctx.PVE.meta.EditSet;

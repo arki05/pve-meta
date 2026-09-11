@@ -1312,10 +1312,15 @@ Ext.define('PVE.meta.Footer', {
         out.push('->');
         out.push({
             // Named by the caller, because the two mean different things: the panel's
-            // footer Apply *writes*, and a modal editor's button stages -- the same
-            // rule the row editor and Add Key follow. One word for both was how the
-            // subtree window came to write directly and see nothing that was staged.
+            // footer Apply *writes*, and a modal editor's button only hands its result
+            // back -- the same OK the row editor and Add Key use. One word for both was
+            // how the subtree window came to write directly and see nothing staged.
+            //
+            // Carried on the button, because `sync` rewrites this text on every
+            // keystroke: setting it once here and not there left the word to be
+            // overwritten by the next thing the user typed.
             text: cfg.applyText || gettext('Apply'),
+            metaApplyText: cfg.applyText || gettext('Apply'),
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
             // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
@@ -1343,10 +1348,9 @@ Ext.define('PVE.meta.Footer', {
         let apply = owner.down('#metaApply');
         if (apply) {
             apply.setDisabled(!state.canApply);
+            let word = apply.metaApplyText || gettext('Apply');
             apply.setText(
-                state.count
-                    ? Ext.String.format(gettext('Apply ({0})'), state.count)
-                    : gettext('Apply'),
+                state.count ? Ext.String.format(gettext('{0} ({1})'), word, state.count) : word,
             );
         }
         let second = owner.down('#metaSecondary');
@@ -1987,12 +1991,17 @@ Ext.define('PVE.meta.TextWindow', {
                     // Stated, like the panel states its own: there is no buffer until
                     // Monaco loads, and `syncFooter` turns it on when there is.
                     applyDisabled: true,
-                    diff: () => me.showBufferDiff(),
+                    // No Diff here. This window opens on the *planned* document, so a
+                    // diff against what it opened with is empty until you type, which
+                    // is what it showed. What a diff is for -- everything staged,
+                    // against what is stored -- is one document up, on the panel's own
+                    // Apply. A value editor does not have one, and this is a value
+                    // editor for a subtree.
                     format: () => me.formatBuffer(),
-                    apply: () => me.showDiff(),
-                    applyText: gettext('Stage'),
+                    apply: () => me.submit(),
+                    applyText: gettext('OK'),
                     secondary: () => me.close(),
-                    secondaryText: gettext('Close'),
+                    secondaryText: gettext('Cancel'),
                 }),
             ),
         });
@@ -2033,28 +2042,19 @@ Ext.define('PVE.meta.TextWindow', {
         return { editor: this.editor, lang: this.lang, original: this.original };
     },
 
-    // The buffer against what was loaded, without committing to it -- the same view
-    // Apply ends with, offered on its own.
-    showBufferDiff: function () {
-        let me = this;
-        if (!me.editor) {
-            return;
-        }
-        PVE.meta.Buffer.diff(me.buffer(), me.view || gettext('(whole document)'));
-    },
-
-    // Apply is live as soon as there is a buffer; the diff decides whether there is
-    // anything in it worth writing. Close becomes Discard once the buffer differs from
-    // what was loaded -- the same rule the panel's footer follows, and for the same
-    // reason: that is the moment there is something to lose.
+    // OK is live as soon as there is a buffer, and Cancel stays Cancel. This is a
+    // modal that yields a value, like the row editor: closing it abandons what was
+    // typed here and nothing else, so there is no Discard to distinguish -- the thing
+    // with something to lose is the panel behind it, which keeps its own staged edits
+    // either way.
     syncFooter: function () {
         let me = this;
         PVE.meta.Footer.sync(me, {
             canApply: !!me.editor,
             count: 0,
-            dirty: !!me.editor && me.editor.getValue() !== me.original,
-            dirtyText: gettext('Discard'),
-            cleanText: gettext('Close'),
+            dirty: false,
+            dirtyText: gettext('Cancel'),
+            cleanText: gettext('Cancel'),
         });
     },
 
@@ -2081,11 +2081,11 @@ Ext.define('PVE.meta.TextWindow', {
         PVE.meta.Buffer.render(me.buffer(), value);
     },
 
-    // Stage stages, and the window closes. The diff is a button of its own, so stopping
-    // to show it again was asking twice for one decision.
-    showDiff: function () {
+    // OK hands the subtree back and closes. An unchanged buffer is not a special
+    // case: staging the value it already had is a no-op the edit set collapses.
+    submit: function () {
         let me = this;
-        if (!me.editor || PVE.meta.Buffer.unchanged(me.buffer())) {
+        if (!me.editor) {
             return;
         }
         me.apply(me.editor.getValue(), me.lang);
