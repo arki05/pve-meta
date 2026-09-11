@@ -57,10 +57,6 @@ jobs:
             cargo-${{ runner.os }}-
 
 
-      - name: Install grass
-        run: |
-          command -v grass >/dev/null 2>&1 || cargo install grass --locked
-          grass --version
 
       # The suites ran only when a human typed the command: `debian/rules`
       # overrides `dh_auto_test`, so `make deb` builds without testing, and

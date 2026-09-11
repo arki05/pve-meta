@@ -650,6 +650,11 @@ cmd_apply() {
 
 # --- remove ---------------------------------------------------------
 
+# Every failure here records a durable marker, for the same reason `apply_one`
+# does: `prerm` runs during a package removal whose exit code dpkg largely
+# swallows, so stderr is gone by the time anyone looks. A removal that half
+# happened leaves a PVE file in a state somebody has to find, and "it printed
+# something during an apt run last week" is not a way to find it.
 remove_one() {
     # $1 = path, $2 = manifest name (claim owner)
     local mpath="$1" mname="$2"
@@ -661,11 +666,13 @@ remove_one() {
     if is_diverted "$mpath"; then
         if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to remove"
+            record_failure "$mpath" "diverted by a different package - refused to remove it"
             return 1
         fi
         existing_claim="$(read_claim "$claim")"
         if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
             err "$mpath: diverted for a different manifest ('$existing_claim') - refusing to remove (documented limitation: no stacking support, see pve-ext/README.md)"
+            record_failure "$mpath" "claim mismatch on removal: diverted for manifest '$existing_claim', asked to remove for '$mname'"
             return 1
         fi
         log "$mpath: restoring pristine file and removing diversion"
@@ -678,6 +685,9 @@ remove_one() {
             if [ -f "$diverted" ] && [ ! -f "$real" ]; then
                 err "$mpath: recovering: restoring from $diverted manually"
                 cp -a "$diverted" "$real"
+                record_failure "$mpath" "dpkg-divert --remove failed; pristine restored by hand from $diverted, diversion still registered"
+            else
+                record_failure "$mpath" "dpkg-divert --remove failed; diversion still registered"
             fi
             return 1
         fi

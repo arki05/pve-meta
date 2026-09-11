@@ -639,7 +639,17 @@ mod tests {
         assert_eq!(ok("shape_governing", json!([listing, [], "broken.x"])), Value::Null);
         let index = ok("shape_schema_index", json!([listing, []]));
         assert_eq!(index[0]["path"], "homelab");
-        assert_eq!(index[1], json!({"path": "homelab.notes", "prefix": "homelab", "schema": {"type": "string"}}));
+        // `hidden` rides with every indexed path: the editor decides from it whether
+        // to offer a row before anything is stored there (decision 018).
+        assert_eq!(
+            index[1],
+            json!({
+                "path": "homelab.notes",
+                "prefix": "homelab",
+                "schema": {"type": "string"},
+                "hidden": false,
+            })
+        );
         let findings = ok("shape_findings", json!([listing, [], {"homelab": {"notes": 5}}]));
         assert_eq!(findings, json!([{"path": "homelab.notes", "msg": "expected string"}]));
         // An enforcing prefix's findings say so, in Perl's spelling of true.
