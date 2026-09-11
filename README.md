@@ -21,8 +21,10 @@ The store holds **intent**. Operators read it and act: a Traefik plugin that bui
 routes from `traefik.spec`, a DNS sync that reads `dns.records`, a backup policy that
 reads `backup.retention`. Several of them share one document safely, because each
 declares the prefix it owns, can attach a schema to it, and can be given a token that
-sees and writes nothing else. The document follows the guest through create, destroy,
-snapshot and rollback.
+sees and writes nothing else. The document is removed when the guest is destroyed,
+cleared when its vmid is reused, and snapshotted and rolled back with the guest;
+migration needs nothing, since the file is cluster-wide. Backups do not include it
+(back up `/etc/pve`), and clone does not copy it.
 
 ## What it looks like
 
