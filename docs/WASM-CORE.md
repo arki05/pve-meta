@@ -67,12 +67,15 @@ already-pruned index.
 ### `edit::EditSet` — what staged edits do
 
 New module. An `EditSet` is the list the editor's `me.pending` always was, given the
-operations the editor performed on it by hand: `stage` (an edit at `p` drops everything
-staged under `p`; the root drops all), `under`/`discard_under`, `apply` (the planned
-document), `between` (recover the edits from a typed document, with the self-check that
-a pure reordering stages nothing), `write_view` (the narrowest
-view covering every staged path, moved up one level when a delete sits exactly there),
-and `changed_paths`.
+operations the editor performed on it by hand: `apply` (the planned document),
+`between` (the edits that turn one document into another, with the self-check that a
+pure reordering stages nothing), `write_view` (the narrowest view covering every staged
+path, moved up one level when a delete sits exactly there), and `changed_paths`. A
+first version also had `stage` (an edit at `p` drops everything staged under `p`),
+`under` and `discard_under`, for a set that was appended to; they went once the editor
+derived the set from the planned document with `between` instead of maintaining it as
+a log, which is what fixed staging the value a row already had and A->B->A leaving two
+edits that described nothing.
 
 The important property is what `apply` is made of: a `set` is `view::replace` and a
 `delete` is `view::remove` — the two operations a `PUT ?view=` and a `DELETE ?view=`
@@ -101,8 +104,9 @@ Two objects and two faces, over five concepts in the core:
   be told is a cache that is stale the first time someone forgets. (A `forgetShapes()`
   hook in `reload` was the first draft; the test suite's stubs, which copy a panel with
   `Object.assign`, found the staleness within a minute.)
-- **`PVE.meta.EditSet`** owns the staged list. `stage` and `discardUnder` change it in
-  place, `between` and `empty` make one, `apply`/`writeView`/`under` ask the core.
+- **`PVE.meta.EditSet`** owns the staged list. `between` and `empty` make one, and
+  nothing changes one in place: the panel derives a new set whenever the planned
+  document changes. `apply` and `writeView` ask the core.
 - **`Codec`** and **`Access`** stay stateless faces: a codec has no state, and an
   `Effective` is one `GET /meta/access` answer the panel already holds.
 

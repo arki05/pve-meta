@@ -1,12 +1,15 @@
-//! Staged edits: what an editor accumulates between a row edit and Apply,
-//! and what one Apply then sends (`docs/DESIGN.md` §12, "Edits are staged").
+//! Staged edits: the difference between what is stored and what an editor
+//! shows, and what one Apply then sends (`docs/DESIGN.md` §12, "Edits are
+//! staged").
 //!
-//! An [`EditSet`] is the one model behind the editor's two views. A row edit
-//! stages an [`Edit`]; the tree renders [`EditSet::apply`] -- the document as
-//! it *would* be; switching to text renders that same planned document, and
-//! switching back turns whatever was typed into edits again through
-//! [`EditSet::between`]; Apply writes the planned subtree at
-//! [`EditSet::write_view`], the narrowest view covering every staged path.
+//! An [`EditSet`] is the one model behind the editor's two views, and it is
+//! derived, not accumulated: a row edit is one [`Edit`] applied to the
+//! planned document, and the set is [`EditSet::between`] the stored document
+//! and the result. The tree renders [`EditSet::apply`] -- the document as it
+//! *would* be; switching to text renders that same planned document, and
+//! switching back runs `between` on whatever was typed; Apply writes the
+//! planned subtree at [`EditSet::write_view`], the narrowest view covering
+//! every staged path.
 //!
 //! The semantics are [`crate::view`]'s: a `set` at a path is
 //! [`view::replace`] there and a `delete` is [`view::remove`], the same two
@@ -42,7 +45,7 @@ impl Edit {
     }
 }
 
-/// The staged edits on one document, in the order they were staged.
+/// The staged edits on one document.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EditSet(Vec<Edit>);
@@ -64,28 +67,10 @@ impl EditSet {
         &self.0
     }
 
-    /// Stages `edit`, dropping every earlier edit at or under its path: a
-    /// write of `a` says everything about `a.b`, so an older `a.b` would only
-    /// be re-applied on top of the new value. The root replaces everything.
-    pub fn stage(&mut self, edit: Edit) {
-        self.0.retain(|e| !edit.path.is_prefix_of(&e.path));
-        self.0.push(edit);
-    }
-
-    /// The edits at or under `path` -- what [`EditSet::stage`] would drop, and
-    /// what discarding one row's edits removes. One rule for both.
-    pub fn under<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = &'a Edit> + 'a {
-        self.0.iter().filter(move |e| path.is_prefix_of(&e.path))
-    }
-
-    /// Drops the edits at or under `path`.
-    pub fn discard_under(&mut self, path: &Path) {
-        self.0.retain(|e| !path.is_prefix_of(&e.path));
-    }
-
-    /// The document as it would be once these edits are applied to `stored`:
-    /// what the tree renders, what the schema findings are computed from, and
-    /// what Apply writes. Key order is kept as [`view::replace`] keeps it.
+    /// The document as it would be once these edits are applied to `stored`,
+    /// in order: what the tree renders, what the schema findings are computed
+    /// from, and what Apply writes. Key order is kept as [`view::replace`]
+    /// keeps it.
     ///
     /// # Errors
     /// [`Error::InvalidPath`] if an edit addresses through an array or a
@@ -188,8 +173,8 @@ fn walk(was: &Value, now: &Value, path: &Path, out: &mut Vec<Edit>) {
 /// answerable for. [`patch::diff`]'s paths, whatever the op -- so a pure key
 /// reordering changes nothing, and a caller is never told that reordering a
 /// document touched every path in it. Not the edits needed to get from one
-/// to the other; that is [`EditSet::between`], which must be exact and so
-/// has a fallback this deliberately lacks.
+/// to the other; that is [`EditSet::between`], which compares lists whole
+/// where this names the member that differs.
 pub fn changed_paths(was: &Value, now: &Value) -> Vec<Path> {
     patch::diff(was, now).into_iter().map(|t| t.path).collect()
 }
@@ -209,13 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn apply_is_view_replace_and_view_remove_in_staging_order() {
+    fn apply_is_view_replace_and_view_remove_in_order() {
         let stored = json!({"zebra": 1, "alpha": 2, "middle": {"z": 1, "a": 2}});
-        let mut set = EditSet::new();
-        set.stage(Edit::set(p("alpha"), json!(9)));
-        set.stage(Edit::set(p("middle.new"), json!(true)));
-        set.stage(Edit::delete(p("middle.z")));
-        set.stage(Edit::set(p("deep.er.key"), json!("made")));
+        let set = EditSet::from(vec![
+            Edit::set(p("alpha"), json!(9)),
+            Edit::set(p("middle.new"), json!(true)),
+            Edit::delete(p("middle.z")),
+            Edit::set(p("deep.er.key"), json!("made")),
+        ]);
         let planned = set.apply(&stored).unwrap();
         assert_eq!(
             ordered(&planned),
@@ -233,29 +219,6 @@ mod tests {
         assert_eq!(set.apply(&stored).unwrap(), json!({"b": 2}));
         let set = EditSet::from(vec![Edit::delete(Path::root())]);
         assert_eq!(set.apply(&stored).unwrap(), json!({}));
-        // And a later root set discards everything staged before it.
-        let mut set = EditSet::new();
-        set.stage(Edit::set(p("a"), json!(5)));
-        set.stage(Edit::set(Path::root(), json!({"fresh": true})));
-        assert_eq!(set.len(), 1);
-    }
-
-    #[test]
-    fn staging_at_a_path_drops_what_was_staged_under_it() {
-        let mut set = EditSet::new();
-        set.stage(Edit::set(p("a.b"), json!(1)));
-        set.stage(Edit::set(p("a.c"), json!(2)));
-        set.stage(Edit::set(p("x"), json!(3)));
-        set.stage(Edit::set(p("a"), json!({"whole": true})));
-        let paths: Vec<String> = set.edits().iter().map(|e| e.path.to_string()).collect();
-        assert_eq!(paths, ["x", "a"]);
-        assert_eq!(set.under(&p("a")).count(), 1);
-        set.discard_under(&p("a"));
-        assert_eq!(set.len(), 1);
-        // `ab` is not under `a`: the separator makes a child.
-        set.stage(Edit::set(p("ab"), json!(1)));
-        set.stage(Edit::set(p("a"), json!(2)));
-        assert_eq!(set.len(), 3);
     }
 
     #[test]

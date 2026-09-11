@@ -42,7 +42,7 @@
 
 use std::cell::RefCell;
 
-use pve_meta_core::edit::{Edit, EditSet};
+use pve_meta_core::edit::EditSet;
 use pve_meta_core::error::Error;
 use pve_meta_core::format::{self, Format};
 use pve_meta_core::path::{self, Path};
@@ -310,23 +310,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
         }
 
         // -- edits: edit::EditSet ----------------------------------------
-        "edits_stage" => {
-            let mut set: EditSet = a.parsed()?;
-            let edit: Edit = a.parsed()?;
-            set.stage(edit);
-            serde_json::to_value(set)?
-        }
-        "edits_under" => {
-            let set: EditSet = a.parsed()?;
-            let path = a.path()?;
-            serde_json::to_value(set.under(&path).collect::<Vec<_>>())?
-        }
-        "edits_discard_under" => {
-            let mut set: EditSet = a.parsed()?;
-            let path = a.path()?;
-            set.discard_under(&path);
-            serde_json::to_value(set)?
-        }
         "edits_apply" => {
             let stored = a.value()?;
             let set: EditSet = a.parsed()?;
@@ -691,7 +674,7 @@ mod tests {
     #[test]
     fn edits_go_through_the_edit_set() {
         let stored = json!({"zebra": 1, "alpha": 2});
-        let set = ok("edits_stage", json!([[], {"path": "alpha", "op": "set", "value": 9}]));
+        let set = json!([{"path": "alpha", "op": "set", "value": 9}]);
         let planned = ok("edits_apply", json!([stored, set]));
         assert_eq!(serde_json::to_string(&planned).unwrap(), r#"{"zebra":1,"alpha":9}"#);
         assert_eq!(ok("edits_write_view", json!([set])), json!("alpha"));
@@ -704,8 +687,6 @@ mod tests {
         assert_eq!(ok("same", json!([stored, {"alpha": 2, "zebra": 1}])), json!(true));
         assert_eq!(ok("same", json!([stored, {"alpha": 3, "zebra": 1}])), json!(false));
         assert!(ok("edits_between", json!([stored, {"alpha": 2, "zebra": 1}])).as_array().unwrap().is_empty());
-        assert_eq!(ok("edits_under", json!([set, "alpha"])).as_array().unwrap().len(), 1);
-        assert_eq!(ok("edits_discard_under", json!([set, ""])), json!([]));
         let e = err("edits_apply", json!([{"a": [1]}, [{"path": "a.b", "op": "set", "value": 1}]]));
         assert!(e.message.contains("never through an array"), "{e:?}");
     }

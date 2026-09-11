@@ -861,16 +861,17 @@ Object.assign(PVE.meta.Shape.prototype, {
 // ---------------------------------------------------------------------------
 // EditSet: the staged edits on a document (`edit::EditSet`).
 //
-// A row edit stages `{ path, op: 'set' | 'delete', value }`; the tree renders
-// `apply` -- the document as it would be; switching to text renders that same
-// planned document and switching back turns the buffer into edits again with
-// `between`; one Apply writes the planned subtree at `writeView`. A set is the
-// server's `view::replace` and a delete its `view::remove`, so what the editor
-// predicts and what a `PUT ?view=` does are the same function.
+// The difference between the stored document and the planned one, as edits
+// `{ path, op: 'set' | 'delete', value }`: `between` derives it, the tree renders
+// `apply` -- the document as it would be -- and one Apply writes the planned
+// subtree at `writeView`. A set is the server's `view::replace` and a delete its
+// `view::remove`, so what the editor predicts and what a `PUT ?view=` does are
+// the same function.
 //
 // The set owns its list (`edits`, read it; never push to it) and every operation
-// on it is the core's. `stage` and `discardUnder` change the set in place, since
-// that is what a panel holding one wants; `between` makes a new one.
+// on it is the core's. Nothing changes a set in place: the panel derives a new one
+// whenever the planned document changes (`setPlanned`), so the set is never a log
+// of what was done that could drift from what is shown.
 // ---------------------------------------------------------------------------
 
 PVE.meta.EditSet = function (edits) {
@@ -898,23 +899,6 @@ Object.defineProperty(PVE.meta.EditSet.prototype, 'length', {
 Object.assign(PVE.meta.EditSet.prototype, {
     isEmpty: function () {
         return this.edits.length === 0;
-    },
-
-    // Stages `edit` on top of what is here: every earlier edit at or under its
-    // path is dropped, since a write of `a` says everything about `a.b`.
-    stage: function (edit) {
-        this.edits = PVE.meta.Core.call('edits_stage', this.edits, edit);
-        return this;
-    },
-
-    // The edits at or under `path` -- what discarding one row's edits removes.
-    under: function (path) {
-        return PVE.meta.Core.call('edits_under', this.edits, path);
-    },
-
-    discardUnder: function (path) {
-        this.edits = PVE.meta.Core.call('edits_discard_under', this.edits, path);
-        return this;
     },
 
     // The document as it would be once these edits are applied to `stored`.

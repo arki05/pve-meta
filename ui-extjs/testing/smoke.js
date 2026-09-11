@@ -1457,20 +1457,6 @@ console.log('\n--- staged edits: the change that had no legal single step ---');
     eq('a proto-named key is a key', Object.prototype.hasOwnProperty.call(planned, '__proto__'), true);
     eq('and the prototype is untouched', {}.oops, undefined);
     eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
-
-    // Staging subsumes: an edit at `p` drops what was staged under `p`, the root
-    // drops all. The set changes in place, which is what a panel holding one wants.
-    const s = EditSet.empty()
-        .stage({ path: 'a.b', op: 'set', value: 1 })
-        .stage({ path: 'a.c', op: 'set', value: 2 })
-        .stage({ path: 'x', op: 'set', value: 3 })
-        .stage({ path: 'a', op: 'set', value: { whole: true } });
-    eq('an edit at a path replaces the edits under it', s.edits.map((e) => e.path), ['x', 'a']);
-    eq('the edits under a path', s.under('a').length, 1);
-    s.stage({ path: 'ab', op: 'set', value: 1 });
-    eq('`ab` is not under `a`', [s.under('a').length, s.length], [1, 3]);
-    eq('discarding under a path', s.discardUnder('a').edits.map((e) => e.path), ['x', 'ab']);
-    eq('the root replaces everything', s.stage({ path: '', op: 'set', value: {} }).edits, [{ path: '', op: 'set', value: {} }]);
 }
 
 console.log('\n--- the registry lists ---');
