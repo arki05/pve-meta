@@ -3745,19 +3745,43 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (kind === 'guest') {
             return [me.prefixes, me.tags];
         }
-        if (kind === 'prefix' || kind === 'permission') {
+        if (kind === 'permission') {
             return [(me.schemas || {})[kind]];
+        }
+        if (kind === 'prefix') {
+            // The document too, because the meta-schema depends on it: a prefix's
+            // `schema` is described from the keys it actually declares, since
+            // `properties` is named by whoever wrote the file and no static
+            // description can reach those names at any depth.
+            //
+            // Compared as text rather than by identity: `plannedData` crosses the
+            // wasm boundary and comes back a new object every time, so an identity
+            // check would rebuild the shape on every question asked of it.
+            let doc = me.plannedData(id);
+            return [(me.schemas || {})[kind], JSON.stringify(doc && doc.schema)];
         }
         return [];
     },
 
     buildShape: function (id, inputs) {
-        let kind = this.docKind(id);
+        let me = this;
+        let kind = me.docKind(id);
         if (kind === 'guest') {
             return PVE.meta.Shape.of(inputs[0], inputs[1]);
         }
-        if (kind === 'prefix' || kind === 'permission') {
+        if (kind === 'permission') {
             return PVE.meta.Shape.rooted(inputs[0]);
+        }
+        if (kind === 'prefix') {
+            // Every key this prefix declares gets the keyword rows at its own path,
+            // however deep. A key it does not declare is described by nothing, which
+            // is correct: it does not exist until Declare Key adds it.
+            // The served meta-schema is the base: the server stays the authority
+            // on what a prefix file may contain, and the document supplies only the
+            // names no served description could have known.
+            return PVE.meta.Shape.rooted(
+                PVE.meta.Core.call('metaschema_prefix_for', inputs[0], me.plannedData(id)),
+            );
         }
         return PVE.meta.Shape.empty();
     },

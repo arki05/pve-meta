@@ -283,6 +283,13 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
                 .collect();
             json!(index)
         }
+        // -- the meta-schema, tailored to one registry document ------------
+        "metaschema_prefix_for" => {
+            let base = a.value()?;
+            let doc = a.value()?;
+            pve_meta_core::metaschema::prefix_for(&base, &doc)
+        }
+
         "shape_findings" => {
             let shape = a.shape()?;
             let doc = a.value()?;

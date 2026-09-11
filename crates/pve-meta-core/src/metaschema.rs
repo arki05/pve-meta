@@ -126,6 +126,112 @@ fn parse(text: &str, what: &str) -> Value {
         .unwrap_or_else(|e| panic!("the built-in {what} meta-schema does not parse: {e}"))
 }
 
+/// One node of the schema dialect, as the meta-schema describes it: the
+/// keywords a property declaration may carry.
+///
+/// `properties` is deliberately absent here and is filled in by
+/// [`prefix_for`] from the document's own keys. It cannot be declared: the
+/// children of `properties` are named by whoever wrote the prefix, and this
+/// dialect has no `$ref` or wildcard with which to say "every child here is
+/// another one of these".
+///
+/// `hidden` and `enforce` are shown rather than hidden, unlike the rest of the
+/// tail: they are the two you most often want when declaring a key, which is
+/// the opposite of `minimum` or `format`.
+fn schema_node() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["object", "string", "integer", "number", "boolean", "array"],
+                "description": "What a value here must be.",
+            },
+            "description": {
+                "type": "string",
+                "optional": 1,
+                "description": "Shown as the tooltip on this key's row.",
+            },
+            "hidden": {
+                "type": "boolean",
+                "optional": 1,
+                "description": "Do not offer this key as a row until it is set. Inherited by everything below it unless that node says otherwise.",
+            },
+            "enforce": {
+                "type": "boolean",
+                "optional": 1,
+                "description": "Refuse a write that leaves this subtree not matching its schema. Inherited by everything below it unless that node says otherwise.",
+            },
+            "default": { "type": "string", "optional": 1, "hidden": 1,
+                "description": "Offered by \"Set to default\"; never written on its own." },
+            "enum": { "type": "array", "optional": 1, "hidden": 1,
+                "description": "The only accepted values; the row editor becomes a dropdown." },
+            "minimum": { "type": "integer", "optional": 1, "hidden": 1,
+                "description": "For integer and number keys." },
+            "maximum": { "type": "integer", "optional": 1, "hidden": 1,
+                "description": "For integer and number keys." },
+            "format": { "type": "string", "optional": 1, "hidden": 1,
+                "description": "A PVE format name. Checked by the editor, never by the server." },
+            "multiline": { "type": "boolean", "optional": 1, "hidden": 1,
+                "description": "Edit this string in a text box rather than on one line." },
+        },
+    })
+}
+
+/// The prefix meta-schema `base`, with its `schema:` subtree described **as far
+/// as `doc` itself goes**.
+///
+/// `base` is what `GET /meta/schemas` served, not this crate's own [`prefix`]:
+/// the server stays the authority on what a prefix file may contain, and the
+/// document supplies only the names this description could not have known.
+///
+/// A static description stops at `schema`, because everything below it is keyed
+/// by whatever an operator named their properties. Unrolling to a fixed depth
+/// does not help: the names are unknown at every level, not just the first. So
+/// the description is built from the document being edited -- every property it
+/// actually declares gets the keyword rows, at its own path, however deep.
+///
+/// A key the document does not have yet is described by nothing, which is
+/// correct: it does not exist. Declare Key is how one is added, and the next
+/// read describes it.
+pub fn prefix_for(base: &Value, doc: &Value) -> Value {
+    let mut out = base.clone();
+    let described = describe_properties(doc.get("schema"));
+    if let Some(schema) = out
+        .get_mut("properties")
+        .and_then(|p| p.get_mut("schema"))
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(props) = described {
+            schema.insert("properties".into(), props);
+        }
+    }
+    out
+}
+
+/// The `properties` description mirroring `node`'s own `properties`, recursing
+/// through whatever the document declares.
+fn describe_properties(node: Option<&Value>) -> Option<Value> {
+    let props = node?.get("properties")?.as_object()?;
+    let mut out = serde_json::Map::new();
+    for (key, child) in props {
+        let mut described = schema_node();
+        if let Some(sub) = describe_properties(Some(child)) {
+            if let Some(map) = described.as_object_mut() {
+                let inner = serde_json::json!({
+                    "type": "object",
+                    "optional": 1,
+                    "description": "The keys this node describes.",
+                    "properties": sub,
+                });
+                map["properties"]["properties"] = inner;
+            }
+        }
+        out.insert(key.clone(), described);
+    }
+    Some(Value::Object(out))
+}
+
 /// The prefix file's schema.
 pub fn prefix() -> Value {
     parse(PREFIX, "prefix")
@@ -232,6 +338,61 @@ mod tests {
         assert!(!with("{}"), "neither is not");
         assert!(!with("{all: true, tag: web}"), "and both is not");
         assert!(!with("{all: false}"), "nor is 'all: false', which selects nothing");
+    }
+
+    /// The `schema:` subtree is described from the document's own property
+    /// names, because there is no other way to reach them: `properties` is keyed
+    /// by whatever an operator wrote, at every level, so a static description --
+    /// unrolled to any depth -- can never name a single one of them.
+    #[test]
+    fn a_prefix_document_describes_its_own_declared_keys() {
+        let doc = serde_json::json!({
+            "selector": { "all": true },
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "properties": { "host": { "type": "string" } },
+                    },
+                },
+            },
+        });
+        let meta = prefix_for(&prefix(), &doc);
+        let at = |path: &[&str]| -> Value {
+            let mut node = meta.clone();
+            for seg in path {
+                node = node["properties"][seg].clone();
+            }
+            node
+        };
+
+        // Every declared key gets the keyword rows, at its own depth.
+        for path in [
+            vec!["schema", "spec"],
+            vec!["schema", "spec", "properties", "host"],
+        ] {
+            let node = at(&path);
+            let props = node["properties"].as_object().unwrap_or_else(|| {
+                panic!("{path:?} should be described");
+            });
+            assert!(props.contains_key("type"), "{path:?}");
+            // The two worth offering are shown; the tail is described and hidden.
+            assert!(props["hidden"].get("hidden").is_none(), "{path:?}: hidden is offered");
+            assert!(props["enforce"].get("hidden").is_none(), "{path:?}: enforce is offered");
+            assert_eq!(props["format"]["hidden"], 1, "{path:?}: format is hidden");
+        }
+
+        // A key the document does not declare is described by nothing, which is
+        // correct: it does not exist until Declare Key adds it.
+        assert!(at(&["schema", "spec"])["properties"]["properties"]["properties"]
+            .get("nope")
+            .is_none());
+
+        // And a prefix with no schema at all still describes its own fields.
+        let bare = prefix_for(&prefix(), &serde_json::json!({ "selector": { "all": true } }));
+        assert!(bare["properties"]["schema"].get("properties").is_none());
+        assert!(bare["properties"]["selector"].is_object());
     }
 
     #[test]
