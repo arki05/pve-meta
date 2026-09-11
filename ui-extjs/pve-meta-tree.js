@@ -2647,7 +2647,46 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        me.pending = PVE.meta.EditSet.between(me.dataOf(me.textDocId), parsed);
+        let pending = PVE.meta.EditSet.between(me.dataOf(me.textDocId), parsed);
+
+        // Whatever you typed becomes staged rows, and the tree then shows it -- so
+        // switching needs no confirmation and gets none. The exception is a change
+        // the tree has no way to show: key order and layout are text, not document
+        // (decision 007), so a buffer that reorders keys or reindents them parses to
+        // the document it started as and stages nothing. Switching would drop it with
+        // no row to mark and nothing to say what happened.
+        //
+        // Apply *from* Text keeps it, because that path sends the buffer rather than
+        // the model. So this is the one place that has to ask, and only here: the
+        // edit is real, it is just not one the other view can hold.
+        if (pending.isEmpty() && me.textIsDirty()) {
+            Ext.Msg.show({
+                title: gettext('Switch to the tree?'),
+                message: gettext(
+                    'This changes how the document is laid out, not what it says -- ' +
+                        'key order, indentation. The tree shows the document, so it ' +
+                        'cannot carry that and switching will drop it. Apply from Text ' +
+                        'first to keep it.',
+                ),
+                buttons: Ext.Msg.YESNO,
+                buttonText: { yes: gettext('Switch and drop it'), no: gettext('Stay in Text') },
+                icon: Ext.Msg.QUESTION,
+                fn: function (btn) {
+                    if (btn === 'yes') {
+                        me.finishLeavingTextMode(pending);
+                    } else {
+                        me.setModeButton('text');
+                    }
+                },
+            });
+            return;
+        }
+        me.finishLeavingTextMode(pending);
+    },
+
+    finishLeavingTextMode: function (pending) {
+        let me = this;
+        me.pending = pending;
         PVE.meta.Monaco.dispose(me.textEditor);
         me.textEditor = null;
         me.mode = 'tree';

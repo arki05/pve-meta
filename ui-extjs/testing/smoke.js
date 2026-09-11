@@ -324,6 +324,23 @@ eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
 
+console.log('\n--- leaving Text only asks when the tree cannot carry the change ---');
+{
+    // Ordinary edits become staged rows, so switching needs no dialog and gets none.
+    // A reorder or a reindent parses to the document it started as (decision 007:
+    // order is kept, not meaning), so it stages nothing -- and switching would drop
+    // it with no row to mark. That single case asks.
+    const stored = { b: 1, a: 2 };
+    const E = ctx.PVE.meta.EditSet;
+    eq('a reordering stages nothing', E.between(stored, { a: 2, b: 1 }).isEmpty(), true);
+    eq('a real edit still stages', E.between(stored, { b: 9, a: 2 }).length, 1);
+    // The condition the dialog fires on: nothing staged, but the text did change.
+    const asks = (set, textDirty) => set.isEmpty() && textDirty;
+    eq('reorder: nothing staged, text dirty -> ask', asks(E.between(stored, { a: 2, b: 1 }), true), true);
+    eq('a real edit -> no dialog', asks(E.between(stored, { b: 9, a: 2 }), true), false);
+    eq('untouched buffer -> no dialog', asks(E.empty(), false), false);
+}
+
 console.log('\n--- request: the destroyed-component guard around API2Request ---');
 {
     const sent = [];
