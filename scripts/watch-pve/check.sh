@@ -347,7 +347,7 @@ open_failure_issue() {
         echo "---"
         echo "<!-- TODO(llm-fix): hand-off point for a planned LLM-assisted fix"
         echo "     flow (see docs/DISTRIBUTION.md, \"Ceiling watcher\": a"
-        echo "     claude-code-action run that regenerates the failing hunks"
+        echo "     automated run that regenerates the failing hunks"
         echo "     against the new upstream source and opens a draft PR for"
         echo "     human review). Not implemented yet -- for now, a human"
         echo "     fixes the diff(s) under pve-ext/patches/ (pve-manager's own"

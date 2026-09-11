@@ -9,7 +9,7 @@ Citation roots:
 
 | Short name | Path |
 |---|---|
-| `$SB` | `/private/tmp/claude-501/-Users-arki-Documents-proxmox/afff609e-fb1e-4d06-8a92-09f2b57a5c90/scratchpad/upstream` |
+| `$SB` | `<scratch>/upstream` |
 | `PDM` | `$SB/proxmox-datacenter-manager` |
 | `COMP` | `$SB/proxmox-yew-comp` |
 | `PWT` | `$SB/proxmox-yew-widget-toolkit` |

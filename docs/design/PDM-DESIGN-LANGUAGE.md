@@ -8,7 +8,7 @@ checkouts, pinned at the revisions already in `ui/Cargo.toml`'s `[patch.crates-i
 
 | Short name | Path |
 |---|---|
-| `PDM` | `/private/tmp/claude-501/-Users-arki-Documents-proxmox/afff609e-fb1e-4d06-8a92-09f2b57a5c90/scratchpad/upstream/proxmox-datacenter-manager/ui` |
+| `PDM` | `<scratch>/upstream/proxmox-datacenter-manager/ui` |
 | `COMP` | `.../scratchpad/upstream/proxmox-yew-comp` (rev `2384eea`) |
 | `PWT` | `.../scratchpad/upstream/proxmox-yew-widget-toolkit` (rev `3ce6f16`) |
 | `SCSS` | `/Users/arki/Documents/proxmox/pve-meta/ui/pwt-assets/scss` (vendored, byte-identical to upstream `pwt-assets/scss`) |

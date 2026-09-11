@@ -1,42 +1,45 @@
 # pve-meta
 
-A structured metadata store for Proxmox VE. Every guest (vmid) gets one nested key-value
-document, stored as YAML under `/etc/pve/meta` and replicated by pmxcfs like the rest of
-the cluster config. It is reachable through a native API on port 8006
-(`/api2/json/meta`), a tree editor on every guest's **Metadata** tab, and a local CLI for
-hook scripts. A schema can describe any part of a document, and an API token can be
-scoped to a part of it.
+Structured metadata for Proxmox VE guests. One YAML document per VM or container,
+stored in `/etc/pve` and replicated with the cluster, with a native API, an editor tab
+in the PVE UI, and a CLI for hook scripts. Schemas describe parts of a document;
+API tokens can be scoped to parts of it.
 
-Three packages: `pve-ext` (a generic extension layer for PVE, its own package), and
-`pve-meta` + `libpve-meta-rs-perl` (this project). The rules live in one Rust crate,
-`pve-meta-core`, which the API calls through perlmod and the editor runs as wasm, so
-there is one implementation of every rule.
+![The Metadata tab on a guest](ui-extjs/docs/screenshots/readme-tree-light.png)
+
+## Why
+
+PVE has no place for structured data about a guest. Tags are flat labels, the Notes
+field is free text, and every tool that needs to know something about a VM keeps its
+own inventory that drifts. Docker solved this for containers with labels; pve-meta is
+labels for PVE guests, with structure.
+
+The store holds **intent**. Operators read it and act: a Traefik plugin that builds
+routes from `traefik.spec`, a DNS sync that reads `dns.records`, a backup policy that
+reads `backup.retention`. Several of them share one document safely, because each
+declares the prefix it owns, can attach a schema to it, and can be given a token that
+sees and writes nothing else. The document follows the guest through create, destroy,
+snapshot and rollback.
 
 ## What it looks like
 
-A document, `/etc/pve/meta/105.yaml`:
-
 ```yaml
-backup:
-  schedule: "03:00"
-  schedule__: local time, cron-ish, interpreted by whatever reads this key
-  retention: 7
+# /etc/pve/meta/105.yaml
 traefik:
   spec: { host: web.example, port: 8080 }
+backup:
+  retention: 7
+  retention__: days; read by the nightly job     # a comment key documents its sibling
 ```
 
-A key ending in `__` documents its sibling; the editor shows it as the row's
-description. A caller reads or writes through a **view**, a dotted key-path prefix:
-`GET /meta/guests/105?view=traefik` returns the `traefik` subtree and nothing else.
-
-A **prefix** says what a prefix is — `/etc/pve/meta.d/prefixes/traefik.yaml`, or a
-packaged default under `/usr/share/pve-meta/prefixes/`; the file name is the prefix:
+A **prefix** file says what a prefix is (the file name is the prefix):
 
 ```yaml
+# /etc/pve/meta.d/prefixes/traefik.yaml
 description: Traefik dynamic configuration
-selector: { tag: traefik }   # or { all: true }: which guests it reaches
-enforce: true                # optional: refuse an API write that breaks the schema
-schema:                      # optional, PVE::JSONSchema dialect
+selector: { tag: traefik }        # which guests it reaches: { all: true } or a tag
+enforce: true                     # refuse writes that break the schema (force=1 overrides)
+schema:                           # PVE::JSONSchema dialect; drives the editor's rows
   type: object
   properties:
     spec:
@@ -46,76 +49,21 @@ schema:                      # optional, PVE::JSONSchema dialect
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A **permission** says who may touch one — `/etc/pve/meta.d/permissions/traefik.yaml`,
-cluster-only, so a package can declare a prefix but never grant itself access:
+A **permission** file says who may touch one, and is cluster-only, so a package can
+declare a prefix but never grant itself access:
 
 ```yaml
+# /etc/pve/meta.d/permissions/traefik.yaml
 authid: svc@pve!traefik
 rules:
   - { prefix: traefik, mode: rw, selector: { tag: traefik } }
 ```
 
-Full read of a guest's document is `VM.Audit` on the guest, full write is
-`VM.Config.Options`; a permission adds a prefix on the guests its selector matches. A
-write is authorized by what it changes, not by the view it names. All of this, precisely,
-is [`docs/DESIGN.md`](docs/DESIGN.md); why it is so is [`docs/decisions/`](docs/decisions/README.md).
-
-## API
-
-`GET /meta/version` (poll it), `GET /meta/guests`, `GET|PUT|DELETE /meta/guests/{vmid}`
-with `view`, `format`, `mode=replace|merge`, `digest`, `dry_run`, `force`;
-`GET /meta/access`; `GET /meta/prefixes`, `GET /meta/permissions` and the two files as
-documents at `/meta/prefixes/{name}` and `/meta/permissions/{name}`; `GET /meta/schemas`.
-The table is in `docs/DESIGN.md` §8. Every write that changes a file leaves a syslog line
-tagged `pve-meta audit:`.
-
-## The CLI
-
-`/usr/sbin/pve-meta`, for root on the node — no ticket, no pveproxy, so it works in a
-hook script during boot:
-
-```sh
-host=$(pve-meta get 105 traefik.spec.host)          # a scalar prints bare; exit 2 = not there
-pve-meta get 105 traefik                             # structure prints YAML
-pve-meta set 105 traefik --data '{"spec":{"host":"web.example"}}'
-pve-meta merge 105 traefik --text 'spec: {port: 8080}'
-pve-meta delete 105 traefik.spec.port
-pve-meta ls --orphans && pve-meta rm 999500          # files whose guest is gone
-```
-
-Writes go through the same code as the API (lint, digest check, enforced schemas,
-audit) under the same cluster lock, and skip only permissions. See
-`examples/maintenance-hook.pl`.
-
-## The editor
-
-A **Metadata** tab on every LXC/QEMU guest: one tree of the document, with the keys the
-governing prefixes declare shown greyed with their defaults. Edits are staged and one
-Apply writes them; a Tree | Text toggle and an "Edit selection as text" window give
-Monaco over the same document. Schema mismatches are marked, and Apply asks for a "Save
-anyway" tick before storing one. The Datacenter panel's Metadata tab lists the prefixes
-and permissions and edits them in the same editor. `ui-extjs/` is plain JavaScript with
-no build step; the rules it needs come from `crates/pve-meta-wasm` (`docs/WASM-CORE.md`).
-
-## Lifecycle
-
-One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), carries the
-hooks: a document is cleared when a vmid is created afresh, removed when the guest is
-destroyed, and copied, restored and removed with snapshots. Migration needs nothing.
-Clone and backup are not carried: back up `/etc/pve`. See `docs/LIFECYCLE-PATCHES.md`.
-
-## How it plugs into PVE
-
-Everything that touches pve-manager goes through `pve-ext`'s three seams: an API-module
-loader (one line in `PVE/API2.pm`), a UI-page loader (one `<script>` line in
-`index.html.tpl`), and `pve-ext-patch`, which applies, verifies, removes and reports
-dpkg-diverted patches from TOML manifests and re-applies them when the patched package
-is reshipped. pve-meta ships two page manifests and one patch manifest.
+Full read of a guest's document is `VM.Audit`, full write is `VM.Config.Options`; a
+rule adds one prefix on the guests its selector matches. A write is authorized by what
+it changes, not by the view it names.
 
 ## Install
-
-From the signed apt repository (amd64 and arm64; `docs/DISTRIBUTION.md` describes the
-pipeline):
 
 ```sh
 curl -fsSL https://apt.arki05.com/pubkey.asc \
@@ -125,47 +73,60 @@ echo "deb [signed-by=/etc/apt/keyrings/arki05.gpg] https://apt.arki05.com trixie
 apt update && apt install pve-meta
 ```
 
-Or build the three `.deb`s (below) and install them in dependency order:
+amd64 and arm64, PVE 9 on Debian trixie. Three packages come along: `pve-ext` (the
+extension layer that mounts the API module and the tab, its own package),
+`libpve-meta-rs-perl` (the Rust core, as a Perl module) and `pve-meta` itself. The
+install applies one managed patch to `libpve-guest-common-perl` for the lifecycle hooks,
+verified with `perl -c` and re-applied when that package is upgraded. Removing
+`pve-meta` restores the pristine file and leaves the documents alone.
+
+## Use
+
+**In the UI.** Every LXC and QEMU guest gets a **Metadata** tab: one tree of the
+document, declared-but-unset keys greyed with their defaults, edits staged and applied
+together, a Text mode with Monaco, and a diff before you commit. The Datacenter panel's
+Metadata tab lists the prefixes and permissions and edits them in the same editor.
+
+| Text mode with the diff | Save anyway, when a schema objects |
+|---|---|
+| ![](ui-extjs/docs/screenshots/readme-text-diff-light.png) | ![](ui-extjs/docs/screenshots/readme-save-anyway-light.png) |
+
+| Prefixes on the Datacenter panel | Editing a declaration |
+|---|---|
+| ![](ui-extjs/docs/screenshots/readme-prefixes-light.png) | ![](ui-extjs/docs/screenshots/readme-declare-key-light.png) |
+
+**From a script on the node**, no token, no pveproxy, works during boot:
 
 ```sh
-dpkg -i pve-ext_*.deb
-dpkg -i libpve-meta-rs-perl_*.deb pve-meta_*.deb
+host=$(pve-meta get 105 traefik.spec.host)              # a scalar prints bare; exit 2 = not there
+pve-meta get 105 traefik                                 # structure prints YAML
+pve-meta set 105 traefik --data '{"spec":{"host":"web.example"}}'
+pve-meta merge 105 backup --text 'retention: 14'
+pve-meta delete 105 traefik.spec.port
 ```
 
-`pve-meta`'s `postinst` applies the lifecycle patch (dpkg-divert, gated on `perl -c`),
-creates `/etc/pve/meta.d/{prefixes,permissions}` when `/etc/pve` is mounted, and
-restarts `pvedaemon`/`pveproxy`. The patch step never fails install; a trigger re-runs it
-when `libpve-guest-common-perl` reships the file. `pve-ext-patch status` shows what is
-applied. `dpkg -r pve-meta` restores the pristine file and leaves `/etc/pve/meta/*`
-alone: that is guest data.
+`examples/maintenance-hook.pl` refuses to start a guest whose metadata says it is under
+maintenance, in twenty lines.
 
-## Building
+**Over the API**, `/api2/json/meta`, with an ordinary PVE ticket or token:
 
-Debian 13 with a rustup toolchain (`wasm32-unknown-unknown` target added), `libperl-dev`,
-and `npm` to vendor Monaco. `make build` builds the perlmod crate and the editor's
-`.wasm`; `make ui` fetches Monaco; `make deb` builds all three packages into the parent
-directory. Only `pve-meta-core` and `pve-meta-wasm` build on macOS. Gates: `make check`
-(clippy, rustdoc, the wasm smoke suite), `make test`, `make check-perl` (shellcheck and
-`perl -c` against stub PVE modules), `make -C crates/pve-meta-perl check` (the Perl
-boundary suite, Linux only). `docs/BUILD.md` has the details and the safe way to replace
-the installed `.so` on a live node.
+```sh
+pvesh get /meta/guests --has traefik                     # every guest with that prefix
+pvesh get /meta/guests/105 --view traefik --format yaml  # one subtree, exact types
+pvesh set /meta/guests/105 --view traefik --data '{"spec":{"port":8081}}' --digest <d>
+pvesh get /meta/version --id 105                          # poll this; it moves when anything changes
+```
 
-## Repository layout
+Every write leaves one syslog line tagged `pve-meta audit:`.
 
-| Path | What |
+## Where things are
+
+| | |
 |---|---|
-| `crates/pve-meta-core` | The rules: model, views, prefixes, permissions, shape, edit set, store, API layer |
-| `crates/pve-meta-perl` | `PVE::RS::Meta`, the perlmod bindings |
-| `crates/pve-meta-wasm` | The same core for the browser |
-| `perl/PVE/API2/Ext/Meta.pm` | The REST module |
-| `bin/pve-meta` | The CLI |
-| `ui-extjs/` | The editor and its tests |
-| `pve-ext/` | The extension layer (own package) |
-| `pages/`, `patches/`, `prefixes/` | Page manifests, the lifecycle patch, packaged example prefixes |
-| `docs/` | `DESIGN.md` (the spec), `decisions/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |
-| `scripts/` | The ceiling watcher, Perl stubs for `perl -c` |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | the specification: what is true of the code |
+| [`docs/decisions/`](docs/decisions/README.md) | why, one record per decision |
+| [`docs/BUILD.md`](docs/BUILD.md), [`docs/DISTRIBUTION.md`](docs/DISTRIBUTION.md) | building, releasing, the apt repository |
+| `crates/pve-meta-core` | every rule, in Rust; the API calls it through perlmod, the editor runs it as wasm |
+| `perl/`, `bin/`, `ui-extjs/`, `pve-ext/` | the API module, the CLI, the editor, the extension layer |
 
-## License
-
-AGPL-3.0-or-later for this project's own code; the vendored Monaco carries its own
-licenses. See `debian/copyright`.
+AGPL-3.0-or-later.
