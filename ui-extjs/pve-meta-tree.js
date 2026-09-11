@@ -94,6 +94,8 @@ PVE.meta.Utils = {
     isComment: (key) => key.length >= 2 && key.slice(-2) === '__',
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
+    // The path above `path`, or '' for a top-level key (and for the root itself).
+    parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
     // The key a path declares, if it is a declaration inside a prefix file's schema
     // -- `schema.properties.host`, or `schema.properties.spec.properties.host` --
@@ -1885,6 +1887,26 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
         });
     },
 
+    // The keys the form owns. Everything else in an existing declaration -- a nested
+    // `properties`, a keyword this dialect has and the form does not show, such as
+    // `optional` -- is kept as it was when the declaration is edited: the form
+    // rewrites what it asks about and nothing more. Without this, editing the
+    // description of a map declaration dropped every key declared inside it.
+    FORM_KEYS: ['type', 'description', 'default', 'enum', 'minimum', 'maximum', 'format', 'multiline', 'hidden', 'enforce'],
+
+    // An edited declaration: the form's fields laid over what the declaration
+    // already held outside them. The form's keys come first, in the order a reader
+    // wants, and the kept ones after -- `properties` naturally last.
+    merged: function (existing, fresh) {
+        let out = Object.assign({}, fresh);
+        Object.keys(existing || {}).forEach(function (k) {
+            if (PVE.meta.DeclareKeyWindow.prototype.FORM_KEYS.indexOf(k) === -1) {
+                out[k] = existing[k];
+            }
+        });
+        return out;
+    },
+
     // `schemaFrom` backwards: a declaration as the form's own fields, so editing
     // one starts from what it says. The two have to agree about every field, which
     // is why they sit next to each other -- a field one of them forgot is a field
@@ -1926,10 +1948,14 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
             out.default = U.parseValue(dflt, U.schemaValueKind(v.type));
         }
         if (v.enum) {
+            // Members typed like the key: an integer key's `enum: [80, 443]` must not
+            // come back as strings after a trip through the form.
+            let kind = U.schemaValueKind(v.type);
             out.enum = String(v.enum)
                 .split(',')
                 .map((x) => x.trim())
-                .filter((x) => x !== '');
+                .filter((x) => x !== '')
+                .map((x) => (['integer', 'number'].indexOf(v.type) !== -1 ? U.parseValue(x, kind) : x));
         }
         ['minimum', 'maximum'].forEach(function (n) {
             if (['integer', 'number'].indexOf(v.type) !== -1 && v[n] !== undefined && v[n] !== '') {
@@ -3672,11 +3698,34 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // door every editor stages through: the row editor, Add Key, Add Rule, Declare
     // Key, Set to Default, the list helpers and the subtree text editor.
     stage: function (path, op, value) {
+        let me = this;
+        let U = PVE.meta.Utils;
         let edit = { path: path, op: op };
         if (op === 'set') {
             edit.value = value;
         }
-        this.setPlanned(new PVE.meta.EditSet([edit]).apply(this.plannedData()));
+        let doc = new PVE.meta.EditSet([edit]).apply(me.plannedData());
+        if (op === 'delete') {
+            // A delete never leaves behind a container the stored document does not
+            // have. `view::remove` takes the key and keeps its parent, which is right
+            // for a map the file holds -- an empty map is a stored state -- and wrong
+            // for one an earlier edit created on the way to a key that is now gone:
+            // set a ghost `docker.compose`, discard it, and `docker: {}` would stay
+            // staged, with Apply lit to write a map the guest never asked for.
+            let stored = me.dataOf(me.docId);
+            let parent = U.parentPath(path);
+            while (parent) {
+                let now = U.valueAt(doc, parent);
+                let isEmptyMap =
+                    now && typeof now === 'object' && !Array.isArray(now) && Object.keys(now).length === 0;
+                if (!isEmptyMap || U.valueAt(stored, parent) !== undefined) {
+                    break;
+                }
+                doc = new PVE.meta.EditSet([{ path: parent, op: 'delete' }]).apply(doc);
+                parent = U.parentPath(parent);
+            }
+        }
+        me.setPlanned(doc);
     },
 
     isDirty: function () {
@@ -4780,7 +4829,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             'PVE.meta.DeclareKeyWindow',
             { prefix: me.docTitle(docId), declaration: current, keyName: key },
             'declarekey',
-            (_key, schema) => me.stage(rec.data.path, 'set', schema),
+            // Laid over the declaration as it is: the form rewrites the fields it
+            // asks about and keeps the rest -- a map's nested `properties` above all.
+            (_key, schema) =>
+                me.stage(rec.data.path, 'set', PVE.meta.DeclareKeyWindow.prototype.merged(current, schema)),
         );
         return true;
     },

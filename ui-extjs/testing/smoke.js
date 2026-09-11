@@ -1873,6 +1873,29 @@ console.log('\n--- acting on one member rewrites its list ---');
     eq('nor is a negative one', stub.pending.edits, []);
 }
 
+console.log('\n--- a delete leaves no container the stored document does not have ---');
+{
+    // Set a ghost `docker.compose` on a document with no `docker`, then discard it:
+    // the map the first edit created on the way must go with the key, or `docker: {}`
+    // stays staged and Apply writes a map the guest never asked for. A map the file
+    // does hold is a stored state and stays, empty or not.
+    const s = stagingStub({ keep: { a: 1 }, empty: {} });
+    s.stage('docker.compose', 'set', 'x');
+    eq('the edit created the container', s.plannedData().docker, { compose: 'x' });
+    s.discardRow({ data: { path: 'docker.compose' } });
+    eq('discarding the ghost leaves nothing staged', [s.pending.edits, s.isDirty()], [[], false]);
+    s.stage('deep.er.key', 'set', 1);
+    s.stage('deep.er.key', 'delete');
+    eq('removing the only key removes the chain it created', s.pending.edits, []);
+    s.stage('keep.a', 'delete');
+    eq('a stored map stays when its last key goes', s.plannedData().keep, {});
+    s.stage('empty.new', 'set', 1);
+    s.stage('empty.new', 'delete');
+    eq('... and a stored empty map is not touched either',
+        [s.plannedData().empty, s.pending.edits.filter((e) => e.path.indexOf('empty') === 0)], [{}, []]);
+    eq('parentPath', [U.parentPath('a.b.c'), U.parentPath('a'), U.parentPath('')], ['a.b', '', '']);
+}
+
 console.log('\n--- discarding one member puts that member back, not the list ---');
 {
     // The edit is staged on the *list*, so dropping it would throw away every other
@@ -2113,6 +2136,35 @@ eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', e
     eq('declaration ' + i + ' survives a trip through the form',
         U.sameValue(back, decl), true);
 });
+
+// Editing keeps what the form does not own. A map declaration carries its nested
+// `properties`, and a keyword the form has no field for -- `optional` -- is still
+// part of what the file says; the form rewrites the fields it asks about and lays
+// them over the rest. Without this, editing a description dropped every declared
+// key inside the map.
+{
+    const existing = {
+        type: 'object',
+        description: 'old',
+        optional: 1,
+        properties: { host: { type: 'string' }, port: { type: 'integer' } },
+    };
+    const edited = D.schemaFrom(Object.assign({}, D.valuesFrom(existing, 'spec'), { description: 'new' }));
+    const merged = D.merged(existing, edited);
+    eq('the edited field changed', merged.description, 'new');
+    eq('nested declarations survive an edit of their parent', merged.properties, existing.properties);
+    eq('and so does a keyword the form does not show', merged.optional, 1);
+    eq('a field the form owns and now leaves empty is gone, not kept',
+        D.merged({ type: 'string', description: 'x' }, { type: 'string' }).description, undefined);
+    eq('the form keys come first, the kept ones after', Object.keys(merged), ['type', 'description', 'optional', 'properties']);
+}
+// Members of an enum are typed like the key: an integer key's values must not come
+// back as strings after a trip through the form.
+eq('an integer enum stays integers', D.schemaFrom({ type: 'integer', enum: '80, 443' }).enum, [80, 443]);
+eq('a string enum stays strings', D.schemaFrom({ type: 'string', enum: '80, 443' }).enum, ['80', '443']);
+eq('... and an integer declaration survives the round trip',
+    U.canonical(D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom({ type: 'integer', enum: [80, 443] }, 'k')))),
+    U.canonical({ type: 'integer', enum: [80, 443] }));
 
 // The two flags are three-state in both directions: absent means inherit, and
 // `false` is a statement that has to come back as `false` rather than as absent.
