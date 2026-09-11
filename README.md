@@ -5,7 +5,10 @@ stored in `/etc/pve` and replicated with the cluster, with a native API, an edit
 in the PVE UI, and a CLI for hook scripts. Optionally, a schema can describe part of a
 document and an API token can be scoped to part of it.
 
-![The Metadata tab on a guest](ui-extjs/docs/screenshots/readme-tree-light.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-tree-dark.png">
+  <img alt="The Metadata tab on a guest" src="ui-extjs/docs/screenshots/readme-tree-light.png">
+</picture>
 
 ## Why
 
