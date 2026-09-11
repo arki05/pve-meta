@@ -163,9 +163,16 @@ impl Shape {
     /// A shape with one schema rooted at the document itself, which is how a
     /// registry document is described by its meta-schema
     /// ([`crate::metaschema`], `docs/DESIGN.md` §6).
+    ///
+    /// Through [`Shape::new`] rather than building the struct, because the editor
+    /// constructs exactly this one-entry listing and hands it to the generic path.
+    /// Built by hand here, the two were the same only by coincidence: a change to
+    /// how `new` treats an empty-path entry would have broken the editor's rooted
+    /// shape while this function's own tests carried on passing. Now it must break
+    /// both or neither.
     pub fn rooted(schema: Value) -> Shape {
-        Shape {
-            prefixes: vec![Declared {
+        Shape::new(
+            [Declared {
                 prefix: Path::root(),
                 selector: Selector::All,
                 description: None,
@@ -173,7 +180,8 @@ impl Shape {
                 enforce: false,
                 hidden: false,
             }],
-        }
+            &[],
+        )
     }
 
     /// A document nothing describes: a guest no prefix reaches.

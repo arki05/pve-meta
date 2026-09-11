@@ -110,15 +110,12 @@ PVE.meta.Utils = {
     // Two document values are the same value. Maps compare as sets: key order is
     // kept on disk as a courtesy and is not a value (DESIGN §2), so the keys are
     // sorted before the two are encoded and compared.
-    sameValue: (a, b) => PVE.meta.Utils.canonical(a) === PVE.meta.Utils.canonical(b),
-    canonical: (v) =>
-        JSON.stringify(v, (key, val) =>
-            val && typeof val === 'object' && !Array.isArray(val)
-                ? Object.keys(val)
-                      .sort()
-                      .reduce((o, k) => ((o[k] = val[k]), o), {})
-                : val,
-        ),
+    // Two documents are the same value. The core's rule (`same`), not a local
+    // one: this was a hand-rolled canonical `JSON.stringify` with sorted keys,
+    // which is the same rule spelled a second time -- and a third copy of it
+    // nearby had no sort, so a list member whose keys arrived in a different
+    // order rendered as changed when nothing about it had changed.
+    sameValue: (a, b) => PVE.meta.Core.call('same', a, b),
 
     // Why a key name is not one, or `null` if it is fine. A dotted path is
     // accepted and checked segment by segment, since the Key field takes one.
@@ -742,7 +739,6 @@ PVE.meta.Buffer = {
 PVE.meta.Access = {
     covers: (prefix, path) => PVE.meta.Core.call('covers', prefix, path),
 
-    canRead: (access, path) => PVE.meta.Core.call('access_can_read', access || {}, path),
 
     canWrite: (access, path) => PVE.meta.Core.call('access_can_write', access || {}, path),
 
@@ -831,6 +827,12 @@ Object.assign(PVE.meta.Shape.prototype, {
     },
 
     // The prefix governing `path`, as its listing entry, or `null`.
+    //
+    // No production caller: the row builder asks `schemaIndex`, which the core has
+    // already pruned by governance. It stays because its tests are what drive
+    // `shape_governing` across the boundary, and most-specific-wins is a rule this
+    // project has got wrong before -- a wrapper nobody calls is cheap, and losing
+    // the only cross-boundary check of that rule is not.
     governing: function (path) {
         let me = this;
         let hit = me.cache.governing;
@@ -3992,7 +3994,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             label.setVisible(false);
             return;
         }
-        let scoped = (me.access.scopes || []).some((s) => s.mode === 'rw');
+        // The core's rule, the same one the footer's Apply asks for. Deciding it
+        // again here is how a label and a button come to disagree.
+        let scoped = PVE.meta.Access.hasAnyWrite(me.access);
         label.setText(scoped ? gettext('Scoped write access') : gettext('Read-only'));
         label.setVisible(true);
     },
@@ -4334,7 +4338,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (!Array.isArray(before) || index >= before.length) {
                 return true; // appended
             }
-            return JSON.stringify(before[index]) !== JSON.stringify(item);
+            return !PVE.meta.Utils.sameValue(before[index], item);
         };
         let storedMember = function (listPath, index) {
             let before = PVE.meta.Utils.valueAt(storedDoc, listPath);

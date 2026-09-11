@@ -223,12 +223,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             }
         }
         "file_name_valid" => json!(registry::is_valid_file_name(a.str()?)),
-        "path_contains" => {
-            let p = a.path()?;
-            let q = a.path()?;
-            json!(p.is_prefix_of(&q))
-        }
-
         // -- access: scopes::Effective -----------------------------------
         //
         // `covers` is the coverage rule on its own (a rule on `p` covers `p`,

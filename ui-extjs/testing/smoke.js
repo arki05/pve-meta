@@ -257,8 +257,6 @@ eq('an auditor holds nothing', Access.hasAnyWrite({ read: 1, write: 0, scopes: [
 eq('a missing access object is not write access', Access.hasAnyWrite(undefined), false);
 eq('canWrite inside an rw scope', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'traefik.spec'), true);
 eq('canWrite outside it', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'netbird'), false);
-eq('canRead with an ro scope', Access.canRead({ read: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }, 'netbird.groups'), true);
-eq('a scope-only principal cannot read the root', Access.canRead({ read: 0, scopes: [{ prefix: 'netbird', mode: 'rw' }] }, ''), false);
 
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
@@ -2113,7 +2111,7 @@ eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', e
     // them, which need not be the order the file had, and key order is not a value
     // (decision 007). What has to survive is what it says.
     eq('declaration ' + i + ' survives a trip through the form',
-        U.canonical(back), U.canonical(decl));
+        U.sameValue(back, decl), true);
 });
 
 // The two flags are three-state in both directions: absent means inherit, and
