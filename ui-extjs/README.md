@@ -4,8 +4,8 @@ One file, `pve-meta-tree.js`, plain ES2017 with no build step of its own, plus t
 (`pve-meta-core.wasm`, built by `make wasm` from `crates/pve-meta-wasm`) and `monaco/`
 (fetched by `make ui`, gitignored). It defines two panels that pve-ext's page loader
 instantiates as native tabs: `pveMetaTreePanel`, one document's editor, on every guest's
-config panel; and `pveMetaDatacenterPanel`, that editor over the datacenter document plus
-the two registry grids, on the Datacenter panel.
+config panel; and `pveMetaDatacenterPanel`, the two registry grids, Prefixes and
+Permissions, on the Datacenter panel, each row of which opens in that same editor.
 
 The editor implements no rules. The YAML codec, the key-name charset, who may touch a
 path, which prefix governs one, what a schema makes of a value and what staged edits do
@@ -29,8 +29,8 @@ The behaviour is specified in `docs/DESIGN.md` §12 and not repeated here: one t
 the document the caller can see; lists as containers with one row per member; edits
 staged and written by one Apply at the narrowest covering view; Tree and Text as two
 views of the same planned document; the schema markers and the "Save anyway" banner;
-the footer that every editor shares; the datacenter tab's three sub-tabs and the two
-forms behind its registry grids. What follows is what is specific to *this* file.
+the footer that every editor shares; the datacenter tab's two registry grids and the two
+forms behind them. What follows is what is specific to *this* file.
 
 ### The Tree card
 
@@ -52,7 +52,7 @@ forms behind its registry grids. What follows is what is specific to *this* file
   `GET /meta/access` returns alongside the access answer — `rw` ones by name in normal
   text, `ro` ones muted with `(ro)`, `rw` first. The cell tooltip spells each one out
   with its selector (`example-traefik (rw, all guests)`). Scopes apply to guest documents
-  only, so the datacenter tree has no entries.
+  only, so a registry document's tree has no entries.
 * **The toolbar** acts on the document's *contents*: Add Rule (permission files only),
   Add, Edit, Set to Default, Declare Key (prefix files only), Remove, Edit selection as
   text, Reload, and at the right the muted *Scoped write access* / *Read-only* label
@@ -126,8 +126,8 @@ real write.
 
 The editor **reads every document as YAML** (`format=yaml`), never as JSON: perlmod
 renders a document as a native Perl hash on the way out, and a Perl hash has no key
-order, so `format=json` cannot carry the order the store holds (DESIGN §12). That is what
-makes a root Apply write the file back in the order it was in.
+order, so `format=json` cannot carry the order the store holds (DESIGN §7, decision 007).
+That is what makes a root Apply write the file back in the order it was in.
 
 ## How it is wired
 
@@ -170,8 +170,7 @@ directly, which injects `pveSelNode` through that panel's `defaults`.
 
 Note for whoever maintains the loader: `Ext.ClassManager.isCreated()` takes a class
 *name*, not an xtype — the xtype resolves through `getNameByAlias('widget.' + xtype)`
-first. The installed loader already does this correctly; only the stale comment in the
-repository copy's header still says otherwise.
+first, which is what its `waitForXtype()` does.
 
 ## Verifying it
 
@@ -223,4 +222,4 @@ and the Tree | Text toggle are in the footer now, and edits stage rather than wr
 | `extjs-scoped-light.png` | a caller with one `rw` scope: "Scoped write access", rows outside `traefik` not editable |
 | `extjs-readonly-dark.png` | a caller with read but no write: "Read-only", every editing button disabled |
 | `extjs-addkey.png` | the Add Key window |
-| `extjs-datacenter.png` | the same panel over `/meta/datacenter` |
+| `extjs-datacenter.png` | the same panel over the datacenter document, which decision 013 has since removed |

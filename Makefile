@@ -127,7 +127,7 @@ install:
 	# section 11) and its static files. Both are the `script`+`xtype` form: pve-ext's
 	# loader defines the class and puts a native ExtJS panel in the tab, so there is
 	# no iframe. Two manifests, one file: they name different `xtype`s
-	# (a guest's document editor, and the datacenter's three sub-tabs) out of the
+	# (a guest's document editor, and the datacenter's two registry grids) out of the
 	# same script, which the loader fetches once.
 	install -D -m 0644 pages/pve-meta.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta.json
 	install -D -m 0644 pages/pve-meta-dc.json $(DESTDIR)$(PREFIX)/share/pve-ext/pages/pve-meta-dc.json
