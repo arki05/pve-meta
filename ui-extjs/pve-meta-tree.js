@@ -2556,7 +2556,7 @@ PVE.meta.TextCard = {
     // made "check before you commit" a thing you could do only after switching views.
     showTextDiff: function () {
         let me = this;
-        let title = Ext.String.format(gettext('Changes: {0}'), me.textDocId || me.docId);
+        let title = Ext.String.format(gettext('Changes: {0}'), me.docId);
         if (me.mode === 'text') {
             if (!me.textEditor) {
                 return;
@@ -2632,21 +2632,15 @@ PVE.meta.TextCard = {
     enterTextMode: function () {
         let me = this;
         me.mode = 'text';
-        // Which document the Text card shows. On a guest tab there is only one; on
-        // the datacenter tab it is the one the selection is in, so switching to Text
-        // with a prefix row selected edits that prefix -- the alternative was
-        // a full-document editor that could only ever mean one of several documents.
-        let rec = me.getSelection()[0];
-        me.textDocId = (rec && rec.data.docId) || me.docId;
         me.syncButtons();
         me.getLayout().setActiveItem(me.down('#metaText'));
         Proxmox.Utils.setErrorMask(me, true);
         me.request({
-            url: me.urlFor(me.textDocId),
+            url: me.urlFor(me.docId),
             params: { format: 'yaml' },
             success: function (response) {
                 let d = response.result.data || {};
-                me.setDigest(me.textDocId, d.digest);
+                me.setDigest(me.docId, d.digest);
                 // The server's own text, comments and all -- but what the buffer shows
                 // is the *planned* document, so staged edits are there too. With
                 // nothing staged the two are the same text (`renderBuffer` prefers the
@@ -2730,7 +2724,7 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        let unchanged = PVE.meta.Core.call('same', me.dataOf(me.textDocId), parsed);
+        let unchanged = PVE.meta.Core.call('same', me.dataOf(me.docId), parsed);
 
         // Whatever you typed becomes staged rows, and the tree then shows it -- so
         // switching needs no confirmation and gets none. The exception is a change
@@ -2828,12 +2822,12 @@ PVE.meta.TextCard = {
         // from the planned document -- so this applies all of it, and the staged edits
         // are spent.
         let write = function (force) {
-            let params = { mode: 'replace', digest: me.digestOf(me.textDocId) };
+            let params = { mode: 'replace', digest: me.digestOf(me.docId) };
             params[me.textLang === 'json' ? 'data' : 'text'] = edited;
             if (force) {
                 params.force = 1; // the "Save anyway" tick, see the tree's Apply
             }
-            me.submit({ url: me.urlFor(me.textDocId), method: 'PUT', params: params }, function () {
+            me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
                 me.pending = PVE.meta.EditSet.empty();
                 me.refreshText();
             });
@@ -2974,7 +2968,7 @@ PVE.meta.TextCard = {
     // for. Reordering keys therefore stops demanding a tick, since a reordering
     // changes no value at all.
     textShape: function () {
-        return this.shapeFor(this.textDocId || this.docId);
+        return this.shapeFor(this.docId);
     },
 
     textFindings: function () {
@@ -2988,7 +2982,7 @@ PVE.meta.TextCard = {
         }
         try {
             let value = PVE.meta.Codec.parse(me.textEditor.getValue(), me.textLang);
-            let stored = me.dataOf(me.textDocId || me.docId);
+            let stored = me.dataOf(me.docId);
             return PVE.meta.Shape.introduced(
                 shape.findings(stored),
                 shape.findings(value),
@@ -3030,11 +3024,11 @@ PVE.meta.TextCard = {
     refreshText: function () {
         let me = this;
         me.request({
-            url: me.urlFor(me.textDocId),
+            url: me.urlFor(me.docId),
             params: { format: 'yaml' },
             success: function (response) {
                 let d = response.result.data || {};
-                me.setDigest(me.textDocId, d.digest);
+                me.setDigest(me.docId, d.digest);
                 me.textOriginal = d.text || '';
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
