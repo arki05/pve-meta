@@ -1,6 +1,10 @@
 # 010 — Edits are staged; the tree and the text editor are two views of one edit set
 
-**Status:** accepted (2026-09-09/10).
+**Status:** accepted (2026-09-09/10). Superseded on one point by `9320da6` and
+`01e5fa8`: the edit set is not a log a row edit appends to and `between` recovers when
+leaving Text mode; it is the difference between the stored document and the planned one,
+derived again after every edit, and the log's own operations (`stage`, `under`,
+`discard_under`) are gone. Everything else here stands.
 
 ## Context
 

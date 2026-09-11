@@ -6,10 +6,10 @@ edits do to a document — are `pve-meta-core`, compiled for `wasm32-unknown-unk
 (`crates/pve-meta-wasm`) and asked through a hand-written JSON-string ABI. Nothing of
 them is implemented in JavaScript any more. This was built as a spike on a branch
 (`968cf82`, `fdee33e`, `e1a9baa`), reviewed adversarially, answered in a fourth commit
-(`04b0a4d`), and merged; the behaviour it fixed is `docs/DESIGN.md` §8 ("The browser
-reimplements nothing", "The editor's YAML is the store's YAML — by construction"), and
-this file keeps what that section does not need: what was rejected, what it costs, what
-got harder, and what is still open.
+(`04b0a4d`), and merged; the behaviour it fixed is `docs/DESIGN.md` §12 (the rules the
+editor needs are the core compiled to wasm, and "the editor reimplements none of them"),
+and this file keeps what that section does not need: what was rejected, what it costs,
+what got harder, and what is still open.
 
 ## 1. The problem
 
@@ -358,10 +358,12 @@ plus a parse (~1 ms) on a warm Shape.
 - The wasm crate's `truthy` and `Selector::from_wire` exist because Perl renders `true`
   as `1`. The Perl JSON encoding leaks exactly as far as the adapter and no further.
 - `FormatCheck` is the core saying "I cannot judge this"; see §3. A type for a gap.
-- `EditSet::between` falls back to a whole-document set on *any* order change, including
-  inserting a key anywhere but the end. That is the old `diffDocuments` behaviour,
-  faithfully moved, and the test says so. A smarter diff that expresses "insert before"
-  would need a write operation the API does not have.
+- `EditSet::between` cannot express an order: a pure reordering is no edit at all (§2,
+  `docs/decisions/007`), and a key inserted in the middle of a map is one `set` on that
+  key, which lands at the end of the map. A reordering typed in Text mode therefore
+  survives only an Apply *from* Text mode, which sends the buffer; switching to the tree
+  drops it. A diff that expresses "insert before" would need a write operation the API
+  does not have.
 - The panel's Shape cache is keyed by document id and validated by the *identity* of
   the Shape's inputs. That holds because every load assigns a fresh array or object;
   a future change that mutated `me.prefixes` in place would serve a stale Shape, and
