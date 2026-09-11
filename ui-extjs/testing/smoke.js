@@ -1687,10 +1687,19 @@ console.log('\n--- text is just another way to edit rows ---');
     stub.dataOf = (id) => (stub.docState[id] || {}).data || {};
     stub.buildTree = () => {};
     stub.syncButtons = () => {};
+    // Staging the whole document replaces everything under it. The edit set is
+    // re-derived from the result, so what it holds is the *minimal* description of
+    // that -- the keys that went, and the one that arrived -- rather than one opaque
+    // root edit. The planned document is the assertion; the shape is how the tree gets
+    // to mark the rows that actually differ.
     stub.stage('', 'set', { a: 1 });
-    eq('the document replaces everything under it', stub.pending.edits, [{ path: '', op: 'set', value: { a: 1 } }]);
-    stub.stage('b', 'delete');
-    eq('a delete is staged without a value', stub.pending.edits[1], { path: 'b', op: 'delete' });
+    eq('the planned document is what was staged', stub.pending.apply(stored), { a: 1 });
+    eq(
+        'and it is described minimally',
+        stub.pending.edits.map((e) => e.path + ':' + e.op).sort(),
+        ['a:set', 'homelab:delete', 'netbird:delete'],
+    );
+    eq('an edit under a replaced key is not re-applied on top', stub.pending.apply(stored).homelab, undefined);
 
     // Dirty means the document differs, not that an edit exists. Staging the value a
     // row already has -- which is what the subtree editor's OK does when you typed
@@ -1712,6 +1721,17 @@ console.log('\n--- text is just another way to edit rows ---');
     eq('a real change still stages', noop.pending.length, 1);
     noop.stage('homelab.owner', 'set', stored.homelab.owner);
     eq('changing it back cancels the edit', noop.pending.edits, []);
+
+    // A delete is staged without a value, and is a real change.
+    noop.stage('netbird', 'delete');
+    eq('a delete is staged without a value', noop.pending.edits, [{ path: 'netbird', op: 'delete' }]);
+    eq('... and removes the key from the planned document', noop.pending.apply(stored).netbird, undefined);
+
+    // `stage` reports whether it changed the document, which is what tells the subtree
+    // editor that a reorder had nothing to stage.
+    eq('staging a real change reports true', noop.stage('homelab.owner', 'set', 'again'), true);
+    eq('staging what is already there reports false',
+        noop.stage('homelab.owner', 'set', 'again'), false);
 }
 
 console.log('\n--- a single delete has to stay a DELETE ---');

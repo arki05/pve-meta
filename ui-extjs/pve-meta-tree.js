@@ -2165,7 +2165,25 @@ Ext.define('PVE.meta.TextWindow', {
             Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             return;
         }
-        me.tree.stageFromView(me.view, value);
+        let changed = me.tree.stageFromView(me.view, value);
+
+        // Typed something, changed nothing: a reorder or a reindent parses to the
+        // document it started as (decision 007), so there is nothing to stage and no
+        // row to mark. Closing on that would look exactly like it had worked. The same
+        // thing the Tree|Text switch says, for the same reason.
+        if (!changed && !PVE.meta.Buffer.unchanged(me.buffer())) {
+            Ext.Msg.alert(
+                gettext('Nothing to stage'),
+                Ext.htmlEncode(
+                    gettext(
+                        'This changes how the subtree is laid out, not what it says -- ' +
+                            'key order, indentation. The tree shows the document, so there ' +
+                            'is nothing for it to carry.',
+                    ),
+                ),
+            );
+            return;
+        }
         me.close();
     },
 });
@@ -3569,16 +3587,32 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // both, and anything else that reaches the same place by a route nobody thought of.
     stage: function (path, op, value) {
         let me = this;
+        let stored = me.dataOf(me.docId);
+        let before = me.plannedData();
         let edit = { path: path, op: op };
         if (op === 'set') {
             edit.value = value;
         }
         me.pending.stage(edit);
-        if (PVE.meta.Core.call('same', me.plannedData(), me.dataOf(me.docId))) {
-            me.pending = PVE.meta.EditSet.empty();
-        }
+
+        // Re-derived, not accumulated. The edit set *is* the difference between what
+        // is stored and what you are looking at, so the honest way to keep it true is
+        // to recompute it from the result rather than to append and hope.
+        //
+        // Not creating a no-op edit would have been the narrower fix, and it misses
+        // the case that motivated this: editing a row from A to B and back to A stages
+        // a real change each time -- A over a pending B *is* a change at that moment --
+        // and leaves an edit set describing nothing. Asking what the document now is
+        // catches that, the no-op OK, and anything else that gets here by a route
+        // nobody thought of.
+        //
+        // It also makes every staged edit minimal, which the Text card already did on
+        // the way out: replacing a whole subtree marks the rows that actually differ,
+        // not the whole subtree.
+        me.pending = PVE.meta.EditSet.between(stored, me.plannedData());
         me.buildTree();
         me.syncButtons();
+        return !PVE.meta.Core.call('same', before, me.plannedData());
     },
 
     isDirty: function () {
@@ -3652,8 +3686,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // The one way a text buffer becomes staged edits at a view -- what "Edit selection
     // as text" ends with, and the reason that window no longer needs a write path of
     // its own.
+    // Returns whether it changed anything, which is not the same as whether the user
+    // typed: a reorder or a reindent parses to the document it started as.
     stageFromView: function (view, value) {
-        this.stage(view || '', 'set', value);
+        return this.stage(view || '', 'set', value);
     },
 
     revertPending: function () {
