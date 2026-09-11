@@ -20,13 +20,15 @@ pub struct CallerAcl {
     /// The caller's PVE authid (`user@realm`, optionally `!tokenid`).
     #[serde(default)]
     pub authid: String,
-    /// `VM.Audit` on `/vms/<vmid>` (or `Sys.Audit` on `/`).
+    /// `VM.Audit` on `/vms/<vmid>`; always true for a registry document, which
+    /// every authenticated user may read.
     #[serde(default)]
     pub read: bool,
-    /// `VM.Config.Options` on `/vms/<vmid>` (or `Sys.Modify` on `/`).
+    /// `VM.Config.Options` on `/vms/<vmid>`; `Sys.Modify` on `/` for a
+    /// registry document.
     #[serde(default)]
     pub write: bool,
-    /// The guest's PVE tags. Empty for the datacenter document.
+    /// The guest's PVE tags. Empty for a registry document.
     #[serde(default)]
     pub tags: Vec<String>,
 }
@@ -53,7 +55,7 @@ pub struct ApiVersion {
 /// One row of `GET /meta/version?detail=1`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiDocumentDigest {
-    /// A vmid, or `"datacenter"`.
+    /// A vmid, `prefixes/<name>` or `permissions/<name>`.
     pub id: String,
     pub digest: String,
 }

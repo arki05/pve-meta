@@ -317,14 +317,15 @@ async function main() {
         await api(`/api2/json/meta/guests/${vmid}?view=protokeys`, 'DELETE', tk, csrf, '');
         await sleep(500);
 
-        // --- 6. The datacenter document --------------------------------------
+        // --- 6. The datacenter tab: the two registry lists, and no document ------
         await openTab(page, 'dc');
         result.checks.datacenter = await page.evaluate(() => {
-            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-            if (!p) return 'no panel';
-            const r = [];
-            p.getRootNode().cascadeBy((n) => n.data.path && r.push(n.data.path));
-            return { dc: p.dc, baseUrl: p.baseUrl, access: p.access, rows: r };
+            const grids = Ext.ComponentQuery.query('pveMetaRegistryGrid');
+            return {
+                grids: grids.map((g) => g.kind),
+                treePanels: Ext.ComponentQuery.query('pveMetaTreePanel').length,
+                rows: grids.map((g) => g.getStore().getCount()),
+            };
         });
         await page.screenshot({ path: `${out}/extjs-datacenter.png` });
 

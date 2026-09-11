@@ -1,10 +1,11 @@
 # pve-meta
 
-A structured metadata store for Proxmox VE. Every guest (vmid) and the datacenter get
-one nested key-value document, stored under `/etc/pve/meta` and replicated by pmxcfs
-like the rest of the cluster config. The document is reachable through a native API on
-port 8006 (`PVE::API2::Ext::Meta`) and edited through a tree editor embedded as a
-"Metadata" tab on every guest and on the Datacenter panel. Three packages: `pve-ext`
+A structured metadata store for Proxmox VE. Every guest (vmid) gets one nested
+key-value document, stored under `/etc/pve/meta` and replicated by pmxcfs like the rest
+of the cluster config. The document is reachable through a native API on port 8006
+(`PVE::API2::Ext::Meta`) and edited through a tree editor embedded as a "Metadata" tab
+on every guest; the Datacenter panel's "Metadata" tab lists the prefixes and
+permissions that describe and govern those documents. Three packages: `pve-ext`
 (a generic extension layer for PVE), and `pve-meta` + `libpve-meta-rs-perl` (this
 project, a consumer of it).
 
@@ -79,7 +80,6 @@ enforced by where the files live rather than by a rule someone has to remember.
   that PVE tag. Tag membership comes from the cluster's cached guest properties. Adding
   the tag is the deliberate, manual act of including that guest; pve-meta does not
   enforce anything about the tag itself, it only filters by it.
-* Both apply to guest documents only; the datacenter document is governed by ACLs alone.
 * A rule on prefix `p` also covers the sibling comment key `p__` — the only
   comment-key access rule.
 
@@ -94,8 +94,7 @@ concepts and not one (`docs/DESIGN.md` §12).
 
 Grants for a caller on a guest document:
 
-* Full read = `VM.Audit` on `/vms/<vmid>`; full write = `VM.Config.Options` (datacenter:
-  `Sys.Audit` / `Sys.Modify` on `/`).
+* Full read = `VM.Audit` on `/vms/<vmid>`; full write = `VM.Config.Options`.
 * Scopes = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
 * Reading view `P` needs full read or a scope covering `P`. A caller with no rule at all
@@ -124,8 +123,7 @@ are `protected` and run in pvedaemon.
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode` = `replace` or `merge`, `digest`, `dry_run` | `{ id, view, digest, touched }`; 409 on digest mismatch, 403 outside the caller's permissions, 400 on invalid content |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
-| GET/PUT/DELETE | `/meta/datacenter` | same as guests | same shapes with `id: "datacenter"` |
-| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes, tags }` for that document, selectors already resolved; `tags` are the guest's PVE tags (`VM.Audit` only, empty otherwise); without either, the caller's own datacenter read/write |
+| GET | `/meta/access` | `id` (any document id) | `{ read, write, scopes, tags }` for that document, selectors already resolved; `tags` are the guest's PVE tags (`VM.Audit` only, empty otherwise); without `id`, the caller's read/write on the registry (`read` always, `write` = `Sys.Modify` on `/`) |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, most-specific prefix first — what each prefix is and where it applies. A file that did not parse is listed too, as `{ prefix, origin, error }` and nothing else, so it can be found and repaired instead of silently ceasing to exist |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules: [{ prefix, mode, selector }] }]` — who may touch which prefix; drives the Access column. A file that did not parse is listed as `{ name, origin, error }`; it grants nothing |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`<br>`/meta/permissions/{name}` | same as a document | the file itself as a document (`id: "prefixes/<name>"`). Writes land in the cluster directory, never over a packaged file, and are refused if the result would not parse as a prefix definition/permission file. `Sys.Modify` on `/` to write |
@@ -140,8 +138,8 @@ boundary as native hashes/arrays, not JSON strings.
 
 ## The editor
 
-A **Metadata** tab appears on every LXC/QEMU guest's config panel and on the
-Datacenter panel.
+A **Metadata** tab appears on every LXC/QEMU guest's config panel, and one on the
+Datacenter panel for the registry.
 
 On a guest it is one tree of the document the caller can see. Rows are the union of the
 keys present and the keys the governing prefix definition declares; an unset declared key
@@ -159,9 +157,8 @@ change like "this prefix applies to a tag rather than to every guest" possible a
 dropping `all` and adding `tag` are each refused on their own, because a definition's
 selector is exactly one of the two. Editability is per row, from `/meta/access`.
 
-On the Datacenter panel it is three sub-tabs: **Document** (the same editor, on the
-datacenter document), **Prefixes** and **Grants** — two grids over `/meta/prefixes` and
-`/meta/permissions`, with columns a tree could not show (which guests a prefix reaches,
+On the Datacenter panel it is two sub-tabs, **Prefixes** and **Permissions** — two
+grids over `/meta/prefixes` and `/meta/permissions`, with columns a tree could not show (which guests a prefix reaches,
 whether it carries a schema, and whether the file is a package's or yours on top of one).
 Editing a row opens that file in the same document editor, because a prefix definition is
 a document like any other. **Create Service Token** on the Permissions list makes the
@@ -221,8 +218,8 @@ generic seams, so pve-meta itself patches nothing directly:
   targets — a same-origin iframe (`url`) or a native ExtJS panel loaded once and
   instantiated in place (`script` + `xtype`). pve-meta ships two in the
   `script`+`xtype` form, `pages/pve-meta.json` (guests) and `pages/pve-meta-dc.json`
-  (the datacenter), over one script — a manifest carries a single `xtype`, and the two
-  tabs are different panels.
+  (the registry lists on the Datacenter panel), over one script — a manifest carries a
+  single `xtype`, and the two tabs are different panels.
 * **Managed patches.** `pve-ext-patch` applies, verifies, removes and reports a set of
   dpkg-diverted file patches described by TOML manifests; pve-meta ships one
   (`patches/lifecycle.toml`) for the five guest-lifecycle hooks.
@@ -267,7 +264,7 @@ account system of its own:
 | Scope | Read | Write |
 |---|---|---|
 | A guest's document | `VM.Audit` on `/vms/<vmid>` | `VM.Config.Options` on `/vms/<vmid>` |
-| Datacenter document | `Sys.Audit` on `/` | `Sys.Modify` on `/` |
+| A prefix or permission file | every authenticated user | `Sys.Modify` on `/` |
 
 A permission file (above) additionally grants a prefix, read-only or read-write, on the
 guests its selector matches, to a principal that may hold no VM privilege at all.
@@ -298,7 +295,7 @@ live node.
 | `ui-extjs/` | The editor tab: plain JS, a native `Ext.tree.Panel` |
 | `pve-ext/` | The extension layer: API-module loader, UI-page loader, `pve-ext-patch` (own package) |
 | `patches/` | `lifecycle.toml`, the managed-patch manifest, and `lifecycle/` holding the one guest-lifecycle diff it names |
-| `pages/` | The "Metadata" tab's two page manifests (guest, datacenter) |
+| `pages/` | The "Metadata" tab's two page manifests (guest, and the registry lists on the Datacenter panel) |
 | `debian/` | The `pve-meta` source package: `control`, triggers, systemd units, `postinst`/`prerm` |
 | `docs/` | `DESIGN.md` (authoritative), `design/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |
 | `scripts/apt-repo/` | Signed apt repo build/publish scripts (Cloudflare R2) |

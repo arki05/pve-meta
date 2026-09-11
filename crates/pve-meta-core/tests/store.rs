@@ -363,7 +363,7 @@ fn list_snapshots_ignores_documents_temp_files_and_other_guests() {
     let (dir, store) = store();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.put_raw(&DocId::Guest(1000), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Datacenter, "a: 1\n", None).unwrap();
+    store.put_raw(&DocId::Guest(200), "a: 1\n", None).unwrap();
     store.snapshot(100, "before").unwrap();
     std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
     std::fs::write(dir.path().join("100.bad name.yaml"), "a: 1\n").unwrap();
@@ -392,14 +392,17 @@ fn version_lists_documents_with_their_digests_and_never_snapshots() {
     assert!(store.version().unwrap().documents.is_empty());
 
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Datacenter, "b: 2\n", None).unwrap();
+    store.put_raw(&DocId::Guest(200), "b: 2\n", None).unwrap();
     // A snapshot copy moves the token but is not a document: nothing addresses
     // it through the API, so a caller diffing the list has nothing to do about it.
     store.snapshot(100, "before").unwrap();
+    // So does a stray file with no vmid in its name -- a `datacenter.yaml` left
+    // by the release that had such a document, say.
+    std::fs::write(_dir.path().join("datacenter.yaml"), "note: x\n").unwrap();
 
     let v = store.version().unwrap();
     let ids: Vec<DocId> = v.documents.iter().map(|(id, _)| id.clone()).collect();
-    assert_eq!(ids, vec![DocId::Guest(100), DocId::Datacenter]);
+    assert_eq!(ids, vec![DocId::Guest(100), DocId::Guest(200)]);
 
     // Each digest is that document's own, matching what a read reports.
     for (id, digest) in &v.documents {
@@ -478,13 +481,13 @@ fn version_token_returns_to_an_earlier_value_when_content_does() {
 fn reads_never_lint_but_writes_still_do() {
     // `docs/DESIGN.md` §4. Out-of-band content -- a hand-edited
     // file, a restored backup, pmxcfs replication -- must stay readable, or
-    // one bad key in `datacenter.yaml` denies every guest operation
-    // cluster-wide and blocks the repair that would fix it.
+    // one bad key in a file denies every operation on it and blocks the
+    // repair that would fix it.
     let (dir, store) = store();
     let broken = "bad key: 1\nempty:\nlist:\n- ~\n";
-    std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+    std::fs::write(dir.path().join("200.yaml"), broken).unwrap();
 
-    let doc = store.read(&DocId::Datacenter).unwrap();
+    let doc = store.read(&DocId::Guest(200)).unwrap();
     assert_eq!(doc.raw, broken);
     assert_eq!(doc.value["bad key"], json!(1));
     assert_eq!(doc.value["empty"], Value::Null);
@@ -492,16 +495,16 @@ fn reads_never_lint_but_writes_still_do() {
     // The repair goes through, even though the *old* content would never
     // pass lint (it used to be re-parsed strictly, just to compute a diff).
     let good = "ok: 1\n";
-    let result = store.put_raw(&DocId::Datacenter, good, Some(&doc.digest)).unwrap();
+    let result = store.put_raw(&DocId::Guest(200), good, Some(&doc.digest)).unwrap();
     assert_eq!(result.document.raw, good);
-    assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+    assert_eq!(store.read(&DocId::Guest(200)).unwrap().value, json!({"ok": 1}));
 
     // ... and the write-time gate is untouched.
     assert!(matches!(
-        store.put_raw(&DocId::Datacenter, "bad key: 1\n", None),
+        store.put_raw(&DocId::Guest(200), "bad key: 1\n", None),
         Err(Error::Lint(_))
     ));
-    assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+    assert_eq!(store.read(&DocId::Guest(200)).unwrap().value, json!({"ok": 1}));
 
     // A syntax error is reported *per document*, not raised: see
     // `a_syntax_error_is_reported_per_document_and_never_blocks_a_repair`.
@@ -527,9 +530,9 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
         "? [1, 2]\n: v\n",           // a complex key
     ] {
         let (dir, store) = store();
-        std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+        std::fs::write(dir.path().join("200.yaml"), broken).unwrap();
 
-        let doc = store.read(&DocId::Datacenter).unwrap();
+        let doc = store.read(&DocId::Guest(200)).unwrap();
         assert!(doc.parse_error.is_some(), "{broken:?} parsed after all");
         // The empty document, the real bytes, the real digest.
         assert_eq!(doc.value, json!({}));
@@ -541,14 +544,14 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
         // thing standing between the file and its own fix.
         let good = "ok: 1\n";
         store
-            .put_raw(&DocId::Datacenter, good, Some(&doc.digest))
+            .put_raw(&DocId::Guest(200), good, Some(&doc.digest))
             .unwrap_or_else(|e| panic!("{broken:?}: repair refused: {e}"));
-        assert_eq!(store.read(&DocId::Datacenter).unwrap().value, json!({"ok": 1}));
+        assert_eq!(store.read(&DocId::Guest(200)).unwrap().value, json!({"ok": 1}));
 
         // A stale digest is still a 409-shaped refusal, not a free pass.
-        std::fs::write(dir.path().join("datacenter.yaml"), broken).unwrap();
+        std::fs::write(dir.path().join("200.yaml"), broken).unwrap();
         assert!(matches!(
-            store.put_raw(&DocId::Datacenter, good, Some("deadbeef")),
+            store.put_raw(&DocId::Guest(200), good, Some("deadbeef")),
             Err(Error::DigestMismatch { .. })
         ));
     }
@@ -615,7 +618,8 @@ fn stored_vmids_covers_documents_and_snapshot_copies() {
 
     store.put_raw(&DocId::Guest(999500), "a: 1\n", None).unwrap();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Datacenter, "a: 1\n", None).unwrap();
+    // A stray file with no vmid in its name is not a guest.
+    std::fs::write(dir.path().join("datacenter.yaml"), "a: 1\n").unwrap();
     store.snapshot(100, "before").unwrap();
     // A guest whose document was deleted but whose snapshot copy survives.
     store.put_raw(&DocId::Guest(777), "a: 1\n", None).unwrap();

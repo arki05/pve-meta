@@ -736,7 +736,7 @@ PVE.meta.Access = {
 // The prefixes that reach a guest, most-specific first; which of them governs a
 // path; what its schema says about the value there. Schemas shadow, they never
 // merge (DESIGN §3.1). A registry document is shaped by its meta-schema rooted at
-// the document itself; the datacenter document by nothing.
+// the document itself.
 //
 // A Shape owns its two inputs -- the `GET /meta/prefixes` listing and the guest's
 // tags -- and caches what the core derives from them alone (the applicable
@@ -2100,19 +2100,13 @@ PVE.meta.Doc = {
 
     // The API path of a document, from its id. Total by construction: a registry id
     // is `prefixes/<name>` -- the path it is served at -- and everything else is a
-    // vmid or the literal `datacenter` (`api::parse_id`).
+    // vmid (`api::parse_id`).
     urlFor: function (id) {
-        if (id === 'datacenter') {
-            return '/meta/datacenter';
-        }
         return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
     },
 
     // What kind of document an id names -- which decides what governs its rows.
     docKind: function (id) {
-        if (id === 'datacenter') {
-            return 'datacenter';
-        }
         if (id.indexOf('prefixes/') === 0) {
             return 'prefix';
         }
@@ -2129,7 +2123,7 @@ PVE.meta.Doc = {
 
     // The digest to send with a write, and the parsed document to build rows from.
     // Per document, because a compare-and-swap is per document: one shared `digest`
-    // field would have sent a prefix's digest with a write to the datacenter.
+    // field would have sent a prefix's digest with a write to another document.
     digestOf: function (id) {
         return (this.docState[id] || {}).digest || '';
     },
@@ -2247,12 +2241,10 @@ PVE.meta.Doc = {
         let me = this;
         me.request({
             url: '/meta/access',
-            // Ask about the document this panel is actually showing. `dc: 1` used to
-            // stand in for "not a guest", which stopped being true the moment a
-            // prefix or permission file could be the document: those are readable by every
-            // authenticated user, and asking about the datacenter document instead
-            // answered with Sys.Audit -- disabling Text mode on a file the caller may
-            // certainly read (DESIGN §3.5).
+            // Ask about the document this panel is actually showing: a guest's read
+            // is VM.Audit, a registry file's is open to every authenticated user, and
+            // asking about the wrong kind once disabled Text mode on a file the
+            // caller could certainly read (DESIGN §3.5).
             params: { id: me.docId },
             success: function (response) {
                 me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
@@ -2271,7 +2263,7 @@ PVE.meta.Doc = {
     // registry document, and a guest tab never shows one.
     loadSchemas: function (next) {
         let me = this;
-        if (!me.dc) {
+        if (!me.registryDoc) {
             next();
             return;
         }
@@ -2952,21 +2944,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let sel = (me.pveSelNode && me.pveSelNode.data) || {};
 
         me.vmid = me.vmid || sel.vmid;
-        me.dc = !me.vmid;
-        // This panel is ONE document's editor, named by `docId`: a guest's, the
-        // datacenter's, or a prefix/permission file's -- they are all documents (DESIGN
-        // §3.5), so the same tree, markers, text editor and diff serve all three, and
-        // the registry grids open one of these in a window rather than reimplementing
-        // any of it.
+        // This panel is ONE document's editor, named by `docId`: a guest's, or a
+        // prefix/permission file's -- they are all documents (DESIGN §3.5), so the
+        // same tree, markers, text editor and diff serve both, and the registry
+        // grids open one of these in a window rather than reimplementing any of it.
         //
         // Rows still carry their document's id even though there is only ever one:
         // it is what every write threads through, and a panel that had to remember
         // which document it was on top of which row was selected is how the digest of
         // one document ends up on a write to another.
-        me.docId = me.docId || (me.dc ? 'datacenter' : String(me.vmid));
+        me.docId = me.docId || String(me.vmid);
+        // A registry document: no tags to resolve, no permissions to apply, and the
+        // meta-schema describes it instead of the prefixes.
+        me.registryDoc = me.docKind(me.docId) !== 'guest';
         // Start fetching the core now rather than at the first document read: the
-        // registry grids beside a datacenter document open their dialogs before that
-        // read lands, and a validator with no core to ask checks nothing.
+        // registry grids open their dialogs before that read lands, and a validator
+        // with no core to ask checks nothing.
         // `loadDocument` awaits the same promise and reports its failure.
         PVE.meta.Core.load().catch(Ext.emptyFn);
         me.docState = Object.create(null); // id -> { digest, data }
@@ -3342,7 +3335,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 // keys are fixed and `deny_unknown_fields` refuses a fourth, so a
                 // comment key cannot exist there to describe one (DESIGN §3.5). An
                 // always-empty column is a column that teaches you to ignore columns.
-                hidden: me.docKind(me.docId) !== 'guest' && me.docKind(me.docId) !== 'datacenter',
+                hidden: me.docKind(me.docId) !== 'guest',
                 // The row's own comment key (`k__`) if present, else nothing.
                 text: gettext('Description'),
                 dataIndex: 'description',
@@ -3531,9 +3524,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // What describes this document's shape (`PVE.meta.Shape`). A guest document is
     // described by the prefixes that reach it, most-specific first (they shadow); a
     // prefix or permission file by the one meta-schema for its kind, rooted at the
-    // document itself; the datacenter document by nothing at all -- prefixes are
-    // guest-only (DESIGN §3.3), which is what keeps a prefix from painting rows onto
-    // it. One function, every caller that needs it -- the row builder, the row
+    // document itself. One function, every caller that needs it -- the row builder, the row
     // markers, the text editor's squiggles and hovers, and the warning banner Apply
     // shows -- so they cannot disagree about what describes the document.
     //
@@ -3559,7 +3550,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // guest's tags (the server resolved the selectors it enforces; these tags are for
     // the rendering decisions the client makes on top, and the client only ever
     // matches tags it was given, DESIGN §8). A registry file's: the meta-schema for
-    // its kind. The datacenter document's: nothing -- prefixes are guest-only.
+    // its kind.
     shapeInputs: function (id) {
         let me = this;
         let kind = me.docKind(id);
@@ -3799,7 +3790,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // server computes a caller's scopes, and a file that did not load grants nothing.
     applicablePermissions: function () {
         let me = this;
-        if (me.dc) {
+        if (me.registryDoc) {
             return []; // permissions apply to guest documents only
         }
         return PVE.meta.Access.rulesReaching(me.permissions, me.tags);
@@ -4600,10 +4591,8 @@ Ext.define('PVE.meta.DocumentWindow', {
             items: [
                 {
                     xtype: 'pveMetaTreePanel',
-                    // `dc: true` says "this is not a guest": no tags to resolve
-                    // and no permissions to apply. Which ACL answers apply is decided by
-                    // `docId`, which `loadAccess` sends as-is.
-                    dc: true,
+                    // Which ACL answers apply, and that this is not a guest, are both
+                    // decided by `docId`, which `loadAccess` sends as-is.
                     docId: me.docId,
                     border: false,
                     // The panel's footer is the only bar: a window with Close at the
@@ -4899,7 +4888,7 @@ Ext.define('PVE.meta.NewRegistryWindow', {
 //
 // The optional role goes on `/vms`, not per-guest and not `/`: per-guest silently
 // misses guests created later, and `PVEAuditor` on `/` would also hand over
-// `Sys.Audit`, which is the datacenter document's own read permission.
+// `Sys.Audit`, far more than a metadata reader needs.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.ServiceToken', {
@@ -5153,12 +5142,9 @@ Ext.define('PVE.meta.RegistryGrid', {
         let me = this;
         me.request({
             url: '/meta/access',
-            // The datacenter document's answer, and this grid only reads `write`
-            // from it -- which is Sys.Modify on `/` for both (DESIGN §3.5). The
-            // *read* bits differ (a registry file is readable by everyone), which is
-            // why the document editor asks by id instead; a list needs neither the
-            // read bit nor a file to ask about.
-            params: { dc: 1 },
+            // No id: the registry's own answer, whose `write` is Sys.Modify on `/`
+            // (DESIGN §3.5). A list needs no file to ask about.
+            params: {},
             success: function (response) {
                 me.access = response.result.data || { write: 0 };
                 me.syncButtons();
@@ -5325,12 +5311,12 @@ Ext.define('PVE.meta.RegistryGrid', {
 });
 
 // ---------------------------------------------------------------------------
-// The datacenter tab: the datacenter document, and the two registry lists.
+// The datacenter tab: the two registry lists.
 //
-// Three sub-tabs rather than one tree of everything. They are three different
-// kinds of thing -- one document, a list of prefix definitions, a list of permissions --
-// and drawing them as branches of a single tree claimed a relationship they do
-// not have, while hiding the columns that make a list worth reading.
+// Two sub-tabs rather than one tree of everything. They are two different kinds
+// of thing -- a list of prefix definitions, a list of permissions -- and drawing
+// them as branches of a single tree claimed a relationship they do not have,
+// while hiding the columns that make a list worth reading.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DatacenterPanel', {
@@ -5344,12 +5330,6 @@ Ext.define('PVE.meta.DatacenterPanel', {
         let me = this;
         Ext.apply(me, {
             items: [
-                {
-                    title: gettext('Document'),
-                    iconCls: 'fa fa-file-text-o',
-                    xtype: 'pveMetaTreePanel',
-                    dc: true,
-                },
                 {
                     title: gettext('Prefixes'),
                     iconCls: 'fa fa-sitemap',

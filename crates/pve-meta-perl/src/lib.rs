@@ -156,8 +156,8 @@ mod pve_rs_meta {
     }
 
     /// Every vmid the store holds any file for -- a document, a snapshot
-    /// copy, or both -- sorted ascending. The datacenter document is not a
-    /// guest and is never listed.
+    /// copy, or both -- sorted ascending. A file whose name carries no vmid
+    /// is not a guest and is never listed.
     ///
     /// What `pve-meta ls --orphans` subtracts the vmlist from, and what
     /// `pve-meta rm` checks before removing anything: the one case the
@@ -237,7 +237,7 @@ mod pve_rs_meta {
 
     /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
     /// with the permissions' selectors already resolved against `$acl`'s
-    /// tags. `$id` is a vmid or `"datacenter"`.
+    /// tags. `$id` is a vmid, `prefixes/<name>` or `permissions/<name>`.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
@@ -257,8 +257,8 @@ mod pve_rs_meta {
         api::list_guests(&store, &open_permissions(&store), authid, &guests, has)
     }
 
-    /// `GET /meta/guests/{vmid}` / `GET /meta/datacenter` (`$id` is a vmid
-    /// or `"datacenter"`).
+    /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
+    /// a vmid, `prefixes/<name>` or `permissions/<name>`).
     #[export]
     pub fn api_get(
         id: &str,
@@ -270,7 +270,7 @@ mod pve_rs_meta {
         api::get_document(&store, &open_permissions(&store), id, view, format, &acl)
     }
 
-    /// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
+    /// `PUT /meta/guests/{vmid}` and the registry documents' `PUT`.
     ///
     /// `$payload` is the only string crossing: the client's `data` (JSON) or
     /// `text` (YAML) parameter, decoded once in Rust.
@@ -306,7 +306,7 @@ mod pve_rs_meta {
         )
     }
 
-    /// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`. Removes the
+    /// `DELETE /meta/guests/{vmid}` and the registry documents' `DELETE`. Removes the
     /// current document only -- never a snapshot copy.
     #[export]
     pub fn api_delete(

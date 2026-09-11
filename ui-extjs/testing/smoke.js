@@ -627,7 +627,7 @@ const TRAEFIK_SCHEMA = {
     },
 };
 const panel = {
-    dc: false,
+    registryDoc: false,
     docId: '200',
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
@@ -1209,42 +1209,37 @@ console.log('\n--- many documents in one panel ---');
 const D = ctx.PVE.meta.DeclareKeyWindow;
 // An id is an address: the path it is served at, for every kind of document.
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
-eq('the datacenter id', P.urlFor.call(P, 'datacenter'), '/meta/datacenter');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
 eq('a permission id', P.urlFor.call(P, 'permissions/scoped'), '/meta/permissions/scoped');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
-eq('kind of the datacenter', P.docKind.call(P, 'datacenter'), 'datacenter');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
 eq('kind of a permission file', P.docKind.call(P, 'permissions/scoped'), 'permission');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
 
 // Per-document digests. One shared field would have sent a prefix's digest with a
-// write to the datacenter, which is a 409 at best and the wrong document at worst.
+// write to another document, which is a 409 at best and the wrong document at worst.
 {
     const panelM = Object.assign({}, panel, {
-        docState: { datacenter: { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
+        docState: { 'permissions/y': { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
     });
     ['digestOf', 'dataOf', 'docOf'].forEach((m) => (panelM[m] = P[m]));
-    panelM.docId = 'datacenter';
+    panelM.docId = 'permissions/y';
     eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
-    eq('and its own data', panelM.dataOf('datacenter'), { a: 1 });
+    eq('and its own data', panelM.dataOf('permissions/y'), { a: 1 });
     eq('an unknown document has no digest', panelM.digestOf('permissions/nope'), '');
     eq('a row names its document', panelM.docOf({ data: { docId: 'prefixes/x' } }), 'prefixes/x');
-    eq('no row means the default one', panelM.docOf(null), 'datacenter');
+    eq('no row means the default one', panelM.docOf(null), 'permissions/y');
 }
 
-// What describes each kind of document. The datacenter document gets nothing:
-// prefixes reach guest documents only (DESIGN §3.3).
+// What describes a registry document: its meta-schema, rooted at the document.
 {
     const META = { type: 'object', properties: { selector: { type: 'object' } } };
-    const panelG = Object.assign({}, panel, { dc: true, schemas: { prefix: META, permission: {} } });
+    const panelG = Object.assign({}, panel, { registryDoc: true, schemas: { prefix: META, permission: {} } });
     ['shapeFor', 'shapeInputs', 'buildShape', 'docKind'].forEach((m) => (panelG[m] = P[m]));
     eq('a prefix document is described by the meta-schema, rooted at the document',
         panelG.shapeFor('prefixes/x').declared().map((g) => g.prefix), ['']);
     eq('... which is the schema served for its kind',
         panelG.shapeFor('prefixes/x').declared()[0].schema, META);
-    eq('the datacenter document is described by nothing', panelG.shapeFor('datacenter').declared(), []);
-    eq('... and has no findings to offer', panelG.shapeFor('datacenter').hasSchema(), false);
 }
 
 // A root-rooted schema governs the whole document. There is no special case for it:
@@ -1272,7 +1267,7 @@ eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 
     eq('a missing meta-schema (an older API) describes nothing', Shape.rooted(undefined).declared(), []);
     // The same rows the tree would show, including a declared-but-unset one.
     const panelR = Object.assign({}, panel, {
-        dc: true,
+        registryDoc: true,
         docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
         schemas: { prefix: META },
     });
@@ -1653,7 +1648,7 @@ console.log('\n--- a staged value is linted like a stored one ---');
     // the schema is marked the moment it is staged -- not after it is written.
     const SCHEMA = { type: 'object', properties: { port: { type: 'integer', maximum: 65535 } } };
     const panelS = Object.assign({}, panel, {
-        dc: false,
+        registryDoc: false,
         docId: '201',
         docState: { 201: { digest: 'd', data: { docker: { port: 80 } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
@@ -1827,7 +1822,7 @@ console.log('\n--- reloading must not fold the tree up ---');
     const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
     const prefixes = { data: { docId: null, path: '', key: 'Prefixes' } };
     const permissions = { data: { docId: null, path: '', key: 'Permissions' } };
-    const dcRoot = { data: { docId: 'datacenter', path: '', key: 'datacenter' } };
+    const dcRoot = { data: { docId: 'permissions/scoped', path: '', key: 'permissions/scoped' } };
     const nsRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
     const same = { data: { docId: 'prefixes/homelab', path: 'selector', key: 'selector' } };
     const other = { data: { docId: 'permissions/scoped', path: 'selector', key: 'selector' } };
@@ -1845,7 +1840,7 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
     };
     const panelF = Object.assign({}, panel, {
-        dc: false,
+        registryDoc: false,
         docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
         tags: [],
@@ -1861,7 +1856,7 @@ console.log('\n--- the tree marks a row its schema refuses ---');
 
     // A registry document is linted by its meta-schema through the same call.
     const panelR = Object.assign({}, panel, {
-        dc: true,
+        registryDoc: true,
         docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
         schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
     });
@@ -1875,11 +1870,6 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         panelR.findingsFor().description,
         'expected string',
     );
-    // The datacenter document has no schema at all, so it can never be marked.
-    panelR.docState.datacenter = { digest: 'd', data: { anything: 5 } };
-    panelR.docId = 'datacenter';
-    eq('the datacenter document is never marked', panelR.findingsFor(), {});
-
     // And the banner Apply shows asks the same Shape, through `applyFindingsFor`.
     panelF.applyFindingsFor = P.applyFindingsFor;
     eq('the banner names what an edit introduced',

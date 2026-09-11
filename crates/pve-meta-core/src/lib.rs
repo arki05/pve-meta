@@ -36,8 +36,7 @@
 //! - [`digest`] — [`digest::digest`], the SHA-256 content digest used
 //!   throughout the store.
 //! - [`store`] — [`store::MetaStore`], the atomic on-disk file store: guest
-//!   and datacenter documents, snapshot copies, and content-hashed version
-//!   polling.
+//!   documents, snapshot copies, and content-hashed version polling.
 //! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
 //!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/

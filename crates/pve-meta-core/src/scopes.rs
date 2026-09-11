@@ -6,7 +6,7 @@
 //! rules of the [permission files](crate::registry) whose `authid` is the
 //! caller and whose selector matches the guest. Scopes are **additive**: they
 //! never restrict a principal that already holds the ACL, and they apply to
-//! guest documents only — the datacenter document is governed by ACLs alone.
+//! guest documents only — a registry document is governed by ACLs alone.
 //!
 //! This module turns that into yes/no decisions ([`Effective::can_read`],
 //! [`Effective::can_write`]), the prefix list for an unscoped read
@@ -44,11 +44,11 @@ pub struct Scope {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Effective {
     /// `true` if the principal has full read access (`VM.Audit` on the
-    /// guest, or `Sys.Audit` on `/` for the datacenter document).
+    /// guest; always true for a registry document).
     #[serde(default)]
     pub full_read: bool,
     /// `true` if the principal has full write access (`VM.Config.Options`
-    /// on the guest, or `Sys.Modify` on `/` for the datacenter document).
+    /// on the guest, or `Sys.Modify` on `/` for a registry document).
     #[serde(default)]
     pub full_write: bool,
     /// Prefix-scoped permissions, in addition to (never subtracted from) full

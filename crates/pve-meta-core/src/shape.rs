@@ -144,8 +144,7 @@ impl Shape {
         }
     }
 
-    /// A document nothing describes: the datacenter document, or a guest no
-    /// prefix reaches.
+    /// A document nothing describes: a guest no prefix reaches.
     pub fn empty() -> Shape {
         Shape::default()
     }

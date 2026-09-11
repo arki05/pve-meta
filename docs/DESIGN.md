@@ -24,8 +24,11 @@ platform itself grants.
 
 ## 2. The feature
 
-Every guest (vmid) and the datacenter have one **document**: a nested key-value tree
-stored as YAML in `/etc/pve/meta/<vmid>.yaml` (`datacenter.yaml`). A document is the JSON
+Every guest (vmid) has one **document**: a nested key-value tree stored as YAML in
+`/etc/pve/meta/<vmid>.yaml`. There is no datacenter-level document: cluster-wide
+intent that is not about one guest belongs in the operator that acts on it, and a
+`datacenter.yaml` an earlier release left behind is a stray file the store ignores. A
+document is the JSON
 data model with ordered maps and no nulls. A key ending in `__` is a **comment key**: a
 string note about its sibling (`host__` documents `host`, a bare `__` documents the
 map). Comment keys are ordinary data; the UI renders them as the description of the
@@ -151,15 +154,13 @@ this is two concepts and not one.
   tag), read from the cluster's cached guest properties. Adding the tag is the
   deliberate act of including that guest. It is *not* enforced by PVE — see §1: this is
   a selector, not a permission boundary.
-* Grants apply to **guest documents only**. The datacenter document is governed by ACLs
-  alone.
+* Grants apply to **guest documents only**; a registry file is governed by ACLs alone.
 * A rule on prefix `p` covers the subtree `p` and the sibling comment key `p__`. That
   is the only comment-key rule.
 
 ### 3.4 Effective access for one request
 
-* `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`
-  (datacenter: `Sys.Audit` / `Sys.Modify` on `/`).
+* `full_read` = `VM.Audit` on `/vms/<vmid>`, `full_write` = `VM.Config.Options`.
 * `scopes` = the union of rules whose `authid` is the caller and whose selector
   matches the guest.
 * Reading view `P` requires full read or a scope covering `P`. A read by a caller with
@@ -222,9 +223,9 @@ breaking silently. Making it legitimate would mean patching a fourth package.
 ### 3.5 The registry files are documents too
 
 A prefix definition or permission file is addressed as a document: `prefixes/<name>` and
-`permissions/<name>` are ids like `100` and `datacenter`, reachable at
+`permissions/<name>` are ids like `100`, reachable at
 `/meta/prefixes/{name}` and `/meta/permissions/{name}` with the same `view`, `format`,
-`mode`, `digest` and `dry_run` the other two take. That is not an aesthetic choice: the
+`mode`, `digest` and `dry_run` a guest document takes. That is not an aesthetic choice: the
 editor's tree, its markers, its diff, the digest compare-and-swap and the version poll
 are all written against *a document*, and the alternative was a second read/write path
 beside the first — the shape of every wrong-result bug this project has had.
@@ -333,8 +334,7 @@ covering only the keywords we happened to think of. The small form that *does* e
 | GET | `/meta/guests/{vmid}` | `view`, `format` = `json` (default) or `yaml` | `{ id, view, digest, data }` or `{ id, view, digest, text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data` or `text`, `mode`, `digest`, `dry_run` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | removes the subtree, or the whole document |
-| GET/PUT/DELETE | `/meta/datacenter` | same | same with `id: "datacenter"` |
-| GET | `/meta/access` | `id` (any document id; `vmid`/`dc=1` are the older, guest-or-datacenter-only spelling) | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document (selectors already resolved); `tags` are the guest's PVE tags, filtered exactly as `/meta/guests` filters them (`VM.Audit` only) and empty for any other document; without either parameter, the caller's datacenter read/write |
+| GET | `/meta/access` | `id` (any document id) | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document (selectors already resolved); `tags` are the guest's PVE tags, filtered exactly as `/meta/guests` filters them (`VM.Audit` only) and empty for any other document; without `id`, the caller's read/write on the registry (`read` always, `write` = `Sys.Modify` on `/`) |
 | GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, schema? }]`, sorted most-specific first — every prefix, readable by every authenticated user |
 | GET | `/meta/permissions` | — | `[{ name, authid, rules: [{ prefix, mode, selector }] }]` — every permission file, readable by every authenticated user |
 | GET/PUT/DELETE | `/meta/prefixes/{name}` | same as a document | the prefix **file** as a document, with `id: "prefixes/<name>"`. Read is open like the listing; write is `Sys.Modify` on `/`. A `PUT` whose result would not parse as a prefix is a 400, never a 200 (§3.5) |
@@ -416,7 +416,7 @@ manifest-driven `pve-ext-patch`, and page manifests in `/usr/share/pve-ext/pages
 `xtype` (a native ExtJS panel class defined by that script and instantiated as the tab).
 Both substitute the same placeholders; `requires` gating applies to both. pve-meta ships
 **two** manifests over one script — a manifest carries a single `xtype`, and a guest tab
-(one document's editor) and the datacenter tab (that plus the two registry lists) are
+(one document's editor) and the datacenter tab (the two registry lists) are
 different panels. The loader fetches a `script` once per URL, so the second manifest
 costs one file and no second download.
 
@@ -642,20 +642,17 @@ the digest and a 409 reloads. The version poll refreshes the tree and the regist
 grids, never while an editor is open or anything is staged.
 
 **Which ACL answers apply is a property of the document, not of the tab.** `GET
-/meta/access` takes the document's `id`, because the three kinds answer differently and
-only one of the differences is obvious: a guest's read is `VM.Audit`, the datacenter
-document's is `Sys.Audit`, and a registry file's is **open to every authenticated user**
-while its write is `Sys.Modify` (§3.5). The write bits of the last two coincide, which is
-exactly why asking the wrong question was invisible until someone held `Sys.Modify`
-without `Sys.Audit`: the editor then greyed out Text mode on a file that caller could
-certainly read.
+/meta/access` takes the document's `id`, because the two kinds answer differently: a
+guest's read is `VM.Audit`, and a registry file's is **open to every authenticated
+user** while its write is `Sys.Modify` (§3.5). Asking the wrong question once greyed out
+Text mode on a file the caller could certainly read.
 
-**The datacenter tab has three sub-tabs.** A guest tab is one document's editor, and
-looks as it always did. The datacenter tab is a tab panel: **Document** (the datacenter
-document, the same editor), **Prefixes** and **Grants** (two grids). They are three
-different kinds of thing — one document, a list of definitions, a list of permissions — and
-an earlier revision drew them as branches of a single tree, which claimed a relationship
-they do not have and hid the only columns worth reading. A grid shows what a tree could
+**The datacenter tab has two sub-tabs.** A guest tab is one document's editor. The
+datacenter tab is a tab panel: **Prefixes** and **Permissions** (two grids). They are
+two different kinds of thing — a list of definitions, a list of permissions — and an
+earlier revision drew them as branches of a single tree, which claimed a relationship
+they do not have and hid the only columns worth reading. There is no datacenter
+document to edit there (§2). A grid shows what a tree could
 not: which guests a prefix reaches, whether it carries a schema, and **where the file
 came from** — `packaged`, `cluster`, or `cluster (overrides packaged)`, the last being
 the one where Remove does not remove the prefix but reverts to the package's copy. That
@@ -720,8 +717,8 @@ an ACL on the token alone is denied, and so is one on the user alone). This user
 only to carry this token, so they are one principal in practice.
 
 The optional **guest access** role goes on `/vms`, propagating: per-guest silently misses
-guests created later, and `PVEAuditor` on `/` would also hand over `Sys.Audit`, which is
-the datacenter document's own read permission. The dialog says the part that is easy to
+guests created later, and `PVEAuditor` on `/` would hand over far more than a metadata
+reader needs. The dialog says the part that is easy to
 miss — a role there lets the principal read *all* metadata on those guests, because
 `VM.Audit` is full read (§3.4); only writes stay inside its rules.
 
@@ -805,7 +802,7 @@ crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, api exports (native per
 crates/pve-meta-wasm     the core for the browser: a JSON-string ABI over wasm32, loaded by ui-extjs
 perl/PVE/API2/Ext/Meta.pm
 bin/pve-meta             the local CLI for hook scripts and orphan cleanup (Perl over PVE::RS::Meta; /usr/sbin)
-pages/                   the two page manifests, guest and datacenter (§7)
+pages/                   the two page manifests: guest, and the registry lists on the Datacenter panel (§7)
 prefixes/                packaged example prefixes (none required)
 patches/                 lifecycle.toml + libpve-guest-common-perl_AbstractConfig.pm.diff (one file)
 pve-ext/                 the extension layer (own package)

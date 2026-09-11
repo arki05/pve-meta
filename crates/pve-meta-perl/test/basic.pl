@@ -144,13 +144,13 @@ PVE::RS::Meta::on_snapshot(999500, 'snapA');
 write_file('9200.old.yaml', "a: 1\n");
 
 is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200, 999500],
-    'stored_vmids lists every guest vmid with any file, sorted, never the datacenter');
+    'stored_vmids lists every guest vmid with any file, sorted, never a stray file');
 
 # The only removal path for a stale vmid is the destroy hook, run by `pve-meta rm`
 # under the document's own write lock (docs/DESIGN.md section 6).
 is(PVE::RS::Meta::on_destroy(999500), 2, 'on_destroy removes a stale document and its snapshot copy');
 is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200], '... and the vmid leaves the list');
-ok(file_exists('datacenter.yaml'), 'the datacenter document is never a guest');
+ok(file_exists('datacenter.yaml'), 'a stray file with no vmid in its name is never a guest');
 
 for my $gone (qw(gc gc_candidates gc_purge)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
@@ -201,8 +201,9 @@ for my $case (
 
 # The GC section above emptied the store, and a `documents` assertion against an
 # empty list passes for the wrong reason -- `grep` over nothing found nothing.
-# So seed one of each thing the walk has to tell apart: a guest document, the
-# datacenter document, and a snapshot copy, which is *not* a document.
+# So seed one of each thing the walk has to tell apart: a guest document, a
+# snapshot copy, and a stray file with no vmid in its name -- the last two are
+# *not* documents (a `datacenter.yaml` is what an earlier release left behind).
 write_file('datacenter.yaml', "note: keep me\n");
 write_file('9100.yaml', "a: 1\n");
 write_file('9100.keep.yaml', "a: 1\n");
@@ -215,8 +216,8 @@ ok(!defined($v->{documents}), 'no `documents` without detail');
 my $vd = PVE::RS::Meta::api_version(1, undef);
 is($vd->{token}, $v->{token}, 'detail does not change the token');
 ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
-is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200', 'datacenter'],
-    'every guest and the datacenter document are listed by id, and the snapshot copy is not');
+is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200'],
+    'every guest is listed by id; the snapshot copy and the stray file are not');
 
 # Scoped to one document: its own file plus the registry directories, and
 # nothing else. This is the form the editor polls, so the arity has to work
@@ -253,7 +254,7 @@ ok(!defined($missing->{data_json}), 'there is no data_json field any more');
 ok(!defined($missing->{keys}), 'and no `keys` wire field (docs/DESIGN.md §10)');
 
 $res = eval { PVE::RS::Meta::api_get('not-a-vmid', undef, 'json', $FULL) };
-ok(!defined($res), 'api_get dies for an id that is neither a vmid nor "datacenter"');
+ok(!defined($res), 'api_get dies for an id that is neither a vmid nor a registry id');
 like($@, api_error_status(400), 'api_get bad-id error is prefixed 400:');
 
 # replace mode creates the document; `data` is the one JSON string parameter.
@@ -439,8 +440,8 @@ is_deeply(
     ['traefik', 'web'],
     'a caller with VM.Audit gets the guest tags back',
 );
-is_deeply(PVE::RS::Meta::api_access('datacenter', $FULL)->{tags}, [],
-    'the datacenter document has no tags');
+is_deeply(PVE::RS::Meta::api_access('prefixes/traefik', $FULL)->{tags}, [],
+    'a registry document has no tags');
 is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', scoped_acl('traefik'))->{data},
     { traefik => { spec => { host => 'ct.example' } }, netbird => { groups => ['lan'] } },
     'and the read now carries both subtrees, but never `other`');
@@ -562,11 +563,11 @@ $res = eval { PVE::RS::Meta::api_put('9400', 'netbird__', 'json', '"nope"', 'rep
 ok(!defined($res), '... but not another key\'s comment (netbird is ro)');
 PVE::RS::Meta::api_delete('9400', 'traefik__', undef, scoped_acl('traefik'));
 
-# Scopes never apply to the datacenter document.
-my $dc_scoped = PVE::RS::Meta::api_access('datacenter', scoped_acl('traefik'));
-is_deeply($dc_scoped->{scopes}, [], 'no registration ever reaches the datacenter document');
-$res = eval { PVE::RS::Meta::api_get('datacenter', 'traefik', 'json', scoped_acl('traefik')) };
-ok(!defined($res), 'and a scoped datacenter read is refused');
+# Scopes never apply to a registry document.
+my $reg_scoped = PVE::RS::Meta::api_access('prefixes/traefik', scoped_acl('traefik'));
+is_deeply($reg_scoped->{scopes}, [], 'no permission ever reaches a registry document');
+$res = eval { PVE::RS::Meta::api_get('prefixes/traefik', 'traefik', 'json', scoped_acl('traefik')) };
+ok(!defined($res), 'and a read of one with no read bit is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # A malformed file is skipped with a warning and grants/defines nothing; it

@@ -59,7 +59,7 @@ usage: $SELF get <id> [<view>] [--format yaml|json]
        $SELF ls [--orphans] [--format plain|json]
        $SELF rm <vmid>
 
-  <id>    a vmid, 'datacenter', 'prefixes/<name>' or 'permissions/<name>'
+  <id>    a vmid, 'prefixes/<name>' or 'permissions/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
   ls --orphans  only vmids the store holds files for that are not in the vmlist

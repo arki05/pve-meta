@@ -1,8 +1,8 @@
-//! The on-disk file store: atomic reads/writes of guest and datacenter
-//! documents, snapshots, and change-version polling.
+//! The on-disk file store: atomic reads/writes of guest documents, snapshots,
+//! and change-version polling.
 //!
 //! Root is `/etc/pve/meta` in production, a tempdir in tests. Documents are
-//! always YAML (`docs/DESIGN.md` §2): `<vmid>.yaml`, `datacenter.yaml`, and
+//! always YAML (`docs/DESIGN.md` §2): `<vmid>.yaml`, and
 //! `<vmid>.<snapname>.yaml` for a guest's snapshot copies. All writes are
 //! atomic (write a hidden, node- and call-unique sibling, then `rename`),
 //! which pmxcfs supports.
@@ -83,8 +83,8 @@ pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 /// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
 pub const DISK_FORMAT: Format = Format::Yaml;
 
-/// Identifies a top-level document in the store: a guest's metadata, the
-/// datacenter's, or one registry file. Snapshots are addressed separately, by
+/// Identifies a top-level document in the store: a guest's metadata or one
+/// registry file. Snapshots are addressed separately, by
 /// `(vmid, name)`, via the dedicated snapshot methods.
 ///
 /// A registry file is a document like any other **on purpose**: it is YAML, it
@@ -103,8 +103,6 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
     Guest(u32),
-    /// The datacenter's metadata document, named `datacenter.yaml`.
-    Datacenter,
     /// A prefix or permission file, named `<name>.yaml` in its kind's directory.
     /// The name is a single path segment (`crate::path::is_valid_segment`), so
     /// it can never contain a slash or escape that directory.
@@ -115,20 +113,18 @@ impl DocId {
     fn base_name(&self) -> String {
         match self {
             DocId::Guest(vmid) => vmid.to_string(),
-            DocId::Datacenter => "datacenter".to_string(),
             DocId::Registry(_, name) => name.clone(),
         }
     }
 }
 
 /// The id as the API spells it and as `parse_id` reads it back: `105`,
-/// `datacenter`, `prefixes/<name>`, `permissions/<name>`. The one string
+/// `prefixes/<name>`, `permissions/<name>`. The one string
 /// form of a document id, used on the wire and in error messages alike.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DocId::Guest(vmid) => write!(f, "{vmid}"),
-            DocId::Datacenter => write!(f, "datacenter"),
             DocId::Registry(kind, name) => write!(f, "{kind}/{name}"),
         }
     }
@@ -291,7 +287,7 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The on-disk metadata store.
 ///
-/// Two things, not one: `root` holds the guest and datacenter documents and
+/// Two things, not one: `root` holds the guest documents and
 /// the snapshot copies, and `registry` holds the prefix and permission
 /// drop-directory lists ([`DocId::Registry`]). Those lists are ordered lowest
 /// precedence first, exactly as [`Registry`] loads them, so the **last**
@@ -692,8 +688,8 @@ impl MetaStore {
     }
 
     /// Every vmid the store holds *any* file for — a live document, a
-    /// snapshot copy, or both — sorted ascending. The datacenter document and
-    /// temp files are not guests.
+    /// snapshot copy, or both — sorted ascending. Temp files and any other
+    /// file whose name is not `<vmid>[.<snap>].yaml` are not guests.
     ///
     /// This is the store's half of the GC (`docs/DESIGN.md` §6): Perl passes
     /// the vmlist, and every vmid here that is not in it is removed together
@@ -1042,11 +1038,10 @@ fn registry_document_id(kind: RegistryKind, name: &str) -> Option<DocId> {
 
 fn document_id(name: &str) -> Option<DocId> {
     let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
-    if stem == "datacenter" {
-        return Some(DocId::Datacenter);
-    }
     // `<vmid>.<snapname>.yaml` also ends with the suffix; its stem is not a
-    // bare number, which is exactly what tells the two apart.
+    // bare number, which is exactly what tells the two apart. So does a stray
+    // `datacenter.yaml` left by a release that had such a document: it moves
+    // the token like any file in the directory and addresses nothing.
     stem.parse::<u32>().ok().map(DocId::Guest)
 }
 

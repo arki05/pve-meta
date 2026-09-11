@@ -738,8 +738,8 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 /// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
 /// prefixes nest, and deliberately so — permission is a union, shape is not.
 ///
-/// Permissions apply to **guest documents only**; the datacenter document is
-/// governed by ACLs alone, so this is never called for it.
+/// Permissions apply to **guest documents only**; a registry document is
+/// governed by ACLs alone, so this is never called for one.
 pub fn scopes_for(files: &[Permission], authid: &str, tags: &[String]) -> Vec<Scope> {
     rules_reaching(files, tags)
         .filter(|(file, _)| file.authid == authid)

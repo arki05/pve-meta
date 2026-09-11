@@ -144,17 +144,13 @@ fn forbidden(path: &DocPath) -> ApiError {
 
 /// The caller's effective [`Effective`] on `doc_id`.
 ///
-/// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3); the
-/// datacenter document is governed by ACLs alone, which is what keeps the
-/// registry from being able to grant access to it.
+/// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3).
 pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> Effective {
     let scopes = match doc_id {
         DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
-        // The datacenter document is governed by ACLs alone -- that is what
-        // keeps the registry from being able to grant access to it -- and a
-        // registry document for the same reason one turn further: a permission that
+        // A registry document is governed by ACLs alone: a permission that
         // could reach the permission files would be able to widen itself.
-        DocId::Datacenter | DocId::Registry(..) => Vec::new(),
+        DocId::Registry(..) => Vec::new(),
     };
     Effective {
         full_read: acl.read,
@@ -163,8 +159,8 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
     }
 }
 
-/// Parses an API `id` into a [`DocId`]: a vmid, the literal `"datacenter"`, or
-/// a registry document as `prefixes/<name>` / `permissions/<name>`.
+/// Parses an API `id` into a [`DocId`]: a vmid, or a registry document as
+/// `prefixes/<name>` / `permissions/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
@@ -173,9 +169,6 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
 /// a leading dot or a `..`, so an id can never address a file outside its
 /// directory.
 pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
-    if id == "datacenter" {
-        return Ok(DocId::Datacenter);
-    }
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
             "prefixes" => RegistryKind::PrefixDef,
@@ -196,8 +189,7 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'datacenter', \
-             'prefixes/<name>' or 'permissions/<name>'"
+            "invalid id '{id}': must be a vmid, 'prefixes/<name>' or 'permissions/<name>'"
         ))
     })
 }
@@ -469,7 +461,7 @@ pub fn list_guests(
     Ok(out)
 }
 
-/// `GET /meta/guests/{vmid}` / `GET /meta/datacenter`.
+/// `GET /meta/guests/{vmid}`, and the registry documents' `GET`.
 ///
 /// With a `view`, requires read access to it ([`Effective::can_read`]); without
 /// one, returns the union of the caller's readable subtrees
@@ -722,7 +714,7 @@ fn plan_write(
 /// write that removed it. The rule is the parser itself, not a copy of it, so
 /// what the API accepts and what the loader reads back cannot drift.
 ///
-/// Guest and datacenter documents have no shape beyond `model::lint`: they
+/// Guest documents have no shape beyond `model::lint`: they
 /// hold whatever an administrator puts in them, which is the point of them.
 fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
     let DocId::Registry(kind, name) = doc_id else {
@@ -744,7 +736,7 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
     })
 }
 
-/// `PUT /meta/guests/{vmid}` / `PUT /meta/datacenter`.
+/// `PUT /meta/guests/{vmid}`, and the registry documents' `PUT`.
 ///
 /// `mode` is `"replace"` (default: the view's subtree is replaced by
 /// `payload` wholesale — an empty object stores an empty map) or `"merge"`
@@ -836,8 +828,8 @@ pub fn put_document(
     })
 }
 
-/// `DELETE /meta/guests/{vmid}` / `DELETE /meta/datacenter`: removes the
-/// subtree at `view`, or the whole document if `view` is absent.
+/// `DELETE /meta/guests/{vmid}`, and the registry documents' `DELETE`:
+/// removes the subtree at `view`, or the whole document if `view` is absent.
 ///
 /// Removes **only the current document**: snapshot copies belong to the
 /// snapshot hooks and are never touched from the REST API

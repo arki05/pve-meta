@@ -170,7 +170,7 @@ fn del_with(
 fn version_detail_names_the_documents_that_changed() {
     let (_dir, store) = store();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Datacenter, "b: 2\n", None).unwrap();
+    store.put_raw(&DocId::Guest(200), "b: 2\n", None).unwrap();
 
     // Without `detail` the shape is unchanged: no `documents` on the wire.
     let plain = version(&store, false, None).unwrap();
@@ -179,7 +179,7 @@ fn version_detail_names_the_documents_that_changed() {
     let detailed = version(&store, true, None).unwrap();
     let docs = detailed.documents.expect("detail asked for");
     let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-    assert_eq!(ids, vec!["100", "datacenter"]);
+    assert_eq!(ids, vec!["100", "200"]);
     assert_eq!(docs[0].digest, store.read(&DocId::Guest(100)).unwrap().digest);
     assert_eq!(detailed.token, plain.token, "detail does not change the token");
 }
@@ -273,15 +273,6 @@ fn a_scoped_version_refuses_a_garbage_id() {
     assert!(tagged.can_write(&DocPath::parse("traefik.spec").unwrap()));
     assert!(tagged.can_read(&DocPath::parse("netbird").unwrap()));
     assert!(!tagged.can_write(&DocPath::parse("netbird").unwrap()));
-}
-
-#[test]
-fn scopes_never_apply_to_the_datacenter_document() {
-    // `docs/DESIGN.md` §3: the datacenter document is governed by ACLs
-    // alone, so no registration can ever reach it.
-    let g = effective(&regs(), &DocId::Datacenter, &scoped(&["traefik"]));
-    assert!(g.scopes.is_empty());
-    assert!(g.readable_prefixes().is_empty());
 }
 
 #[test]
@@ -985,8 +976,9 @@ fn access_reports_resolved_scopes() {
     );
     let untagged = access(&permission_files, &DocId::Guest(100), &scoped(&[]));
     assert_eq!(untagged.scopes.len(), 1);
-    let dc = access(&permission_files, &DocId::Datacenter, &full());
-    assert!(dc.read && dc.write && dc.scopes.is_empty());
+    // A registry document gets the ACL answers through and never a scope.
+    let reg = access(&permission_files, &parse_id("prefixes/traefik").unwrap(), &full());
+    assert!(reg.read && reg.write && reg.scopes.is_empty());
 }
 
 #[test]
@@ -1009,7 +1001,7 @@ fn access_returns_the_tags_only_to_a_caller_who_may_read_the_guest() {
     assert!(hidden.tags.is_empty(), "no VM.Audit, no tags");
     assert_eq!(hidden.scopes.len(), 2, "the selector still resolved server-side");
 
-    assert!(access(&permission_files, &DocId::Datacenter, &full()).tags.is_empty());
+    assert!(access(&permission_files, &parse_id("prefixes/traefik").unwrap(), &full()).tags.is_empty());
 }
 
 #[test]
@@ -1283,18 +1275,15 @@ fn a_permission_never_reaches_the_registry_documents() {
     .unwrap();
 
     // `scoped@pve!t1` holds `traefik` rw -- on *guests*. A registry
-    // document gets no scopes at all, so this is the same 403 the
-    // datacenter document gives it.
+    // document gets no scopes at all.
     let acl = scoped(&["traefik"]);
     let id = parse_id("prefixes/traefik").unwrap();
     assert!(effective(&regs(), &id, &acl).scopes.is_empty());
 
     // `access` passes the ACL answers through untouched for these documents --
-    // which is the point: the two bits differ from the datacenter document's
-    // (a registry file is readable by every authenticated user, while writing
-    // one is Sys.Modify), so the caller has to say which document it is asking
-    // about. `GET /meta/access?id=` is that question; asking `?dc=1` instead
-    // answered `read: 0` for a file the caller could certainly read.
+    // a registry file is readable by every authenticated user, while writing
+    // one is Sys.Modify -- so the caller has to say which document it is asking
+    // about, and `GET /meta/access?id=` is that question.
     let admin = CallerAcl {
         authid: "writer@pve".to_string(),
         read: true,

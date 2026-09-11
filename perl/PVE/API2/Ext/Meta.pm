@@ -43,13 +43,12 @@ sub ext_path { return 'meta' }
 # -- the caller's ACL ------------------------------------------------------
 #
 # `docs/DESIGN.md` §3: `full_read` = `VM.Audit` on `/vms/<vmid>`,
-# `full_write` = `VM.Config.Options` (datacenter: `Sys.Audit` / `Sys.Modify`
-# on `/`). Rust adds the scopes from the permission files whose authid
-# is the caller and whose selector matches the guest's tags -- which is why
-# the tags travel with the ACL.
-#
-# Scopes apply to guest documents only; the datacenter document is governed by
-# ACLs alone, and Rust enforces that rather than trusting an empty list here.
+# `full_write` = `VM.Config.Options`. Rust adds the scopes from the permission
+# files whose authid is the caller and whose selector matches the guest's tags
+# -- which is why the tags travel with the ACL. A registry document (a prefix
+# or permission file) is readable by every authenticated user and written with
+# `Sys.Modify` on `/`; scopes never apply to one, and Rust enforces that rather
+# than trusting an empty list here.
 
 # A guest's PVE tags, as an array ref. `get_guest_config_properties` is the
 # cluster-wide cached property fetch `list_guests` already used for the display
@@ -78,24 +77,13 @@ sub _guest_acl {
     };
 }
 
-sub _datacenter_acl {
-    my ($rpcenv, $authuser) = @_;
-    return {
-        authid => $authuser,
-        read => $rpcenv->check($authuser, '/', ['Sys.Audit'], 1) ? 1 : 0,
-        write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
-        tags => [],
-    };
-}
-
 # A registry document -- one prefix definition or permission file (docs/DESIGN.md §3) --
 # is an administrator's to edit and nobody else's.
 #
 # Read is open to every authenticated user, because it has to agree with the
 # two list endpoints below: they already return the same files' content to
 # everyone, and a document read that was stricter than the list of the same
-# thing would be a rule with two answers. Write is Sys.Modify on '/', the same
-# as the datacenter document.
+# thing would be a rule with two answers. Write is Sys.Modify on '/'.
 #
 # There is deliberately no scope path here at all: `api::effective` gives a
 # registry document no scopes, so an operator holding `rw` on some prefix
@@ -292,8 +280,8 @@ my $PUT_RETURNS = {
     },
 };
 
-# `$id` is a vmid or the literal "datacenter"; `$acl` is that resource's ACL
-# hash (see above).
+# `$id` is a vmid, `prefixes/<name>` or `permissions/<name>`; `$acl` is that
+# resource's ACL hash (see above).
 my $get_view = sub {
     my ($id, $param, $acl) = @_;
     return _call(
@@ -339,7 +327,7 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests datacenter prefixes permissions schemas)];
+        return [map { { subdir => $_ } } qw(version access guests prefixes permissions schemas)];
     },
 });
 
@@ -366,7 +354,7 @@ __PACKAGE__->register_method({
             id => {
                 type => 'string',
                 optional => 1,
-                description => "Watch just this document: a vmid, 'datacenter', "
+                description => "Watch just this document: a vmid, "
                     . "'prefixes/<name>' or 'permissions/<name>'. The token then covers "
                     . "that document plus the prefix and permission directories, and "
                     . "nothing else -- which is what an open editor watches, at a cost "
@@ -392,7 +380,7 @@ __PACKAGE__->register_method({
                 items => {
                     type => 'object',
                     properties => {
-                        id => { type => 'string', description => "A vmid, or 'datacenter'." },
+                        id => { type => 'string', description => "A vmid, 'prefixes/<name>' or 'permissions/<name>'." },
                         digest => { type => 'string' },
                     },
                 },
@@ -416,11 +404,12 @@ __PACKAGE__->register_method({
     permissions => { user => 'all' },
     description => "The caller's effective access for one document (docs/DESIGN.md §3): "
         . "'read'/'write' are the ACL answers for that document (VM.Audit / "
-        . "VM.Config.Options with 'vmid'; Sys.Audit / Sys.Modify with 'dc'), and "
-        . "'scopes' lists the prefix scopes the permission files give the caller "
-        . "on it, with selectors already resolved against the guest's tags. Scopes "
-        . "apply to guest documents only, never to the datacenter document. "
-        . "With no parameter at all, 'read'/'write' describe the datacenter document. "
+        . "VM.Config.Options on a guest; for a prefix or permission file, read is open "
+        . "to every authenticated user and write is Sys.Modify on /), and 'scopes' "
+        . "lists the prefix scopes the permission files give the caller on it, with "
+        . "selectors already resolved against the guest's tags. Scopes apply to guest "
+        . "documents only. With no 'id', 'read'/'write' describe the registry as a "
+        . "whole -- what the prefix and permission lists ask before offering Add. "
         . "Used by the editor UI to decide what to offer and whether to enable Apply.",
     parameters => {
         additionalProperties => 0,
@@ -429,15 +418,7 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "The document to ask about, as an id: a vmid, "
-                    . "'datacenter', 'prefixes/<name>' or 'permissions/<name>'. Prefer this "
-                    . "over 'vmid'/'dc', which predate registry documents and cannot "
-                    . "name one.",
-            },
-            vmid => get_standard_option('pve-vmid', { optional => 1 }),
-            dc => {
-                type => 'boolean',
-                optional => 1,
-                description => "Ask about the datacenter document instead of a guest.",
+                    . "'prefixes/<name>' or 'permissions/<name>'. Omit for the registry.",
             },
         },
     },
@@ -465,20 +446,17 @@ __PACKAGE__->register_method({
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
 
-        my $given = grep { $_ } (defined($param->{id}), defined($param->{vmid}), $param->{dc});
-        raise_param_exc({ id => "'id', 'vmid' and 'dc' are mutually exclusive" }) if $given > 1;
-
         # One place that maps a document id to the ACL answers for that *kind* of
-        # document. The three endpoint families each knew their own mapping; this
-        # endpoint used to infer it from which parameter was set, which could not
-        # name a registry document at all -- so the editor asked about the
-        # datacenter document instead and got Sys.Audit for a file every
-        # authenticated user may read (docs/DESIGN.md §3.5).
+        # document: the endpoint families each know their own mapping, and this
+        # endpoint has to agree with them. The two kinds answer differently, and
+        # only the write bit coincides -- which is why asking about the wrong
+        # kind used to be invisible until someone held Sys.Modify without
+        # Sys.Audit.
         my $id = $param->{id};
         if (!defined($id)) {
-            $id = defined($param->{vmid}) ? "$param->{vmid}" : 'datacenter';
+            my $acl = _registry_acl($rpcenv, $authuser);
+            return { read => $acl->{read}, write => $acl->{write}, scopes => [], tags => [] };
         }
-
         if ($id =~ m{^(prefixes|permissions)/}) {
             return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
         }
@@ -488,11 +466,9 @@ __PACKAGE__->register_method({
                 \&PVE::RS::Meta::api_access, $id, _guest_acl($rpcenv, $authuser, $id),
             );
         }
-        # 'datacenter' -- or anything else, which the id parser refuses with a 400
-        # rather than this endpoint growing a second opinion about what an id is.
-        return _call(
-            \&PVE::RS::Meta::api_access, $id, _datacenter_acl($rpcenv, $authuser),
-        );
+        # Anything else is refused by the one id parser with a 400, rather than
+        # this endpoint growing a second opinion about what an id is.
+        return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
     },
 });
 
@@ -622,18 +598,18 @@ __PACKAGE__->register_method({
 
 # -- one document, three methods ---------------------------------------------
 #
-# Every kind of document -- a guest's, the datacenter's, a prefix file, a
-# permission file -- is read, written and removed by the same three calls into
+# Every kind of document -- a guest's, a prefix file, a permission file -- is
+# read, written and removed by the same three calls into
 # Rust ($get_view / $put_view / $delete_view). What differs is how the request
 # names the document, which ACL answers describe the caller on it, what lock a
 # write holds, and what the API docs say. Those are a spec, and the three
 # methods are generated from it: two copies of a read/write pair is how this
-# project has produced every wrong-result bug it has had, and the guest and
-# datacenter triples used to be exactly that beside the generated registry ones.
+# project has produced every wrong-result bug it has had, and the guest triple
+# used to be exactly that beside the generated registry ones.
 #
 #   name      the method-name suffix: get_<name>, put_<name>, delete_<name>
 #   path      the REST path, with its parameter placeholder if it has one
-#   params    that parameter's schema ({} for the datacenter)
+#   params    that parameter's schema
 #   id        $param -> the document id Rust addresses
 #   lock      $param -> the cfs_lock_domain suffix every write holds
 #   acl       ($rpcenv, $authuser, $param) -> the caller's ACL hash
@@ -887,30 +863,6 @@ _register_document_methods({
         get => "Gets a guest's metadata document (or a view/prefix of it).",
         put => "Writes a guest's metadata document (or a view/prefix of it).",
         delete => "Removes a guest's document, or the subtree at 'view'.",
-    },
-});
-
-# -- datacenter -----------------------------------------------------------
-
-_register_document_methods({
-    name => 'datacenter',
-    path => 'datacenter',
-    params => {},
-    id => sub { 'datacenter' },
-    lock => sub { 'datacenter' },
-    acl => sub { _datacenter_acl($_[0], $_[1]) },
-    perms => {
-        get => "Requires Sys.Audit on / (docs/DESIGN.md §3 -- scopes never "
-            . "apply to the datacenter document); anyone else is refused with 403.",
-        put => "Requires Sys.Modify on / for the view and every touched path "
-            . "(docs/DESIGN.md §3).",
-        delete => "Requires Sys.Modify on / for the view and every touched path, "
-            . "same as PUT.",
-    },
-    describe => {
-        get => "Gets the datacenter metadata document (or a view/prefix of it).",
-        put => "Writes the datacenter metadata document (or a view/prefix of it).",
-        delete => "Removes the datacenter document, or the subtree at 'view'.",
     },
 });
 
