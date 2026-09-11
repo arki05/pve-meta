@@ -153,8 +153,7 @@ fn delete_removes_document() {
 fn delete_is_idempotent_and_says_whether_it_removed_anything() {
     // Deleting a document is a request for it to be gone; it being already
     // gone -- because a concurrent DELETE or the GC won the race -- is that
-    // request satisfied. The old `locate`-then-remove pair turned the loser
-    // of that race into an `Error::Io`, which the API layer maps to 500.
+    // request satisfied.
     let (_dir, store) = store();
     assert!(!store.delete(&DocId::Guest(100)).unwrap());
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
@@ -165,12 +164,11 @@ fn delete_is_idempotent_and_says_whether_it_removed_anything() {
 
 #[test]
 fn a_file_that_vanishes_between_syscalls_is_not_found_not_an_io_error() {
-    // Reads run unlocked, writes hold `pve-meta-<id>` and the GC holds
-    // `pve-meta-gc`: three disjoint domains, so a file can disappear between
-    // any two syscalls of a read. Simulated here by removing it before the
-    // read rather than mid-read -- the point is that every path answers
-    // NotFound rather than propagating `io::ErrorKind::NotFound` as
-    // `Error::Io`.
+    // Reads run unlocked while writes hold `pve-meta-<id>`, so a file can
+    // disappear between any two syscalls of a read. Simulated here by
+    // removing it before the read rather than mid-read -- the point is
+    // that every path answers NotFound rather than propagating
+    // `io::ErrorKind::NotFound` as `Error::Io`.
     let (dir, store) = store();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     std::fs::remove_file(dir.path().join("100.yaml")).unwrap();
@@ -274,9 +272,9 @@ fn purge_is_idempotent_and_cleans_left_behind_snapshots() {
 
 #[test]
 fn api_delete_then_rollback_does_not_lose_snapshot_metadata() {
-    // The forward propagation of that rule: a plain DELETE that ate the
-    // snapshot copies, after which `on_rollback` read "no snapshot" as
-    // "there was no metadata" and deleted the freshly rewritten document.
+    // Pin: after a DELETE and a fresh write, a rollback to an earlier
+    // snapshot must still restore it, not mistake the DELETE for proof
+    // there was no snapshot.
     let (_dir, store) = store();
     store.put_raw(&DocId::Guest(100), "traefik:\n  host: a\n", None).unwrap();
     store.snapshot(100, "snapA").unwrap();
@@ -479,7 +477,7 @@ fn version_token_returns_to_an_earlier_value_when_content_does() {
 
 #[test]
 fn reads_never_lint_but_writes_still_do() {
-    // `docs/DESIGN.md` §4. Out-of-band content -- a hand-edited
+    // `docs/DESIGN.md` §7. Out-of-band content -- a hand-edited
     // file, a restored backup, pmxcfs replication -- must stay readable, or
     // one bad key in a file denies every operation on it and blocks the
     // repair that would fix it.
@@ -493,7 +491,7 @@ fn reads_never_lint_but_writes_still_do() {
     assert_eq!(doc.value["empty"], Value::Null);
 
     // The repair goes through, even though the *old* content would never
-    // pass lint (it used to be re-parsed strictly, just to compute a diff).
+    // pass lint.
     let good = "ok: 1\n";
     let result = store.put_raw(&DocId::Guest(200), good, Some(&doc.digest)).unwrap();
     assert_eq!(result.document.raw, good);
@@ -516,7 +514,7 @@ fn reads_never_lint_but_writes_still_do() {
 
 #[test]
 fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
-    // `docs/DESIGN.md` §4: a parse failure is a *per-document* condition.
+    // `docs/DESIGN.md` §7: a parse failure is a *per-document* condition.
     // Both write handlers read the document before planning, so a fatal parse
     // here would make a tab or an indentation slip in a hand-edited file
     // unrepairable through the API. Each of these is a real YAML syntax
@@ -540,8 +538,7 @@ fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
         assert_eq!(doc.digest, digest(broken.as_bytes()));
 
         // The repair goes through, with the compare-and-swap precondition
-        // intact -- `put_raw`'s parse of the *old* bytes used to be the last
-        // thing standing between the file and its own fix.
+        // intact, even though the *old* bytes never parse.
         let good = "ok: 1\n";
         store
             .put_raw(&DocId::Guest(200), good, Some(&doc.digest))
@@ -589,8 +586,8 @@ fn a_document_larger_than_the_read_cap_is_refused_rather_than_hashed() {
 
 #[test]
 fn there_is_one_write_gate_and_it_is_the_document_lint() {
-    // `docs/DESIGN.md` §10 deletes `WriteGate` and the privilege-narrowed
-    // lint variants: nothing this store writes can fail `model::lint`.
+    // The document lint (`model::lint`) is the only write gate: nothing
+    // this store writes can bypass it.
     let (dir, store) = store();
     std::fs::write(dir.path().join("100.yaml"), "bad key: 1\ntraefik:\n  host: a\n").unwrap();
 
@@ -610,7 +607,7 @@ fn there_is_one_write_gate_and_it_is_the_document_lint() {
 
 #[test]
 fn stored_vmids_covers_documents_and_snapshot_copies() {
-    // The store's half of the GC (`docs/DESIGN.md` §6): Perl passes the
+    // The store's half of the GC (`docs/DESIGN.md` §9): Perl passes the
     // vmlist, and everything here that is not in it is purged. A vmid whose
     // *only* file is a snapshot copy has to be found too.
     let (dir, store) = store();

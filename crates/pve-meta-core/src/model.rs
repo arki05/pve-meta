@@ -50,7 +50,7 @@ impl fmt::Display for Lint {
     }
 }
 
-/// The **one** lint (`docs/DESIGN.md` §4), run on the planned document:
+/// The **one** lint (`docs/DESIGN.md` §7), run on the planned document:
 ///
 /// 1. the top level must be an object;
 /// 2. no `null` anywhere (absent means unset);
@@ -60,10 +60,8 @@ impl fmt::Display for Lint {
 ///    `serde_json::Value` without the `arbitrary_precision` feature, so this
 ///    is not checked separately at runtime).
 ///
-/// There is deliberately no second variant. Revision 4 grew three
-/// (`lint_relaxed`, `lint_relaxed_at`, `lint_at`) plus a before/after
-/// finding-set comparison, because the lint had been narrowed by privilege;
-/// revision 5 lints the planned document once, for every caller.
+/// There is deliberately no second variant: the lint runs once, the same way
+/// for every caller, never narrowed by privilege.
 pub fn lint(doc: &Value) -> Vec<Lint> {
     let mut out = Vec::new();
     if !doc.is_object() {
@@ -122,7 +120,7 @@ fn walk(v: &Value, path: &Path, out: &mut Vec<Lint>) {
 /// `true` if `a` and `b` are the same document **including key order**.
 ///
 /// `Value`'s own `==` compares maps as sets, which is right for "did a value
-/// change" (a reordering touches no path, `docs/DESIGN.md` §3.4) and wrong
+/// change" (a reordering touches no path, `docs/DESIGN.md` §5) and wrong
 /// for "is this the document that was typed": key order is data (§2), and a
 /// staged edit set that loses a reordering has lost something.
 pub fn same_ordered(a: &Value, b: &Value) -> bool {
@@ -185,7 +183,7 @@ mod tests {
 
     #[test]
     fn lint_names_the_offending_path() {
-        // `docs/DESIGN.md` §4: the 400 names the offending path. There is no
+        // `docs/DESIGN.md` §7: the 400 names the offending path. There is no
         // redaction rule and no caller-dependent message.
         let lints = lint(&json!({"a": {"b": {"bad key": 1}}}));
         assert_eq!(lints.len(), 1);
@@ -214,10 +212,9 @@ mod tests {
 
     #[test]
     fn no_key_is_reserved_in_any_document() {
-        // `docs/DESIGN.md` §2. Revision 4 reserved `scopes` in every document
-        // and relaxed the key rule inside it for PVE authids; access-control
-        // data now lives outside documents entirely (§3), so `scopes` is
-        // ordinary user data and an authid-shaped key is not special anywhere.
+        // No key is reserved (`docs/DESIGN.md` §2): `scopes` is ordinary data,
+        // and an authid-shaped key (`user@realm!token`) is unrestricted, but a
+        // dotted key still fails the ordinary key charset (§4).
         assert!(lint(&json!({"scopes": {"a": 1}})).is_empty());
         assert_eq!(lint(&json!({"scopes": {"john.doe@pve": 1}})).len(), 1);
         assert!(lint(&json!({"scopes": {"svc@pve!traefik": 1}})).is_empty());

@@ -2,9 +2,8 @@
 //! parse/dump, with format-specific validation.
 //!
 //! YAML is the *only* on-disk format (`docs/DESIGN.md` §2); JSON exists
-//! solely as a wire format for a view's `data` (`docs/DESIGN.md` §3). There
-//! is no TOML support: it was removed together with the unreachable
-//! format-preserving edit engine.
+//! solely as a wire format for a view's `data` (`docs/DESIGN.md` §7). There
+//! is no TOML support.
 
 use std::fmt;
 use std::str::FromStr;
@@ -102,7 +101,7 @@ pub fn parse(format: Format, text: &str) -> Result<Value, Error> {
 ///
 /// Free-form comments in a document's previous text are *not* preserved: a
 /// document is always rewritten canonically from its value. Comment *keys*
-/// (`foo__`) are ordinary data and survive (`docs/DESIGN.md` §1).
+/// (`foo__`) are ordinary data and survive (`docs/DESIGN.md` §2).
 pub fn dump(format: Format, doc: &Value) -> String {
     let text = match format {
         Format::Json => serde_json::to_string_pretty(doc).expect("json dump of a valid document"),

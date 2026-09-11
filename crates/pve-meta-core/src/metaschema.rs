@@ -1,8 +1,8 @@
 //! The **meta-schema**: the two registry file formats described in the same
 //! dialect a prefix uses to describe a guest's subtree (`docs/DESIGN.md`
-//! §3.6).
+//! §6).
 //!
-//! Since revision 6 a prefix or permission file is an ordinary document
+//! A prefix or permission file is an ordinary document
 //! ([`crate::store::DocId::Registry`]), so the editor can show it as a tree and
 //! lint it as it is typed -- but only if something says what shape it has. That
 //! is what this module is: `prefix.yaml` and `grant.yaml` written out as
@@ -26,13 +26,13 @@
 //! The `schema:` property of a prefix is described as a free-form object on
 //! purpose. It is a schema in its own right, in an open-ended dialect, and the
 //! editor's honest offer for it is the text editor (a map row opens Monaco on
-//! its own subtree, DESIGN §8) rather than a form that would only ever cover
+//! its own subtree, DESIGN §12) rather than a form that would only ever cover
 //! the keywords we happened to think of.
 
 use crate::format::{self, Format};
 use crate::model::Value;
 
-/// The prefix file format (`docs/DESIGN.md` §3.1).
+/// The prefix file format (`docs/DESIGN.md` §3).
 const PREFIX: &str = r#"
 type: object
 description: >-
@@ -76,7 +76,7 @@ properties:
       format, plus 'multiline' as an editor hint. Free-form, so it is edited as text.
 "#;
 
-/// The permission file format (`docs/DESIGN.md` §3.2).
+/// The permission file format (`docs/DESIGN.md` §4).
 const PERMISSION: &str = r#"
 type: object
 description: >-
@@ -191,12 +191,10 @@ mod tests {
     }
 
     /// The editor renders declared-but-unset rows from `properties`, so a schema
-    /// that named a key the parser does not know would paint a row that can
-    /// never be written.
-    /// The nested half of the same question. `properties()` only ever looked one
-    /// level down, so everything inside `selector` -- the one sub-object either
-    /// schema has -- was unchecked: a typo in `tag`, or a claim that `all` is
-    /// required, would have passed silently.
+    /// that names a key the parser does not know paints a row that can never be
+    /// written. `properties()` alone only looks one level down, so this checks
+    /// the nested case too: everything inside `selector`, the one sub-object
+    /// either schema has.
     #[test]
     fn the_selector_is_described_the_way_the_parser_reads_it() {
         let selector = &prefix()["properties"]["selector"];

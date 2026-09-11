@@ -16,7 +16,7 @@ owns the prefix listing and the tags and caches what the core derives from them,
 and `PVE.meta.Access`, plus the key-name checks on `Utils`. See `docs/WASM-CORE.md`
 for how and why.
 
-This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
+This is **the** editor (DESIGN §12). A second implementation in pwt/Yew was built to the
 same specification and compared on the lab; it was removed once the choice was made (git
 tag `pwt-ui-removed`).
 
@@ -25,7 +25,7 @@ in this file re-derives any of them.
 
 ## What it does
 
-The behaviour is specified in `docs/DESIGN.md` §8 and not repeated here: one tree of
+The behaviour is specified in `docs/DESIGN.md` §12 and not repeated here: one tree of
 the document the caller can see; lists as containers with one row per member; edits
 staged and written by one Apply at the narrowest covering view; Tree and Text as two
 views of the same planned document; the schema markers and the "Save anyway" banner;
@@ -78,7 +78,7 @@ forms behind its registry grids. What follows is what is specific to *this* file
   Leaving Text parses the buffer back into staged edits; only a buffer that does not
   parse refuses the switch, and it says so.
 * The card is the *root view*, which a scope-only principal may not read at all
-  (DESIGN §3.4) — so the **Text** segment is disabled when `/meta/access` reports no
+  (DESIGN §5) — so the **Text** segment is disabled when `/meta/access` reports no
   full read, rather than offering a button that can only fail.
 
 ### Everywhere
@@ -126,7 +126,7 @@ real write.
 
 The editor **reads every document as YAML** (`format=yaml`), never as JSON: perlmod
 renders a document as a native Perl hash on the way out, and a Perl hash has no key
-order, so `format=json` cannot carry the order the store holds (DESIGN §8). That is what
+order, so `format=json` cannot carry the order the store holds (DESIGN §12). That is what
 makes a root Apply write the file back in the order it was in.
 
 ## How it is wired
@@ -136,7 +136,7 @@ pve-ext's page loader (`pve-ext/js/pve-ext-loader.js`) reads page manifests from
 either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This
 editor ships **two** manifests in the second form over one script, because a manifest
 carries a single `xtype` and the guest tab and the datacenter tab are different panels
-(DESIGN §7):
+(DESIGN §11):
 
 `pages/pve-meta.json`:
 

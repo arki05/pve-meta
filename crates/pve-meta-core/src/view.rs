@@ -13,7 +13,7 @@
 //! a *merge patch* may additionally contain `null` delete markers).
 //!
 //! Nothing in this module lints. A payload is not a document until it has
-//! been spliced in, so the one lint (`docs/DESIGN.md` §4) runs on the
+//! been spliced in, so the one lint (`docs/DESIGN.md` §7) runs on the
 //! planned document in [`crate::api`], where its findings name real
 //! document paths.
 //!
@@ -113,13 +113,13 @@ pub fn extract(doc: &Value, prefix: &Path) -> Option<Value> {
 /// Replaces the subtree at `prefix` with `subtree` wholesale (not a merge),
 /// creating any missing intermediate maps along the way. An empty-object
 /// `subtree` stores an **empty map** — it does not remove the key
-/// (`docs/DESIGN.md` §4; deleting a view is [`remove`], i.e.
+/// (`docs/DESIGN.md` §7; deleting a view is [`remove`], i.e.
 /// `DELETE …?view=`). Replacing at the root replaces the whole document
 /// (`subtree` must then itself satisfy the full document rules: an object,
 /// no nulls, valid keys).
 ///
 /// The result is **not** linted here: the one lint runs on the planned
-/// document, in [`crate::api`] (`docs/DESIGN.md` §4).
+/// document, in [`crate::api`] (`docs/DESIGN.md` §7).
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
@@ -169,7 +169,7 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
 ///
 /// A merge that changes nothing **mutates nothing**: intermediate maps are
 /// only materialised once the patch is known to write something
-/// (`docs/DESIGN.md` §4). A non-object value at `prefix` is
+/// (`docs/DESIGN.md` §7). A non-object value at `prefix` is
 /// merged over as if it were `{}`.
 ///
 /// # Errors
@@ -285,7 +285,7 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
 /// [`crate::scopes::Effective::can_read`] answers with — so a key is emitted
 /// exactly when an explicit view of it would be allowed. That single rule is
 /// all comment keys need: `p__` travels with a readable `p` (the one
-/// sibling rule, `docs/DESIGN.md` §3), while a map's bare `__` documents the
+/// sibling rule, `docs/DESIGN.md` §4), while a map's bare `__` documents the
 /// whole map and so travels only where the map itself is readable.
 ///
 /// **A document that is not a map at the top level is the empty document
@@ -339,7 +339,7 @@ pub fn render(value: &Value, format: Format) -> String {
 /// The payload is not validated here because it is not yet a document: the
 /// one lint runs on the *planned* document, after the payload has been
 /// spliced in, so its findings name real document paths
-/// (`docs/DESIGN.md` §4).
+/// (`docs/DESIGN.md` §7).
 ///
 /// # Errors
 /// [`Error::Parse`] on a syntax error.
@@ -349,7 +349,7 @@ pub fn parse(text: &str, format: Format) -> Result<Value> {
 
 /// Parses `text` as `format` into a `mode=merge` payload: an RFC 7386 merge
 /// patch, in which `null` is the delete marker *anywhere*
-/// (`docs/DESIGN.md` §4: "`merge` with `null` deletes").
+/// (`docs/DESIGN.md` §7: "`merge` with `null` deletes").
 ///
 /// The only structural rule is that a patch is an object — otherwise
 /// [`patch::apply_patch`] would silently do nothing. Everything else the
@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn replace_with_empty_object_stores_an_empty_map() {
-        // docs/DESIGN.md §4: `replace` with `{}` stores an empty map;
+        // docs/DESIGN.md §7: `replace` with `{}` stores an empty map;
         // deleting a view is `DELETE ?view=`.
         let mut doc = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
         let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();
@@ -601,11 +601,8 @@ mod tests {
 
     #[test]
     fn merge_never_stores_a_nested_delete_marker_as_a_literal_null() {
-        // Through the view layer: `view::merge` does the
-        // empty-scratch trick for the value at the prefix itself, but
-        // `patch::apply_obj`'s fallback spliced a nested patch object in
-        // verbatim, nulls and all -- so a legal merge payload produced a
-        // document the whole-document lint refused.
+        // A nested delete marker must never be spliced into the document as
+        // a literal `null` -- the same rule the top-level merge enforces.
         let mut absent = json!({"traefik": {"host": "x"}});
         let touched = merge(&mut absent, &p("traefik"), &json!({"sub": {"gone": null}})).unwrap();
         assert_eq!(absent, json!({"traefik": {"host": "x"}}));
@@ -733,9 +730,8 @@ mod tests {
 
     #[test]
     fn filter_keeps_comment_key_that_follows_its_own_key() {
-        // The natural authoring order (`a` then `a__`) must not
-        // drop the comment, because the first pass's map was drained as the
-        // second pass walked it.
+        // The natural authoring order (`a` then `a__`) must still surface
+        // the comment.
         let doc = json!({"a": 1, "a__": "about a", "b": 2});
         assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1, "a__": "about a"}));
     }
@@ -757,10 +753,9 @@ mod tests {
 
     #[test]
     fn filter_never_emits_a_bare_map_comment_the_permission_cannot_read() {
-        // Reproduced live with a zero-ACL scoped
-        // token: the document-root `__` documents the *whole* document, so a
-        // scope on one key must not disclose it -- `?view=__` is a 403, and
-        // the view-less read must agree.
+        // The document-root `__` documents the *whole* document, so a scope
+        // on one key must not disclose it -- `?view=__` is a 403, and the
+        // view-less read must agree.
         let doc = json!({"__": "top level note - secret-ish", "a": 1, "b": 2});
         assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1}));
         assert_eq!(filter(&doc, &[]), json!({}));
@@ -854,12 +849,9 @@ mod tests {
 
     #[test]
     fn filter_of_a_document_that_is_not_a_map_is_empty_for_a_scoped_reader() {
-        // A lenient read makes this arm reachable: a
-        // catch-all arm returned the value unchanged without ever consulting
-        // the prefixes, so a document rewritten out of band as a list or a
-        // scalar was handed in full to a scope-only caller. Before P2 the
-        // store linted on read and rule 1 turned such a document into a 400,
-        // so nothing exercised the arm.
+        // A lenient read makes this arm reachable: a document rewritten out
+        // of band as a list or a scalar must never leak to a scope-only
+        // caller.
         for doc in [
             json!([1, 2, 3]),
             json!(["a"]),
@@ -896,7 +888,7 @@ mod tests {
 
     #[test]
     fn parse_does_not_lint_the_payload() {
-        // `docs/DESIGN.md` §4: the one lint runs on the planned *document*,
+        // `docs/DESIGN.md` §7: the one lint runs on the planned *document*,
         // so a payload's `null` is refused there -- naming the path it would
         // land on -- rather than here, at the payload's own root.
         let value = parse("[1, null]", Format::Yaml).unwrap();
@@ -925,7 +917,7 @@ mod tests {
 
     #[test]
     fn parse_patch_carries_null_delete_markers_through() {
-        // `docs/DESIGN.md` §4: `merge` with `null` deletes, in both wire
+        // `docs/DESIGN.md` §7: `merge` with `null` deletes, in both wire
         // formats, top-level and nested.
         for (text, fmt) in [
             ("{\"host\": null}", Format::Json),

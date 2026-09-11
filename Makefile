@@ -61,7 +61,7 @@ ui:
 		echo "warning: npm not found, packaging without Monaco (no Text card, no diff)" >&2; \
 	fi
 
-# Per docs/DESIGN.md section 7, pve-meta is a consumer of pve-ext's three generic
+# Per docs/DESIGN.md section 11, pve-meta is a consumer of pve-ext's three generic
 # seams (see pve-ext/README.md), not a package that patches PVE itself:
 #   - API module:    perl/PVE/API2/Ext/Meta.pm, discovered by PVE::API2::Ext at
 #                     pvedaemon/pveproxy startup -- no registration diff needed.
@@ -75,7 +75,7 @@ ui:
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
 #
 # Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module
-# (docs/DESIGN.md section 5), the ExtJS editor tab with its core `.wasm` and
+# (docs/DESIGN.md section 8), the ExtJS editor tab with its core `.wasm` and
 # vendored Monaco (served by pveproxy), the two CLIs, and the pve-ext page/patch
 # manifests.
 install:
@@ -102,7 +102,7 @@ install:
 	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
-	# The local reader (bin/pve-meta, docs/DESIGN.md section 6). In sbin because
+	# The local reader (bin/pve-meta, docs/DESIGN.md section 10). In sbin because
 	# it reads /etc/pve/meta directly and so is root's tool, not an API client's:
 	# a hook script runs as root on the node, often before pveproxy is reachable.
 	install -D -m 0755 bin/pve-meta $(DESTDIR)$(PREFIX)/sbin/pve-meta
@@ -111,7 +111,7 @@ install:
 	# storage's snippets directory, which is where PVE looks for hookscripts.
 	install -D -m 0644 examples/maintenance-hook.pl \
 		$(DESTDIR)$(PREFIX)/share/doc/pve-meta/examples/maintenance-hook.pl
-	# Packaged example prefixes (docs/DESIGN.md section 3.1); none are
+	# Packaged example prefixes (docs/DESIGN.md section 3); none are
 	# required for pve-meta to work, so this directory may be empty in a
 	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
 	# copy, never a hard failure.
@@ -157,7 +157,7 @@ install:
 #   - pve-meta, libpve-meta-rs-perl: this source package's two binaries (see debian/control).
 #
 # lintian runs as part of this target, not as a separate step (see
-# docs/design/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 9,
+# docs/design/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 13,
 # pve-ext/README.md "Building and packaging"), mirroring the plain
 # `lintian $(DEBS)` upstream pve-rs uses (no --fail-on override: lintian's
 # own default -- exit non-zero only on an E: tag -- is what "fatal" below

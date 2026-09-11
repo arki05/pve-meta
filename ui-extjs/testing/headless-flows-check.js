@@ -280,7 +280,7 @@ async function main() {
 
         // --- 5. Document keys colliding with Object.prototype members (S3) ---
         // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved
-        // document keys (DESIGN §4). A throwaway subtree, deleted again below.
+        // document keys (DESIGN §7). A throwaway subtree, deleted again below.
         await api(
             `/api2/json/meta/guests/${vmid}`,
             'PUT',

@@ -7,20 +7,17 @@
  * a same-origin iframe, layout: 'fit' - to every matching target config
  * panel (PVE.lxc.Config / PVE.qemu.Config / PVE.node.Config / PVE.dc.Config).
  *
- * This generalizes an early, single-purpose prototype (see
- * docs/LIFECYCLE-PATCHES.md, superseded): same script-tag injection point
- * (right after pvemanagerlib.js in index.html.tpl), same
- * feature-detection posture, and - this is the part that must never be
- * "simplified" back - the *exact* same
- * PVE.panel.Config.prototype.initComponent patch technique: capture the
- * original prototype method in a closure and invoke it with a plain
- * Function.prototype.apply(), no Ext class-system machinery involved at
- * all. An earlier version used the global Ext.override(cls, {...}) shim
- * with this.callParent(arguments) inside the replacement instead, and
- * that combination throws in real ExtJS 7 classic (as shipped by PVE),
- * silently killing the *whole* config panel for every guest. The
- * capture-and-apply fix is proven in a real browser against real
- * pve-manager and must not be changed without re-doing that verification.
+ * The script tag is injected right after pvemanagerlib.js in
+ * index.html.tpl. This is the part that must never be "simplified" back:
+ * the *exact* PVE.panel.Config.prototype.initComponent patch technique of
+ * capturing the original prototype method in a closure and invoking it
+ * with a plain Function.prototype.apply(), no Ext class-system machinery
+ * involved at all. The obvious alternative - Ext.override(cls, {...})
+ * with this.callParent(arguments) inside the replacement - throws in real
+ * ExtJS 7 classic (as shipped by PVE), silently killing the *whole*
+ * config panel for every guest. The capture-and-apply fix is proven in a
+ * real browser against real pve-manager and must not be changed without
+ * re-doing that verification.
  *
  * A manifest's tab content is either a same-origin iframe ("url") or a
  * native ExtJS panel class ("script" + "xtype"): the script is inserted

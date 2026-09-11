@@ -1,5 +1,5 @@
 //! Effective: a principal's effective access to one document
-//! (`docs/DESIGN.md` §3).
+//! (`docs/DESIGN.md` §5).
 //!
 //! A [`Effective`] is built per request by [`crate::api`] from two inputs: the
 //! PVE ACL answers Perl passes in (`full_read`/`full_write`) and the scope
@@ -31,7 +31,7 @@ pub enum Mode {
 
 /// One resolved scope: a key-path prefix and the access it grants on the
 /// document being addressed. Selectors are already resolved by the time a
-/// `Scope` exists (`docs/DESIGN.md` §5, `GET /meta/access`).
+/// `Scope` exists (`docs/DESIGN.md` §8, `GET /meta/access`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     /// The key-path prefix this scope covers.
@@ -61,7 +61,7 @@ pub struct Effective {
 ///
 /// Beyond plain prefix containment, a scope on `p` also covers the sibling
 /// **comment key** `p__` — the human note *about* `p`. That is the **only**
-/// comment-key rule in the project (`docs/DESIGN.md` §3): a comment key is
+/// comment-key rule in the project (`docs/DESIGN.md` §4): a comment key is
 /// otherwise ordinary data that travels with the subtree it sits in.
 ///
 /// The aliasing is confined to the final segment at the scope's own depth, so
@@ -151,14 +151,11 @@ mod tests {
     use crate::patch::Op;
     use pretty_assertions::assert_eq;
 
-    /// The prefix-coverage rule, one case per line (`docs/DESIGN.md` §3.3).
+    /// The prefix-coverage rule, one case per line (`docs/DESIGN.md` §4).
     ///
-    /// This table used to be `testdata/covers-cases.json`, read by this crate and
-    /// by the editor's JavaScript suite, because the editor held its own copy of
-    /// `covers` to predict what the server would enforce -- and an editor that
-    /// predicts differently shows rows a write then rejects. The editor asks
-    /// this function now (through `crates/pve-meta-wasm`), so the table lives
-    /// with the one implementation.
+    /// The editor consults this same table, through `crates/pve-meta-wasm`,
+    /// rather than keeping its own copy, so the two can never predict a
+    /// write's outcome differently.
     #[test]
     fn covers_is_containment_plus_the_one_comment_key_alias() {
         let cases: &[(&str, &str, bool, &str)] = &[

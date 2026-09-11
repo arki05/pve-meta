@@ -19,7 +19,7 @@
 #
 # * **Metadata is useful with no operator anywhere.** No token, no permission
 #   file, no daemon -- a key, a hook script and `pve-meta`. That is the smallest
-#   complete use of this system (docs/DESIGN.md section 3).
+#   complete use of this system (docs/DESIGN.md section 10).
 # * **`pve-meta` is a local reader.** PVE runs a hook script as root on the node,
 #   at a moment when the API may not be reachable at all -- during boot, or with
 #   pveproxy stopped. This never opens a socket.

@@ -1,5 +1,5 @@
 //! The API layer: everything `PVE::API2::Ext::Meta` does that is not
-//! parameters, PVE ACLs or locking (`docs/DESIGN.md` §5).
+//! parameters, PVE ACLs or locking (`docs/DESIGN.md` §8).
 //!
 //! `crates/pve-meta-perl` exports these functions to Perl as
 //! `PVE::RS::Meta::api_*`, adding nothing but a [`crate::store::MetaStore`]
@@ -17,7 +17,7 @@
 //! ## Authorization
 //!
 //! A write is authorized **by what it changes, not by what it is addressed
-//! to** (`docs/DESIGN.md` §3.4):
+//! to** (`docs/DESIGN.md` §5):
 //!
 //! 1. [`authorize_view_write`] refuses the two request shapes that must not
 //!    reach the content check at all: the caller must be able to *read* the
@@ -26,13 +26,13 @@
 //! 2. the mutation is planned against a **clone** of the stored document and
 //!    every path the plan touches is checked with [`Effective::check_write`];
 //! 3. the planned document is linted — once, the same way for every caller
-//!    (`docs/DESIGN.md` §4);
+//!    (`docs/DESIGN.md` §7);
 //! 4. only then is the planned value written.
 //!
 //! ## Wire contract
 //!
 //! Everything crosses the Perl/Rust boundary as **native hashes and arrays**
-//! (`docs/DESIGN.md` §5): the caller's ACL and tags in, the guest rows in,
+//! (`docs/DESIGN.md` §8): the caller's ACL and tags in, the guest rows in,
 //! the documents and results out — perlmod's `serde`-based conversion renders
 //! them as Perl scalars/arrays/hashes directly. The single exception is the
 //! client-supplied `data` parameter, which is a JSON **string** because that
@@ -71,12 +71,11 @@ fn unix_secs(t: SystemTime) -> u64 {
 }
 
 /// An HTTP status plus a message, `Display`ed as exactly `"{status}: {msg}"`
-/// — the string every `api::*` function has always returned on its `Err`
-/// side, and the one the Perl layer parses back out to re-raise via
-/// `PVE::Exception::raise`. Making the status a field rather than a string
-/// prefix means a bare `?` can no longer produce an error with no status at
-/// all: its `From<CoreError>` impl and this module's own constructors
-/// (`bad_request`, `forbidden`) are the only ways to make one.
+/// — the string every `api::*` function returns on its `Err` side, which the
+/// Perl layer parses back out to re-raise via `PVE::Exception::raise`. The
+/// status is a field, not a string prefix, so a bare `?` cannot produce an
+/// error with no status at all: its `From<CoreError>` impl and this module's
+/// own constructors (`bad_request`, `forbidden`) are the only ways to make one.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -145,7 +144,7 @@ fn forbidden(path: &DocPath) -> ApiError {
 
 /// The caller's effective [`Effective`] on `doc_id`.
 ///
-/// Scopes apply to **guest documents only** (`docs/DESIGN.md` §3).
+/// Scopes apply to **guest documents only** (`docs/DESIGN.md` §5).
 pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> Effective {
     let scopes = match doc_id {
         DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
@@ -198,7 +197,7 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
 /// Parses a `view` parameter (a dotted/slash path, or absent = the whole
 /// document). No key is reserved and no segment is special: the one lint on
 /// the planned document is what refuses a write that would build something
-/// the document model does not allow (`docs/DESIGN.md` §4).
+/// the document model does not allow (`docs/DESIGN.md` §7).
 fn parse_view(view: Option<&str>) -> Result<DocPath, ApiError> {
     match view {
         Some(s) => DocPath::parse(s).map_err(ApiError::from),
@@ -210,7 +209,7 @@ fn view_out(view: Option<&str>) -> String {
     view.unwrap_or("").to_string()
 }
 
-/// Parses a view's wire `format`: `json` or `yaml` (`docs/DESIGN.md` §4).
+/// Parses a view's wire `format`: `json` or `yaml` (`docs/DESIGN.md` §7).
 fn parse_view_format(name: &str) -> Result<Format, ApiError> {
     Format::from_ext(name)
         .ok_or_else(|| bad_request(format!("invalid format '{name}': expected 'json' or 'yaml'")))
@@ -227,7 +226,7 @@ struct Stored {
     digest: String,
     /// `Some(reason)` when a file exists but its content could not be
     /// recovered *as a document*. Exactly one condition, with three causes
-    /// (`docs/DESIGN.md` §4):
+    /// (`docs/DESIGN.md` §7):
     ///
     /// * it is not valid YAML (or not text at all);
     /// * it is above the store's read cap, so it is never parsed;
@@ -414,7 +413,7 @@ pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Ve
 ///
 /// A guest the caller can read *nothing* of is omitted entirely, and
 /// `node`/`name`/`tags` are returned only to a caller with `VM.Audit` on that
-/// guest (`docs/DESIGN.md` §5).
+/// guest (`docs/DESIGN.md` §8).
 ///
 /// # Errors
 /// `400:` if `has` is not a valid path.
@@ -471,7 +470,7 @@ pub fn list_guests(
 /// not an empty document with the real digest (which would be a
 /// change-detection oracle over content they may not see).
 ///
-/// **A document whose content could not be recovered** (`docs/DESIGN.md` §4
+/// **A document whose content could not be recovered** (`docs/DESIGN.md` §7
 /// and [`Stored::unrecoverable`] — it does not parse, it is above the read
 /// cap, or it is not a mapping): `format=yaml` for a full reader answers
 /// `200` with the file's raw text plus `parse_error`, so an administrator can
@@ -562,7 +561,7 @@ pub fn get_document(
 /// Refuses every write against a document whose content could not be
 /// recovered — see [`Stored::unrecoverable`] for the three causes — except
 /// the two that *replace the file whole*: a root `replace` and a root
-/// `DELETE` (`docs/DESIGN.md` §4).
+/// `DELETE` (`docs/DESIGN.md` §7).
 ///
 /// The value planned against is the empty document (nothing else can be
 /// recovered), so any narrower write would silently discard everything the
@@ -618,16 +617,6 @@ fn check_repairable(
 /// This function only refuses the requests that must not reach that check at
 /// all.
 ///
-/// It used to be the other way round: the view had to be inside a writable
-/// scope, and the root view demanded `full_write` outright. That is strictly
-/// coarser than the question anyone is actually asking, and it refused writes
-/// that violate nobody's permissions — a permission file has `rules`, plural,
-/// so holding `rw` on two prefixes and editing one key in each is ordinary,
-/// and the narrowest view covering both is the document root. Same for a key
-/// reordering, which changes no path at all and can only be expressed as a
-/// whole-document write. Both were 403s for writes whose every change was
-/// permitted (`docs/DESIGN.md` §3.4).
-///
 /// Two things still have to be refused here, and neither is about the content:
 ///
 /// * **You must be able to read the view you name.** Otherwise the content
@@ -643,10 +632,9 @@ fn check_repairable(
 ///   auditor rewrite a file. `has_any_write` is the floor that keeps the
 ///   people who may not write here from causing a write at all.
 ///
-/// `full_write` short-circuits both: it is the existing "may write the whole
-/// document" answer, and it does not depend on being able to read it (a PVE
-/// ACL can grant `VM.Config.Options` without `VM.Audit`, and that principal
-/// could write the root before this change).
+/// `full_write` short-circuits both: it is the "may write the whole document"
+/// answer, and it does not depend on being able to read it (a PVE ACL can
+/// grant `VM.Config.Options` without `VM.Audit`).
 fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), ApiError> {
     if access.full_write {
         return Ok(());
@@ -680,7 +668,7 @@ fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), A
 /// The lint lives here, before the `dry_run` branch, so a dry run validates
 /// exactly what the write validates — and it is the same lint for every
 /// caller, on the whole planned document, naming the offending path
-/// (`docs/DESIGN.md` §4).
+/// (`docs/DESIGN.md` §7).
 fn plan_write(
     planned: &mut Value,
     access: &Effective,
@@ -708,12 +696,12 @@ fn plan_write(
 /// text about to be written must parse as the kind it is
 /// (`registry::parse_prefix` / `registry::parse_permission`).
 ///
-/// The loader **skips** a malformed file with a warning and carries on -- that
-/// isolation is why this data left `datacenter.yaml` -- so without this check
-/// the editor's most likely mistake (a typo in `selector:`) would be answered
-/// by the prefix silently disappearing from the list, with a 200 on the
-/// write that removed it. The rule is the parser itself, not a copy of it, so
-/// what the API accepts and what the loader reads back cannot drift.
+/// The loader **skips** a malformed file with a warning and carries on, so
+/// without this check the editor's most likely mistake (a typo in `selector:`)
+/// would be answered by the prefix silently disappearing from the list, with
+/// a 200 on the write that removed it. The rule is the parser itself, not a
+/// copy of it, so what the API accepts and what the loader reads back cannot
+/// drift.
 ///
 /// Guest documents have no shape beyond `model::lint`: they
 /// hold whatever an administrator puts in them, which is the point of them.
@@ -749,7 +737,7 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// what was already wrong elsewhere in the document -- unless `force`. That
 /// is the editor's "Save anyway" tick, and it is available to anyone who may
 /// write: enforcement makes a mismatch a deliberate act, not an impossible
-/// one, so a drifted schema can never lock an administrator out (§4).
+/// one, so a drifted schema can never lock an administrator out (§7).
 ///
 /// # Errors
 /// `400:` invalid id/view/format/mode/payload, or the planned document fails
@@ -757,7 +745,7 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// planned touched path is outside the caller's write permissions. `422:`
 /// the write introduces a finding under an enforcing prefix and `force` is
 /// not set.
-#[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
+#[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
 pub fn put_document(
     store: &MetaStore,
     permission_files: &[Permission],
@@ -823,7 +811,7 @@ pub fn put_document(
     //     entirely: rewriting the file advances its mtime and so
     //     `version()`'s `changed`, while the content token correctly does not
     //     move, and "a merge that touches nothing changes nothing"
-    //     (`docs/DESIGN.md` §4) is not true of a file whose timestamp jumped.
+    //     (`docs/DESIGN.md` §7) is not true of a file whose timestamp jumped.
     //     Both halves of the condition are needed: `touched: []` alone still
     //     covers the repair of a document that reads back as empty because it
     //     is unrecoverable, and a byte comparison alone would skip nothing a
@@ -902,7 +890,7 @@ fn check_enforced(
 ///
 /// Removes **only the current document**: snapshot copies belong to the
 /// snapshot hooks and are never touched from the REST API
-/// (`docs/DESIGN.md` §6).
+/// (`docs/DESIGN.md` §9).
 ///
 /// # Errors
 /// `400:` invalid id/view. `409:` digest mismatch. `403:` the view is not
@@ -936,7 +924,7 @@ pub fn delete_document(
     // missing document is the only one that reports an empty digest — rather
     // than by a fresh `locate`, whose answer could already be stale by the
     // time it is acted on. `MetaStore::delete` is idempotent for the same
-    // reason: losing the race to another `DELETE` or to the GC is this
+    // reason: losing the race to another `DELETE` or to `pve-meta rm` is this
     // request's own outcome, not a 500.
     let existed = !stored.digest.is_empty();
     let new_digest = if view_path.is_root() {

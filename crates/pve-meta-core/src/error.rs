@@ -31,9 +31,7 @@ pub enum Error {
         /// A human-readable description of the failure.
         msg: String,
         /// Where in the text, when the parser knows. An editor puts its
-        /// marker on this line; the message alone would leave it guessing
-        /// (and js-yaml's `mark` was the one thing of it the editor leaned
-        /// on that the server's message did not carry).
+        /// marker on this line; the message alone would leave it guessing.
         at: Option<Location>,
     },
 
@@ -72,7 +70,7 @@ pub enum Error {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
-    /// A prefix definition or permission file (`docs/DESIGN.md` §3) is malformed; see
+    /// A prefix definition or permission file (`docs/DESIGN.md` §6) is malformed; see
     /// [`crate::registry::parse_prefix`] / [`crate::registry::parse_permission`].
     #[error("invalid registry file: {0}")]
     Registry(String),

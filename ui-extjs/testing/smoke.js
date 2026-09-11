@@ -269,7 +269,7 @@ eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
 
 // A grammar's `minimum`/`maximum` reach the number editor, and its `format` is
-// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §8).
+// resolved to the proxmoxlib vtype that already validates that shape (DESIGN §12).
 let numEd = U.editorFor({ kind: 'number', minimum: 1, maximum: 65535 });
 eq('editor number honours minimum', numEd.minValue, 1);
 eq('editor number honours maximum', numEd.maxValue, 65535);
@@ -360,10 +360,9 @@ console.log('\n--- enforce: an enforcing prefix\'s findings say so ---');
 }
 
 console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
-// The Text card and the subtree window used to hold one copy each of Format, the
-// YAML | JSON switch, Diff and "did anything change", and the copies drifted.
-// These are the shared ones, driven through a fake editor: the rules they call
-// are the core's; what is checked is the choreography around them.
+// The Text card and the subtree window share one copy of Format, the YAML | JSON
+// switch, Diff and "did anything change", driven through a fake editor: the rules
+// they call are the core's; what is checked is the choreography around them.
 {
     const Buffer = ctx.PVE.meta.Buffer;
     const editor = (value) => ({
@@ -643,8 +642,8 @@ const panel = {
     docId: '200',
     tags: ['traefik'],
     access: { read: 1, write: 1, scopes: [] },
-    // Two lists now, two rules (DESIGN section 3): prefixes decide shape, permissions
-    // decide access.
+    // Two lists now, two rules (DESIGN sections 3-4): prefixes decide shape,
+    // permissions decide access.
     prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
@@ -694,7 +693,7 @@ eq('declared key is unset', spec.port.present, false);
 eq('display boolean', U.displayValue(1, 'boolean'), 'Yes');
 eq('declared default carried', spec.port.defaultValue, 80);
 eq('declared enum carried', spec.scheme.enumValues, ['http', 'https']);
-// The grammar's description is the tooltip, not the Description column (DESIGN §8).
+// The grammar's description is the tooltip, not the Description column (DESIGN §12).
 eq('grammar description is its own field', spec.host.grammarDescription, 'Public host name');
 eq('grammar description is not the comment', spec.host.description, undefined);
 eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
@@ -711,9 +710,6 @@ eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
 console.log('\n--- Set to Default answers "what should this be", not only "what if unset" ---');
 {
-    // It used to work on unset rows only, so the one moment you most want a declared
-    // default -- the value in front of you is wrong -- was the one moment it refused,
-    // and the only way back was to remember the default and retype it.
     const staged = [];
     const sd = { stage: (path, op, value) => staged.push({ path, op, value }) };
     sd.setToDefault = P.setToDefault;
@@ -746,11 +742,10 @@ console.log('\n--- Set to Default answers "what should this be", not only "what 
 
 console.log('\n--- the hostile document: the editor writes exactly what the store writes ---');
 {
-    // testdata/yaml-cases.json used to hold two emitters together. There is one
-    // emitter now, and this is the end-to-end check that it is the one the store
-    // uses: the document of values that historically break hand-written YAML, and
-    // the exact bytes the store writes for it, through the wasm. The Rust suite
-    // pins the same bytes natively (tests/formats.rs).
+    // This is the end-to-end check that the editor's emitter is the one the store
+    // uses: the document of values that break hand-written YAML, and the exact
+    // bytes the store writes for it, through the wasm. The Rust suite pins the
+    // same bytes natively (tests/formats.rs).
     const y = JSON.parse(
         fs.readFileSync(path.join(__dirname, '..', '..', 'testdata', 'yaml-cases.json'), 'utf8'),
     );
@@ -796,9 +791,9 @@ console.log('\n--- the document is read as YAML because key order is data ---');
 console.log('\n--- a registry file that did not load is still a row ---');
 {
     const G = ctx.PVE.meta.RegistryGrid.statics;
-    // Before this, `load_dirs` dropped a file it could not parse and the listing
-    // never mentioned it, so a prefix that stopped parsing ceased to exist with
-    // nothing anywhere saying so -- the one failure mode with no symptom.
+    // A prefix that stops parsing must still be listed, with its error --
+    // silently ceasing to exist is the one failure mode with no symptom
+    // (docs/decisions/003-registry-files-are-documents.md).
     const pfx = G.rowsFrom('prefixes', [
         { prefix: 'good', selector: { all: true }, origin: 'cluster' },
         { prefix: 'broken', origin: 'packaged', error: 'mapping values are not allowed here' },
@@ -836,9 +831,7 @@ console.log('\n--- a registry file that did not load is still a row ---');
 
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
 {
-    // A prefix with no schema used to paint no row at all, so `netbird` -- which
-    // applies to every guest -- was invisible on every guest that had not used it
-    // yet. A prefix is itself a statement about the document: something of mine
+    // A prefix is itself a statement about the document: something of mine
     // lives at this key. That is the statement permissions are written in terms of,
     // so it earns a row; it just has less to say than a schema'd one.
     const doc = (data) => {
@@ -956,7 +949,7 @@ eq('a format is checked by the vtype and lands in the findings',
     [{ path: 'traefik.spec.host', msg: 'not a valid dns-name' }]);
 eq('a format that passes says nothing', GRAMMAR.findings({ traefik: { spec: { host: 'a.example' } } }), []);
 
-// DESIGN section 4: the JSON view renders booleans as 1/0; flagging those would put a
+// DESIGN section 7: the JSON view renders booleans as 1/0; flagging those would put a
 // warning on every boolean in the store.
 eq('a boolean on the wire as 1 is not a finding',
     GRAMMAR.findings({ traefik: { spec: { enabled: 1 } } }), []);
@@ -1031,8 +1024,8 @@ eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null)
 console.log('\n--- nesting: most-specific wins, schemas never merge ---');
 // `homelab` and `homelab.docker` are both prefixes. The child governs its whole
 // subtree; the parent's own `properties.docker` is shadowed, not combined
-// (DESIGN section 3.1). Before revision 6 both walked and their findings unioned.
-// The rule lives in one place now (shape::Shape); this shows the face over it.
+// (DESIGN section 3). The rule lives in one place (shape::Shape); this shows the
+// face over it.
 const NESTED = Shape.of([
     {
         prefix: 'homelab',
@@ -1076,8 +1069,7 @@ eq('the parent lints its own keys',
     NESTED.findings({ homelab: { notes: 7 } }).map((f) => f.path),
     ['homelab.notes']);
 
-// Hovers resolve to the governing prefix rather than to whichever was collected
-// last -- which used to depend on iteration order.
+// Hovers resolve to the governing prefix rather than to whichever was collected last.
 const NESTED_IDX = Object.create(null);
 NESTED.schemaIndex().forEach((e) => (NESTED_IDX[e.path] = e.schema));
 eq('hover at the boundary comes from the child',
@@ -1098,7 +1090,7 @@ console.log('\n--- nesting: the ROW builder must shadow too, not just the linter
             prefix: 'homelab',
             selector: { all: true },
             // The parent has an opinion about `docker` and must not get one: the child
-            // prefix governs that subtree entirely (DESIGN section 3.1).
+            // prefix governs that subtree entirely (DESIGN section 3).
             schema: {
                 type: 'object',
                 properties: {
@@ -1149,7 +1141,7 @@ eq('covers aliases the comment key (permission rule)', Access.covers('a', 'a__')
 
 console.log('\n--- nesting: a schema-less prefix still shadows ---');
 {
-    // A prefix may declare a selector and no schema (the lab's `netbird` does).
+    // A prefix may declare a selector and no schema.
     // It still governs its subtree -- so a parent's schema must not reach into it.
     const all = Shape.of([
         { prefix: 'homelab.docker', selector: { all: true } },   // no schema
@@ -1331,7 +1323,7 @@ console.log('\n--- staged edits: the change that had no legal single step ---');
     // The case that forced this: a prefix definition's selector is exactly one of
     // `all` or `tag`, so `{all: true}` -> `{tag: web}` has NO valid intermediate.
     // Dropping `all` first is refused by the server; adding `tag` first is refused;
-    // the row editor could only ever do one at a time. Reproduced on the lab.
+    // the row editor could only ever do one at a time.
     const stored = { description: 'Home', selector: { all: true } };
     const pending = new EditSet([
         { path: 'selector.all', op: 'delete' },
@@ -1426,8 +1418,8 @@ console.log('\n--- the registry lists ---');
         'all guests',
         'all guests',
     ]);
-    // A column a tree could not show: a schema-less definition is a real thing
-    // (the lab's netbird), and looked identical to one with a schema.
+    // A column a tree could not show: a schema-less definition is a real thing,
+    // indistinguishable from one with a schema without it.
     eq('carrying a schema is a column', rows.map((r) => r.schema), ['yes', '', 'yes']);
 
     // Three origin states, not two. The middle one is where Remove does not remove.
@@ -1495,9 +1487,8 @@ console.log('\n--- a key name is refused in the field, not after a round trip --
 
 console.log('\n--- an edit answers for what it broke, not for what was already broken ---');
 {
-    // One bad value used to make every later edit anywhere in the document stop at a
-    // "Save anyway" tick, forever. `Shape.introduced` scopes the banner to what this
-    // edit did; the amber row markers still show everything wrong with the document.
+    // `Shape.introduced` scopes the banner to what this edit did; the amber row
+    // markers still show everything wrong with the document.
     const stored = {
         homelab: { owner: 'arki', port: 'not-a-number' },
         netbird: { groups: ['lan'] },
@@ -1541,8 +1532,7 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
         ['netbird.groups'],
     );
 
-    // A pure key reordering changes no value at any path, so it introduces nothing --
-    // this is the case that used to demand a tick for reordering a broken document.
+    // A pure key reordering changes no value at any path, so it introduces nothing.
     eq(
         'reordering changes no path',
         EditSet.changedPaths(stored, { netbird: stored.netbird, homelab: stored.homelab }),
@@ -1574,9 +1564,8 @@ console.log('\n--- an edit answers for what it broke, not for what was already b
 
 console.log('\n--- text is just another way to edit rows ---');
 {
-    // Editing as text used to be a second model with its own buffer, apply and write,
-    // kept apart from the tree by rules. `EditSet.between` turns whatever was typed back
-    // into edits *on rows*, so both are the same model and the rules go away.
+    // `EditSet.between` turns whatever was typed back into edits *on rows*, so
+    // both are the same model and the rules go away.
     const stored = {
         homelab: { owner: 'arki', notes: 'the box', docker: { port: 80, restart: 'always' } },
         netbird: { groups: ['lan'] },
@@ -1673,7 +1662,7 @@ console.log('\n--- a staged value is linted like a stored one ---');
     panelS.pending = new EditSet([{ path: 'docker.port', op: 'set', value: 70000 }]);
     eq('a staged value that does not fit is', panelS.findingsFor()['docker.port'], 'must be at most 65535');
     // ... and it is still allowed to be staged and applied: the marker is advisory,
-    // the server's lint is the authority (DESIGN §4).
+    // the server's lint is the authority (DESIGN §7).
     eq('the planned document keeps it', panelS.plannedData().docker.port, 70000);
 
     // Discarding one row drops that row's edits and nothing else.
@@ -1844,9 +1833,8 @@ console.log('\n--- reloading must not fold the tree up ---');
 
 console.log('\n--- the tree marks a row its schema refuses ---');
 {
-    // The text editor has squiggled these since revision 6; the tree, which is what
-    // people open, said nothing. Same rule, same function -- `shapeFor` is shared by
-    // both callers so they cannot answer differently.
+    // Same rule, same function -- `shapeFor` is shared by both callers so they
+    // cannot answer differently.
     const SCHEMA = {
         type: 'object',
         properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
@@ -1981,7 +1969,7 @@ eq('an empty value is empty', U.previewText(undefined), '');
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
-// keys (DESIGN §4) that must become ordinary rows, not resolve through the
+// keys (DESIGN §7) that must become ordinary rows, not resolve through the
 // prototype chain to the page's global Object.
 const protoDoc = { constructor: 'ctor-value', toString: 'tostring-value', hasOwnProperty: 'hop-value' };
 const protoRoot = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };

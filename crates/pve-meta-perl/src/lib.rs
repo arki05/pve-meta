@@ -5,16 +5,16 @@
 //! * the **lifecycle hooks** (`on_create`/`on_destroy`, and
 //!   `on_snapshot`/`on_rollback`/`on_delsnap`), called from the one patched
 //!   PVE Perl file (`PVE/AbstractConfig.pm`, package
-//!   `libpve-guest-common-perl`; `docs/DESIGN.md` §6). Clone and backup are
+//!   `libpve-guest-common-perl`; `docs/DESIGN.md` §9). Clone and backup are
 //!   not carried;
 //! * `stored_vmids`, the store's own list of guest vmids, which is what lets
 //!   `pve-meta ls --orphans` and `pve-meta rm` find and remove a document
-//!   whose guest config was deleted out of band (`docs/DESIGN.md` §6); and
+//!   whose guest config was deleted out of band (`docs/DESIGN.md` §10); and
 //! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`
-//!   (`docs/DESIGN.md` §5), implemented in [`pve_meta_core::api`] — this
+//!   (`docs/DESIGN.md` §8), implemented in [`pve_meta_core::api`] — this
 //!   crate only supplies the store and the registry.
 //!
-//! **Everything crosses as a native Perl structure** (`docs/DESIGN.md` §5):
+//! **Everything crosses as a native Perl structure** (`docs/DESIGN.md` §8):
 //! the caller's ACL hash and tags in, guest rows in, documents and results
 //! out. The single exception is the client-supplied `data` parameter, which
 //! is a JSON string because that is what the REST parameter is; it is decoded
@@ -55,7 +55,7 @@ mod proxmox_lib_pve_meta {}
 
 #[perlmod::package(name = "PVE::RS::Meta", lib = "pve_meta_rs")]
 mod pve_rs_meta {
-    //! The `PVE::RS::Meta` package: the guest snapshot hooks, the store GC,
+    //! The `PVE::RS::Meta` package: the guest lifecycle hooks, `stored_vmids`,
     //! and the `api_*` functions used by `PVE::API2::Ext::Meta`.
 
     use anyhow::Error;
@@ -66,7 +66,7 @@ mod pve_rs_meta {
 
     use super::{open_store, RollbackOutcome};
 
-    /// Every grant (`docs/DESIGN.md` §3.2). Cluster-only on purpose: an
+    /// Every grant (`docs/DESIGN.md` §4). Cluster-only on purpose: an
     /// operator's `.deb` may ship a prefix but must never ship its own
     /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
     /// a stale grant is a wrong answer about who may write.
@@ -85,7 +85,7 @@ mod pve_rs_meta {
     // write), and `api_prefixes` below reads `Registry::list_prefixes`
     // directly because it -- alone -- needs the files that failed to load too.
 
-    // -- snapshot hooks (`docs/DESIGN.md` §6) -----------------------------
+    // -- snapshot hooks (`docs/DESIGN.md` §9) -----------------------------
     //
     // Called from the patched `PVE/AbstractConfig.pm`. They run inside PVE's
     // own guest locks and copy whole files; they do not consult permissions.
@@ -124,7 +124,7 @@ mod pve_rs_meta {
         Ok(open_store().delete_snapshot(vmid, snapname)?)
     }
 
-    // -- garbage collection (`docs/DESIGN.md` §6) --------------------------
+    // -- orphans (`docs/DESIGN.md` §9) -------------------------------------
 
     /// Clears any metadata left at `$vmid` — the document and every snapshot copy.
     /// Returns the number of files removed.
@@ -176,7 +176,7 @@ mod pve_rs_meta {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    // -- API-shaped exports (`PVE::API2::Ext::Meta`, `docs/DESIGN.md` §5) --
+    // -- API-shaped exports (`PVE::API2::Ext::Meta`, `docs/DESIGN.md` §8) --
     //
     // Thin wrappers over `pve_meta_core::api` (see that module's docs for the
     // wire contract and the authorization rules). All of these die with a
@@ -280,9 +280,9 @@ mod pve_rs_meta {
     /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
     /// `cfs_lock_domain` lock: the digest precondition is re-checked inside
     /// this call, but only a lock makes the read-modify-write atomic across
-    /// nodes (`docs/DESIGN.md` §4).
+    /// nodes (`docs/DESIGN.md` §7).
     #[export]
-    #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §5)
+    #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
     pub fn api_put(
         id: &str,
         view: Option<&str>,

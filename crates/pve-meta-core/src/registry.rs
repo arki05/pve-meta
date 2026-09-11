@@ -1,5 +1,5 @@
 //! The two drop directories: **prefixes** (what a prefix is) and **grants**
-//! (who may touch one) — `docs/DESIGN.md` §3.
+//! (who may touch one) — `docs/DESIGN.md` §3, §4.
 //!
 //! Both live outside the documents, one file each, parsed strictly and
 //! independently: a malformed file is skipped with a warning and contributes
@@ -62,8 +62,9 @@
 //! subtree would be surprising.
 //!
 //! Shape has one owner, so it shadows; permission is a union, so it adds. Those
-//! two rules cannot live on one object, which is the concrete reason revision 6
-//! made this two concepts and not one (`docs/DESIGN.md` §12).
+//! two rules cannot live on one object, which is why a prefix and a permission
+//! are two concepts, not one (see
+//! `docs/decisions/001-prefix-and-permission-are-two-concepts.md`).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -667,7 +668,7 @@ fn load_dirs<T>(
 }
 
 /// [`load_dirs`] for prefixes, plus the most-specific-first sort the listing
-/// promises (`docs/DESIGN.md` §5) -- shared by [`load_prefixes`] (which drops
+/// promises (`docs/DESIGN.md` §8) -- shared by [`load_prefixes`] (which drops
 /// the failures) and [`Registry::list_prefixes`] (which keeps them), so the
 /// two can never compute the sort differently.
 fn prefixes_with_failures(dirs: &[PathBuf]) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
@@ -740,7 +741,7 @@ fn yaml_files(dir: &FsPath) -> Vec<(String, PathBuf)> {
 }
 
 /// The scopes `authid` holds on a guest carrying `tags`: the union of every
-/// rule for that authid whose selector matches (`docs/DESIGN.md` §3.4).
+/// rule for that authid whose selector matches (`docs/DESIGN.md` §5).
 ///
 /// Effective **accumulate**: a rule on `homelab` covers `homelab.docker`, because
 /// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
@@ -1008,7 +1009,7 @@ rules:
         assert_eq!(scopes.len(), 2, "both entries, the tag one having matched");
 
         // A rule on `traefik` covers everything under it -- containment, not
-        // most-specific-wins (`docs/DESIGN.md` §3.2).
+        // most-specific-wins (`docs/DESIGN.md` §4).
         let access = crate::scopes::Effective { full_read: false, full_write: false, scopes };
         assert!(access.can_write(&Path::parse("traefik.spec.host").unwrap()));
         assert!(access.can_read(&Path::parse("netbird.groups").unwrap()));

@@ -1,6 +1,6 @@
 //! Integration tests for `pve_meta_core::format`: round trips, order
 //! preservation, and format-specific rejections. YAML is the only on-disk
-//! format; JSON is a wire format only (`docs/DESIGN.md` §2).
+//! format; JSON is a wire format only (`docs/DESIGN.md` §7).
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::error::Error;
@@ -131,13 +131,12 @@ fn lint_errors_surface_through_parse() {
 /// The canonical YAML this crate writes, pinned byte for byte against
 /// `testdata/yaml-cases.json`.
 ///
-/// The editor used to write documents with a second emitter (js-yaml), and this
-/// table was what held the two together. The editor now writes them with this
-/// crate, built for the browser (`crates/pve-meta-wasm`), so the table has one
-/// job left: to notice when a `serde_yaml_ng` upgrade changes the bytes -- every
-/// line that moves is a line the editor's diff would then attribute to whatever
-/// was being edited. The editor's suite runs the same document through the
-/// wasm as its end-to-end "the core loads and answers" check.
+/// The editor writes documents with this crate, built for the browser
+/// (`crates/pve-meta-wasm`), so the table's job is to notice when a
+/// `serde_yaml_ng` upgrade changes the bytes -- every line that moves is a
+/// line the editor's diff would then attribute to whatever was being edited.
+/// The editor's suite runs the same document through the wasm as its
+/// end-to-end "the core loads and answers" check.
 ///
 /// The values are the ones that historically break hand-written YAML --
 /// structural punctuation, quote characters, comment markers, strings that

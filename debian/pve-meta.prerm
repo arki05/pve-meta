@@ -14,7 +14,7 @@
 #
 # No `preinst` and no `postrm` in this package: this is pve-meta's first
 # release, so there is nothing to migrate, and with the GC timer gone
-# (docs/DESIGN.md section 6 -- guest create and destroy clear metadata
+# (docs/DESIGN.md section 9 -- guest create and destroy clear metadata
 # themselves now) debhelper has no systemd snippet left to put in a
 # `postrm` either. A hand-written one would hold the debhelper-substitution
 # placeholder with nothing else around it, which is exactly the shape

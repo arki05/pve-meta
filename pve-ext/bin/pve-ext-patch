@@ -3,15 +3,9 @@
 # pve-ext-patch - apply/remove/verify/status for pve-ext's generic
 # managed-patch seam (see pve-ext/README.md, "Managed patches").
 #
-# This is the generalized, TOML-manifest-driven successor to the two
-# proven, single-purpose tools this project prototyped first as research
-# (see docs/LIFECYCLE-PATCHES.md, superseded): a one-file awk-anchor
-# insertion tool for the UI template, and a seven-file, patch(1)-based,
-# perl -c gated tool for the guest-lifecycle hooks (now pve-meta's own
-# `patches/lifecycle.toml` manifest, applied through this tool instead).
-# Every mechanic that made those two safe is kept, generalized to an
-# arbitrary number of files across an arbitrary number of packages,
-# described declaratively instead of hardcoded per tool:
+# A TOML-manifest-driven tool that patches an arbitrary number of files
+# across an arbitrary number of packages, described declaratively instead
+# of hardcoded per file:
 #   1. dpkg-divert each file away (suffix ".pve-ext-orig", owned by the
 #      package "pve-ext" - never by whatever package a manifest names in
 #      its `package` field, which is informational/for status output
@@ -427,10 +421,9 @@ restore_on_failure() {
         # the dry-run/patch/check gates, so a dry-run, patch or check
         # failure leaves $real holding that placeholder copy). remove_one
         # clears $real first for exactly this reason; do the same here -
-        # skipping it used to silently turn this "rollback" into a no-op
-        # that still deleted the claim marker and logged success while the
-        # diversion stayed live in dpkg's database -- a review's failure-
-        # injection run found it.
+        # skipping it turns this "rollback" into a no-op that deletes the
+        # claim marker and logs success while the diversion stays live in
+        # dpkg's database.
         rm -f "$real"
         if dpkg_divert_remove "$mpath" >/dev/null 2>&1; then
             rm -f "$(claim_file_for "$mpath")" 2>/dev/null
@@ -563,11 +556,10 @@ apply_one() {
 
     # A fresh divert physically moves $real away; some patched files are
     # transitively `require`d by unrelated code while we're mid-way
-    # through applying a *different* file in the same run (seen in
-    # practice with the lifecycle patches), so leaving $real briefly
-    # missing can cause spurious failures elsewhere. Restore the pristine
-    # placeholder for the duration of the check; `install` below replaces
-    # it with the real patched content once validated.
+    # through applying a *different* file in the same run, so leaving
+    # $real briefly missing can cause spurious failures elsewhere. Restore
+    # the pristine placeholder for the duration of the check; `install`
+    # below replaces it with the real patched content once validated.
     if [ ! -f "$real" ]; then
         if ! cp "$diverted" "$real"; then
             err "$mpath: failed to restore pristine placeholder at $real for the duration of the check"
@@ -912,8 +904,7 @@ cmd_status() {
 # identity outside this script - e.g. the root Makefile's `install`
 # target, which installs patches/lifecycle.toml under its declared id -
 # resolves it through this tool's own TOML reader instead of maintaining
-# a second, independently-drifting awk one-liner (the Makefile's own copy
-# had already drifted when a review compared the two).
+# a second, independently-drifting awk one-liner.
 cmd_manifest_id() {
     [ "${#MANIFESTS[@]}" -eq 1 ] || die "manifest-id takes exactly one manifest argument"
     manifest_id "${MANIFESTS[0]}" || die "${MANIFESTS[0]}: no top-level 'id' field found"

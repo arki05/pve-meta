@@ -1,5 +1,5 @@
 //! Wire types: request/response shapes that cross the Perl/Rust boundary
-//! (`docs/DESIGN.md` §5). Everything here carries data and decides nothing —
+//! (`docs/DESIGN.md` §8). Everything here carries data and decides nothing —
 //! no authorization, no lint, no I/O. If a type would ever need a method
 //! with a branch in it, it belongs in `api.rs`, not here.
 
@@ -60,7 +60,7 @@ pub struct ApiDocumentDigest {
     pub digest: String,
 }
 
-/// One row of `GET /meta/guests` (`docs/DESIGN.md` §5).
+/// One row of `GET /meta/guests` (`docs/DESIGN.md` §8).
 #[derive(Debug, Clone, Serialize)]
 pub struct GuestListEntry {
     pub vmid: u32,
@@ -91,7 +91,7 @@ pub struct ApiViewDocument {
     pub view: String,
     pub digest: String,
     /// Present when `format=json`. A native structure, unordered once it is a
-    /// Perl hash; key order is not a wire contract (`docs/DESIGN.md` §4).
+    /// Perl hash; key order is not a wire contract (`docs/DESIGN.md` §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     /// Present when `format=yaml`: the file's own text for the root view, a
@@ -100,7 +100,7 @@ pub struct ApiViewDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     /// Present only when the stored document is not valid YAML
-    /// (`docs/DESIGN.md` §4): the parser's message.
+    /// (`docs/DESIGN.md` §7): the parser's message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parse_error: Option<String>,
 }
@@ -132,7 +132,7 @@ pub struct ApiAccess {
     ///
     /// Filtered exactly as `GET /meta/guests` filters the same field: a
     /// caller without `VM.Audit` on the guest gets an empty list, not the
-    /// tags (`docs/DESIGN.md` §5).
+    /// tags (`docs/DESIGN.md` §8).
     pub tags: Vec<String>,
 }
 

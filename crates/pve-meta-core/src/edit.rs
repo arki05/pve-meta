@@ -1,5 +1,5 @@
 //! Staged edits: what an editor accumulates between a row edit and Apply,
-//! and what one Apply then sends (`docs/DESIGN.md` §8, "Edits are staged").
+//! and what one Apply then sends (`docs/DESIGN.md` §12, "Edits are staged").
 //!
 //! An [`EditSet`] is the one model behind the editor's two views. A row edit
 //! stages an [`Edit`]; the tree renders [`EditSet::apply`] -- the document as
@@ -140,7 +140,7 @@ impl EditSet {
     ///
     /// Narrow on purpose: a write that names less can collide with less, and
     /// a scope-only principal cannot name the root view at all
-    /// (`docs/DESIGN.md` §3.4). Not narrow for *permission* reasons -- this
+    /// (`docs/DESIGN.md` §5). Not narrow for *permission* reasons -- this
     /// consults no scopes; what a write may do is decided by what it changes,
     /// and a plan whose narrowest view is the root is an ordinary write.
     pub fn write_view(&self) -> Option<Path> {

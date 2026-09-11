@@ -2,7 +2,7 @@
 # postinst for the pve-meta package.
 #
 # pve-meta is a consumer of pve-ext's generic extension layer (see
-# docs/DESIGN.md section 5, pve-ext/README.md): its UI tab is a page
+# docs/DESIGN.md section 11, pve-ext/README.md): its UI tab is a page
 # manifest (pages/pve-meta.json) pve-ext-loader.js discovers on its own,
 # and its API module (perl/PVE/API2/Ext/Meta.pm) is discovered by
 # PVE::API2::Ext at pvedaemon/pveproxy startup -- neither needs anything

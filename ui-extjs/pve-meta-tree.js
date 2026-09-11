@@ -1,7 +1,7 @@
 /*
  * pve-meta-tree.js — the native ExtJS implementation of the pve-meta editor.
  *
- * One panel, one edited document, two views of it (DESIGN.md §7, §8):
+ * One panel, one edited document, two views of it (DESIGN.md §11, §12):
  *
  *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
  *     document the caller can see. Rows are the union of the keys present in the
@@ -152,7 +152,7 @@ PVE.meta.Utils = {
         return 'string';
     },
 
-    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §8).
+    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §12).
     displayValue: function (value, kind) {
         if (kind === 'map') {
             return '';
@@ -170,7 +170,7 @@ PVE.meta.Utils = {
     // than to a regex of ours. A format with no vtype (or one we do not know) simply
     // does not constrain the field: an unknown constraint must never block an edit.
     // This is the ONLY implementation of the format set anywhere: the server passes a
-    // prefix's `schema` through verbatim and never validates `format` (DESIGN §4 --
+    // prefix's `schema` through verbatim and never validates `format` (DESIGN §7 --
     // the lint is the authority, a schema is an affordance), and the shared core's
     // schema findings hand a `format` back here to be checked (`Shape.findings`)
     // rather than carrying a third implementation of what `ipv4` means.
@@ -297,7 +297,7 @@ PVE.meta.Utils = {
     // schema said so with `multiline`, which is the only way to know before the
     // first value exists. Adding a `nested yaml` *type* instead would be the string
     // blob wearing a hat: it costs the per-key rows, diffs and writes that nesting is
-    // for (docs/DESIGN.md §8).
+    // for (docs/DESIGN.md §12).
     editorKind: function (d) {
         if (!d) {
             return 'none';
@@ -450,10 +450,10 @@ PVE.meta.request = function (owner, opts) {
 // ---------------------------------------------------------------------------
 // The core: pve-meta-core, built for the browser (crates/pve-meta-wasm).
 //
-// The server's own code answers the questions this editor used to answer with a
-// second implementation: how a document reads and dumps, which key names are
-// legal, who may touch a path, which prefix governs one, what a schema makes of
-// a value, and what a set of staged edits does to a document. Below it: `Codec`
+// The server's own code answers the questions this editor needs: how a document
+// reads and dumps, which key names are legal, who may touch a path, which prefix
+// governs one, what a schema makes of a value, and what a set of staged edits
+// does to a document. Below it: `Codec`
 // and `Access`, stateless faces over the core's functions; `Shape` and `EditSet`,
 // objects that own their inputs (a Shape its listing and tags, an EditSet its
 // list) and whose methods are the core's -- so a call site reads as the concept
@@ -615,9 +615,7 @@ PVE.meta.Codec = {
 // the YAML | JSON switch, Diff, and "did anything change".
 //
 // The whole-document Text card and the subtree window each held a copy of all
-// of these, and copies drift: the window's toggle once re-dumped where the
-// card's kept the server's text, and a Format button called a helper the other
-// had renamed. A `buffer` is the small interface both editors hold:
+// of these, and copies drift. A `buffer` is the small interface both editors hold:
 // `{ editor, lang, original }` -- the Monaco editor, the language it is
 // showing, and the text it was loaded with, which is always the store's YAML.
 // ---------------------------------------------------------------------------
@@ -715,7 +713,7 @@ PVE.meta.Buffer = {
 // the same struct the server builds per request, read here from the wire.
 // Permissions accumulate by containment, and a rule on `p` covers `p`, its
 // comment key `p__` and everything under `p.` -- the only comment-key rule
-// there is (DESIGN §3.3).
+// there is (DESIGN §4).
 // ---------------------------------------------------------------------------
 
 PVE.meta.Access = {
@@ -727,7 +725,7 @@ PVE.meta.Access = {
 
     // May this caller write *anything* here: full write, or at least one `rw`
     // scope. What a write may actually change is decided by what it changes
-    // (DESIGN §3.4); this only says whether there is any point offering Apply.
+    // (DESIGN §5); this only says whether there is any point offering Apply.
     hasAnyWrite: (access) => PVE.meta.Core.call('access_has_any_write', access || {}),
 
     // Every rule, from every permission file in the `GET /meta/permissions`
@@ -743,7 +741,7 @@ PVE.meta.Access = {
 //
 // The prefixes that reach a guest, most-specific first; which of them governs a
 // path; what its schema says about the value there. Schemas shadow, they never
-// merge (DESIGN §3.1). A registry document is shaped by its meta-schema rooted at
+// merge (DESIGN §3). A registry document is shaped by its meta-schema rooted at
 // the document itself.
 //
 // A Shape owns its two inputs -- the `GET /meta/prefixes` listing and the guest's
@@ -1210,7 +1208,7 @@ PVE.meta.Monaco = {
                     hidden: !warnings.length,
                     boxLabel: gettext('Save anyway'),
                     // Advisory, not a gate: the server's lint decides what is storable
-                    // (DESIGN section 4). The tick is here so a mismatch is a deliberate
+                    // (DESIGN section 7). The tick is here so a mismatch is a deliberate
                     // act rather than a dialog reflex -- never to make it impossible.
                     listeners: {
                         change: (box, value) => win.down('#diffApplyBtn').setDisabled(!value),
@@ -1623,7 +1621,7 @@ Ext.define('PVE.meta.AddRuleWindow', {
 //
 // The key is not validated here on purpose: `schema.properties.<key>` is a document
 // path like any other, so the server's one lint decides what a key may be and says
-// so (DESIGN §4). A *dotted* key is refused, because that would silently declare a
+// so (DESIGN §7). A *dotted* key is refused, because that would silently declare a
 // nested property rather than the one the form is asking about.
 //
 // There is deliberately **no Optional field**. Every key of a guest document is
@@ -1631,7 +1629,7 @@ Ext.define('PVE.meta.AddRuleWindow', {
 // no code reads and no write enforces. A missing value is a legitimate state -- an
 // operator fills it in, or there is a reason it is not there -- and a `default` is an
 // offer the row makes ("Set to default"), never something written behind your back.
-// (`optional` survives in the meta-schema, DESIGN §3.6, because *those* files really do
+// (`optional` survives in the meta-schema, DESIGN §6, because *those* files really do
 // have required fields: a permission file without an `authid` is refused on the way in.)
 // ---------------------------------------------------------------------------
 
@@ -1822,7 +1820,7 @@ Ext.define('PVE.meta.DeclareKeyWindow', {
 });
 
 // ---------------------------------------------------------------------------
-// The row editor — opened by Edit, double-click or Enter (DESIGN §8).
+// The row editor — opened by Edit, double-click or Enter (DESIGN §12).
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.EditValueWindow', {
@@ -2098,9 +2096,8 @@ Ext.define('PVE.meta.TextWindow', {
 //
 // Everything that reads or writes `docState`, or talks to `/meta/*` directly.
 // The tree and the Text card each render a document; neither one owns it --
-// this is the seam that used to be invisible because both sides just called
-// `this.request`, `this.reload`, `this.write`, and nobody had to say which
-// `this` they meant.
+// this is the seam between them, so that `this.request`, `this.reload` and
+// `this.write` say which `this` they mean.
 // ---------------------------------------------------------------------------
 
 PVE.meta.Doc = {
@@ -2202,9 +2199,8 @@ PVE.meta.Doc = {
         );
     },
 
-    // /meta/prefixes and /meta/permissions are revision 6; against an older API they
-    // simply fail and the Access column and the schema-declared rows stay empty,
-    // rather than the page.
+    // A failure here doesn't break the page: the Access column and the
+    // schema-declared rows stay empty, rather than the page.
     loadPrefixes: function (next) {
         let me = this;
         me.request({
@@ -2239,9 +2235,9 @@ PVE.meta.Doc = {
     },
 
     // There is no separate tag request: `GET /meta/access` returns the guest's
-    // tags with the access answer (see `loadAccess`). It used to be
-    // `GET /meta/guests`, which reads, parses and digests every document in the
-    // cluster -- to learn one guest's tags, on every open of every guest tab
+    // tags with the access answer (see `loadAccess`), instead of a `GET
+    // /meta/guests` that would read, parse and digest every document in the
+    // cluster just to learn one guest's tags, on every open of every guest tab
     // that has a `tag:` selector anywhere in the registry, which the shipped
     // traefik prefix has.
 
@@ -2250,9 +2246,8 @@ PVE.meta.Doc = {
         me.request({
             url: '/meta/access',
             // Ask about the document this panel is actually showing: a guest's read
-            // is VM.Audit, a registry file's is open to every authenticated user, and
-            // asking about the wrong kind once disabled Text mode on a file the
-            // caller could certainly read (DESIGN §3.5).
+            // is VM.Audit, a registry file's is open to every authenticated user, so
+            // asking about the wrong kind gives the wrong access answer (DESIGN §6).
             params: { id: me.docId },
             success: function (response) {
                 me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
@@ -2293,11 +2288,10 @@ PVE.meta.Doc = {
     //
     // perlmod renders a document as a **native Perl hash**, and a Perl hash has no
     // key order at all: two `GET`s of the same document come back with their keys
-    // in different orders, depending on which pvedaemon worker answered (verified
-    // on the lab -- three requests, two different orders). Key order is data in
-    // this model (DESIGN section 2), and `plannedData()` is exactly what an Apply
-    // at the root view sends back, so reading JSON meant writing the document back
-    // in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
+    // in different orders, depending on which pvedaemon worker answered. Key order is
+    // data in this model (DESIGN section 2), and `plannedData()` is exactly what an
+    // Apply at the root view sends back, so reading JSON meant writing the document
+    // back in an order nobody chose. Nothing ever *looked* wrong, because the tree sorts
     // its rows; the file changed anyway. The canonical YAML text is the one
     // representation on this wire that carries the order the store actually holds.
     //
@@ -2325,7 +2319,7 @@ PVE.meta.Doc = {
                         //
                         // So hand it to the text editor, which is the one place a
                         // document that is not a document can still be worked on, and
-                        // is where DESIGN §4 says the repair happens: a root replace
+                        // is where DESIGN §7 says the repair happens: a root replace
                         // with a full document. Monaco already puts the parser's own
                         // complaint on the offending line, so nothing here has to
                         // explain what is wrong. `docParseError` is what keeps the
@@ -2534,8 +2528,8 @@ PVE.meta.TextCard = {
     },
 
     // The loaded document rendered in `lang`; the diff's "original" side and the
-    // yardstick the dirty check uses. `Utils.originalInLang` -- the subtree
-    // window's own diff used to inline the same conversion rather than share this.
+    // yardstick the dirty check uses. `Utils.originalInLang` is shared with the
+    // subtree window's own diff rather than a second inline conversion there.
     // What the buffer should show: the **planned** document -- stored plus whatever is
     // staged -- in `lang`. With nothing staged this is the server's own text, comments
     // and all, because `renderBuffer` prefers the original when the document is
@@ -2630,8 +2624,7 @@ PVE.meta.TextCard = {
 
     // Going back to the tree keeps whatever was typed: the buffer is turned into
     // staged edits on rows, so the tree shows which keys changed and to what, and one
-    // Apply writes them. Switching views is not a decision about your work any more --
-    // it used to ask you to discard it, which is why it felt like a trap.
+    // Apply writes them. Switching views is not a decision about your work.
     //
     // The one thing that can stop it is a buffer that does not parse: there is no
     // document to show as a tree, and guessing at one would lose what was typed. So it
@@ -2724,7 +2717,7 @@ PVE.meta.TextCard = {
         // Same rule as the tree's Apply: stop only when the document would not match
         // the schema, because that is the one case where seeing the diff changes what
         // you decide. The tick keeps storing it anyway a deliberate act -- the server's
-        // lint decides what is *storable* (DESIGN §4), and an operator whose schema has
+        // lint decides what is *storable* (DESIGN §7), and an operator whose schema has
         // drifted must not be able to lock the administrator out of editing.
         let warnings = me.textFindings();
         if (!warnings.length) {
@@ -2770,7 +2763,7 @@ PVE.meta.TextCard = {
     // each declared line on hover.
     //
     // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
-    // is the authority (DESIGN section 4):
+    // is the authority (DESIGN section 7):
     //
     //   * a YAML syntax error, as one Error marker on the line the parser reports. Monaco
     //     ships a JSON language service that does this for the JSON view already, but
@@ -2956,7 +2949,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
         me.vmid = me.vmid || sel.vmid;
         // This panel is ONE document's editor, named by `docId`: a guest's, or a
-        // prefix/permission file's -- they are all documents (DESIGN §3.5), so the
+        // prefix/permission file's -- they are all documents (DESIGN §6), so the
         // same tree, markers, text editor and diff serve both, and the registry
         // grids open one of these in a window rather than reimplementing any of it.
         //
@@ -3140,7 +3133,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             '-',
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
-            // Only shown when the caller is restricted (DESIGN §8).
+            // Only shown when the caller is restricted (DESIGN §12).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
         ];
     },
@@ -3215,7 +3208,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(html) + '"';
             }
         };
-        // The grammar's description is the tooltip of every cell in the row (DESIGN §8)
+        // The grammar's description is the tooltip of every cell in the row (DESIGN §12)
         // -- unless the row does not match its schema, in which case that is the more
         // urgent thing to say and goes first.
         let rowTip = function (rec, meta) {
@@ -3328,10 +3321,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                               (stored || '&nbsp;') +
                               '</div>'
                             : shown;
-                    // The discard sits on the row it acts on. It used to be a button
-                    // in the top toolbar, which meant reading the toolbar to find out
-                    // what it would apply to -- and on a list member it applied to the
-                    // whole list, which was worse than unclear.
+                    // The discard sits on the row it acts on, not in a toolbar, so what
+                    // it applies to is never in question -- on a list member in
+                    // particular, where an edit applies to the whole list.
                     let undo =
                         ' <i class="fa fa-undo pve-meta-undo" style="cursor:pointer" ' +
                         'data-qtip="' + Ext.htmlEncode(gettext('Discard this change')) + '"></i>';
@@ -3344,7 +3336,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             {
                 // Guest documents only, structurally: a registry document's top-level
                 // keys are fixed and `deny_unknown_fields` refuses a fourth, so a
-                // comment key cannot exist there to describe one (DESIGN §3.5). An
+                // comment key cannot exist there to describe one (DESIGN §6). An
                 // always-empty column is a column that teaches you to ignore columns.
                 hidden: me.docKind(me.docId) !== 'guest',
                 // The row's own comment key (`k__`) if present, else nothing.
@@ -3360,7 +3352,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 },
             },
             {
-                // Permissions reach guest documents only (DESIGN §3.3), so on anything
+                // Permissions reach guest documents only (DESIGN §4), so on anything
                 // else this column can only ever be blank.
                 hidden: me.docKind(me.docId) !== 'guest',
                 text: gettext('Access'),
@@ -3395,9 +3387,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // Every path in `docId` whose value does not match its schema, by path. The tree
-    // shows these on the rows themselves: the text editor has squiggled them since
-    // revision 6, but the tree is the view people actually open, and a value the
-    // schema refuses looked exactly like one it liked. The same Shape answers here,
+    // shows these on the rows themselves: the text editor already squiggles them, but
+    // the tree is the view people actually open, and a value the schema refuses would
+    // otherwise look exactly like one it liked. The same Shape answers here,
     // for the text editor's squiggles and for the warning banner Apply shows: one
     // question asked three times, through one implementation.
     findingsFor: function () {
@@ -3560,7 +3552,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // What a document's Shape is built from. A guest's: the prefix listing and the
     // guest's tags (the server resolved the selectors it enforces; these tags are for
     // the rendering decisions the client makes on top, and the client only ever
-    // matches tags it was given, DESIGN §8). A registry file's: the meta-schema for
+    // matches tags it was given, DESIGN §12). A registry file's: the meta-schema for
     // its kind.
     shapeInputs: function (id) {
         let me = this;
@@ -3695,10 +3687,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         let declare = me.down('#declareBtn');
         if (declare) {
-            // Hidden by the *document*, disabled by the *row* -- the rule above. It
-            // used to read `row.docId`, so with nothing selected it hid itself and
-            // reappeared on the next click: a button that flickers as you move
-            // through a tree, for a fact that cannot change while you are in it.
+            // Hidden by the *document*, disabled by the *row* -- the rule above. Hidden
+            // reads `me.docId`, not the selected row, because the document kind cannot
+            // change while you are in the tree, but the selected row does on every click.
             declare.setHidden(me.docKind(me.docId) !== 'prefix');
             declare.setDisabled(text || !row || !row.editable);
         }
@@ -3719,7 +3710,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // caller may write at all -- the diff is what decides if it is worth it.
             //
             // "At all" means any rw scope, not full write access. A whole-document
-            // write is authorized by what it changes (DESIGN §3.4), so a principal
+            // write is authorized by what it changes (DESIGN §5), so a principal
             // holding `rw` on one prefix can perfectly well apply a buffer whose only
             // changes are inside it -- and the server refuses the rest, naming the path
             // it refused. Requiring full write here disabled the button for exactly the
@@ -3737,7 +3728,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // The label is a restriction notice, so it says nothing at all for a caller with
-    // full write access (DESIGN §8).
+    // full write access (DESIGN §12).
     syncAccessLabel: function () {
         let me = this;
         let modeBtn = me.down('#modeBtn');
@@ -3759,14 +3750,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         if (modeBtn && modeBtn.items.getAt(1)) {
             // The Text card is the whole document at the root view, and a scope-only
-            // principal may not read that at all (DESIGN §3): do not offer it. Staged
+            // principal may not read that at all (DESIGN §5): do not offer it. Staged
             // edits are no longer a reason to refuse -- the buffer is rendered from the
             // planned document, so they are *in* it, and switching back turns whatever
             // was typed into staged edits again.
             modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
         // A Text-mode Apply is a root replace, which needs full write and nothing else
-        // (DESIGN §3.4, `authorize_view_write`). Without this a read-only caller could
+        // (DESIGN §5, `authorize_view_write`). Without this a read-only caller could
         // compose a whole document, open the diff, tick through the schema warning and
         // collect a 403 at the very end -- the server was right, the button was a lie.
         me.syncFooter();
@@ -3787,7 +3778,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // `shapeFor` (the prefixes that reach this guest) and `applicablePermissions`
     // (the rules that do) both resolve `selector: { tag: t }` against `me.tags`,
-    // which `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §5).
+    // which `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §8).
     // That is not a gap here: this is a guest tab, and a caller without VM.Audit
     // on `/vms/<vmid>` never sees the guest in the resource tree at all
     // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
@@ -3796,7 +3787,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // The permission rules that reach this guest, with the file each came from.
     // Permissions decide *access*, and unlike prefixes they accumulate by
-    // containment: a rule on `homelab` covers `homelab.docker` (DESIGN section 3.2).
+    // containment: a rule on `homelab` covers `homelab.docker` (DESIGN section 4).
     // The core answers from the listing and this guest's tags, the same way the
     // server computes a caller's scopes, and a file that did not load grants nothing.
     applicablePermissions: function () {
@@ -3852,7 +3843,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             key: key,
             path: path,
             // Object.create(null): `key` is a document key (attacker-chosen, and
-            // no key is reserved - DESIGN §4), so a plain `{}` here lets a key
+            // no key is reserved - DESIGN §2), so a plain `{}` here lets a key
             // like `constructor` or `hasOwnProperty` resolve through the
             // prototype chain instead of being treated as absent.
             children: Object.create(null),
@@ -3894,7 +3885,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // only, so there is no path to `groups[1]` (DESIGN §2) and nothing may try
             // to write one. They carry their index instead, and everything that acts
             // on one rewrites the list it is in -- which is exactly what staging is
-            // for (§8), so this needs no new write path.
+            // for (§12), so this needs no new write path.
             if (child.kind === 'array') {
                 v.forEach(function (item, i) {
                     let row = me.entry(child, String(i), child.path);
@@ -3928,10 +3919,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // default, enum, range, format and description -- from the core's schema index,
     // which is already pruned where a more specific prefix governs, so a parent's
     // `properties` never reach into a child prefix's subtree and rewrite its row
-    // kind. Schemas shadow, they never merge (DESIGN section 3.1); the same rule
+    // kind. Schemas shadow, they never merge (DESIGN section 3); the same rule
     // the findings and the hovers come through, from the same Shape.
     //
-    // A registry document's meta-schema is rooted at the document (DESIGN §3.6):
+    // A registry document's meta-schema is rooted at the document (DESIGN §6):
     // its "prefix" is the empty path, which is the root row itself and gets nothing.
     addShape: function (root, shape) {
         let me = this;
@@ -3973,7 +3964,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             let ps = ix.schema || {};
             let child = ensure(ix.path);
             // The comment key stays the Description column; the grammar's own
-            // description is the tooltip (DESIGN §8), so they are two fields.
+            // description is the tooltip (DESIGN §12), so they are two fields.
             child.grammarDescription = child.grammarDescription || ps.description;
             if (ps.type === 'object') {
                 child.kind = 'map';
@@ -4006,7 +3997,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // a block of text". Only a declaration can say so before the key has
             // a value, which is exactly what `Utils.editorKind` cannot see for
             // itself. It is an editor hint and nothing else -- the server neither
-            // reads it nor validates against it, like `format` (DESIGN §4).
+            // reads it nor validates against it, like `format` (DESIGN §7).
             if (ps.multiline !== undefined && child.multiline === undefined) {
                 child.multiline = !!ps.multiline;
             }
@@ -4021,7 +4012,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // The merged rows of ONE document: what is present in it, plus what its grammar
-    // declares (DESIGN §8). Two sources, one set of entries.
+    // declares (DESIGN §12). Two sources, one set of entries.
     documentEntries: function () {
         let me = this;
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
@@ -4080,7 +4071,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let me = this;
         let I = PVE.meta.Icons;
         // Permissions reach guest documents only, so the Access
-        // column is empty on the datacenter tab by construction (DESIGN §3.3).
+        // column is empty on the datacenter tab by construction (DESIGN §4).
         let scopes = me.applicablePermissions();
 
         let findings = me.findingsFor();
@@ -4173,7 +4164,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                             (stagedBelow[c.path] || {}).count ||
                             (kind === 'array' && staged[c.path] ? 1 : 0),
                         // Rendered with the row's own kind, not one inferred from the
-                        // raw value: the API returns booleans as 1/0 (DESIGN §4), so
+                        // raw value: the API returns booleans as 1/0 (DESIGN §7), so
                         // inferring would print a struck-through "1" under a row whose
                         // stored value reads "Yes".
                         storedText: (function () {
@@ -4290,8 +4281,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // That is the whole point: the states in between are the ones the server refuses
     // (a selector with both `all` and `tag`, or neither), so they must never reach it.
     // The write is a `replace` at the narrowest view covering every staged path, with
-    // the planned subtree as its content -- for a single row edit that is exactly the
-    // one-key write this used to send immediately.
+    // the planned subtree as its content -- for a single row edit that is exactly a
+    // one-key write.
     //
     // Apply applies: it stops for the diff only when the planned document would not
     // match the schema (see `confirmAndApply`, which says why there is no `dry_run`
@@ -4325,15 +4316,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         //
         // `writeView` steps up a level for a delete, because you cannot remove a key by
         // replacing it -- and for a *top-level* key that step lands on the document
-        // root. That used to be a 403 for a scoped principal; now the server reads a
-        // root replace by what it changes, so it would be allowed. This stays anyway,
-        // because `DELETE ?view=traefik` is the smaller write: it names one subtree
-        // instead of the whole document, so it collides with less, and it does not
-        // require the caller to be able to send back every key it did not touch.
+        // root. A root replace is not required for permission reasons -- the server
+        // authorizes a write by what it changes -- but the narrower `DELETE
+        // ?view=traefik` stays anyway, because it is the smaller write: it names one
+        // subtree instead of the whole document, so it collides with less, and it does
+        // not require the caller to be able to send back every key it did not touch.
         let onlyDelete =
             me.pending.length === 1 && me.pending.edits[0].op === 'delete' && me.pending.edits[0].path;
         // `force` is what the warned dialog's Apply sends: the "Save anyway" tick.
-        // A prefix with `enforce: true` refuses the write without it (DESIGN §4).
+        // A prefix with `enforce: true` refuses the write without it (DESIGN §7).
         let write = function (force) {
             if (onlyDelete) {
                 let q = Ext.Object.toQueryString({
@@ -4421,7 +4412,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // Stage a declared default, because someone asked for it. Never on its own: an
     // unset key stays unset, and a set one keeps whatever it was set to, until this
-    // click (DESIGN §8).
+    // click (DESIGN §12).
     //
     // A row already at its default is refused here as well as disabled in the
     // toolbar, so the two cannot drift apart -- the button's state is a hint, this is
@@ -4587,7 +4578,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 //
 // It is the ordinary editor panel, unchanged: tree, row editors, markers, the
 // Tree | Text toggle, the diff. A prefix definition or a permission file is a document
-// (DESIGN §3.5), so "edit one" was never a thing that needed its own editor.
+// (DESIGN §6), so "edit one" was never a thing that needed its own editor.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DocumentWindow', {
@@ -4627,7 +4618,7 @@ Ext.define('PVE.meta.DocumentWindow', {
 //
 // Everything else about a prefix definition is optional and is filled in by
 // editing the document it creates; this only gets far enough that the file parses,
-// because a file the loader would skip is refused on the way in (DESIGN §3.5).
+// because a file the loader would skip is refused on the way in (DESIGN §6).
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.NewRegistryWindow', {
@@ -4891,7 +4882,7 @@ Ext.define('PVE.meta.NewRegistryWindow', {
 // ---------------------------------------------------------------------------
 // Creating a service principal, for the "New" dialog's second half.
 //
-// Two things about PVE's model shape this, both verified on the lab:
+// Two things about PVE's model shape this:
 //
 // * **A `pve`-realm user with no password cannot log in at all** (`/access/ticket`
 //   answers "authentication failure"), while its token keeps working. That is the
@@ -5153,7 +5144,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         };
         set('addBtn', !may);
         // A packaged file is editable: the write creates the cluster override rather
-        // than touching the package's copy (DESIGN §3.5). Removing one is not, since
+        // than touching the package's copy (DESIGN §6). Removing one is not, since
         // there would be nothing of ours to remove.
         set('editBtn', !rec || !may);
         set('removeBtn', !rec || !may || rec.data.origin === 'packaged');
@@ -5168,7 +5159,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         me.request({
             url: '/meta/access',
             // No id: the registry's own answer, whose `write` is Sys.Modify on `/`
-            // (DESIGN §3.5). A list needs no file to ask about.
+            // (DESIGN §6). A list needs no file to ask about.
             params: {},
             success: function (response) {
                 me.access = response.result.data || { write: 0 };

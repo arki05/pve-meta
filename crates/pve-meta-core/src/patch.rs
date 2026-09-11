@@ -99,7 +99,7 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
                 // in itself, even if the patch body wrote no leaves; creating
                 // a container the patch then writes nothing into is not (a
                 // merge that touches nothing changes nothing,
-                // `docs/DESIGN.md` §4). Either way the *container's* path is
+                // `docs/DESIGN.md` §7). Either way the *container's* path is
                 // what is reported, keeping this arm's "replacing a whole
                 // subtree yields its root path" convention.
                 if existed || !sub.is_empty() {
@@ -279,13 +279,10 @@ mod tests {
 
     #[test]
     fn a_nested_delete_marker_is_applied_not_spliced_into_the_document() {
-        // The catch-all arm must not insert the patch value
-        // verbatim when the target key was absent or not an object, so a
-        // nested `null` landed in the document as a literal null and the
-        // whole-document lint then rejected the write -- making the
-        // documented combined set+delete shape unusable against a container
-        // that does not exist yet. A merge payload may carry those nulls on
-        // purpose, so nothing it accepts may trip `model::lint`.
+        // A nested `null` delete marker must never land in the document as a
+        // literal null, even against a container that does not exist yet: a
+        // merge payload may carry those nulls on purpose, so nothing it
+        // accepts may trip `model::lint`.
 
         // (a) Absent container, nothing but deletes: a no-op that creates
         //     nothing and touches nothing.
@@ -337,9 +334,9 @@ mod tests {
 
     #[test]
     fn a_patch_key_that_only_deletes_never_reaches_the_document() {
-        // There is no separate patch lint any more (`docs/DESIGN.md` §4: one
-        // lint, on the planned document). A patch key that would be invalid
-        // as a document key is harmless as long as it only ever deletes.
+        // One lint runs on the planned document (`docs/DESIGN.md` §7). A patch
+        // key that would be invalid as a document key is harmless as long as
+        // it only ever deletes.
         let mut doc = json!({"a": 1});
         assert!(apply_patch(&mut doc, &json!({"bad key": null})).is_empty());
         assert_eq!(doc, json!({"a": 1}));

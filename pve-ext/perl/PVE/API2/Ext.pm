@@ -175,16 +175,8 @@ sub _scan_and_register {
 # first, so _register_guarded's eval-wrapped register_method call for the
 # extension fails and is warned-and-skipped) instead of the reverse.
 #
-# Previously this module registered itself and ran its scan as top-level
-# statements, executed the moment `use PVE::API2::Ext;` compiled this file
-# in -- which happens at BEGIN time, i.e. before *any* of PVE/API2.pm's
-# own runtime register_method calls, regardless of where in that file the
-# `use` line sits. That made every extension win every collision against
-# core, which is exactly backwards. `require` (not `use`) plus this
-# explicit call, placed at the true end of PVE/API2.pm, fixes the
-# ordering; folding the two side effects that used to run at `use` time
-# into this one guarded call is what makes a colliding ext_path (`ext`
-# itself included) a `warn`, never a fatal `die` that takes pvedaemon and
+# This guarded call is what makes a colliding ext_path (`ext` itself
+# included) a `warn`, never a fatal `die` that takes pvedaemon and
 # pveproxy down with it.
 sub register_all {
     my ($class) = @_;

@@ -417,7 +417,7 @@ async function main() {
             // The 409 path: send a write with a stale digest and read the dialog.
             result.checks.conflict = await page.evaluate(() => {
                 const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-                p.write({ view: 'traefik.spec.host', mode: 'replace', data: '"x"', digest: 'deadbeef' });
+                p.write(p.docId, { view: 'traefik.spec.host', mode: 'replace', data: '"x"', digest: 'deadbeef' });
                 return 'sent';
             });
             await sleep(2500);

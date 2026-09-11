@@ -1,4 +1,4 @@
-# An example prefix definition (docs/DESIGN.md §3.1).
+# An example prefix definition (docs/DESIGN.md §3).
 #
 # Packaged definitions live in /usr/share/pve-meta/prefixes/<prefix>.yaml and
 # are dropped in by an operator's own .deb; a cluster-wide file of the same
@@ -11,7 +11,7 @@
 # A definition names no principal. Declaring that a prefix exists and has a
 # shape is useful with no operator, no token and no automation anywhere near
 # it -- a structured notes field with a schema is a complete use of this
-# system. Who may *write* it is a separate file (docs/DESIGN.md §3.2).
+# system. Who may *write* it is a separate file (docs/DESIGN.md §4).
 #
 # Files are parsed strictly and independently. A malformed file is skipped
 # with a warning and contributes nothing; it never affects another one.

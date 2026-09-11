@@ -14,7 +14,7 @@ use PVE::RS::Meta;
 use base qw(PVE::RESTHandler);
 
 # `PVE::API2::Ext::Meta`: the native `/meta/...` API tree (`docs/DESIGN.md`
-# §5), a thin `PVE::RESTHandler` subclass whose methods call straight into
+# §8), a thin `PVE::RESTHandler` subclass whose methods call straight into
 # `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`, implemented in
 # `pve_meta_core::api`). This module does parameters, PVE ACL checks, the
 # vmlist, the guests' tags and the per-document write lock; everything else --
@@ -24,7 +24,7 @@ use base qw(PVE::RESTHandler);
 # Rust.
 #
 # Everything crosses the boundary as a **native structure** (`docs/DESIGN.md`
-# §5): the caller's ACL hash goes in, documents and results come back as Perl
+# §8): the caller's ACL hash goes in, documents and results come back as Perl
 # hashes and arrays. The one exception is the client's `data` parameter, which
 # is a JSON string because that is what the REST parameter is; Rust decodes it
 # once. There is no JSON encoding or decoding in this file.
@@ -42,7 +42,7 @@ sub ext_path { return 'meta' }
 
 # -- the caller's ACL ------------------------------------------------------
 #
-# `docs/DESIGN.md` §3: `full_read` = `VM.Audit` on `/vms/<vmid>`,
+# `docs/DESIGN.md` §5: `full_read` = `VM.Audit` on `/vms/<vmid>`,
 # `full_write` = `VM.Config.Options`. Rust adds the scopes from the permission
 # files whose authid is the caller and whose selector matches the guest's tags
 # -- which is why the tags travel with the ACL. A registry document (a prefix
@@ -77,7 +77,7 @@ sub _guest_acl {
     };
 }
 
-# A registry document -- one prefix definition or permission file (docs/DESIGN.md §3) --
+# A registry document -- one prefix definition or permission file (docs/DESIGN.md §5) --
 # is an administrator's to edit and nobody else's.
 #
 # Read is open to every authenticated user, because it has to agree with the
@@ -122,10 +122,10 @@ sub _call {
 }
 
 # Runs $code under the cluster-wide lock for one document
-# (`docs/DESIGN.md` §4): every API write is a read-modify-write of a file on
+# (`docs/DESIGN.md` §7): every API write is a read-modify-write of a file on
 # pmxcfs, which is shared by every node, and the writes are deliberately not
 # `proxyto`'d -- so without this two nodes can both read, both write, and
-# silently lose one update (observed live on the lab cluster). The digest
+# silently lose one update. The digest
 # precondition is re-checked *inside* the critical section, because the whole
 # Rust call happens in here and `cfs_lock_domain` runs `cfs_update()` before
 # invoking $code.
@@ -154,7 +154,7 @@ sub _vmlist_ids {
     return $vmlist->{ids} || {};
 }
 
-# `docs/DESIGN.md` §5: "PUT and DELETE return 404 for a vmid that is not in
+# `docs/DESIGN.md` §8: "PUT and DELETE return 404 for a vmid that is not in
 # the vmlist; GET of such a vmid is 404 too." Without this, "every guest
 # document" is really "every u32": any caller with one rw scope could create
 # unbounded files under `/etc/pve/meta` (replicated cluster-wide by pmxcfs,
@@ -231,14 +231,14 @@ my $FORCE_SCHEMA = {
     default => 0,
     description => "Store the result even where a prefix declares 'enforce: true' and "
         . "the write would leave its subtree not matching that prefix's schema "
-        . "(docs/DESIGN.md §4). Without it such a write is a 422 naming the paths. "
+        . "(docs/DESIGN.md §7). Without it such a write is a 422 naming the paths. "
         . "This is what the editor's \"Save anyway\" tick sends.",
 };
 
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
-        . "permission files (docs/DESIGN.md §3.2), with selectors already resolved.",
+        . "permission files (docs/DESIGN.md §4), with selectors already resolved.",
     items => {
         type => 'object',
         properties => {
@@ -260,7 +260,7 @@ my $VIEW_RETURNS = {
             type => 'string',
             optional => 1,
             description => "Present only when the stored document's content could not be "
-                . "recovered (docs/DESIGN.md §4): it is not valid YAML, it is above the "
+                . "recovered (docs/DESIGN.md §7): it is not valid YAML, it is above the "
                 . "store's read cap, or it parses to something that is not a mapping. "
                 . "'text' is then the file's raw text, so an administrator can repair it "
                 . "with a whole-document PUT (no 'view', mode=replace) or remove it with "
@@ -412,7 +412,7 @@ __PACKAGE__->register_method({
     path => 'access',
     method => 'GET',
     permissions => { user => 'all' },
-    description => "The caller's effective access for one document (docs/DESIGN.md §3): "
+    description => "The caller's effective access for one document (docs/DESIGN.md §5): "
         . "'read'/'write' are the ACL answers for that document (VM.Audit / "
         . "VM.Config.Options on a guest; for a prefix or permission file, read is open "
         . "to every authenticated user and write is Sys.Modify on /), and 'scopes' "
@@ -459,9 +459,8 @@ __PACKAGE__->register_method({
         # One place that maps a document id to the ACL answers for that *kind* of
         # document: the endpoint families each know their own mapping, and this
         # endpoint has to agree with them. The two kinds answer differently, and
-        # only the write bit coincides -- which is why asking about the wrong
-        # kind used to be invisible until someone held Sys.Modify without
-        # Sys.Audit.
+        # only the write bit coincides -- mixing up the kind is silently
+        # wrong for a caller holding Sys.Modify without Sys.Audit.
         my $id = $param->{id};
         if (!defined($id)) {
             my $acl = _registry_acl($rpcenv, $authuser);
@@ -492,7 +491,7 @@ __PACKAGE__->register_method({
             . "(docs/DESIGN.md §1) and is what the editor needs to render typed rows.",
         user => 'all',
     },
-    description => "Every prefix (docs/DESIGN.md §3.1): the files in "
+    description => "Every prefix (docs/DESIGN.md §3): the files in "
         . "/usr/share/pve-meta/prefixes and /etc/pve/meta.d/prefixes, with a cluster "
         . "file overriding the packaged one of the same name. The file name is the "
         . "prefix. Sorted most-specific first, which is the order that resolves which "
@@ -540,7 +539,7 @@ __PACKAGE__->register_method({
             . "shows for every row, and listings are out of scope (docs/DESIGN.md §1).",
         user => 'all',
     },
-    description => "Every permission file (docs/DESIGN.md §3.2): the files in "
+    description => "Every permission file (docs/DESIGN.md §4): the files in "
         . "/etc/pve/meta.d/permissions. Cluster-only on purpose -- there is deliberately no "
         . "packaged permissions directory, because an operator's own package may ship a "
         . "prefix definition (what it expects) but must never ship its own. A file that did "
@@ -587,7 +586,7 @@ __PACKAGE__->register_method({
             . "file format, the same one this package's own documentation carries.",
         user => 'all',
     },
-    description => "The two registry file formats as schemas (docs/DESIGN.md §3.6), "
+    description => "The two registry file formats as schemas (docs/DESIGN.md §6), "
         . "keyed 'prefix' and 'permission', in the same PVE::JSONSchema dialect a "
         . "prefix uses to describe a guest's subtree. The editor renders a "
         . "prefix or permission document with these the way it renders a guest document "
@@ -613,9 +612,8 @@ __PACKAGE__->register_method({
 # Rust ($get_view / $put_view / $delete_view). What differs is how the request
 # names the document, which ACL answers describe the caller on it, what lock a
 # write holds, and what the API docs say. Those are a spec, and the three
-# methods are generated from it: two copies of a read/write pair is how this
-# project has produced every wrong-result bug it has had, and the guest triple
-# used to be exactly that beside the generated registry ones.
+# methods are generated from it: a duplicated read/write pair is where this
+# project's wrong-result bugs come from.
 #
 #   name      the method-name suffix: get_<name>, put_<name>, delete_<name>
 #   path      the REST path, with its parameter placeholder if it has one
@@ -727,7 +725,7 @@ my $REGISTRY_NAME_SCHEMA = {
     pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',
     maxLength => 128,
     description => "The file's name, without the '.yaml' suffix. For a prefix "
-        . "definition that name *is* the prefix (docs/DESIGN.md §3.1): the file "
+        . "definition that name *is* the prefix (docs/DESIGN.md §3): the file "
         . "'homelab.docker.yaml' declares 'homelab.docker'.",
 };
 
@@ -750,7 +748,7 @@ for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
         perms => {
             get => "Readable by every authenticated user, exactly as the "
                 . "GET /meta/$dir listing is (docs/DESIGN.md §1).",
-            put => "Requires Sys.Modify on / (docs/DESIGN.md §3).",
+            put => "Requires Sys.Modify on / (docs/DESIGN.md §5).",
             delete => "Requires Sys.Modify on / for the view and every touched "
                 . "path, same as PUT.",
         },
@@ -816,7 +814,7 @@ __PACKAGE__->register_method({
         # opens `/etc/pve/.vmlist` or a guest config, so the two can no longer
         # disagree and guest-config parsing is not re-implemented in a second
         # language. `hostname` is the LXC name field, `name` the qemu one;
-        # `tags` resolves the permission files' and prefix definitions' selectors (docs/DESIGN.md §3).
+        # `tags` resolves the permission files' and prefix definitions' selectors (docs/DESIGN.md §3, §4).
         my $props = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname tags)]) } || {};
         warn "pve-meta: could not read guest properties: $@" if $@;
 
@@ -854,7 +852,7 @@ _register_document_methods({
         get => "The response is filtered to what the caller may read (VM.Audit, "
             . "or a granted scope whose selector matches this guest). A caller with "
             . "neither is refused with 403, as is a 'view' outside the caller's read "
-            . "access. A vmid that is not in the vmlist is 404 (docs/DESIGN.md §5).",
+            . "access. A vmid that is not in the vmlist is 404 (docs/DESIGN.md §8).",
         put => "Anybody may call this. What authorizes the write is what it "
             . "*changes*: every path it touches -- values changed, keys added, keys "
             . "removed -- must be covered by VM.Config.Options or by a granted rw "

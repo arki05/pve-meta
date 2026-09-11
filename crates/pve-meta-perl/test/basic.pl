@@ -7,7 +7,7 @@
 # directly -- see `-I.` above and `Makefile`'s `all` target).
 #
 # The point of this file, beyond the contract itself, is the **boundary**
-# (`docs/DESIGN.md` §5): permissions, guest lists and results cross as native Perl
+# (`docs/DESIGN.md` §8): permissions, guest lists and results cross as native Perl
 # hashes and arrays, and only the client's `data` parameter is a JSON string.
 # So everything below passes real hash refs and inspects real hash refs; the
 # only `encode_json` here is for that one parameter.
@@ -44,7 +44,7 @@ sub read_file {
     return $content;
 }
 
-# The file name is the prefix (docs/DESIGN.md §3.1).
+# The file name is the prefix (docs/DESIGN.md §3).
 sub write_prefix {
     my ($name, $content) = @_;
     open(my $fh, '>', "$nsdir/$name.yaml") or die "failed to write $nsdir/$name.yaml: $!\n";
@@ -73,7 +73,7 @@ my $res;
 like(PVE::RS::Meta::version(), qr/^\d+\.\d+\.\d+$/, 'version() looks like a semver string');
 
 # =========================================================================
-# Snapshot hooks -- the only lifecycle exports (docs/DESIGN.md §6).
+# Snapshot hooks -- the only lifecycle exports (docs/DESIGN.md §9).
 # =========================================================================
 
 is(PVE::RS::Meta::on_snapshot(9001, 'before'), 0, 'on_snapshot is a no-op without a document');
@@ -97,7 +97,7 @@ is(PVE::RS::Meta::on_rollback(9001, 'gone'), 'none', 'on_rollback is a no-op whe
 
 # --- on_create / on_destroy ---------------------------------------------
 #
-# The two hooks patched into PVE::AbstractConfig (docs/DESIGN.md §6). Both clear a
+# The two hooks patched into PVE::AbstractConfig (docs/DESIGN.md §9). Both clear a
 # vmid's document and every snapshot copy; only the call site differs.
 write_file('9300.yaml', "traefik:\n  host: old.example\n");
 PVE::RS::Meta::on_snapshot(9300, 'snapA');
@@ -123,10 +123,9 @@ $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# The lifecycle exports revision 5 removed (docs/DESIGN.md §10) are gone. Two names are
-# deliberately *not* in this list: `on_destroy` came back with the create/destroy hooks
-# (§6), and `api_permissions` came back in revision 6 meaning something else entirely -- the
-# grant-file listing behind GET /meta/permissions, not revision 5's caller-scope lookup.
+# These lifecycle exports are gone. `on_destroy` and `api_permissions` are not in
+# this list: those names exist again, but as the create/destroy hook and the
+# grant-file listing behind GET /meta/permissions, respectively.
 for my $gone (qw(on_clone export_for_backup import_from_backup
                  list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
@@ -147,7 +146,7 @@ is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200, 999500],
     'stored_vmids lists every guest vmid with any file, sorted, never a stray file');
 
 # The only removal path for a stale vmid is the destroy hook, run by `pve-meta rm`
-# under the document's own write lock (docs/DESIGN.md section 6).
+# under the document's own write lock (docs/DESIGN.md section 10).
 is(PVE::RS::Meta::on_destroy(999500), 2, 'on_destroy removes a stale document and its snapshot copy');
 is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200], '... and the vmid leaves the list');
 ok(file_exists('datacenter.yaml'), 'a stray file with no vmid in its name is never a guest');
@@ -163,9 +162,7 @@ unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$roo
 # =========================================================================
 
 # `$acl` is a native hash. perlmod converts a Perl scalar to a Rust bool by
-# *truthiness*, so 1/0/''/undef all mean what a Perl programmer expects --
-# this is the bug class the old hand-built `_permissions_json` existed to avoid
-# (encode_json rendered 1/0 as JSON numbers, and serde wanted true/false).
+# *truthiness*, so 1/0/''/undef all mean what a Perl programmer expects.
 sub acl {
     my (%opts) = @_;
     return {
@@ -271,8 +268,7 @@ is_deeply($doc1->{data}, { traefik => { spec => { host => 'a.example' } } },
     'api_get returns `data` as a native hash, nested structure intact');
 is($doc1->{digest}, $put1->{digest}, 'api_get digest matches api_put digest');
 
-# Types survive the native round trip (this is what the JSON-string
-# convention used to be justified by).
+# Types survive the native round trip.
 PVE::RS::Meta::api_put('9101', 'types', 'json',
     '{"n":8080,"f":1.5,"t":true,"f2":false,"s":"x","list":[1,"two"]}',
     'replace', undef, 0, $FULL);
@@ -343,7 +339,7 @@ ok(!defined($res), 'a caller with no permission at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Prefixes, permissions, selectors and tags (docs/DESIGN.md §3).
+# Prefixes, permissions, selectors and tags (docs/DESIGN.md §3, §4).
 # =========================================================================
 
 # The file name is the prefix; there is no `prefix:` field to disagree with it.
@@ -460,9 +456,9 @@ ok(!defined($res), 'a scoped principal cannot read a view outside its scopes');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # A scope-only principal still cannot write the root view -- not because the root
-# needs full write any more, but because it cannot *read* the whole document, and
+# needs full write, but because it cannot *read* the whole document, and
 # authorizing a write by what it changes needs the caller to be able to say what
-# the document is (docs/DESIGN.md 3.4).
+# the document is (docs/DESIGN.md 5).
 $res = eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"other":2}', 'merge', undef, 0,
         scoped_acl('traefik')) };
 ok(!defined($res), 'a scope-only principal cannot write the root view');
@@ -504,7 +500,7 @@ my $DOC_A = '{"traefik":{"host":"a"},"netbird":{"groups":["lan"]},"homelab":{"ow
 PVE::RS::Meta::api_put('9401', undef, 'json', $DOC_A, 'replace', undef, 0, $FULL);
 
 # One write spanning two granted prefixes. The narrowest view covering both is
-# the document root, which used to be a flat 403.
+# the document root.
 $res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
     '{"traefik":{"host":"b"},"netbird":{"groups":["wan"]},"homelab":{"owner":"arki"}}',
     'replace', undef, 0, audit_scoped_acl()) };
@@ -553,7 +549,7 @@ is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data}, $before_
     'no empty merge created any structure');
 
 # A scope on `traefik` covers the sibling comment key `traefik__` -- the one
-# comment-key rule left (docs/DESIGN.md §3).
+# comment-key rule left (docs/DESIGN.md §4).
 PVE::RS::Meta::api_put('9400', 'traefik__', 'json', '"the ingress config"', 'replace', undef, 0,
     scoped_acl('traefik'));
 is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'))->{data},
@@ -571,11 +567,11 @@ ok(!defined($res), 'and a read of one with no read bit is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # A malformed file is skipped with a warning and grants/defines nothing; it
-# never takes another file's grants away. But it is not *invisible* any more
-# (this is the whole feature): the listing carries a row for it too, named,
-# with 'error' set and nothing else -- the one place an administrator can
-# find out a file stopped loading at all, instead of only a log line nobody
-# reads (docs/DESIGN.md §1). Both directories, independently.
+# never takes another file's grants away, but it is not invisible: the
+# listing carries a row for it too, named, with 'error' set and nothing else
+# -- the one place an administrator can find out a file stopped loading at
+# all, instead of only a log line nobody reads (docs/DESIGN.md §1). Both
+# directories, independently.
 #
 # `alsobroken` names the very authid under test, deliberately: a malformed
 # permission file has to grant nothing even when it claims to be for the
@@ -663,7 +659,7 @@ is(scalar(@{ PVE::RS::Meta::api_list_guests('scoped@pve!t1', $scoped_rows, 'othe
     'has cannot see through a caller\'s own missing scope');
 
 # =========================================================================
-# The one lint (docs/DESIGN.md §4), and parse failures.
+# The one lint (docs/DESIGN.md §7), and parse failures.
 # =========================================================================
 
 for my $case (
@@ -699,7 +695,7 @@ for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
 unlink("$root/9502.yaml");
 
 # An unparseable document: yaml + parse_error for a full reader, 422 for json
-# and for anyone else, repaired by a root replace (docs/DESIGN.md §4).
+# and for anyone else, repaired by a root replace (docs/DESIGN.md §7).
 for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: [\n") {
     (my $label = $broken) =~ s/\n/\\n/g;
     write_file('9500.yaml', $broken);
@@ -736,7 +732,7 @@ for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: 
 
 # A document that parses fine but is not a mapping -- an empty or
 # comment-only file above all -- is the same condition as an unparseable one:
-# there is no structure a narrower write could preserve (docs/DESIGN.md §4).
+# there is no structure a narrower write could preserve (docs/DESIGN.md §7).
 for my $text ("", "# only a comment\n", "- a\n- b\n", "just a scalar\n") {
     (my $label = $text) =~ s/\n/\\n/g;
     write_file('9505.yaml', $text);

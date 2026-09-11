@@ -10,10 +10,9 @@ use crate::error::Error;
 /// `^[A-Za-z0-9_-]+$` object-key charset) specifically so a PVE authid
 /// (`user@realm`, or `user@realm!tokenid`) can be used verbatim as a key.
 /// No key is reserved (`docs/DESIGN.md` §2), so an authid-shaped key is
-/// ordinary document data -- revision 4's reserved, authid-keyed `scopes`
-/// map is gone, and access-control data lives outside documents entirely
-/// (§3). Neither character is a path separator (those are `.` and `/`), so
-/// this does not introduce any addressing ambiguity.
+/// ordinary document data: access-control data lives outside documents
+/// entirely (§4). Neither character is a path separator (those are `.` and
+/// `/`), so this does not introduce any addressing ambiguity.
 pub fn is_valid_segment(s: &str) -> bool {
     !s.is_empty() && invalid_char(s).is_none()
 }

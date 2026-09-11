@@ -9,7 +9,7 @@
 //!
 //! Serialising concurrent writers is *not* this layer's job: the API write
 //! handlers run the whole read-check-write cycle under
-//! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §4), and the digest
+//! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §7), and the digest
 //! precondition enforced here ([`MetaStore::put_raw`]'s `expected_digest`) is
 //! the single owner of the compare-and-swap rule.
 //!
@@ -61,10 +61,10 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 
 /// Hard limit for what [`MetaStore::read`] will read off the disk at all.
 ///
-/// [`MAX_BYTES`] only ever applied to *writes*, so a multi-megabyte file
-/// dropped into `/etc/pve/meta` out of band (a bad rsync, a replicated file
-/// from a future version, a mistake) was read and SHA-256'd on every request
-/// that touched it.
+/// [`MAX_BYTES`] only ever applies to *writes*: without this separate cap, a
+/// multi-megabyte file dropped into `/etc/pve/meta` out of band (a bad
+/// rsync, a replicated file from a future version, a mistake) would be read
+/// and SHA-256'd on every request that touched it.
 ///
 /// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
 /// can ever reach it, so hitting it always means the file arrived out of
@@ -147,17 +147,16 @@ pub struct Document {
     pub value: Value,
     /// `Some(message)` when the file's text is not valid YAML at all, in
     /// which case [`Document::value`] is the empty document
-    /// (`docs/DESIGN.md` §4).
+    /// (`docs/DESIGN.md` §7; see also
+    /// `docs/decisions/005-reads-never-fail-on-content.md`).
     ///
-    /// A *syntax* error used to propagate out of [`MetaStore::read`], which
-    /// made a single tab or indentation slip in a hand-edited
-    /// `datacenter.yaml` a cluster-wide 400 for every principal, root
-    /// included — and unrepairable through the API, because every write
-    /// reads the document before planning. The file is still on disk, still
-    /// carries its real [`Document::digest`], and can still be replaced;
-    /// callers decide what to do with a document they cannot parse. The
-    /// digest is over the file's actual bytes either way, so the
-    /// compare-and-swap precondition of a repairing write is unaffected.
+    /// A syntax error is reported here rather than failing the read, so one
+    /// unparseable file cannot block reads of every other document or its
+    /// own repair. The file is still on disk, still carries its real
+    /// [`Document::digest`], and can still be replaced; callers decide what
+    /// to do with a document they cannot parse. The digest is over the
+    /// file's actual bytes either way, so the compare-and-swap precondition
+    /// of a repairing write is unaffected.
     pub parse_error: Option<String>,
     /// The lowercase hex SHA-256 digest of the raw file bytes.
     pub digest: String,
@@ -223,7 +222,7 @@ pub fn is_valid_snapshot_name(name: &str) -> bool {
 ///
 /// The one idiom for "the file was not there (any more)": every caller in
 /// this module treats that as an outcome rather than an error, because a
-/// concurrent `DELETE` or GC pass can remove a file between any two syscalls
+/// concurrent `DELETE` or `pve-meta rm` can remove a file between any two syscalls
 /// (see the module docs).
 fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
     match r {
@@ -443,31 +442,25 @@ impl MetaStore {
     }
 
     /// Reads and parses one document file. **Reads never lint, and never
-    /// fail on the document's own content** (`docs/DESIGN.md` §4).
+    /// fail on the document's own content** (`docs/DESIGN.md` §7; see
+    /// `docs/decisions/005-reads-never-fail-on-content.md`).
     ///
     /// Every API write is already lint-gated, so invalid content can only
     /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
-    /// backup, pmxcfs replication). Linting on the way *in* made one bad key
-    /// anywhere in `datacenter.yaml` a cluster-wide outage — permissions lived in
-    /// that document then, so every guest request read it — and, worse, blocked the
-    /// administrator's own repair, since they could neither read the document
-    /// to see the problem nor write over it. Strict validation belongs to the
-    /// content being written, and lives in [`MetaStore::put_raw`]'s parse of
-    /// the *new* text.
+    /// backup, pmxcfs replication). Strict validation belongs to the content
+    /// being written, and lives in [`MetaStore::put_raw`]'s parse of the
+    /// *new* text.
     ///
-    /// Pass 2 moved the *lint* off this path and left the *parse* fatal,
-    /// which is the same outage one layer down: a tab, an indentation slip,
-    /// an anchor or an explicit tag still 400'd every endpoint for everyone.
-    /// A syntax error is now reported per document, in
-    /// [`Document::parse_error`], with the empty document as the value — the
-    /// caller decides (`api::effective` grants nothing and warns; a read answers
-    /// with `parse_error` and no data; a full-write caller may replace the
-    /// whole document to repair it).
+    /// A syntax error is reported per document, in [`Document::parse_error`],
+    /// with the empty document as the value — the caller decides
+    /// (`api::effective` grants nothing and warns; a read answers with
+    /// `parse_error` and no data; a full-write caller may replace the whole
+    /// document to repair it).
     ///
     /// # Errors
     /// [`Error::NotFound`] if the file is not there — including the case
     /// where it vanished between this function's own `stat` and its read,
-    /// which is a racing `DELETE` or GC pass and must answer 404, not 500
+    /// which is a racing `DELETE` or `pve-meta rm` and must answer 404, not 500
     /// (see the module docs). [`Error::TooLarge`] if the file exceeds
     /// [`MAX_READ_BYTES`], and I/O errors. [`Error::Parse`] only for bytes
     /// that are not UTF-8 at all — a YAML syntax error is
@@ -528,15 +521,15 @@ impl MetaStore {
     /// Reads `id`'s document. **Reads never lint and never fail on the
     /// document's own content**: text the YAML parser rejects is reported in
     /// [`Document::parse_error`], with the empty document as the value
-    /// (`docs/DESIGN.md` §4).
+    /// (`docs/DESIGN.md` §7).
     ///
     /// # Errors
     /// [`Error::NotFound`] if it does not exist (or ceases to, mid-read);
     /// [`Error::TooLarge`] if the file is bigger than [`MAX_READ_BYTES`].
     pub fn read(&self, id: &DocId) -> Result<Document> {
         // Deliberately no `locate` first: an `is_file()` followed by a read
-        // is a check-then-act pair, and the racing loser of that pair used to
-        // surface as an `Error::Io` (HTTP 500) instead of a 404.
+        // is a check-then-act pair, and the racing loser of that pair would
+        // otherwise surface as an `Error::Io` (HTTP 500) instead of a 404.
         self.read_document(id, &self.read_path_for(id))
     }
 
@@ -556,7 +549,7 @@ impl MetaStore {
     /// The digest precondition, enforced in exactly one place: `None`
     /// means "no precondition";
     /// `Some("")` matches a *missing* document (that is the digest
-    /// `GET` reports for one, `docs/DESIGN.md` §5, so the documented
+    /// `GET` reports for one, `docs/DESIGN.md` §8, so the documented
     /// GET-then-PUT create flow works); any other `Some(_)` must equal the
     /// current file's digest.
     fn check_digest(current: Option<&str>, expected: Option<&str>) -> Result<()> {
@@ -576,7 +569,7 @@ impl MetaStore {
     /// Checks the compare-and-swap precondition for `id` without writing
     /// anything — the same rule [`MetaStore::put_raw`] enforces, exposed so a
     /// `dry_run` can validate exactly what the real write validates
-    /// (`docs/DESIGN.md` §4) without a second implementation
+    /// (`docs/DESIGN.md` §7) without a second implementation
     /// of the rule living in the API layer.
     ///
     /// # Errors
@@ -593,8 +586,7 @@ impl MetaStore {
     ///
     /// The *new* text is parsed and linted: nothing this store writes can
     /// ever fail [`crate::model::lint`]. There is one gate, for every
-    /// caller — the privilege-narrowed variants revision 4 grew are gone
-    /// with the tower that needed them (`docs/DESIGN.md` §10).
+    /// caller.
     ///
     /// # Errors
     /// [`Error::Parse`] / [`Error::Lint`] if `text` does not parse as a valid
@@ -618,7 +610,7 @@ impl MetaStore {
 
         // The *old* content is only read to diff against, so it is parsed
         // leniently: an out-of-band edit that broke it must not stop an
-        // administrator from writing the repair (`docs/DESIGN.md` §4).
+        // administrator from writing the repair (`docs/DESIGN.md` §7).
         // That includes a *syntax* error: it is the last thing that would
         // otherwise stand between a hand-edited document and its repair.
         // Unparseable old content — and content that vanished under us, and
@@ -645,7 +637,7 @@ impl MetaStore {
         let touched = patch::diff(&old_value, &new_value);
         let dig = digest::digest(normalized.as_bytes());
         // The file we just wrote can already be gone again (a racing DELETE
-        // or GC pass): report the write's own moment rather than 500-ing on
+        // or `pve-meta rm`): report the write's own moment rather than 500-ing on
         // a `stat` of something that is no longer there.
         let mtime = match gone_is_none(fs::metadata(&path))? {
             Some(meta) => meta.modified()?,
@@ -667,15 +659,13 @@ impl MetaStore {
     }
 
     /// Deletes `id`'s document — **only** the current document. Snapshot
-    /// copies are owned by the snapshot hooks (`docs/DESIGN.md` §6) and are
+    /// copies are owned by the snapshot hooks (`docs/DESIGN.md` §9) and are
     /// removed by [`MetaStore::purge`], never by this.
     ///
     /// **Idempotent**: returns `Ok(false)` if there was nothing to remove.
     /// Deleting a document is a request for it to be gone, and it being
-    /// already gone — because a concurrent `DELETE` or the GC won the race —
-    /// is that request satisfied, not a failure. The old `locate`-then-remove
-    /// pair turned the loser of that race into an
-    /// `io::ErrorKind::NotFound` → [`Error::Io`] → HTTP 500.
+    /// already gone — because a concurrent `DELETE` or `pve-meta rm` won the race —
+    /// is that request satisfied, not a failure.
     /// A registry document is removed from the **write** directory only: a
     /// packaged prefix belongs to its `.deb`, and deleting the cluster file
     /// that shadowed it is a revert to the packaged one, not a removal. When
@@ -691,9 +681,7 @@ impl MetaStore {
     /// snapshot copy, or both — sorted ascending. Temp files and any other
     /// file whose name is not `<vmid>[.<snap>].yaml` are not guests.
     ///
-    /// This is the store's half of the GC (`docs/DESIGN.md` §6): Perl passes
-    /// the vmlist, and every vmid here that is not in it is removed together
-    /// with its snapshot copies. There is no orphan concept in the API.
+    /// What `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §9).
     pub fn stored_vmids(&self) -> Result<Vec<u32>> {
         let mut out = std::collections::BTreeSet::new();
         if !self.root.is_dir() {
@@ -806,7 +794,7 @@ impl MetaStore {
     }
 
     /// Removes `vmid`'s document **and every snapshot copy** — the guest is
-    /// gone. Used only by the GC (`docs/DESIGN.md` §6); the REST API's
+    /// gone. Used by the lifecycle hooks and `pve-meta rm` (`docs/DESIGN.md` §9); the REST API's
     /// `DELETE` uses [`MetaStore::delete`], which never touches snapshots.
     ///
     /// Returns the number of files removed. Idempotent: a missing document is
@@ -842,7 +830,7 @@ impl MetaStore {
     /// [`identify`]'s surrogate instead, which still changes when it does.
     ///
     /// An entry that disappears mid-walk is skipped: the store is not locked
-    /// against a concurrent `DELETE` or GC pass, and a poll must not 500
+    /// against a concurrent `DELETE` or `pve-meta rm`, and a poll must not 500
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
         self.version_of(None)

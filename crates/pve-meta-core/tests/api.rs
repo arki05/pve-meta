@@ -332,7 +332,7 @@ fn a_scoped_version_refuses_a_garbage_id() {
 
 #[test]
     fn a_selector_resolves_against_the_guests_tags() {
-    // `docs/DESIGN.md` §3: adding the tag is the deliberate act of
+    // `docs/DESIGN.md` §4: adding the tag is the deliberate act of
     // granting the operator that guest.
     let permission_files = regs();
     let untagged = effective(&permission_files, &DocId::Guest(100), &scoped(&[]));
@@ -399,10 +399,9 @@ fn a_token_without_full_read_cannot_write_the_root_view() {
 
 // -- what authorizes a write is what it changes -----------------------
 //
-// `docs/DESIGN.md` §3.4. The gate used to be the *view*: it had to sit
-// inside a writable scope, and the root view took full write access. That
-// refused writes which violated nobody's permissions, so these fix the
-// rule at the level it is actually about.
+// `docs/DESIGN.md` §5: a write is authorized by what it changes, not by
+// the view it targets, so a write spanning two granted prefixes is not
+// refused just because no single view covers both.
 
 #[test]
 fn one_write_may_span_two_granted_prefixes() {
@@ -447,8 +446,7 @@ fn a_whole_document_write_still_answers_for_every_key_it_changes() {
 fn reordering_keys_is_a_write_a_scoped_principal_may_make() {
     // Key order is data -- the model preserves it -- but it is not a path,
     // so a reordering changes nothing the permission rules are written
-    // about. It can only be expressed as a whole-document write, which is
-    // why it used to be a 403 for anyone without full write access.
+    // about. It can only be expressed as a whole-document write.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
@@ -589,9 +587,8 @@ fn a_scoped_write_outside_the_view_is_refused_by_the_touched_check() {
 
 #[test]
 fn one_lint_runs_on_the_planned_document_for_every_caller() {
-    // `docs/DESIGN.md` §4. Revision 4 narrowed the lint by privilege and
-    // then needed a finding-set subset check to make the narrowing safe;
-    // there is one lint now, and it names the offending path.
+    // `docs/DESIGN.md` §7: there is one lint, and it names the offending
+    // path.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
     let before = read_raw(&store, "100").unwrap();
@@ -627,7 +624,7 @@ fn one_lint_runs_on_the_planned_document_for_every_caller() {
 
 #[test]
 fn the_lint_names_the_offending_path_whoever_asks() {
-    // No redaction (`docs/DESIGN.md` §1, §10): an out-of-band bad key
+    // No redaction (`docs/DESIGN.md` §1): an out-of-band bad key
     // blocks the write and is spelled out, for a scoped caller too.
     let (dir, store) = store();
     std::fs::write(
@@ -783,8 +780,8 @@ fn delete_of_a_view_leaves_the_rest_and_reports_touched() {
 
 #[test]
 fn an_unparseable_document_is_yaml_plus_parse_error_json_422_and_root_repairable() {
-    // `docs/DESIGN.md` §4. This is a *per-document* condition: nothing
-    // reads `datacenter.yaml` on a guest request any more, so it is never
+    // `docs/DESIGN.md` §7. This is a *per-document* condition: nothing
+    // reads `datacenter.yaml` on a guest request, so it is never
     // cluster-wide.
     for broken in ["a: 1\n\tb: 2\n", "a: &x 1\nb: *x\n", "a: 1\n  b: 2\n", "a: [\n"] {
         let (dir, store) = store();
@@ -1083,7 +1080,7 @@ fn permissions_list_returns_every_permission() {
 }
 
 /// The one place a file that did not load is visible at all (`docs/DESIGN.md`
-/// §1 and the module docs on `registry::RegistryFailure`): the listing has to
+/// §4 and the module docs on `registry::RegistryFailure`): the listing has to
 /// carry both a loaded entry and a failed one, and the failed one has to be
 /// keyed the same way a loaded row is, or a consumer reading both arrays has
 /// no field to find either by.
@@ -1131,9 +1128,8 @@ fn prefixes_list_carries_failures_keyed_like_a_loaded_prefix() {
 
 #[test]
 fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
-    // Reads run unlocked while writes hold `pve-meta-<id>` and the GC
-    // holds `pve-meta-gc`, so a file can disappear between any two
-    // syscalls. Every one of these used to be an `Error::Io` → 500.
+    // Reads run unlocked while writes hold `pve-meta-<id>`, so a file can
+    // disappear between any two syscalls.
     let (dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
     let digest = get(&store, "100", None, "json", &full()).unwrap().digest;

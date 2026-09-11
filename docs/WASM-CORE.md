@@ -157,7 +157,7 @@ stay one rule.
   document paths to line numbers in the buffer for Monaco (§8, open). `hoverText` is
   gettext.
 - **The `format:` check.** A schema's `format` is a `PVE::JSONSchema` format name, and
-  the editor validates it with proxmoxlib's own vtype for that name (DESIGN §8). The
+  the editor validates it with proxmoxlib's own vtype for that name (DESIGN §3). The
   core does not know what `ipv4` means and should not learn — that would be a third
   implementation of PVE's formats. So `Shape::findings` returns one list of `Report`s —
   findings, and `FormatCheck { path, format, value }` entries it could not judge — sorted
@@ -346,7 +346,7 @@ plus a parse (~1 ms) on a warm Shape.
 - `parse` in the ABI maps a null top level (an empty buffer, `~`) to `{}`. That is an
   editor convention — the model has no nulls and an empty editor is an empty document —
   and it lives in the adapter crate, not the core. The server treats an empty *file*
-  differently (unrecoverable, DESIGN §4), on purpose.
+  differently (unrecoverable, DESIGN §7), on purpose.
 - `Shape::findings` keeps the old tolerance that `1`/`0` satisfy `type: boolean`, with
   the old justification (the JSON wire convention). The editor reads YAML now, so a `1`
   is a `1`; the tolerance is inherited, documented, and probably wrong for a document

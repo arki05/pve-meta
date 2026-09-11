@@ -1,14 +1,13 @@
 //! The shape of one document: which declared prefixes reach it, which of
 //! them governs a given path, and what that prefix's schema says about the
-//! value there (`docs/DESIGN.md` §3.1, §8).
+//! value there (`docs/DESIGN.md` §3).
 //!
 //! A [`Shape`] is built once per document from the prefix registry and the
-//! guest's tags, and everything that used to be a loose predicate -- "does
-//! this selector match", "sort most-specific first", "which prefix governs",
-//! "walk the schema but stop where a child prefix takes over" -- is a method
-//! on it. The editor used to hold a second copy of each of those in
-//! JavaScript; now it holds a `Shape` (through the wasm build of this crate)
-//! and asks.
+//! guest's tags. Every prefix rule -- does this selector match, sort
+//! most-specific first, which prefix governs, walk the schema but stop
+//! where a child prefix takes over -- is a method on it, and the editor
+//! consults that one `Shape` (through the wasm build of this crate) instead
+//! of reimplementing any of them.
 //!
 //! **Schemas shadow; they never merge.** The most specific prefix covering a
 //! path governs it and no other contributes, so with `homelab` and
@@ -63,7 +62,7 @@ impl From<&PrefixDef> for Declared {
 /// One thing a schema says is wrong with a value, at a document path.
 /// Advisory unless `enforced`: the server's one lint ([`model::lint`])
 /// decides what is storable, a schema only describes what was meant
-/// (`docs/DESIGN.md` §4) -- except where its prefix says `enforce: true`,
+/// (`docs/DESIGN.md` §7) -- except where its prefix says `enforce: true`,
 /// and then a write that introduces such a finding is refused without
 /// `force` ([`Shape::enforced_findings`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,7 +76,7 @@ pub struct Finding {
 
 /// A `format:` the schema asks for on a string, which this crate cannot
 /// judge: a format is a `PVE::JSONSchema` format name, and the editor checks
-/// it with proxmoxlib's own validator for that name (`docs/DESIGN.md` §8)
+/// it with proxmoxlib's own validator for that name (`docs/DESIGN.md` §3)
 /// rather than a third implementation of what `ipv4` means. [`Shape::findings`]
 /// carries these out, in place, for whoever holds such a validator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +124,7 @@ impl Shape {
     /// The prefixes among `declared` whose selector matches a guest carrying
     /// `tags`, sorted most-specific first. Anything that did not parse never
     /// gets this far -- a malformed prefix file describes nothing
-    /// (`docs/DESIGN.md` §3.3) -- so the caller drops those before building.
+    /// (`docs/DESIGN.md` §4) -- so the caller drops those before building.
     pub fn new(declared: impl IntoIterator<Item = Declared>, tags: &[String]) -> Shape {
         let mut prefixes: Vec<Declared> = declared
             .into_iter()
@@ -142,7 +141,7 @@ impl Shape {
 
     /// A shape with one schema rooted at the document itself, which is how a
     /// registry document is described by its meta-schema
-    /// ([`crate::metaschema`], `docs/DESIGN.md` §3.6).
+    /// ([`crate::metaschema`], `docs/DESIGN.md` §6).
     pub fn rooted(schema: Value) -> Shape {
         Shape {
             prefixes: vec![Declared {
@@ -285,7 +284,7 @@ impl Shape {
 /// value onto an already-wrong key still warns, and replacing `homelab`
 /// answers for a finding beneath it. Editing something else in the same
 /// document does not: a tick you pass every time is a tick you stop
-/// reading (`docs/DESIGN.md` §8, "And only for what this edit did").
+/// reading (`docs/DESIGN.md` §12, "And only for what this edit did").
 pub fn introduced(before: &[Finding], after: &[Finding], changed: &[Path]) -> Vec<Finding> {
     let touched = |path: &Path| {
         changed
@@ -337,7 +336,7 @@ fn check_value(schema: &Value, value: &Value) -> Option<String> {
 
 /// Whether `value` is of the declared `PVE::JSONSchema` type. A boolean
 /// stored as `1`/`0` passes: it is the API's own wire convention
-/// (`docs/DESIGN.md` §4), and a document written through `format=json` holds
+/// (`docs/DESIGN.md` §7), and a document written through `format=json` holds
 /// exactly that. An unknown type constrains nothing.
 fn type_matches(declared: &str, value: &Value) -> bool {
     match declared {
@@ -379,10 +378,9 @@ mod tests {
         decl(prefix, Selector::Tag(tag.into()), None)
     }
 
-    /// The schema-shadowing rule, one case per line. This table used to be
-    /// `testdata/governing-cases.json`, read by this crate and by the
-    /// editor's JavaScript suite, because both had an implementation to keep
-    /// honest. The editor now asks this one, so the table lives with it.
+    /// The schema-shadowing rule, one case per line. The editor consults
+    /// this same table, through `crates/pve-meta-wasm`, rather than keeping
+    /// its own copy.
     ///
     /// Each case hands over the declared prefixes in arbitrary order with
     /// their selectors, so the whole chain runs -- selector, sort, containment

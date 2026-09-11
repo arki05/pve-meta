@@ -3,8 +3,8 @@
 //!
 //! Two consumers, neither of which reimplements anything here:
 //! `crates/pve-meta-perl` (`PVE::RS::Meta`), which exposes the snapshot
-//! hooks, the GC and the `api_*` functions backing
-//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §5); and
+//! hooks, `stored_vmids` and the `api_*` functions backing
+//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8); and
 //! `crates/pve-meta-wasm`, the browser build the editor asks for the codec,
 //! the path rules, [`scopes::Effective`], [`shape::Shape`] and
 //! [`edit::EditSet`]. There is no daemon and no CLI.
@@ -16,15 +16,15 @@
 //! # Module map
 //!
 //! - [`api`] — the request-shaped API layer (view reads/writes, write
-//!   authorization, the lint, `touched` reporting, the GC) that
+//!   authorization, the lint, `touched` reporting) that
 //!   `PVE::RS::Meta`'s `api_*` functions export to
-//!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §5).
+//!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8).
 //! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
 //!   most-specific first: what governs a path, what its schema says
-//!   (`docs/DESIGN.md` §3.1). Schemas shadow.
+//!   (`docs/DESIGN.md` §3). Schemas shadow.
 //! - [`edit`] — [`edit::EditSet`], the editor's staged edits: apply them to
 //!   the stored document, recover them from an edited one, and the narrowest
-//!   view one Apply writes (`docs/DESIGN.md` §8).
+//!   view one Apply writes (`docs/DESIGN.md` §12).
 //! - [`model`] — the [`model::Value`] alias (an order-preserving
 //!   `serde_json::Value`), the one document [`model::lint`], comment keys
 //!   (`foo__`), and path lookup.
@@ -43,12 +43,12 @@
 //!   [`view::parse_patch`] for a view's wire text.
 //! - [`metaschema`] — the two registry file formats, written as schemas in the
 //!   same dialect a prefix uses, so the editor can show a prefix or grant
-//!   file as a typed tree (`docs/DESIGN.md` §3.6).
+//!   file as a typed tree (`docs/DESIGN.md` §6).
 //! - [`registry`] — the two drop-directories: **prefixes**
 //!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which
 //!   say what a prefix is and carry its schema, and **grants**
 //!   (`/etc/pve/meta.d/permissions`, cluster-only), which say who may touch one
-//!   (`docs/DESIGN.md` §3). They nest by opposite rules: prefixes shadow
+//!   (`docs/DESIGN.md` §4). They nest by opposite rules: prefixes shadow
 //!   most-specific-first ([`shape::Shape::governing`]), grants accumulate by
 //!   containment ([`registry::scopes_for`]).
 //! - [`scopes`] — [`scopes::Effective`], a principal's effective access to one
@@ -82,14 +82,11 @@
 /// wherever it lands.
 ///
 /// **Where a warning has to go, and why it is two places.** Nothing anywhere
-/// initialises a `tracing` subscriber, so every `tracing::warn!` this crate
-/// used to emit was discarded outright, and `docs/DESIGN.md` §3.3's "a
-/// malformed file is skipped with a warning" was not true. stderr looked like
-/// the obvious replacement and is not: `PVE::Daemon` opens STDOUT to
-/// `/dev/null` and dups STDERR onto it before a worker ever runs
+/// initialises a `tracing` subscriber, so a `tracing::warn!` here would be
+/// silently discarded. stderr alone is not enough either: `PVE::Daemon` opens
+/// STDOUT to `/dev/null` and dups STDERR onto it before a worker ever runs
 /// (`/usr/share/perl5/PVE/Daemon.pm`), so a `.so` inside pvedaemon or pveproxy
-/// writes its warnings into the void just as thoroughly. Verified on the lab:
-/// a malformed prefix file produced nothing in the journal at all.
+/// writes its warnings into the void just as thoroughly.
 ///
 /// So both, because the two sinks are each right in a different caller and
 /// neither is right in both:
@@ -108,7 +105,7 @@
 /// a unit or an ident.
 ///
 /// This is a report, not a channel. A caller that must *act* on the failure
-/// needs it in a return value, not in a log line -- see `docs/DESIGN.md` §3.3
+/// needs it in a return value, not in a log line -- see `docs/DESIGN.md` §12
 /// on surfacing an unreadable registry file in the UI.
 pub fn warn(msg: &str) {
     eprintln!("pve-meta: {msg}");
