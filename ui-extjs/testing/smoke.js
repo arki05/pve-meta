@@ -213,6 +213,22 @@ const Shape = ctx.PVE.meta.Shape;
 const EditSet = ctx.PVE.meta.EditSet;
 const Markers = ctx.PVE.meta.Markers;
 
+// A panel reduced to its staging: one stored document, what is staged on it, and
+// the methods that change what is staged -- no tree behind them, so a test can look
+// at the edit set and the planned document directly.
+const stagingStub = (stored, edits) => {
+    const P = ctx.PVE.meta.TreePanel;
+    const stub = { docId: '1', pending: new EditSet(edits || []), docState: { 1: { digest: 'd', data: stored } } };
+    [
+        'setPlanned', 'stage', 'stageFromView', 'plannedData', 'isDirty', 'revertPending',
+        'discardRow', 'discardListMember', 'listAt', 'stageListMember',
+    ].forEach((m) => (stub[m] = P[m]));
+    stub.dataOf = (id) => (stub.docState[id] || {}).data || {};
+    stub.buildTree = () => {};
+    stub.syncButtons = () => {};
+    return stub;
+};
+
 console.log('\n--- PVE.meta.compose: how the panel is three method sets sharing one `this` ---');
 eq('merges left to right into a new object', ctx.PVE.meta.compose({ a: 1 }, { b: 2 }, { c: 3 }), { a: 1, b: 2, c: 3 });
 const composeParts = [{ a: 1 }, { b: 2 }];
@@ -354,26 +370,24 @@ console.log('\n--- the footer keeps the word its caller chose ---');
 
 console.log('\n--- Edit selection as text stages, like every other modal ---');
 {
-    const E = ctx.PVE.meta.EditSet;
     const stored = { traefik: { spec: { host: 'a', port: 80 } }, netbird: { groups: ['lan'] } };
 
-    // A subtree buffer is one edit at the view's own path, and it subsumes anything
-    // staged inside that view -- a buffer for `traefik` says everything about
-    // `traefik.spec`.
-    const set = E.empty();
-    set.stage({ path: 'traefik.spec.host', op: 'set', value: 'b' });
-    eq('an inner edit stages', set.length, 1);
-    set.stage({ path: 'traefik', op: 'set', value: { spec: { host: 'c' } } });
-    eq('the subtree buffer replaces it', set.edits.map((e) => e.path), ['traefik']);
-    eq('and the planned document is what was typed',
-        set.apply(stored).traefik, { spec: { host: 'c' } });
-    eq('... leaving everything outside the view alone',
-        set.apply(stored).netbird, { groups: ['lan'] });
+    // A subtree buffer is one edit at the view's own path, and it says everything
+    // about what is inside that view -- a buffer for `traefik` replaces `traefik.spec`
+    // whatever was staged there before. What is staged afterwards is the difference
+    // that leaves, not the buffer.
+    const stub = stagingStub(stored, [{ path: 'traefik.spec.host', op: 'set', value: 'b' }]);
+    eq('an inner edit stages', stub.pending.length, 1);
+    stub.stageFromView('traefik', { spec: { host: 'c' } });
+    eq('the planned document is what was typed', stub.plannedData().traefik, { spec: { host: 'c' } });
+    eq('... leaving everything outside the view alone', stub.plannedData().netbird, { groups: ['lan'] });
+    eq('and the set is the difference, not the buffer',
+        stub.pending.edits.map((e) => e.path + ':' + e.op).sort(),
+        ['traefik.spec.host:set', 'traefik.spec.port:delete']);
 
     // The whole-document view: the empty path is the document, not a key named "".
-    const root = E.empty();
-    root.stage({ path: '', op: 'set', value: { only: 1 } });
-    eq('the root view stages as the document', root.apply(stored), { only: 1 });
+    stub.stageFromView('', { only: 1 });
+    eq('the root view stages as the document', stub.plannedData(), { only: 1 });
 }
 
 console.log('\n--- leaving Text only asks when the tree cannot carry the change ---');
@@ -1677,21 +1691,13 @@ console.log('\n--- text is just another way to edit rows ---');
         eq('case ' + i + ' round trips', EditSet.between(stored, edited).apply(stored), edited);
     });
 
-    // A root-level edit subsumes narrower ones: it replaces the whole document, so a
-    // staged edit under a key it does not have would otherwise be re-applied on top.
-    // `stage` compares the planned document against the stored one, so the stub needs
-    // both -- that check is what keeps "dirty" from meaning "an edit object exists".
-    const stub = { pending: new EditSet([{ path: 'homelab.owner', op: 'set', value: 'x' }]), docId: '1' };
-    ['stage', 'plannedData'].forEach((m) => (stub[m] = P[m]));
-    stub.docState = { 1: { digest: 'd', data: stored } };
-    stub.dataOf = (id) => (stub.docState[id] || {}).data || {};
-    stub.buildTree = () => {};
-    stub.syncButtons = () => {};
-    // Staging the whole document replaces everything under it. The edit set is
-    // re-derived from the result, so what it holds is the *minimal* description of
-    // that -- the keys that went, and the one that arrived -- rather than one opaque
-    // root edit. The planned document is the assertion; the shape is how the tree gets
-    // to mark the rows that actually differ.
+    // A root-level edit replaces the whole document, so a staged edit under a key it
+    // does not have must not be re-applied on top. The edit set is derived from the
+    // result, so what it holds is the *minimal* description of that -- the keys that
+    // went, and the one that arrived -- rather than one opaque root edit. The planned
+    // document is the assertion; the shape is how the tree gets to mark the rows that
+    // actually differ.
+    const stub = stagingStub(stored, [{ path: 'homelab.owner', op: 'set', value: 'x' }]);
     stub.stage('', 'set', { a: 1 });
     eq('the planned document is what was staged', stub.pending.apply(stored), { a: 1 });
     eq(
@@ -1704,12 +1710,7 @@ console.log('\n--- text is just another way to edit rows ---');
     // Dirty means the document differs, not that an edit exists. Staging the value a
     // row already has -- which is what the subtree editor's OK does when you typed
     // nothing -- must leave nothing staged, or Revert appears with no row marked.
-    const noop = { pending: EditSet.empty(), docId: '1' };
-    ['stage', 'plannedData'].forEach((m) => (noop[m] = P[m]));
-    noop.docState = { 1: { digest: 'd', data: stored } };
-    noop.dataOf = (id) => (noop.docState[id] || {}).data || {};
-    noop.buildTree = () => {};
-    noop.syncButtons = () => {};
+    const noop = stagingStub(stored);
     noop.stage('', 'set', JSON.parse(JSON.stringify(stored)));
     eq('staging the document it already is stages nothing', noop.pending.edits, []);
     noop.stage('homelab.owner', 'set', stored.homelab.owner);
@@ -1764,7 +1765,7 @@ console.log('\n--- a staged value is linted like a stored one ---');
         tags: [],
         pending: EditSet.empty(),
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData', 'pendingUnder'].forEach((m) => (panelS[m] = P[m]));
+    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach((m) => (panelS[m] = P[m]));
 
     eq('a stored value that fits is not marked', panelS.findingsFor()['docker.port'], undefined);
     panelS.pending = new EditSet([{ path: 'docker.port', op: 'set', value: 70000 }]);
@@ -1773,17 +1774,36 @@ console.log('\n--- a staged value is linted like a stored one ---');
     // the server's lint is the authority (DESIGN §7).
     eq('the planned document keeps it', panelS.plannedData().docker.port, 70000);
 
-    // Discarding one row drops that row's edits and nothing else.
-    panelS.pending = new EditSet([
+}
+
+console.log('\n--- discarding a row puts the stored value back there, and nothing else ---');
+{
+    // The edit set is the difference, so "drop this row's edit" and "put back what is
+    // stored here" are one operation -- and it leaves every other row's edit alone.
+    const stored = { docker: { port: 80, host: 'h' }, a: 1, ab: 2 };
+    const paths = (s) => s.pending.edits.map((e) => e.path + ':' + e.op).sort();
+    const stub = stagingStub(stored, [
         { path: 'docker.port', op: 'set', value: 70000 },
         { path: 'docker.host', op: 'set', value: 'x' },
+        { path: 'added', op: 'set', value: 1 },
+        { path: 'a', op: 'set', value: 9 },
+        { path: 'ab', op: 'delete' },
     ]);
-    eq('the row knows its own edits', panelS.pendingUnder('docker.port').length, 1);
-    eq('and a subtree knows all of them', panelS.pendingUnder('docker').length, 2);
-    eq('an untouched path has none', panelS.pendingUnder('netbird').length, 0);
-    ['discardRow', 'buildTree', 'syncButtons'].forEach((m) => (panelS[m] = m === 'discardRow' ? P[m] : () => {}));
-    panelS.discardRow({ data: { path: 'docker.port' } });
-    eq('discarding a row drops its edit and keeps the rest', panelS.pending.edits.map((e) => e.path), ['docker.host']);
+    stub.discardRow({ data: { path: 'docker.port' } });
+    eq('discarding a row drops its edit and keeps the rest', paths(stub), ['a:set', 'ab:delete', 'added:set', 'docker.host:set']);
+    eq('... and the row shows what is stored', stub.plannedData().docker.port, 80);
+    stub.discardRow({ data: { path: 'added' } });
+    eq('a key that was added goes away', [paths(stub).includes('added:set'), stub.plannedData().added], [false, undefined]);
+    stub.discardRow({ data: { path: 'ab' } });
+    eq('a ghost gets its value back', stub.plannedData().ab, 2);
+    eq('`ab` is not under `a`: `a` is still staged', paths(stub), ['a:set', 'docker.host:set']);
+    stub.discardRow({ data: { path: 'netbird' } });
+    eq('an untouched row changes nothing', paths(stub), ['a:set', 'docker.host:set']);
+    stub.discardRow({ data: { path: 'docker' } });
+    eq('discarding a subtree restores everything under it', paths(stub), ['a:set']);
+    eq('... which is what dirty means', stub.isDirty(), true);
+    stub.discardRow({ data: { path: 'a' } });
+    eq('and the last one leaves nothing staged', [stub.isDirty(), stub.plannedData()], [false, stored]);
 }
 
 console.log('\n--- acting on one member rewrites its list ---');
@@ -1821,6 +1841,35 @@ console.log('\n--- acting on one member rewrites its list ---');
     eq('an index that is not there is not an edit', stub.pending.edits, []);
     stub.stageListMember('netbird.groups', -1, 'nope');
     eq('nor is a negative one', stub.pending.edits, []);
+}
+
+console.log('\n--- discarding one member puts that member back, not the list ---');
+{
+    // The edit is staged on the *list*, so dropping it would throw away every other
+    // member's change. Discard puts that one member back instead, and the list's
+    // edit is gone once every member matches again -- a list that matches is not a
+    // difference, so that needs no step of its own.
+    const stored = { netbird: { groups: ['lan', 'wan'] }, k: 1 };
+    const s = stagingStub(stored);
+    const groups = () => s.plannedData().netbird.groups;
+    s.stageListMember('netbird.groups', 0, 'LAN');
+    s.stageListMember('netbird.groups', 1, 'WAN');
+    s.stage('netbird.groups', 'set', groups().concat(['dmz']));
+    eq('three members changed, one edit', [groups(), s.pending.length], [['LAN', 'WAN', 'dmz'], 1]);
+    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: 0 } });
+    eq('discarding one member restores it and not the list', groups(), ['lan', 'WAN', 'dmz']);
+    s.discardListMember('netbird.groups', 2);
+    eq('discarding an appended member removes it', groups(), ['lan', 'WAN']);
+    s.discardListMember('netbird.groups', 1);
+    eq('once every member matches, nothing is staged', s.pending.edits, []);
+
+    // Revert: the document you are looking at is the stored one.
+    s.stage('netbird.groups', 'set', ['x']);
+    s.stage('k', 'delete');
+    s.stage('new', 'set', true);
+    eq('three edits staged', s.pending.length, 3);
+    s.revertPending();
+    eq('Revert clears everything', [s.pending.edits, s.plannedData()], [[], stored]);
 }
 
 console.log('\n--- a list is a container, like a map ---');

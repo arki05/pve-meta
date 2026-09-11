@@ -2153,9 +2153,9 @@ Ext.define('PVE.meta.TextWindow', {
     // which is why it could not see staged edits and they could not see it: it was not
     // editing the same document as everything else.
     //
-    // One edit at the view's own path. `EditSet.stage` already drops anything staged
-    // at or under that path, which is exactly right -- a buffer for `traefik` says
-    // everything about `traefik.spec`.
+    // One edit at the view's own path, and a set there replaces the whole subtree --
+    // a buffer for `traefik` says everything about `traefik.spec`, whatever was
+    // staged inside it before.
     apply: function (text, lang) {
         let me = this;
         let value;
@@ -2746,7 +2746,7 @@ PVE.meta.TextCard = {
             );
             return;
         }
-        let pending = PVE.meta.EditSet.between(me.dataOf(me.textDocId), parsed);
+        let unchanged = PVE.meta.Core.call('same', me.dataOf(me.textDocId), parsed);
 
         // Whatever you typed becomes staged rows, and the tree then shows it -- so
         // switching needs no confirmation and gets none. The exception is a change
@@ -2758,7 +2758,7 @@ PVE.meta.TextCard = {
         // Apply *from* Text keeps it, because that path sends the buffer rather than
         // the model. So this is the one place that has to ask, and only here: the
         // edit is real, it is just not one the other view can hold.
-        if (pending.isEmpty() && me.textIsDirty()) {
+        if (unchanged && me.textIsDirty()) {
             Ext.Msg.show({
                 title: gettext('Switch to the tree?'),
                 message: gettext(
@@ -2772,7 +2772,7 @@ PVE.meta.TextCard = {
                 icon: Ext.Msg.QUESTION,
                 fn: function (btn) {
                     if (btn === 'yes') {
-                        me.finishLeavingTextMode(pending);
+                        me.finishLeavingTextMode(parsed);
                     } else {
                         me.setModeButton('text');
                     }
@@ -2780,19 +2780,19 @@ PVE.meta.TextCard = {
             });
             return;
         }
-        me.finishLeavingTextMode(pending);
+        me.finishLeavingTextMode(parsed);
     },
 
-    finishLeavingTextMode: function (pending) {
+    // The mode first, then the document: `setPlanned` syncs the buttons, and they
+    // are the tree's only once the mode says so.
+    finishLeavingTextMode: function (parsed) {
         let me = this;
-        me.pending = pending;
         PVE.meta.Monaco.dispose(me.textEditor);
         me.textEditor = null;
         me.mode = 'tree';
         me.setModeButton('tree');
         me.getLayout().setActiveItem(me.down('#metaTree'));
-        me.buildTree();
-        me.syncButtons();
+        me.setPlanned(parsed);
     },
 
     // Presentation only, exactly like the selection window's toggle. `textLang` is
@@ -3108,8 +3108,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // `loadDocument` awaits the same promise and reports its failure.
         PVE.meta.Core.load().catch(Ext.emptyFn);
         me.docState = Object.create(null); // id -> { digest, data }
-        // Edits accumulate here until Apply, in the order they were made:
-        // `{ path, op: 'set' | 'delete', value }`, at most one entry per path.
+        // What is staged: the difference between the stored document and the one
+        // shown, as `{ path, op: 'set' | 'delete', value }` each. `setPlanned`
+        // derives it whenever the shown document changes; a write clears it.
         me.pending = PVE.meta.EditSet.empty();
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0, scopes: [] };
@@ -3571,66 +3572,61 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         this.stage(path, 'set', list);
     },
 
-    // Records one edit. A staged path replaces any earlier entry for itself *and*
-    // for everything under it: staging `selector` after `selector.tag` means the
-    // subtree was replaced wholesale, and keeping the older, narrower entry would
-    // re-apply it on top of the new value.
-    // The one door every editor stages through: the row editor, Add Key, Add Rule,
-    // Declare Key, Set to Default, the list helpers and the subtree text editor.
+    // Makes `doc` the document you are looking at. The edit set is not a log of what
+    // was done, it is the difference between what is stored and this -- so it is
+    // derived here, from the result, and nowhere else. That is what keeps dirty
+    // meaning *the document differs from what is stored* rather than *an edit object
+    // exists*. Two ways it came to lie, both reported: opening the subtree editor and
+    // pressing OK without typing staged a set of the value already there, and editing
+    // a row from A to B and back to A left two edits describing no change. Either way
+    // Revert appeared and Apply lit up while no row was marked. Not creating a no-op
+    // edit would have been the narrower fix, and it misses the second case: A over a
+    // pending B *is* a change at that moment. Asking what the document now is catches
+    // both, and anything else that gets here by a route nobody thought of.
     //
-    // Dirty has to mean *the document differs from what is stored*, not that an edit
-    // object exists. Two ways it came to lie, both reported: opening the subtree
-    // editor and pressing OK without typing staged a set of the value already there,
-    // and editing a row from A to B and back to A left two edits describing no change.
-    // Either way Revert appeared and Apply lit up while no row was marked, because
-    // nothing had in fact changed. Checking the *result* rather than each edit catches
-    // both, and anything else that reaches the same place by a route nobody thought of.
-    stage: function (path, op, value) {
+    // It also makes every staged edit minimal, which the Text card already did on the
+    // way out: replacing a whole subtree marks the rows that actually differ, not the
+    // whole subtree.
+    //
+    // Returns whether the document changed, which is not the same as whether the user
+    // typed: a reorder or a reindent parses to the document it started as (decision
+    // 007), and the subtree editor says so rather than closing on nothing.
+    setPlanned: function (doc) {
         let me = this;
-        let stored = me.dataOf(me.docId);
         let before = me.plannedData();
+        me.pending = PVE.meta.EditSet.between(me.dataOf(me.docId), doc);
+        me.buildTree();
+        me.syncButtons();
+        return !PVE.meta.Core.call('same', before, doc);
+    },
+
+    // Records one edit: a `set` is `view::replace` at `path` and a `delete` is
+    // `view::remove`, applied to the document as it stands -- so a set at `selector`
+    // says everything about `selector.tag`, whatever was staged there before. The one
+    // door every editor stages through: the row editor, Add Key, Add Rule, Declare
+    // Key, Set to Default, the list helpers and the subtree text editor.
+    stage: function (path, op, value) {
         let edit = { path: path, op: op };
         if (op === 'set') {
             edit.value = value;
         }
-        me.pending.stage(edit);
-
-        // Re-derived, not accumulated. The edit set *is* the difference between what
-        // is stored and what you are looking at, so the honest way to keep it true is
-        // to recompute it from the result rather than to append and hope.
-        //
-        // Not creating a no-op edit would have been the narrower fix, and it misses
-        // the case that motivated this: editing a row from A to B and back to A stages
-        // a real change each time -- A over a pending B *is* a change at that moment --
-        // and leaves an edit set describing nothing. Asking what the document now is
-        // catches that, the no-op OK, and anything else that gets here by a route
-        // nobody thought of.
-        //
-        // It also makes every staged edit minimal, which the Text card already did on
-        // the way out: replacing a whole subtree marks the rows that actually differ,
-        // not the whole subtree.
-        me.pending = PVE.meta.EditSet.between(stored, me.plannedData());
-        me.buildTree();
-        me.syncButtons();
-        return !PVE.meta.Core.call('same', before, me.plannedData());
+        return this.setPlanned(new PVE.meta.EditSet([edit]).apply(this.plannedData()));
     },
 
     isDirty: function () {
         return this.pending.length > 0;
     },
 
-    // The staged edits at `path` or under it -- the same subsumption `stage()` uses,
-    // so "what would Discard drop" and "what did staging replace" are one rule.
-    pendingUnder: function (path) {
-        return this.pending.under(path);
-    },
-
-    // Drops the staged edits on one row, leaving the rest alone.
+    // Puts the stored value back on one row and leaves the rest alone. Dropping a
+    // row's edits and restoring what is stored there are the same thing once the edit
+    // set is the difference: a ghost gets its value back, a key that was added goes,
+    // and a subtree comes back whole.
     //
-    // A list member needs more care than "drop what is staged at this path": the edit
-    // is staged on the *list*, so dropping it would throw away every other member's
-    // change too. Put that one member back to what the document says instead, and
-    // drop the whole staged edit only once the list matches again.
+    // A list member needs more care: the edit is staged on the *list*, so putting the
+    // whole stored list back would throw away every other member's change too. That
+    // one member goes back instead, and the list's edit is gone once every member
+    // matches again -- with no step of its own, since a list that matches is not a
+    // difference.
     discardRow: function (rec) {
         let me = this;
         if (!rec || !rec.data.path) {
@@ -3641,36 +3637,18 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.discardListMember(d.path, d.arrayIndex);
             return;
         }
-        if (!me.pendingUnder(d.path).length) {
-            return;
-        }
-        me.pending.discardUnder(d.path);
-        me.buildTree();
-        me.syncButtons();
+        let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), d.path);
+        me.stage(d.path, stored === undefined ? 'delete' : 'set', stored);
     },
 
     discardListMember: function (path, index) {
         let me = this;
         let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), path);
-        let list = me.listAt(path);
         if (!Array.isArray(stored)) {
             return;
         }
-        if (index < stored.length) {
-            list[index] = JSON.parse(JSON.stringify(stored[index]));
-        } else {
-            list.splice(index, 1); // it was appended; putting it back means removing it
-        }
-        if (JSON.stringify(list) === JSON.stringify(stored)) {
-            // Nothing of this list's edit is left to keep. Nothing can be staged
-            // *under* a list (its members are not addressable), so this drops
-            // exactly the list's own edit.
-            me.pending.discardUnder(path);
-            me.buildTree();
-            me.syncButtons();
-            return;
-        }
-        me.stage(path, 'set', list);
+        // An appended member has nothing stored to go back to: it goes.
+        me.stageListMember(path, index, index < stored.length ? stored[index] : undefined);
     },
 
     // The document as it would be. Everything the tree shows is computed from this,
@@ -3692,14 +3670,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return this.stage(view || '', 'set', value);
     },
 
+    // Revert: the document you are looking at is the stored one.
     revertPending: function () {
         let me = this;
         if (!me.isDirty()) {
             return;
         }
-        me.pending = PVE.meta.EditSet.empty();
-        me.buildTree();
-        me.syncButtons();
+        me.setPlanned(me.dataOf(me.docId));
     },
 
     // The document a row belongs to; the panel's default for anything with no row.
@@ -4216,15 +4193,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (!Array.isArray(before) || before.length <= e.value.length) {
                 return;
             }
-            let list = PVE.meta.Utils.valueAt(me.plannedData(), e.path);
             let entry = root;
             let path = '';
             e.path.split('.').forEach(function (seg) {
                 path = PVE.meta.Utils.joinPath(path, seg);
                 entry = me.entry(entry, seg, path);
             });
-            before.slice(Array.isArray(list) ? list.length : 0).forEach(function (item, i) {
-                let row = me.entry(entry, String((list || []).length + i), e.path);
+            before.slice(e.value.length).forEach(function (item, i) {
+                let row = me.entry(entry, String(e.value.length + i), e.path);
                 row.present = false;
                 row.pendingDelete = true;
                 row.arrayIndex = null; // gone: there is no member to act on
