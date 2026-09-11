@@ -1,6 +1,6 @@
 --- a/usr/share/perl5/PVE/AbstractConfig.pm
 +++ b/usr/share/perl5/PVE/AbstractConfig.pm
-@@ -11,6 +11,7 @@
+@@ -12,6 +12,7 @@
  use PVE::GuestHelpers qw(typesafe_ne);
  use PVE::ReplicationConfig;
  use PVE::Replication;
@@ -8,7 +8,7 @@
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -266,6 +267,15 @@
+@@ -267,6 +268,33 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -18,13 +18,31 @@
 +    # this vmid was free -- a restore *over* an existing guest keeps its document,
 +    # since a backup does not carry one and clearing it would be data loss.
 +    if (!$allow_existing) {
-+        eval { PVE::RS::Meta::on_create($vmid) };
-+        warn "pve-meta: on_create($vmid) failed: $@" if $@;
++        # pve-meta: under the document's own lock -- the one every other writer
++        # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`). Without it the
++        # hook races an in-flight write: the write passes its checks, this purge
++        # runs, the vmid is reused, and the stalled write lands on the new guest's
++        # slot carrying the old guest's metadata. That is the vmid-reuse window
++        # these hooks exist to close, so they have to close it against writers too.
++        #
++        # `cfs_lock_domain` reports the callback's die through `$@` rather than
++        # raising, so `$@` is read inside the eval, before leaving it clears it.
++        # The eval is for `cfs_lock_domain` itself: cleaning up metadata must never
++        # be able to fail a guest create or destroy.
++        my $meta_err;
++        eval {
++            PVE::Cluster::cfs_lock_domain(
++                "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_create($vmid) },
++            );
++            $meta_err = $@;
++        };
++        $meta_err = $@ if !$meta_err;
++        warn "pve-meta: on_create($vmid) failed: $meta_err" if $meta_err;
 +    }
  }
  
  # destroys configuration, only applicable for configs owned by the callers node.
-@@ -275,6 +285,13 @@
+@@ -276,6 +304,31 @@
  
      my $config_fn = $class->config_file($vmid, $nodename);
      unlink $config_fn or die "failed to remove config file: $!\n";
@@ -33,12 +51,30 @@
 +    # Every destroy path funnels through here (primary destroy, create/restore failure
 +    # cleanup, clone failure cleanup, remote-migration abort), and this runs only after
 +    # the unlink above succeeded: while the config still exists, so does the guest.
-+    eval { PVE::RS::Meta::on_destroy($vmid) };
-+    warn "pve-meta: on_destroy($vmid) failed: $@" if $@;
++    # pve-meta: under the document's own lock -- the one every other writer
++    # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`). Without it the
++    # hook races an in-flight write: the write passes its checks, this purge
++    # runs, the vmid is reused, and the stalled write lands on the new guest's
++    # slot carrying the old guest's metadata. That is the vmid-reuse window
++    # these hooks exist to close, so they have to close it against writers too.
++    #
++    # `cfs_lock_domain` reports the callback's die through `$@` rather than
++    # raising, so `$@` is read inside the eval, before leaving it clears it.
++    # The eval is for `cfs_lock_domain` itself: cleaning up metadata must never
++    # be able to fail a guest create or destroy.
++    my $meta_err;
++    eval {
++        PVE::Cluster::cfs_lock_domain(
++            "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_destroy($vmid) },
++        );
++        $meta_err = $@;
++    };
++    $meta_err = $@ if !$meta_err;
++    warn "pve-meta: on_destroy($vmid) failed: $meta_err" if $meta_err;
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -873,6 +890,9 @@
+@@ -876,6 +929,9 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
@@ -48,7 +84,7 @@
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1049,6 +1069,9 @@
+@@ -1052,6 +1108,9 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -58,7 +94,7 @@
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1211,6 +1234,9 @@
+@@ -1214,6 +1273,9 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);
