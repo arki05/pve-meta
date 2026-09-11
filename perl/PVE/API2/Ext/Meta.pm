@@ -506,8 +506,8 @@ __PACKAGE__->register_method({
     },
     returns => {
         type => 'array',
-        # `{ prefix, description?, selector, schema? }` for a loaded prefix --
-        # `schema` is a free-form PVE::JSONSchema-dialect subtree -- or
+        # `{ prefix, description?, selector, enforce, hidden, schema?, origin, overrides }`
+        # for a loaded prefix -- `schema` is a free-form PVE::JSONSchema-dialect subtree -- or
         # `{ prefix, origin, error }` for one that did not load.
         items => {
             type => 'object',

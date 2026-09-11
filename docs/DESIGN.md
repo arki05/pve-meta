@@ -54,6 +54,7 @@ of the same name. **The file name is the prefix**: `homelab.docker.yaml` declare
 description: Traefik dynamic configuration   # optional
 selector: { tag: traefik }                   # required: { all: true } or { tag: <t> }
 enforce: true                                # optional, default false
+hidden: false                                # optional, default false
 schema:                                      # optional, PVE::JSONSchema dialect
   type: object
   properties:
@@ -73,11 +74,19 @@ schema:                                      # optional, PVE::JSONSchema dialect
   owns is shadowed, silently. A prefix with no `schema` still governs its subtree.
 * The schema dialect the editor consumes: `type`, `properties`, `description`,
   `default`, `enum`, `minimum`, `maximum`, `format` (a PVE::JSONSchema format name,
-  validated by proxmoxlib's own vtype in the editor), and `multiline` (an editor hint).
-  Nothing in pve-meta requires a key to be present; a `default` is written only by an
-  explicit action.
+  validated by proxmoxlib's own vtype in the editor), the editor hints `multiline` and
+  `hidden`, and `enforce`. Nothing in pve-meta requires a key to be present; a `default`
+  is written only by an explicit action.
+* **`hidden: true`** on a schema node: the editor offers no declared-but-unset row at
+  that path. It never hides a key that is set — a stored value has its row from the
+  document, typed and described by the schema as ever — and it never reaches
+  validation.
 * **`enforce: true`** makes the schema a rule for API writes (§7). Off, a schema is
   advisory: the editor marks mismatches and asks for a tick.
+* **Both flags are inherited** down the schema node by node, an explicit setting on a
+  node winning at any depth; the prefix-level field is the root default. So
+  `enforce: true` on the prefix with `enforce: false` on a passthrough subtree, or
+  `hidden: true` on the prefix with `hidden: false` on the two keys worth offering.
 
 ## 4. Permissions — who may touch a prefix
 
@@ -152,11 +161,12 @@ affordance, not the validator; a test keeps its required keys equal to the parse
   write that changes nothing rewrites nothing.
 * **One lint** runs on the planned document: top level is a map, no nulls, keys match
   the charset, comment keys are strings. A failure is a 400 naming the path.
-* **Enforced schemas.** If a prefix that reaches the guest says `enforce: true`, a
-  write that would leave that prefix's subtree not matching its schema — for the
-  findings the write introduces or touches, never for what was already wrong elsewhere
-  — is a 422 naming the paths, unless the request carries `force=1`. Anyone who may
-  write may force. `format:` checks are never enforced.
+* **Enforced schemas.** If a prefix that reaches the guest says `enforce: true` (for
+  itself, or on a schema node under it: §3), a write that would leave the enforced part
+  of its subtree not matching the schema — for the findings the write introduces or
+  touches, never for what was already wrong elsewhere — is a 422 naming the paths,
+  unless the request carries `force=1`. Anyone who may write may force. `format:`
+  checks are never enforced.
 * **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
   `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
   else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
@@ -186,7 +196,7 @@ Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
 | PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
 | GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, schema?, origin, overrides }]`, most-specific first, plus `{ prefix, origin, error }` for a file that did not load |
+| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, overrides }]`, most-specific first, plus `{ prefix, origin, error }` for a file that did not load |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules, origin, overrides }]`, plus `{ name, origin, error }` rows |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>` |
 | GET | `/meta/schemas` | — | `{ prefix, permission }` |
@@ -264,9 +274,10 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 (`crates/pve-meta-wasm`, see `WASM-CORE.md`); the editor reimplements none of them.
 
 * **Guest tab**: one tree of the document the caller can see. Rows are the union of
-  keys present and keys the governing prefixes declare; declared-but-unset rows are
-  greyed with their default and a **Set to default** action. Columns: key, value,
-  description (the row's comment key), access (every rule covering the row).
+  keys present and keys the governing prefixes declare and do not hide (§3);
+  declared-but-unset rows are greyed with their default and a **Set to default** action.
+  Columns: key, value, description (the row's comment key), access (every rule covering
+  the row).
 * **Edits are staged** and one **Apply** writes them as a single `replace` at the
   narrowest view covering every staged path (a single delete is a `DELETE`). Staged
   rows render like a pending PVE config change. **Revert** drops them.

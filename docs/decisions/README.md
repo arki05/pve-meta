@@ -24,6 +24,7 @@ new record; the old one stays and is marked superseded.
 | [015](015-audit-line-per-write.md) | Every write logs one audit line | accepted |
 | [016](016-write-cli-for-root.md) | The CLI writes, for root on the node, skipping only permissions | accepted |
 | [017](017-data-is-a-native-structure.md) | `data` on a read is a native structure, in PVE's spelling | accepted |
+| [018](018-hidden-declarations.md) | A declaration can say it is not a row; `hidden` and `enforce` are inherited per schema node | accepted |
 
 Related records kept in their own files: [`../WASM-CORE.md`](../WASM-CORE.md) (how the
 core reaches the browser) and [`../LIFECYCLE-PATCHES.md`](../LIFECYCLE-PATCHES.md) (the
