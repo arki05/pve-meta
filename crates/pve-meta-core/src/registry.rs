@@ -311,12 +311,30 @@ struct RawPrefixDef {
     description: Option<String>,
     #[serde(default)]
     selector: Option<RawSelector>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flag")]
     enforce: Option<bool>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_flag")]
     hidden: Option<bool>,
     #[serde(default)]
     schema: Option<Value>,
+}
+
+/// A prefix-level flag: `true`/`false`, or `1`/`0` as this dialect already
+/// spells `optional` and `multiline`, and as the same flag reads on a schema
+/// node (`shape`). Anything else is refused, since a file is parsed strictly.
+fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(b)) => Some(b),
+        Some(Value::Number(n)) if n.as_i64() == Some(1) => Some(true),
+        Some(Value::Number(n)) if n.as_i64() == Some(0) => Some(false),
+        Some(other) => {
+            return Err(serde::de::Error::custom(format!(
+                "expected true/false or 1/0, got {other}"
+            )))
+        }
+    })
 }
 
 #[derive(Deserialize)]
@@ -951,6 +969,10 @@ rules:
         assert!(parse_prefix("x", "selector: {all: true}\nenforce: true\n").unwrap().enforce);
         assert!(!parse_prefix("x", "selector: {all: true}\nenforce: false\n").unwrap().enforce);
         assert!(parse_prefix("x", "selector: {all: true}\nenforce: nope\n").is_err());
+        // The file's own idiom for a flag, as `optional: 1` and `multiline: 1`.
+        assert!(parse_prefix("x", "selector: {all: true}\nenforce: 1\n").unwrap().enforce);
+        assert!(!parse_prefix("x", "selector: {all: true}\nhidden: 0\n").unwrap().hidden);
+        assert!(parse_prefix("x", "selector: {all: true}\nenforce: 2\n").is_err());
     }
 
     #[test]

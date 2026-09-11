@@ -80,13 +80,16 @@ schema:                                      # optional, PVE::JSONSchema dialect
 * **`hidden: true`** on a schema node: the editor offers no declared-but-unset row at
   that path. It never hides a key that is set — a stored value has its row from the
   document, typed and described by the schema as ever — and it never reaches
-  validation.
+  validation. On the prefix itself it hides every declared key below; the prefix's own
+  row stays, since it is the declaration that something lives there.
 * **`enforce: true`** makes the schema a rule for API writes (§7). Off, a schema is
   advisory: the editor marks mismatches and asks for a tick.
 * **Both flags are inherited** down the schema node by node, an explicit setting on a
   node winning at any depth; the prefix-level field is the root default. So
   `enforce: true` on the prefix with `enforce: false` on a passthrough subtree, or
   `hidden: true` on the prefix with `hidden: false` on the two keys worth offering.
+  Either flag may be spelled `true`/`false` or `1`/`0`, the idiom `optional` and
+  `multiline` already use.
 
 ## 4. Permissions — who may touch a prefix
 
@@ -282,9 +285,14 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
   narrowest view covering every staged path (a single delete is a `DELETE`). Staged
   rows render like a pending PVE config change. **Revert** drops them.
 * **Tree | Text** switches between the tree and a Monaco buffer of the same planned
-  document; switching back turns the typed text into staged edits. **Edit selection as
-  text** opens Monaco on one subtree. Both text editors share Format, a YAML/JSON view
-  toggle, Diff and Apply.
+  document; switching back turns the typed text into staged edits, and asks first
+  when the buffer changed only layout, which the tree cannot hold. Apply from Text
+  sends the buffer, so a `#` comment or a reordering typed there reaches the file.
+  **Edit selection as text** opens Monaco on one subtree of the planned document and
+  stages the parsed value on OK, like the row editor; a comment typed there is not
+  kept. Both text editors share Format and a YAML/JSON view toggle. **Diff** shows what
+  Apply would write against what is stored, from either view: a buffer verbatim, a
+  document rendered.
 * Schema findings mark rows amber, bubble up to ancestors, and squiggle the text buffer.
   Apply stops to show the diff only when the edit introduces a finding; a **Save
   anyway** tick then applies with `force=1`, and enforced findings are labelled.

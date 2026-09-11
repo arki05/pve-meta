@@ -47,9 +47,10 @@ pub struct Declared {
     /// the per-node `enforce`, which is inherited from here down.
     pub enforce: bool,
     /// The root default for the per-node `hidden`: with it set, this prefix
-    /// offers no declared-but-unset rows at all unless a node asks to be shown.
-    /// For a vocabulary large enough that the useful default is "show what is
-    /// set, and nothing else".
+    /// offers no declared-but-unset rows below its own unless a node asks to
+    /// be shown. For a vocabulary large enough that the useful default is
+    /// "show what is set, and nothing else". The prefix's own row stays: it is
+    /// the declaration that something lives there.
     pub hidden: bool,
 }
 
@@ -246,10 +247,7 @@ impl Shape {
         // mostly keys nobody sets on a given guest -- and un-hiding one key
         // inside it is how you keep the two or three that matter. The walk
         // always descends, so that override needs no lookahead.
-        let hidden = schema
-            .get("hidden")
-            .and_then(Value::as_bool)
-            .unwrap_or(inherited_hidden);
+        let hidden = flag(schema, "hidden", inherited_hidden);
         out.push(Described { path: path.clone(), schema, hidden });
         if let Some(props) = schema.get("properties").and_then(Value::as_object) {
             for (k, sub) in props {
@@ -307,10 +305,7 @@ impl Shape {
         // way to say `enforce: false` on that subtree, the escape hatch and the
         // enforcement cannot both exist -- and the escape hatch is what makes a
         // partial schema honest.
-        let enforce = schema
-            .get("enforce")
-            .and_then(Value::as_bool)
-            .unwrap_or(inherited_enforce);
+        let enforce = flag(schema, "enforce", inherited_enforce);
         if let Some(msg) = check_value(schema, value) {
             out.push(Report::Finding(Finding { path, msg, enforced: enforce }));
             return; // a value of the wrong shape says nothing useful about its children
@@ -336,6 +331,21 @@ impl Shape {
             }
             self.walk(owner, sub, child, child_path, enforce, out);
         }
+    }
+}
+
+/// A schema node's `hidden` or `enforce`, or `inherited` when the node does
+/// not say. Spelled `true`/`false` or, as this dialect already spells
+/// `optional: 1` and `multiline: 1`, as `1`/`0` -- a hand-written
+/// `enforce: 0` on a passthrough subtree is exactly the escape hatch these
+/// flags exist for, and it must not be read as "not stated" and inherit the
+/// `true` it was written to override.
+fn flag(schema: &Value, key: &str, inherited: bool) -> bool {
+    match schema.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) if n.as_i64() == Some(1) => true,
+        Some(Value::Number(n)) if n.as_i64() == Some(0) => false,
+        _ => inherited,
     }
 }
 
@@ -549,6 +559,28 @@ mod tests {
             })
             .collect();
         assert!(all.contains(&"t.extra.n".to_string()), "{all:?}");
+    }
+
+    /// The flags are read as `true`/`false` and as the file's own `1`/`0`
+    /// idiom alike; anything else is "not stated" and inherits.
+    #[test]
+    fn a_node_flag_may_be_spelled_one_or_zero() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "integer", "enforce": 0 },
+                "b": { "type": "integer", "enforce": 1 },
+                "c": { "type": "integer", "enforce": "yes" },
+                "h": { "type": "integer", "hidden": 1 },
+            },
+        });
+        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema)) };
+        let shape = Shape::new([strict], &tags(&[]));
+        let doc = serde_json::json!({ "t": { "a": "x", "b": "x", "c": "x" } });
+        let enforced: Vec<String> =
+            shape.enforced_findings(&doc).into_iter().map(|f| f.path.to_string()).collect();
+        assert_eq!(enforced, ["t.b", "t.c"], "0 opts out, 1 opts in, anything else inherits");
+        assert!(shape.schema_index().iter().find(|d| d.path.to_string() == "t.h").unwrap().hidden);
     }
 
     /// `hidden` is inherited, and an explicit setting wins at any depth: a

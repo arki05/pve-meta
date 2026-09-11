@@ -50,7 +50,9 @@ may write, so enforcement is still a deliberate act rather than an impossible on
 
 Both flags also exist at the prefix level, which is just the root default of the
 inherited value -- `hidden: true` there is "this prefix offers no declared-but-unset
-rows at all", which is what a vocabulary wants and what five keys do not.
+rows below its own", which is what a vocabulary wants and what five keys do not. The
+prefix's own row stays: it is the declaration that something lives there, and one
+row is not the problem two hundred were.
 
 ## Consequences
 
