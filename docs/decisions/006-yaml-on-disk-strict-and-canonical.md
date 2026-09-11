@@ -19,5 +19,5 @@ comment *keys* are data and survive anything.
 
 The editor's YAML is the store's YAML by construction (011): one emitter, compiled to
 wasm, and `testdata/yaml-cases.json` exists to notice when a `serde_yaml_ng` upgrade
-moves the bytes. Booleans in `data` are `1`/`0` on the way out, the PVE convention;
-`format=yaml` carries exact types for clients that need them.
+moves the bytes. Booleans in `data` are `1`/`0` on the way out, the PVE convention
+(017); `format=yaml` carries exact types for clients that need them.

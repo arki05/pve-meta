@@ -34,5 +34,5 @@ already has rather than churning it.
 ## Consequences
 
 One notion of equality. If sorted files are ever wanted, that is one line in
-`format::dump`. Returning `data` as a JSON string, which would carry booleans and let
-the editor read JSON, remains a separate, open choice (006).
+`format::dump`. Whether `data` should be a JSON string instead is settled in 017: it
+stays native.
