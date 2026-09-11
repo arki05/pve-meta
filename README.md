@@ -114,8 +114,18 @@ is reshipped. pve-meta ships two page manifests and one patch manifest.
 
 ## Install
 
-There is no published apt repository yet (`docs/DISTRIBUTION.md` documents the
-pipeline). Build the three `.deb`s (below) and install in dependency order:
+From the signed apt repository (amd64 and arm64; `docs/DISTRIBUTION.md` describes the
+pipeline):
+
+```sh
+curl -fsSL https://apt.arki05.com/pubkey.asc \
+    | gpg --dearmor -o /etc/apt/keyrings/arki05.gpg
+echo "deb [signed-by=/etc/apt/keyrings/arki05.gpg] https://apt.arki05.com trixie main" \
+    > /etc/apt/sources.list.d/arki05.list
+apt update && apt install pve-meta
+```
+
+Or build the three `.deb`s (below) and install them in dependency order:
 
 ```sh
 dpkg -i pve-ext_*.deb
@@ -153,7 +163,7 @@ the installed `.so` on a live node.
 | `pve-ext/` | The extension layer (own package) |
 | `pages/`, `patches/`, `prefixes/` | Page manifests, the lifecycle patch, packaged example prefixes |
 | `docs/` | `DESIGN.md` (the spec), `decisions/`, `BUILD.md`, `DISTRIBUTION.md`, `LIFECYCLE-PATCHES.md`, `WASM-CORE.md` |
-| `scripts/` | apt-repo publishing, the ceiling watcher, Perl stubs for `perl -c` |
+| `scripts/` | The ceiling watcher, Perl stubs for `perl -c` |
 
 ## License
 

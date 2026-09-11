@@ -1,41 +1,60 @@
 name: build
 
+# Every push and pull request builds and tests the three packages on amd64 and
+# arm64. A tag `v<version>` additionally publishes the .debs as a GitHub
+# Release and asks apt.arki05.com to index them (docs/DISTRIBUTION.md).
+
 on:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native builds on both, in the same Debian the packages target.
+          # libpve-meta-rs-perl is a compiled Perl module and cannot be
+          # cross-built casually (perlmod compiles against the host perl), so
+          # each architecture builds itself. The arm64 hosted runners are free
+          # for public repositories only.
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
     steps:
-      # actions/checkout needs git; debian:trixie ships without it, so
-      # install it (and the other bits checkout/curl steps need) before the
-      # checkout step runs.
-      - name: Install git
+      # actions/checkout needs git and node; debian:trixie ships without them.
+      - name: Prepare container
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
+          apt-get install -y --no-install-recommends git ca-certificates curl nodejs
 
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential curl git pkg-config libssl-dev libperl-dev perl \
+            build-essential pkg-config libssl-dev libperl-dev perl libjson-perl \
             debhelper dh-cargo devscripts fakeroot dpkg-dev lintian \
-            nodejs npm shellcheck libjson-perl
+            npm shellcheck
 
       # `--profile minimal` is rustc, cargo and rust-std for the host only.
-      # `make wasm` (a dependency of `make build` and `make check`) needs the
-      # wasm32 standard library as well, and building for a target that is not
-      # installed is a hard error, not a skip. The toolchain lives in ~/.rustup,
-      # which the cache below does not cover, so this runs on every job.
+      # `make wasm` needs the wasm32 standard library as well, and building
+      # for a target that is not installed is a hard error, not a skip.
       - name: Install rustup toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -50,95 +69,122 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin
             target
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-
+            cargo-${{ matrix.arch }}-
 
-
-
-      # The suites ran only when a human typed the command: `debian/rules`
-      # overrides `dh_auto_test`, so `make deb` builds without testing, and
-      # tagged builds published to the apt repo with no gate at all. They run
-      # here, before the packages are built, on the same container that has
-      # every dependency they need.
-      - name: Rust tests, clippy and rustdoc
+      # The gates, before anything is packaged: `debian/rules` skips
+      # dh_auto_test (a packaging build has no guaranteed network), so this
+      # is where the suites run.
+      - name: Rust tests, clippy, rustdoc and the editor smoke suite
         run: make check test
 
       - name: The perlmod boundary suite
         run: make -C crates/pve-meta-perl check
 
-      # shellcheck on pve-ext-patch and perl -c on every Perl file, against
-      # stub PVE modules: this container has no PVE, and the patch tool that
-      # rewrites core PVE files was otherwise never checked anywhere but by
-      # hand.
       - name: Shell and Perl syntax
         run: make check-perl
 
       - name: Build .deb packages
         run: make deb
 
-      - name: Collect built .deb artifacts
+      # Both jobs build all three packages; only the compiled one differs by
+      # architecture. The two `Architecture: all` packages are taken from the
+      # amd64 job alone, so one file name never means two different files.
+      - name: Collect
         run: |
-          mkdir -p dist-out
+          mkdir -p dist
           shopt -s nullglob
-          debs=(../*.deb dist/*.deb)
-          if [ ${#debs[@]} -eq 0 ]; then
-            echo "no .deb files found in ../ or dist/ after 'make deb'" >&2
-            exit 1
+          if [ "${{ matrix.arch }}" = amd64 ]; then
+            cp -v ../*.deb dist/
+          else
+            cp -v ../*_arm64.deb dist/
           fi
-          cp -v "${debs[@]}" dist-out/
+          ls -l dist/
+          [ -n "$(ls dist)" ]
 
       - uses: actions/upload-artifact@v4
         with:
-          name: pve-meta-deb
-          path: dist-out/*.deb
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
           if-no-files-found: error
 
-  publish-repo:
+  release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    container: debian:trixie
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      contents: write
     steps:
-      - name: Install git
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
-
       - uses: actions/checkout@v4
-
-      - name: Install repo tooling
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            apt-utils dpkg-dev gnupg curl unzip ca-certificates
-          curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
-          unzip -q /tmp/rclone.zip -d /tmp
-          install -m 0755 /tmp/rclone-*-linux-amd64/rclone /usr/local/bin/rclone
 
       - uses: actions/download-artifact@v4
         with:
-          name: pve-meta-deb
-          path: incoming-debs
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
 
-      - name: Build signed repo tree
-        env:
-          APT_GPG_KEY_ID: ${{ secrets.APT_GPG_KEY_ID }}
-          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: bash scripts/apt-repo/build-repo.sh incoming-debs repo-out
+      # The tag names the pve-meta version: `v0.1.0` is debian/changelog's
+      # `0.1.0-1`, whose upstream half Cargo.toml has to match too
+      # (debian/rules checks that at build time).
+      - name: The tag is the package version
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
+          want="${GITHUB_REF_NAME#v}"
+          have="$(dpkg-parsechangelog -l debian/changelog -S Version)"
+          have="${have%-*}"
+          if [ "$want" != "$have" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match debian/changelog version $have"
+            exit 1
+          fi
 
-      - name: Publish to R2
+      # Published files are immutable: apt.arki05.com records the hash of
+      # every .deb it has ever published and fails its run if one changes.
+      # A file name that already exists in an earlier release is therefore
+      # never uploaded again -- pve-ext keeps its own version and is rebuilt
+      # by every release, but only a new pve-ext version is published.
+      - name: Publish release
         env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: bash scripts/apt-repo/publish-r2.sh repo-out
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          published=$(gh release list --limit 200 --json tagName -q '.[].tagName' \
+            | xargs -r -I{} gh release view {} --json assets -q '.assets[].name' | sort -u)
+          upload=()
+          for f in dist/*.deb; do
+            name=$(basename "$f")
+            if grep -qxF "$name" <<<"$published"; then
+              echo "already published, skipping: $name"
+            else
+              upload+=("$f")
+            fi
+          done
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          if [ ${#upload[@]} -gt 0 ]; then
+            # No --clobber: an asset that exists on this tag is left alone.
+            gh release upload "$GITHUB_REF_NAME" "${upload[@]}"
+          fi
+          gh release view "$GITHUB_REF_NAME" --json assets -q '.assets[].name'
+
+      # Ask the apt repository to index the release now rather than at its
+      # nightly run. Optional: without the token the release still lands.
+      - name: Trigger apt repository publish
+        env:
+          DISPATCH_TOKEN: ${{ secrets.APT_REPO_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$DISPATCH_TOKEN" ]; then
+            echo "APT_REPO_DISPATCH_TOKEN is not set; the nightly run will pick the release up."
+            exit 0
+          fi
+          # workflow_dispatch rather than repository_dispatch: it needs only
+          # the Actions permission on apt.arki05.com, where repository_dispatch
+          # would need Contents: write -- push access to that repository.
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/arki05/apt.arki05.com/actions/workflows/publish.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "dispatched"
