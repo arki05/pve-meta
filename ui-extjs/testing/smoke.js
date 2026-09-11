@@ -324,6 +324,30 @@ eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
 
+console.log('\n--- Edit selection as text stages, like every other modal ---');
+{
+    const E = ctx.PVE.meta.EditSet;
+    const stored = { traefik: { spec: { host: 'a', port: 80 } }, netbird: { groups: ['lan'] } };
+
+    // A subtree buffer is one edit at the view's own path, and it subsumes anything
+    // staged inside that view -- a buffer for `traefik` says everything about
+    // `traefik.spec`.
+    const set = E.empty();
+    set.stage({ path: 'traefik.spec.host', op: 'set', value: 'b' });
+    eq('an inner edit stages', set.length, 1);
+    set.stage({ path: 'traefik', op: 'set', value: { spec: { host: 'c' } } });
+    eq('the subtree buffer replaces it', set.edits.map((e) => e.path), ['traefik']);
+    eq('and the planned document is what was typed',
+        set.apply(stored).traefik, { spec: { host: 'c' } });
+    eq('... leaving everything outside the view alone',
+        set.apply(stored).netbird, { groups: ['lan'] });
+
+    // The whole-document view: the empty path is the document, not a key named "".
+    const root = E.empty();
+    root.stage({ path: '', op: 'set', value: { only: 1 } });
+    eq('the root view stages as the document', root.apply(stored), { only: 1 });
+}
+
 console.log('\n--- leaving Text only asks when the tree cannot carry the change ---');
 {
     // Ordinary edits become staged rows, so switching needs no dialog and gets none.

@@ -1311,7 +1311,11 @@ Ext.define('PVE.meta.Footer', {
         }
         out.push('->');
         out.push({
-            text: gettext('Apply'),
+            // Named by the caller, because the two mean different things: the panel's
+            // footer Apply *writes*, and a modal editor's button stages -- the same
+            // rule the row editor and Add Key follow. One word for both was how the
+            // subtree window came to write directly and see nothing that was staged.
+            text: cfg.applyText || gettext('Apply'),
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
             // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
@@ -1986,6 +1990,7 @@ Ext.define('PVE.meta.TextWindow', {
                     diff: () => me.showBufferDiff(),
                     format: () => me.formatBuffer(),
                     apply: () => me.showDiff(),
+                    applyText: gettext('Stage'),
                     secondary: () => me.close(),
                     secondaryText: gettext('Close'),
                 }),
@@ -2076,8 +2081,8 @@ Ext.define('PVE.meta.TextWindow', {
         PVE.meta.Buffer.render(me.buffer(), value);
     },
 
-    // Apply applies, and the window closes when the write lands. The diff is a button
-    // of its own now, so stopping to show it again was asking twice for one decision.
+    // Stage stages, and the window closes. The diff is a button of its own, so stopping
+    // to show it again was asking twice for one decision.
     showDiff: function () {
         let me = this;
         if (!me.editor || PVE.meta.Buffer.unchanged(me.buffer())) {
@@ -2086,17 +2091,26 @@ Ext.define('PVE.meta.TextWindow', {
         me.apply(me.editor.getValue(), me.lang);
     },
 
+    // Stages what was typed; it does not write. Every other modal in this editor --
+    // the row editor, Add Key, Add Rule, Declare Key -- stages, and the panel's footer
+    // Apply is the one thing that writes. This window wrote immediately and directly,
+    // which is why it could not see staged edits and they could not see it: it was not
+    // editing the same document as everything else.
+    //
+    // One edit at the view's own path. `EditSet.stage` already drops anything staged
+    // at or under that path, which is exactly right -- a buffer for `traefik` says
+    // everything about `traefik.spec`.
     apply: function (text, lang) {
         let me = this;
-        // JSON is a subset of YAML, but `data` is the parameter that says "this is the
-        // JSON data model", so use it when the user is editing JSON.
-        let params = {
-            view: me.view || undefined,
-            mode: 'replace',
-            digest: me.tree.digestOf(me.docId),
-        };
-        params[lang === 'json' ? 'data' : 'text'] = text;
-        me.tree.write(me.docId, params, () => me.close());
+        let value;
+        try {
+            value = PVE.meta.Codec.parse(text, lang);
+        } catch (err) {
+            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            return;
+        }
+        me.tree.stageFromView(me.view, value);
+        me.close();
     },
 });
 
@@ -3547,8 +3561,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // The document as it would be. Everything the tree shows is computed from this,
     // so a staged value is linted, hovered and diffed exactly like a stored one.
-    plannedData: function () {
-        return this.pending.apply(this.dataOf(this.docId));
+    // The document as it would be if the staged edits were applied. `docId` is here
+    // for a caller holding a row's own document; a panel shows one document, so it
+    // defaults to that one.
+    plannedData: function (docId) {
+        return this.pending.apply(this.dataOf(docId || this.docId));
+    },
+
+    // Fold a whole subtree, as edited somewhere else, back into the edited document.
+    // The one way a text buffer becomes staged edits at a view -- what "Edit selection
+    // as text" ends with, and the reason that window no longer needs a write path of
+    // its own.
+    stageFromView: function (view, value) {
+        let me = this;
+        me.pending.stage({ path: view || '', op: 'set', value: value });
+        me.buildTree();
+        me.syncButtons();
     },
 
     revertPending: function () {
@@ -4591,27 +4619,27 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let view =
             PVE.meta.Utils.editorKind(rec.data) === 'text' ? rec.data.path : me.parentPath(rec);
         let docId = me.docOf(rec);
-        me.request({
-            url: me.urlFor(docId),
-            // The document root is addressed by *omitting* `view`, not by sending an
-            // empty one -- which is what a document row on the datacenter tab is.
-            params: { view: view || undefined, format: 'yaml' },
-            success: function (response) {
-                let d = response.result.data || {};
-                me.setDigest(docId, d.digest);
-                me.textWindow = Ext.create('PVE.meta.TextWindow', {
-                    view: view,
-                    docId: docId,
-                    text: d.text || '',
-                    tree: me,
-                });
-                me.textWindow.on('destroy', function () {
-                    me.textWindow = null;
-                    me.reload();
-                });
-                me.textWindow.show();
-            },
+
+        // Rendered from the *planned* document, not fetched. This window used to read
+        // its subtree back from the server, which meant it showed the stored document
+        // and silently ignored everything staged -- so you could edit a row, open its
+        // subtree as text, and be looking at the value you had just replaced.
+        //
+        // There is nothing to fetch any more: the editor dumps with the same codec the
+        // store writes with (decision 011), so the text here is the text the file would
+        // hold, without asking.
+        let planned = me.plannedData(docId);
+        let subtree = view === '' ? planned : PVE.meta.Utils.valueAt(planned, view);
+        me.textWindow = Ext.create('PVE.meta.TextWindow', {
+            view: view,
+            docId: docId,
+            text: PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'),
+            tree: me,
         });
+        // No reload on close: nothing was written. Reloading would also have asked
+        // whether to discard the staged edits this window has just added to.
+        me.textWindow.on('destroy', () => (me.textWindow = null));
+        me.textWindow.show();
     },
 }, PVE.meta.Doc, PVE.meta.TextCard));
 
