@@ -3,6 +3,10 @@ name: audit
 # RustSec advisories against Cargo.lock: on every change to the dependency
 # set, and weekly regardless, since an advisory can appear for a lock file
 # that has not moved.
+#
+# cargo-audit is built on the day's stable, not the toolchain
+# rust-toolchain.toml pins for the packages: the audit only reads Cargo.lock,
+# and the tool's own dependencies move faster than the pin.
 
 on:
   push:
@@ -15,14 +19,15 @@ on:
 
 permissions:
   contents: read
-  checks: write
-  issues: write
 
 jobs:
   audit:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install cargo-audit on stable
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo +stable install cargo-audit --locked
+      - name: Audit Cargo.lock
+        run: cargo +stable audit
