@@ -114,6 +114,10 @@ rules:                         # optional; a file with none grants nothing
   malformed file contributes nothing, is logged, and **is still listed** by `GET
   /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, error }`, so it
   can be found and repaired.
+* **Precedence is by presence.** A cluster file is the file for its name whether or not
+  it parses: a malformed override is listed as a failure and the packaged file it
+  shadows stays out of effect until the override is repaired or deleted. The listing
+  has one row per name, and `GET prefixes/<name>` opens the file the loader judged.
 
 ## 5. Effective access for one request
 

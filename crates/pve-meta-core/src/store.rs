@@ -371,23 +371,19 @@ impl MetaStore {
         }
     }
 
-    /// Where `id` is **read** from: the highest-precedence directory that
-    /// actually has the file, which for a registry document is the same file
-    /// `crate::registry::load_prefixes` would have picked. Falls back to
-    /// [`MetaStore::path_for`] when none has it, so a "not found" error names
-    /// the place a write would create it.
+    /// Where `id` is **read** from. For a registry document that is
+    /// [`Registry::locate`]'s answer -- the highest-precedence directory that
+    /// has the file, parseable or not, which is the same rule the loader
+    /// applies, so the document opened for repair is the one in effect.
+    /// Falls back to [`MetaStore::path_for`] when none has it, so a "not
+    /// found" error names the place a write would create it.
     fn read_path_for(&self, id: &DocId) -> PathBuf {
-        let DocId::Registry(kind, _) = id else {
-            return self.path_for(id);
-        };
-        let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-        for dir in self.registry.dirs(*kind).iter().rev() {
-            let candidate = dir.join(&file);
-            if candidate.is_file() {
-                return candidate;
+        match id {
+            DocId::Registry(kind, name) => {
+                self.registry.locate(*kind, name).unwrap_or_else(|| self.path_for(id))
             }
+            _ => self.path_for(id),
         }
-        self.path_for(id)
     }
 
     fn snapshot_path(&self, vmid: u32, name: &str) -> PathBuf {

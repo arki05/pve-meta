@@ -12,6 +12,17 @@
 //!   in by an operator's own `.deb`;
 //! * `/etc/pve/meta.d/prefixes/<prefix>.yaml` — cluster overrides, by file name.
 //!
+//! **Precedence is by presence.** The highest-precedence directory that has a
+//! file of a name is the file for that name, whether or not it parses: a
+//! malformed cluster override contributes a failure and nothing else, and the
+//! packaged file it shadows stays inert until the override is fixed or
+//! removed. The alternative -- fall back to the packaged file when the
+//! override is broken -- would let a typo in a deliberate override quietly
+//! re-activate the definition it was written to replace. [`effective_file`]
+//! is that rule, and it is the one both the loader and the document store
+//! ([`crate::store::MetaStore`]) apply, so the file `GET /meta/prefixes/{name}`
+//! opens for repair is always the one the loader judged.
+//!
 //! **The file name is the prefix.** `homelab.docker.yaml` declares the prefix
 //! `homelab.docker`, so a definition and its prefix are one thing and there is
 //! no `prefix:` field for the two to disagree about. A prefix segment is
@@ -288,6 +299,10 @@ pub struct Permission {
 /// always did -- is the one failure mode in the project with no observable
 /// symptom (see the module docs): the name is missing everywhere a caller
 /// would look for it, and only a log line ever said so.
+///
+/// A failed cluster override also shadows the packaged file of its name
+/// (precedence is by presence), so this row is then the *only* row for that
+/// name: the packaged definition is not in effect and is not listed.
 ///
 /// `yaml_files` has already filtered to names [`is_valid_file_name`] accepts
 /// before `load_dirs` calls the parser at all, so `name` here is always
@@ -614,6 +629,13 @@ impl Registry {
         self.dirs(kind).last().cloned()
     }
 
+    /// The file for `name` of `kind`, if any directory has one: the
+    /// highest-precedence one that does ([`effective_file`]). What the store
+    /// reads, and what the loader parses -- the same file, by construction.
+    pub fn locate(&self, kind: RegistryKind, name: &str) -> Option<PathBuf> {
+        effective_file(self.dirs(kind), name).map(|(_, path)| path)
+    }
+
     /// [`load_prefixes`] over this registry's own prefix directories.
     pub fn load_prefixes(&self) -> Vec<PrefixDef> {
         self.list_prefixes().0
@@ -638,8 +660,28 @@ impl Registry {
     }
 }
 
+/// The file for `name` among `dirs` (lowest precedence first): the one in
+/// the highest-precedence directory that has it, with that directory's
+/// index. Presence decides, not content -- see the module docs.
+///
+/// `name` is a bare file stem; the caller has already checked it with
+/// [`is_valid_file_name`], so it cannot carry a separator out of `dirs`.
+pub fn effective_file(dirs: &[PathBuf], name: &str) -> Option<(usize, PathBuf)> {
+    let file = format!("{name}.yaml");
+    dirs.iter()
+        .enumerate()
+        .rev()
+        .map(|(index, dir)| (index, dir.join(&file)))
+        .find(|(_, path)| path.is_file())
+}
+
 /// Loads one drop-directory list, later directories overriding earlier by file
 /// name, and stamps each survivor with where it came from.
+///
+/// One row per name, loaded or failed: every name any directory holds is
+/// resolved to its one effective file ([`effective_file`]), and only that
+/// file is read and parsed. A file it shadows is not looked at -- not loaded,
+/// and not reported either, since nothing it says is in effect.
 ///
 /// Which directory is writable -- and so, here, which is `Origin::Cluster`
 /// rather than `Origin::Packaged` -- is decided in exactly one place,
@@ -656,42 +698,41 @@ fn load_dirs<T>(
     parse: impl Fn(&str, &str) -> Result<T>,
     stamp: impl Fn(&mut T, Origin, bool),
 ) -> (Vec<(String, T)>, Vec<RegistryFailure>) {
-    let mut by_name: BTreeMap<String, T> = BTreeMap::new();
-    let mut failures = Vec::new();
+    // Every name, and how many directories hold it -- the `overrides` fact.
+    let mut holders: BTreeMap<String, usize> = BTreeMap::new();
+    for dir in dirs {
+        for (name, _) in yaml_files(dir) {
+            *holders.entry(name).or_insert(0) += 1;
+        }
+    }
     let last = dirs.len().saturating_sub(1);
-    for (index, dir) in dirs.iter().enumerate() {
+    let mut parsed_out = Vec::new();
+    let mut failures = Vec::new();
+    for (name, count) in holders {
+        // The file `yaml_files` just listed can have vanished since; then the
+        // name is simply not there to load.
+        let Some((index, path)) = effective_file(dirs, &name) else { continue };
         let origin = if index == last { Origin::Cluster } else { Origin::Packaged };
-        for (name, path) in yaml_files(dir) {
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
-                Err(e) => {
-                    crate::warn_line!(
-                        "skipping unreadable {kind} file {}: {e}",
-                        path.display()
-                    );
-                    failures.push(RegistryFailure { name, origin, error: e.to_string() });
-                    continue;
-                }
-            };
-            match parse(&name, &text) {
-                Ok(mut parsed) => {
-                    // File names are unique within a directory, so anything this
-                    // displaces necessarily came from a lower-precedence one.
-                    let displaced = by_name.contains_key(&name);
-                    stamp(&mut parsed, origin, displaced);
-                    by_name.insert(name, parsed);
-                }
-                Err(e) => {
-                    crate::warn_line!(
-                        "skipping malformed {kind} file {}: {e}",
-                        path.display()
-                    );
-                    failures.push(RegistryFailure { name, origin, error: e.to_string() });
-                }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                crate::warn_line!("skipping unreadable {kind} file {}: {e}", path.display());
+                failures.push(RegistryFailure { name, origin, error: e.to_string() });
+                continue;
+            }
+        };
+        match parse(&name, &text) {
+            Ok(mut parsed) => {
+                stamp(&mut parsed, origin, count > 1);
+                parsed_out.push((name, parsed));
+            }
+            Err(e) => {
+                crate::warn_line!("skipping malformed {kind} file {}: {e}", path.display());
+                failures.push(RegistryFailure { name, origin, error: e.to_string() });
             }
         }
     }
-    (by_name.into_iter().collect(), failures)
+    (parsed_out, failures)
 }
 
 /// [`load_dirs`] for prefixes, plus the most-specific-first sort the listing
@@ -999,6 +1040,35 @@ rules:
         let traefik = all.iter().find(|n| n.prefix.to_string() == "traefik").unwrap();
         assert_eq!(traefik.selector, Selector::All, "the cluster file wins");
         assert!(traefik.schema.is_none(), "wholesale override, not a merge");
+    }
+
+    /// Precedence is by presence: the override is the file for its name even
+    /// when it does not parse, so a typo in a deliberate override never
+    /// quietly puts the packaged definition back in charge.
+    #[test]
+    fn a_malformed_cluster_override_shadows_the_packaged_file_it_replaces() {
+        let packaged = tempfile::tempdir().unwrap();
+        let cluster = tempfile::tempdir().unwrap();
+        write(packaged.path(), "traefik.yaml", NS);
+        write(packaged.path(), "broken.yaml", "selector: {nonsense: true}\n");
+        write(cluster.path(), "traefik.yaml", "selector: {nonsense: true}\n");
+        write(cluster.path(), "broken.yaml", "selector: {all: true}\n");
+        let dirs = [packaged.path().to_path_buf(), cluster.path().to_path_buf()];
+
+        let (loaded, failures) = prefixes_with_failures(&dirs);
+        assert_eq!(
+            loaded.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
+            vec!["broken"],
+            "the valid override loads; the broken one shadows its packaged file rather than falling back to it",
+        );
+        assert!(loaded[0].overrides, "a valid override still says what it displaced");
+        assert_eq!(failures.len(), 1, "one row per name: the shadowed packaged files are not reported");
+        assert_eq!(failures[0].name, "traefik");
+        assert_eq!(failures[0].origin, Origin::Cluster, "the row names the file to repair");
+
+        // The file the store would open for repair is the same one.
+        assert_eq!(effective_file(&dirs, "traefik").unwrap().1, cluster.path().join("traefik.yaml"));
+        assert_eq!(effective_file(&dirs, "netbird"), None);
     }
 
     #[test]

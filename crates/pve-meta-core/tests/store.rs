@@ -701,6 +701,38 @@ fn deleting_a_registry_override_falls_back_to_the_packaged_file() {
     assert!(packaged.join("traefik.yaml").is_file());
 }
 
+/// The loader and the store agree on which file a name means -- also when
+/// the override is broken: the read opens the override for repair, and the
+/// loader lists that same file as the failure, not the packaged file as a
+/// prefix.
+#[test]
+fn a_malformed_override_is_the_file_a_read_opens_and_the_loader_reports() {
+    let (dir, store) = store();
+    let packaged = packaged_prefix_dir(dir.path());
+    std::fs::create_dir_all(&packaged).unwrap();
+    std::fs::write(packaged.join("traefik.yaml"), "selector: {all: true}\n").unwrap();
+    store
+        .put_raw(&prefix("traefik"), "selector: {all: true}\n", None)
+        .unwrap();
+    let cluster_file = cluster_prefix_dir(dir.path()).join("traefik.yaml");
+    std::fs::write(&cluster_file, "selector: {nonsense: true}\n").unwrap();
+
+    let read = store.read(&prefix("traefik")).unwrap();
+    assert_eq!(read.path, cluster_file, "the read opens the override");
+    assert_eq!(read.raw, "selector: {nonsense: true}\n");
+
+    let (loaded, failures) = store.registry().list_prefixes();
+    assert!(loaded.is_empty(), "the packaged file is shadowed, not re-activated");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].name, "traefik");
+
+    // Removing the override is the repair: the packaged file is in effect again.
+    assert!(store.delete(&prefix("traefik")).unwrap());
+    let (loaded, failures) = store.registry().list_prefixes();
+    assert_eq!(loaded.len(), 1);
+    assert!(failures.is_empty());
+}
+
 #[test]
 fn a_missing_registry_document_is_not_found() {
     let (_dir, store) = store();
