@@ -1,7 +1,7 @@
 {
     "name": "pve-meta-extjs",
     "private": true,
-    "description": "Monaco editor assets for the pve-meta editor tab; `make ui` copies min/vs into vendor/vs",
+    "description": "Monaco editor assets for the pve-meta editor tab; `make ui` copies min/vs into monaco/vs",
     "dependencies": {
         "monaco-editor": "0.52.2"
     }

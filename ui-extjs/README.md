@@ -1,8 +1,10 @@
 # ui-extjs — the native ExtJS editor
 
-One file, `pve-meta-tree.js`, plain ES2017 with no build step of its own, plus the core
-(`pve-meta-core.wasm`, built by `make wasm` from `crates/pve-meta-wasm`) and `monaco/`
-(fetched by `make ui`, gitignored). It defines two panels that pve-ext's page loader
+One shipped script, `pve-meta-tree.js`, which `make js` generates from `src/*.js` --
+plain ES2017, one file per section, concatenated in name order with no bundler and no
+transform -- plus the core (`pve-meta-core.wasm`, built by `make wasm` from
+`crates/pve-meta-wasm`) and `monaco/` (fetched by `make ui`). The generated script and
+`monaco/` are gitignored; the sources are what is edited. It defines two panels that pve-ext's page loader
 instantiates as native tabs: `pveMetaTreePanel`, one document's editor, on every guest's
 config panel; and `pveMetaDatacenterPanel`, the two registry grids, Prefixes and
 Permissions, on the Datacenter panel, each row of which opens in that same editor.
@@ -174,8 +176,8 @@ first, which is what its `waitForXtype()` does.
 
 ## Verifying it
 
-* `node --check pve-meta-tree.js`
-* `node testing/smoke.js` — offline, no DOM, after `make wasm` (`make check` runs it
+* `make js` — generates `pve-meta-tree.js` and runs `node --check` on it.
+* `node testing/smoke.js` — offline, no DOM, after `make wasm js` (`make check` runs it
   when `node` is present). It loads the real file into `node:vm` behind a small
   `Ext`/`Proxmox` shim, instantiates the *built* `pve-meta-core.wasm` synchronously and
   hands it to `PVE.meta.Core.attach`, so the shipped bytes and the shipped glue are what

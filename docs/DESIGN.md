@@ -280,8 +280,8 @@ manifest (lifecycle).
 
 ## 12. The editor
 
-`ui-extjs/pve-meta-tree.js`: plain JavaScript, a native `Ext.tree.Panel`, no build
-step. The rules it needs — codec, key charset, coverage, governing prefix, schema
+`ui-extjs/src/*.js`, shipped as the one generated `pve-meta-tree.js`: plain JavaScript,
+a native `Ext.tree.Panel`, concatenated by `make js` with no bundler. The rules it needs — codec, key charset, coverage, governing prefix, schema
 findings, staged edits — are `pve-meta-core` compiled to wasm
 (`crates/pve-meta-wasm`, see `WASM-CORE.md`); the editor reimplements none of them.
 
