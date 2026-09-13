@@ -1,3 +1,26 @@
+pve-meta (0.1.1-1) unstable; urgency=medium
+
+  * Schema checks: type, enum and minimum/maximum are independent, and enum
+    membership is by value. A value in the enum no longer skips the type and
+    range checks, and the string "1" is no longer the integer 1.
+  * A prefix whose schema uses a known keyword with a value the checker could
+    not act on (type: interger, enforce: yes, minimum above maximum, an enum
+    member of the wrong type) is refused on load and on write. Unknown
+    keywords still pass.
+  * Registry precedence is by presence: a malformed cluster override shadows
+    the packaged file of its name and is listed as the one row for it, and
+    GET prefixes/<name> opens that same file. The packaged file no longer
+    silently stays in effect while the override is broken.
+  * pve-meta ships no live prefix. The traefik example moves from
+    /usr/share/pve-meta/prefixes/ to /usr/share/doc/pve-meta/examples/.
+    A cluster that relied on the packaged traefik prefix keeps its documents
+    and loses the declaration; copy the example into /etc/pve/meta.d/prefixes/
+    to have it back.
+  * Build: the toolchain is pinned by rust-toolchain.toml; LICENSE at the
+    repository root; Dependabot and a RustSec audit workflow.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Sun, 13 Sep 2026 19:54:52 +0200
+
 pve-meta (0.1.0-1) unstable; urgency=medium
 
   * Initial release: native PVE::API2::Ext::Meta module, perlmod lifecycle
