@@ -316,7 +316,7 @@ crates/pve-meta-wasm     the core for the browser, behind a JSON-string ABI
 perl/PVE/API2/Ext/Meta.pm  the REST module
 bin/pve-meta             the CLI
 pages/                   the two page manifests
-prefixes/                packaged example prefixes
+examples/                the hook script and the example prefix, installed as documentation
 patches/                 the lifecycle patch manifest and diff
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor and its offline and headless tests

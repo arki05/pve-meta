@@ -111,18 +111,17 @@ install:
 	# storage's snippets directory, which is where PVE looks for hookscripts.
 	install -D -m 0644 examples/maintenance-hook.pl \
 		$(DESTDIR)$(PREFIX)/share/doc/pve-meta/examples/maintenance-hook.pl
-	# Packaged example prefixes (docs/DESIGN.md section 3); none are
-	# required for pve-meta to work, so this directory may be empty in a
-	# checkout that hasn't added any yet -- `mkdir -p` plus a tolerant glob
-	# copy, never a hard failure.
+	# The example prefix definition, as documentation: pve-meta ships no live
+	# prefix of its own. The packaged prefix directory (docs/DESIGN.md section 3)
+	# is for an operator's own .deb to drop into; it is created empty so that
+	# package has somewhere to land and dpkg knows who owns the directory.
 	#
 	# There is deliberately no packaged *permissions* directory: an operator's
 	# package may ship a prefix (a declaration) but must never ship its
 	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md section 4).
+	install -D -m 0644 examples/prefixes/traefik.yaml \
+		$(DESTDIR)$(PREFIX)/share/doc/pve-meta/examples/prefixes/traefik.yaml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes
-	if [ -d prefixes ] && ls prefixes/*.yaml >/dev/null 2>&1; then \
-		cp prefixes/*.yaml $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/; \
-	fi
 	# pve-ext UI-page manifests for the editor (see pages/, docs/DESIGN.md
 	# section 11) and its static files. Both are the `script`+`xtype` form: pve-ext's
 	# loader defines the class and puts a native ExtJS panel in the tab, so there is

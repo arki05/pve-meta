@@ -1,8 +1,8 @@
-# An example prefix definition (docs/DESIGN.md §3).
-#
-# Packaged definitions live in /usr/share/pve-meta/prefixes/<prefix>.yaml and
-# are dropped in by an operator's own .deb; a cluster-wide file of the same
-# name in /etc/pve/meta.d/prefixes/<prefix>.yaml overrides it.
+# An example prefix definition (docs/DESIGN.md §3). Documentation only: it is
+# installed under /usr/share/doc/pve-meta/examples/ and declares nothing until
+# it is copied to /etc/pve/meta.d/prefixes/traefik.yaml, or shipped by an
+# operator's own .deb under /usr/share/pve-meta/prefixes/. pve-meta itself
+# packages no prefix: a fresh install declares nothing until someone does.
 #
 # **The file name is the prefix.** This file declares `traefik`; a file named
 # `homelab.docker.yaml` would declare `homelab.docker`. There is no `prefix:`
