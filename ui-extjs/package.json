@@ -3,6 +3,6 @@
     "private": true,
     "description": "Monaco editor assets for the pve-meta editor tab; `make ui` copies min/vs into monaco/vs",
     "dependencies": {
-        "monaco-editor": "0.52.2"
+        "monaco-editor": "0.56.0"
     }
 }
