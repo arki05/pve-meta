@@ -24,6 +24,10 @@ editor holds PVE's validators for them and the server must not refuse on a guess
 ## Consequences
 
 The server's `check_value` (type, enum, minimum, maximum) is now a gate where a prefix
-asks for one, so its completeness matters. A scoped principal cannot be locked out of
+asks for one, so its completeness matters: the four are independent checks and `enum`
+membership is by value. The gate also raised the cost of a schema the checker cannot act
+on, so `parse_prefix` refuses a known keyword with a value that would silently constrain
+nothing (`type: interger`, `enforce: yes`) — unknown keywords still pass, as the dialect
+is open-ended. A scoped principal cannot be locked out of
 its own prefix by another prefix's schema, since it can only change paths inside its
 own. Registry documents have their own gate (003) and are not affected.

@@ -76,7 +76,11 @@ schema:                                      # optional, PVE::JSONSchema dialect
   `default`, `enum`, `minimum`, `maximum`, `format` (a PVE::JSONSchema format name,
   validated by proxmoxlib's own vtype in the editor), the editor hints `multiline` and
   `hidden`, and `enforce`. Nothing in pve-meta requires a key to be present; a `default`
-  is written only by an explicit action.
+  is written only by an explicit action. A file whose known keywords would not do what
+  they say — a `type` not in the list above, an `enum` that is not a list of members of
+  that type, a `minimum` above the `maximum`, a flag that is not a boolean, a
+  `properties` key that is not a key — does not load and cannot be written; an unknown
+  keyword is passed through untouched.
 * **`hidden: true`** on a schema node: the editor offers no declared-but-unset row at
   that path. It never hides a key that is set — a stored value has its row from the
   document, typed and described by the schema as ever — and it never reaches

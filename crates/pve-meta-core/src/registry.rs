@@ -384,6 +384,118 @@ fn bad(msg: impl std::fmt::Display) -> Error {
     Error::Registry(msg.to_string())
 }
 
+/// The types a schema may declare: the ones [`crate::shape`] can check.
+const SCHEMA_TYPES: &[&str] = &["string", "integer", "number", "boolean", "object", "array"];
+
+/// Refuses a `schema:` whose known keywords would not do what they say.
+///
+/// The dialect is open-ended (PVE::JSONSchema has more keywords than the
+/// editor reads, and a future one must not make today's files unloadable),
+/// so an unknown keyword passes. A *known* keyword with a value the checker
+/// cannot act on does not: with `enforce: true` the schema is a write gate,
+/// and `type: interger` silently constraining nothing, or `enforce: yes`
+/// silently inheriting, is exactly the failure a strict parser exists to
+/// turn into a loud one. Every other field of the file is already refused
+/// on a typo; the schema was the one part that was not.
+///
+/// `at` is the dotted place in the file an error names, `schema` for the
+/// root and `schema.properties.<key>` below it.
+fn check_schema_dialect(name: &str, at: &str, node: &Value) -> Result<()> {
+    let fail = |msg: String| bad(format!("{name}: {at}: {msg}"));
+    let Some(map) = node.as_object() else {
+        return Err(fail("a schema node must be a map".into()));
+    };
+
+    let declared = match map.get("type") {
+        None => None,
+        Some(Value::String(t)) if SCHEMA_TYPES.contains(&t.as_str()) => Some(t.as_str()),
+        Some(other) => {
+            return Err(fail(format!(
+                "'type' must be one of {} (got {})",
+                SCHEMA_TYPES.join(", "),
+                crate::shape::scalar_text(other)
+            )))
+        }
+    };
+    let numeric = matches!(declared, Some("integer" | "number"));
+
+    for key in ["description", "format"] {
+        if let Some(v) = map.get(key) {
+            if !v.is_string() {
+                return Err(fail(format!("'{key}' must be a string")));
+            }
+        }
+    }
+    for key in ["hidden", "enforce", "multiline", "optional"] {
+        if let Some(v) = map.get(key) {
+            let ok = v.is_boolean() || matches!(v.as_i64(), Some(0) | Some(1));
+            if !ok {
+                return Err(fail(format!("'{key}' must be true/false or 1/0")));
+            }
+        }
+    }
+
+    if let Some(members) = map.get("enum") {
+        let Some(members) = members.as_array() else {
+            return Err(fail("'enum' must be a list".into()));
+        };
+        if members.is_empty() {
+            return Err(fail("'enum' must not be empty".into()));
+        }
+        for m in members {
+            if !(m.is_string() || m.is_number() || m.is_boolean()) {
+                return Err(fail("'enum' members must be scalars".into()));
+            }
+            if let Some(t) = declared {
+                if !crate::shape::type_matches(t, m) {
+                    return Err(fail(format!(
+                        "'enum' member {} is not of type {t}",
+                        crate::shape::scalar_text(m)
+                    )));
+                }
+            }
+        }
+    }
+
+    let bound = |key: &str| -> Result<Option<f64>> {
+        match map.get(key) {
+            None => Ok(None),
+            Some(v) => match v.as_f64() {
+                Some(n) if declared.is_none() || numeric => Ok(Some(n)),
+                Some(_) => Err(fail(format!("'{key}' has no meaning for type {}", declared.unwrap_or("")))),
+                None => Err(fail(format!("'{key}' must be a number"))),
+            },
+        }
+    };
+    if let (Some(min), Some(max)) = (bound("minimum")?, bound("maximum")?) {
+        if min > max {
+            return Err(fail(format!("'minimum' ({min}) is above 'maximum' ({max})")));
+        }
+    }
+
+    if let (Some(d), Some(t)) = (map.get("default"), declared) {
+        if !crate::shape::type_matches(t, d) {
+            return Err(fail(format!("'default' is not of type {t}")));
+        }
+    }
+
+    if let Some(props) = map.get("properties") {
+        let Some(props) = props.as_object() else {
+            return Err(fail("'properties' must be a map".into()));
+        };
+        if let Some(t) = declared.filter(|t| *t != "object") {
+            return Err(fail(format!("'properties' has no meaning for type {t}")));
+        }
+        for (key, sub) in props {
+            if !crate::path::is_valid_segment(key) {
+                return Err(fail(format!("property '{key}' is not a valid key")));
+            }
+            check_schema_dialect(name, &format!("{at}.properties.{key}"), sub)?;
+        }
+    }
+    Ok(())
+}
+
 /// `true` if `s` is a PVE realm (or token sub-id):
 /// `[A-Za-z][A-Za-z0-9.\-_]+` — `PVE::Auth::Plugin`'s `$realm_regex`, which
 /// also backs `PVE::AccessControl`'s `$token_subid_regex`.
@@ -497,6 +609,9 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
     let raw: RawPrefixDef =
         serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
     let selector = parse_selector(name, raw.selector)?;
+    if let Some(schema) = &raw.schema {
+        check_schema_dialect(name, "schema", schema)?;
+    }
     Ok(PrefixDef {
         // A parse knows the text, not the directory: `load_dirs` stamps the real
         // origin over these. The defaults are what a hand-parsed file is -- the
@@ -1002,6 +1117,55 @@ rules:
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
         assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: rw}]\n").is_err());
+    }
+
+    /// One line per rule of the dialect check: what it refuses, and the
+    /// place in the file the error names. The last lines are what it must
+    /// keep accepting -- an unknown keyword, the `1`/`0` flag spelling, and
+    /// the wire's `1` as a boolean default.
+    #[test]
+    fn a_schema_with_a_known_keyword_it_cannot_act_on_is_refused() {
+        let refused: Vec<(&str, &str, &str)> = vec![
+            ("schema: 1\n", "schema: a schema node must be a map", "not a map at all"),
+            ("schema: {type: interger}\n", "schema: 'type' must be one of", "the typo that would enforce nothing"),
+            ("schema: {type: [string]}\n", "schema: 'type' must be one of", "a list is not a type"),
+            ("schema: {type: object, properties: {p: {type: integer, enum: ['1']}}}\n",
+             "schema.properties.p: 'enum' member 1 is not of type integer", "an enum the value check could never admit"),
+            ("schema: {enum: []}\n", "schema: 'enum' must not be empty", "nothing would ever match"),
+            ("schema: {enum: x}\n", "schema: 'enum' must be a list", "not a list"),
+            ("schema: {enum: [{a: 1}]}\n", "schema: 'enum' members must be scalars", "a map is not a member"),
+            ("schema: {type: integer, minimum: 10, maximum: 3}\n", "schema: 'minimum' (10) is above 'maximum' (3)", "an empty range"),
+            ("schema: {minimum: x}\n", "schema: 'minimum' must be a number", "not a number"),
+            ("schema: {type: string, maximum: 3}\n", "schema: 'maximum' has no meaning for type string", "a range on a string"),
+            ("schema: {type: integer, default: x}\n", "schema: 'default' is not of type integer", "a default the schema itself refuses"),
+            ("schema: {enforce: yes}\n", "schema: 'enforce' must be true/false or 1/0", "would silently inherit"),
+            ("schema: {hidden: 2}\n", "schema: 'hidden' must be true/false or 1/0", "... 2 is not a flag"),
+            ("schema: {description: [x]}\n", "schema: 'description' must be a string", "a description is text"),
+            ("schema: {format: 1}\n", "schema: 'format' must be a string", "a format is a name"),
+            ("schema: {properties: [a]}\n", "schema: 'properties' must be a map", "properties are keyed"),
+            ("schema: {type: string, properties: {a: {}}}\n", "schema: 'properties' has no meaning for type string", "a string has no keys"),
+            ("schema: {properties: {'a.b': {}}}\n", "schema: property 'a.b' is not a valid key", "a dotted key is two keys"),
+            ("schema: {properties: {a: {properties: {b: {type: nope}}}}}\n",
+             "schema.properties.a.properties.b: 'type' must be one of", "the error names the nested place"),
+        ];
+        for (text, want, why) in refused {
+            let text = format!("selector: {{all: true}}\n{text}");
+            let err = parse_prefix("t", &text).unwrap_err().to_string();
+            assert!(err.contains(want), "{why}: {text:?} gave {err:?}, wanted {want:?}");
+        }
+
+        let accepted = [
+            "schema: {type: object, properties: {port: {type: integer, minimum: 1, maximum: 65535, default: 80, enum: [80, 443]}}}\n",
+            "schema: {type: object, properties: {name: {type: string, format: dns-name, multiline: 0, optional: 1, title: T}}}\n",
+            "schema: {type: object, properties: {on: {type: boolean, default: 1, enum: [true, false]}}}\n",
+            "schema: {type: object, hidden: 1, enforce: 0, properties: {x: {pattern: '^a', typetext: xy}}}\n",
+            "schema: {minimum: 1, maximum: 2}\n",
+            "schema: {}\n",
+        ];
+        for text in accepted {
+            let text = format!("selector: {{all: true}}\n{text}");
+            parse_prefix("t", &text).unwrap_or_else(|e| panic!("{text:?} should load: {e}"));
+        }
     }
 
     #[test]

@@ -27,7 +27,9 @@
 //! purpose. It is a schema in its own right, in an open-ended dialect, and the
 //! editor's honest offer for it is the text editor (a map row opens Monaco on
 //! its own subtree, DESIGN §12) rather than a form that would only ever cover
-//! the keywords we happened to think of.
+//! the keywords we happened to think of. Free-form here, not on the way in:
+//! `registry::check_schema_dialect` refuses a known keyword whose value the
+//! checker could not act on, since with `enforce` the schema is a write gate.
 
 use crate::format::{self, Format};
 use crate::model::Value;
