@@ -369,8 +369,10 @@ pub fn introduced(before: &[Finding], after: &[Finding], changed: &[Path]) -> Ve
         .collect()
 }
 
-/// A scalar as the string a schema's `enum` is compared against and a hover
-/// shows: a string as itself, anything else as its JSON.
+/// A scalar as the string a hover shows and a Monaco grammar matches: a
+/// string as itself, anything else as its JSON. Presentation only -- an
+/// `enum` is compared by value ([`enum_admits`]), never by this text, or
+/// `"1"` and `1` would be the same member.
 pub fn scalar_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -379,15 +381,25 @@ pub fn scalar_text(value: &Value) -> String {
 }
 
 /// Why `value` does not fit `schema`, in the words the row marker uses.
+///
+/// `type`, `enum` and `minimum`/`maximum` are three independent constraints
+/// and every one that is stated is checked, the first miss winning: a value
+/// that is in the enum still has to be of the declared type and inside the
+/// range. This is a write gate where a prefix says `enforce: true`
+/// (`docs/decisions/014-...`), so "in the enum, therefore fine" would let
+/// `type: integer, enum: [1]` store `"1"`, and `enum: [5], minimum: 10`
+/// store `5`.
 fn check_value(schema: &Value, value: &Value) -> Option<String> {
-    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-        let allowed: Vec<String> = allowed.iter().map(scalar_text).collect();
-        let shown = scalar_text(value);
-        return (!allowed.contains(&shown)).then(|| format!("expected one of: {}", allowed.join(", ")));
-    }
-    if let Some(declared) = schema.get("type").and_then(Value::as_str) {
+    let declared = schema.get("type").and_then(Value::as_str);
+    if let Some(declared) = declared {
         if !type_matches(declared, value) {
             return Some(format!("expected {declared}"));
+        }
+    }
+    if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
+        if !allowed.iter().any(|member| enum_admits(declared, member, value)) {
+            let shown: Vec<String> = allowed.iter().map(scalar_text).collect();
+            return Some(format!("expected one of: {}", shown.join(", ")));
         }
     }
     if let Some(n) = value.as_f64() {
@@ -405,11 +417,43 @@ fn check_value(schema: &Value, value: &Value) -> Option<String> {
     None
 }
 
+/// Whether an `enum` member admits `value`: equal as JSON values, with one
+/// allowance -- under `type: boolean` the member and the value are compared
+/// as booleans, so `enum: [true]` admits the `1` the wire convention stores
+/// ([`type_matches`]) and `enum: [1]` admits a stored `true`. Without that
+/// declared type, `1` and `true` are different members, as they are
+/// different values.
+fn enum_admits(declared: Option<&str>, member: &Value, value: &Value) -> bool {
+    if declared == Some("boolean") {
+        return match (as_bool(member), as_bool(value)) {
+            (Some(m), Some(v)) => m == v,
+            _ => false,
+        };
+    }
+    member == value
+}
+
+/// A boolean, spelled as one or as the `1`/`0` of the wire convention.
+fn as_bool(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(1) => Some(true),
+            Some(0) => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Whether `value` is of the declared `PVE::JSONSchema` type. A boolean
 /// stored as `1`/`0` passes: it is the API's own wire convention
 /// (`docs/DESIGN.md` §7), and a document written through `format=json` holds
-/// exactly that. An unknown type constrains nothing.
-fn type_matches(declared: &str, value: &Value) -> bool {
+/// exactly that. An unknown type constrains nothing here; the registry
+/// refuses to load a prefix that declares one
+/// (`crate::registry::check_schema_dialect`), so through the API and the
+/// loader this arm is unreachable.
+pub(crate) fn type_matches(declared: &str, value: &Value) -> bool {
     match declared {
         "string" => value.is_string(),
         "integer" => value.is_i64() || value.is_u64(),
@@ -724,6 +768,43 @@ mod tests {
         assert_eq!(introduced(&before, &before[..1], &[p("a.old.deeper")]).len(), 1);
         // A pure reordering changes nothing, so it introduces nothing.
         assert!(introduced(&before, &before, &[]).is_empty());
+    }
+
+    /// `type`, `enum` and the range are independent: being in the enum
+    /// does not excuse a value from the other two, and enum membership is by
+    /// value, not by the text a hover shows. Each line is one way the old
+    /// "enum first, and done" check let a wrong value through -- or refused a
+    /// right one.
+    #[test]
+    fn check_value_checks_type_enum_and_range_independently() {
+        let cases: Vec<(Value, Value, Option<&str>, &str)> = vec![
+            (json!({"type": "integer", "enum": [1]}), json!("1"), Some("expected integer"),
+             "the string \"1\" is not the integer 1, whatever its text"),
+            (json!({"type": "integer", "enum": [1]}), json!(1), None, "... and the integer is"),
+            (json!({"enum": [5], "minimum": 10}), json!(5), Some("must be at least 10"),
+             "in the enum, still below the minimum"),
+            (json!({"enum": [5], "maximum": 3}), json!(5), Some("must be at most 3"),
+             "in the enum, still above the maximum"),
+            (json!({"type": "string", "enum": ["a", "b"]}), json!("c"), Some("expected one of: a, b"),
+             "the right type but not a member"),
+            (json!({"enum": [1]}), json!("1"), Some("expected one of: 1"),
+             "with no type declared, a string is still not a number"),
+            (json!({"enum": [1]}), json!(true), Some("expected one of: 1"),
+             "... and without `type: boolean`, 1 and true are different values"),
+            (json!({"type": "boolean", "enum": [true]}), json!(1), None,
+             "under `type: boolean` the wire's 1 is the member true"),
+            (json!({"type": "boolean", "enum": [0]}), json!(false), None,
+             "... in either spelling"),
+            (json!({"type": "boolean", "enum": [true]}), json!(0), Some("expected one of: true"),
+             "... and 0 is false, which is not in the enum"),
+            (json!({"type": "integer", "minimum": 1, "maximum": 65535}), json!(0), Some("must be at least 1"),
+             "a plain range, no enum"),
+            (json!({"type": "integer", "minimum": 1}), json!("x"), Some("expected integer"),
+             "type first: a non-number has no range to check"),
+        ];
+        for (schema, value, want, why) in cases {
+            assert_eq!(check_value(&schema, &value).as_deref(), want, "{schema} / {value}: {why}");
+        }
     }
 
     #[test]

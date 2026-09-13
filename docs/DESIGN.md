@@ -168,8 +168,9 @@ affordance, not the validator; a test keeps its required keys equal to the parse
   itself, or on a schema node under it: §3), a write that would leave the enforced part
   of its subtree not matching the schema — for the findings the write introduces or
   touches, never for what was already wrong elsewhere — is a 422 naming the paths,
-  unless the request carries `force=1`. Anyone who may write may force. `format:`
-  checks are never enforced.
+  unless the request carries `force=1`. Anyone who may write may force. `type`, `enum`
+  and `minimum`/`maximum` are independent checks, every stated one applied, and `enum`
+  membership is by value (`"1"` is not `1`). `format:` checks are never enforced.
 * **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
   `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
   else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
