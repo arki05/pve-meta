@@ -166,7 +166,7 @@ install: js
 #   - pve-meta, libpve-meta-rs-perl: this source package's two binaries (see debian/control).
 #
 # lintian runs as part of this target, not as a separate step (see
-# docs/design/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 13,
+# docs/reference/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 13,
 # pve-ext/README.md "Building and packaging"), mirroring the plain
 # `lintian $(DEBS)` upstream pve-rs uses (no --fail-on override: lintian's
 # own default -- exit non-zero only on an E: tag -- is what "fatal" below

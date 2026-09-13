@@ -3,7 +3,7 @@
 How Proxmox *writes* things — Rust, Perl, JavaScript, packaging — so pve-meta can adopt them
 verbatim instead of inventing house style.
 
-Companion document: `docs/design/PDM-DESIGN-LANGUAGE.md` (how PDM *composes pages*).
+Companion document: `docs/reference/PDM-DESIGN-LANGUAGE.md` (how PDM *composes pages*).
 
 Citation roots:
 

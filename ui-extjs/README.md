@@ -191,8 +191,9 @@ first, which is what its `waitForXtype()` does.
   colons, quotes, hashes, unicode, numeric-looking strings, booleans, nested maps and
   arrays), asserting `parse(dump(x))` deep-equals `x` with key order intact. The rules
   themselves are tested where they live, in Rust.
-* `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
-  Chromium against the real pve-manager SPA:
+* `testing/lab/` is not a test suite: the two scripts there need a live PVE host and
+  nothing in `make check` or CI runs them. `headless-tab-check.js` and
+  `headless-flows-check.js` run headless Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
   [--scoped] [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` and `GET /meta/permissions` payload; `--scoped` and
   `--ro` stub `GET /meta/access` so the restricted toolbar labels and the per-row
@@ -207,6 +208,6 @@ guest tree with staged edits, Text mode with the diff, the enforced-schema warni
 Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
 (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
 Anything else -- the row editor, the JSON view, a read-only or scoped caller's tab --
-is a run of `testing/headless-tab-check.js` away, which writes a full set into the
+is a run of `testing/lab/headless-tab-check.js` away, which writes a full set into the
 directory you give it; that set is not committed.
 

@@ -7,5 +7,5 @@
 # Note: index.html.tpl and PVE/API2.pm are not this package's concern --
 # pve-ext owns those triggers (see pve-ext/debian/triggers). pve-container
 # and qemu-server are no longer patched at all (lifecycle is snapshot-only,
-# see docs/DESIGN.md section 9 and docs/LIFECYCLE-PATCHES.md).
+# see docs/DESIGN.md section 9 and docs/LIFECYCLE.md).
 interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm

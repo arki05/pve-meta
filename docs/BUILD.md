@@ -3,7 +3,8 @@
 ## Toolchain
 
 Development and CI happen on a Debian 13 (trixie) host with a [rustup](https://rustup.rs/)
-toolchain installed under `~/.cargo/bin` (rustc 1.98 at the time of writing) — **not** the
+toolchain installed under `~/.cargo/bin` (the version `rust-toolchain.toml` pins, which
+rustup installs on first use) — **not** the
 `cargo`/`rustc` Debian packages. `pve-meta-perl` (the perlmod bindings) needs `libperl-dev`
 headers and only builds on Linux; `pve-meta-core` and `pve-meta-wasm` are pure Rust and
 also compile on macOS. Use the Linux build host for anything else:
@@ -75,6 +76,11 @@ precedence first) for the two registry directories — and `test/basic.pl` sets 
 to temp dirs, so nothing here touches `/etc/pve`.
 
 ## Debian package
+
+The second binary package, `libpve-meta-rs-perl`, keeps its own notes in
+`crates/pve-meta-perl/PACKAGING.md`: what it needs from `debian/control` and
+`debian/rules`, and how the two packages' files are kept apart. This section is how the
+packages are built and installed.
 
 The `.deb`s are built with `dpkg-buildpackage`, but **without** relying on Debian's own
 `cargo`/`rustc` packages — `debian/rules` calls `make`, and the `Makefile` resolves `cargo` as

@@ -333,4 +333,5 @@ scripts/perl-stubs/      stub PVE modules so perl -c runs anywhere
 testdata/                the canonical YAML fixture both suites pin
 debian/, Makefile        packaging
 docs/decisions/          why the rules above are what they are
+docs/reference/          notes on upstream Proxmox, taken as input and not maintained
 ```

@@ -374,7 +374,7 @@ it in.
 `make deb` (from this directory, or via the root `Makefile`'s `deb` target,
 which builds this package first) runs `lintian` against the freshly built
 `.deb`(s) as part of the target itself, not as a separate manual step (see
-`docs/design/PROXMOX-CONVENTIONS.md` §7.6 and §8, and `docs/DESIGN.md` §13):
+`docs/reference/PROXMOX-CONVENTIONS.md` §7.6 and §8, and `docs/DESIGN.md` §13):
 fatal (a non-zero `make deb` exit) when `$CI` is set in the environment, and
 `|| true` (advisory only, output still printed) for a local/dev build where
 `$CI` is unset — CI is expected to catch anything a local build let through.

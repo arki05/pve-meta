@@ -4,7 +4,8 @@ This crate (`crates/pve-meta-perl`, Cargo package `pve-meta-rs`) ships as a **se
 Debian binary package**, `libpve-meta-rs-perl`, built from the same `pve-meta` source
 package as the main `pve-meta` binary. The root `Makefile`, `debian/control` and
 `debian/rules` are owned elsewhere in the tree, so this file records what this crate
-needs from them rather than duplicating their contents.
+needs from them rather than duplicating their contents. How the packages are built,
+gated and installed is `docs/BUILD.md`.
 
 ## What is wired up
 
