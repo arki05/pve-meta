@@ -1,0 +1,9 @@
+# The one toolchain every build uses -- a workstation, CI and the Debian package
+# build alike. rustup reads this file and installs the pinned channel with the
+# listed target and component, so `cargo` in this checkout never means "whatever
+# stable is today". Bump it deliberately, in its own commit.
+[toolchain]
+channel = "1.93.0"
+profile = "minimal"
+targets = ["wasm32-unknown-unknown"]
+components = ["clippy", "rustfmt"]

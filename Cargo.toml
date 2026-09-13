@@ -44,6 +44,9 @@ strip = true
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# The oldest toolchain the crates claim to build with; rust-toolchain.toml pins
+# the one they are built with. Kept equal to that pin's minor.
+rust-version = "1.93"
 license = "AGPL-3.0-or-later"
 authors = ["Julius Arkenberg <julius@rkenberg.de>"]
 repository = "https://github.com/arki05/pve-meta"

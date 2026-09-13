@@ -3,6 +3,7 @@ name = "pve-meta-core"
 description = "pve-meta: document model, formats, patch engine and file store"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -172,9 +172,10 @@ fn walk(was: &Value, now: &Value, path: &Path, out: &mut Vec<Edit>) {
 /// Every path at which two documents differ in *value*: what an edit is
 /// answerable for. [`patch::diff`]'s paths, whatever the op -- so a pure key
 /// reordering changes nothing, and a caller is never told that reordering a
-/// document touched every path in it. Not the edits needed to get from one
-/// to the other; that is [`EditSet::between`], which compares lists whole
-/// where this names the member that differs.
+/// document touched every path in it. Lists are whole, as everywhere: a
+/// list that differs is one changed path, never a member of it. Not the
+/// edits needed to get from one to the other; that is [`EditSet::between`],
+/// which says what to set and delete where this only says where.
 pub fn changed_paths(was: &Value, now: &Value) -> Vec<Path> {
     patch::diff(was, now).into_iter().map(|t| t.path).collect()
 }

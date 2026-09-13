@@ -27,11 +27,20 @@ pub fn invalid_char(s: &str) -> Option<char> {
         .find(|&c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '!'))
 }
 
-/// A path into a document: a sequence of object-key or array-index segments.
+/// A path into a document: a sequence of key segments.
 ///
 /// The empty path (`Path::root()`) addresses the document root. `Display`
 /// renders the path in dotted form (`a.b.c`); [`Path::parse`] accepts both
 /// dotted (`a.b.c`) and slash (`a/b/c`, `/a/b/c`) forms.
+///
+/// Every segment satisfies [`is_valid_segment`]; [`Path::parse`] is the only
+/// public way to make one. A segment is a map key wherever a path *addresses*
+/// something -- a view, a scope, a declared prefix, a touched path: array
+/// members are not addressable (`docs/DESIGN.md` §2), and
+/// [`crate::view`] refuses to walk through an array. The one place a segment
+/// is read as an index is diagnostic: [`crate::model::lint`] names the
+/// offending member of a list (`items.2`), and [`crate::model::get_path`]
+/// follows such a path back to it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct Path(Vec<String>);
 
@@ -41,8 +50,10 @@ impl Path {
         Path(Vec::new())
     }
 
-    /// Builds a path from already-validated segments.
-    pub fn new(segments: Vec<String>) -> Self {
+    /// Builds a path from already-validated segments. Crate-private: the
+    /// callers are the ones that took the segments from a parsed `Path` or a
+    /// linted document, so the invariant holds without a second check.
+    pub(crate) fn new(segments: Vec<String>) -> Self {
         Path(segments)
     }
 
@@ -93,8 +104,10 @@ impl Path {
         }
     }
 
-    /// Returns a new path with `segment` appended.
-    pub fn join(&self, segment: impl Into<String>) -> Path {
+    /// Returns a new path with `segment` appended. Crate-private for the
+    /// same reason as [`Path::new`]: every caller appends a key it read out
+    /// of a document or a schema, never text from a request.
+    pub(crate) fn join(&self, segment: impl Into<String>) -> Path {
         let mut segments = self.0.clone();
         segments.push(segment.into());
         Path(segments)
