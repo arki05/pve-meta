@@ -99,7 +99,7 @@ install: js
 	fi
 	# pve-ext managed-patch manifest for the guest-lifecycle hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
-	# the whole lifecycle is one patched file, see docs/LIFECYCLE-PATCHES.md).
+	# the whole lifecycle is one patched file, see docs/LIFECYCLE.md).
 	# Installed under its own declared `id` (patches/lifecycle.toml's
 	# top-level `id = "..."` field), not its checkout filename -- so that
 	# pve-ext-patch's claim identity, read from the manifest's own content

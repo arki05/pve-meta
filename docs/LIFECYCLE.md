@@ -30,10 +30,11 @@ corrupt document, the library not yet installed mid-upgrade) must never take dow
 guest operation over a sidecar file, exactly as PVE already treats
 `/etc/pve/firewall/*.fw` tolerantly in the same code paths.
 
-The patch, its manifest (`patches/lifecycle.toml`) and the one diff
+How the diff reaches the installed file is not this document's subject: the manifest
+(`patches/lifecycle.toml`) and the one diff
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
-`pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst` — see
-`pve-ext/README.md` ("Managed patches") for the tool itself. What each hook does is
+`pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst`, and
+`pve-ext/README.md` ("Managed patches") owns the tool, its diversions and its limits. What each hook does is
 `docs/DESIGN.md` §9; the exports themselves, with their arguments and return values,
 are documented where they are defined, in `crates/pve-meta-perl/src/lib.rs`.
 

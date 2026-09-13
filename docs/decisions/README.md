@@ -27,5 +27,5 @@ new record; the old one stays and is marked superseded.
 | [018](018-hidden-declarations.md) | A declaration can say it is not a row; `hidden` and `enforce` are inherited per schema node | accepted |
 
 Related records kept in their own files: [`../WASM-CORE.md`](../WASM-CORE.md) (how the
-core reaches the browser) and [`../LIFECYCLE-PATCHES.md`](../LIFECYCLE-PATCHES.md) (the
-patch itself and why clone and backup are not carried).
+core reaches the browser) and [`../LIFECYCLE.md`](../LIFECYCLE.md) (the
+five lifecycle hooks, and why clone and backup are not carried).

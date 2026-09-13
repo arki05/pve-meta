@@ -1,7 +1,7 @@
 # pve-meta's own pve-ext managed-patch manifest: the one guest-lifecycle
 # hook that wires PVE::RS::Meta into stock libpve-guest-common-perl (see
 # docs/DESIGN.md section 9 and, for the design this diff implements,
-# docs/LIFECYCLE-PATCHES.md).
+# docs/LIFECYCLE.md).
 #
 # Installed to /usr/share/pve-ext/patches/pve-meta-lifecycle.toml; the diff
 # it references lives alongside it, under a "lifecycle/" subdirectory (both
@@ -13,7 +13,7 @@
 # snapshot, rollback and delete-snapshot all funnel through methods of
 # PVE::AbstractConfig, so the five hooks hang off that
 # one file, and clone/backup are not carried at all -- see
-# docs/LIFECYCLE-PATCHES.md for why. This manifest used to cover seven
+# docs/LIFECYCLE.md for why. This manifest used to cover seven
 # files across pve-container, qemu-server and libpve-guest-common-perl.
 #
 # `id` is this manifest's stable claim identity (see pve-ext/bin/pve-ext-patch's

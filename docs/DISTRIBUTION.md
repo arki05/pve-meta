@@ -91,7 +91,7 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
      `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
    - **libpve-guest-common-perl**: verifies `patches/lifecycle.toml` (pve-meta's one
      guest-lifecycle diff — one file carries the whole lifecycle, see
-     `docs/LIFECYCLE-PATCHES.md`), filtered down first to that package's own `[[file]]`
+     `docs/LIFECYCLE.md`), filtered down first to that package's own `[[file]]`
      entries (a no-op today, kept for a future entry);
 4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
    packages with any failure get **one GitHub issue** (label `pve-upgrade`) carrying the

@@ -16,7 +16,7 @@
 #      is one file in one package, but the
 #      filter step is kept so a future entry doesn't require re-deriving
 #      this logic; see docs/DESIGN.md section 9 and
-#      docs/LIFECYCLE-PATCHES.md).
+#      docs/LIFECYCLE.md).
 #
 # A package with a clean verify on every applicable check gets its ceiling
 # bumped and rolled into one PR. A package with any failure gets rolled into
