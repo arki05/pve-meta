@@ -255,12 +255,19 @@ vzdump plugins `PVE/VZDump/QemuServer.pm` (`qemu-server`) and `PVE/VZDump/LXC.pm
   does not parse, is not carried, and the backup log says so.
 * **Restore.** `write_config`, which every restore path ends in, finds the block,
   writes the document and strips the block from the notes before the config lands.
-  The block wins over whatever document the vmid had: it is the backup being
-  restored. Enforced schemas do not apply; a restore is not an edit. A host without
-  pve-meta restores the block as notes text, readable and harmless. `pve-meta
-  scan-notes`, run once by the package install, reads every such block in the
-  cluster's guest configs into the store and strips it; where a document is already
-  there it is kept and the block only stripped.
+  Only while the marker `create_and_lock_config` left for the vmid under
+  `/run/pve-meta` is there. A create or restore keeps the config locked and writes it
+  more than once on the way, so the marker is taken by the first write that carries a
+  block, or by the first write of an unlocked config, and by nothing in between; only
+  the write that took it imports. A create ends with an unlocked write, so a block
+  pasted into a live guest's notes afterwards is never imported by an ordinary config
+  write. The block wins over whatever
+  document the vmid had: it is the backup being restored. Enforced schemas do not
+  apply; a restore is not an edit. A host without pve-meta restores the block as
+  notes text, readable and harmless. `pve-meta scan-notes`, run once by the package
+  install and by hand for a block a restore left behind, reads every such block in
+  the cluster's guest configs into the store and strips it; where a document is
+  already there it is kept and the block only stripped.
 
 All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation, a
 backup or a restore. Migration needs nothing (the document is cluster-wide). Clone is

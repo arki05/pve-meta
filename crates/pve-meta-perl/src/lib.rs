@@ -88,6 +88,16 @@ impl<'de> serde::Deserialize<'de> for Vmid {
     }
 }
 
+/// The node-local directory of restore markers, `$PVE_META_RUN_DIR` or
+/// `/run/pve-meta`: one empty file per vmid whose config was just created
+/// by `create_and_lock_config` and not yet written since. See
+/// [`pve_rs_meta::mark_created`].
+fn run_dir() -> PathBuf {
+    std::env::var_os("PVE_META_RUN_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/pve-meta"))
+}
+
 /// The wall clock as unix seconds, for the notes block's `time=` field. The
 /// core takes the instant as an argument so it never touches the clock
 /// itself (its wasm build has none).
@@ -119,7 +129,7 @@ mod pve_rs_meta {
     use pve_meta_core::registry::Permission;
     use pve_meta_core::store::MetaStore;
 
-    use super::{now_unix, open_store, RollbackOutcome, Vmid};
+    use super::{now_unix, open_store, run_dir, RollbackOutcome, Vmid};
 
     /// Every grant (`docs/DESIGN.md` §4). Cluster-only on purpose: an
     /// operator's `.deb` may ship a prefix but must never ship its own
@@ -208,7 +218,48 @@ mod pve_rs_meta {
     /// migration abort), all of which funnel through that one method.
     #[export]
     pub fn on_destroy(vmid: Vmid) -> Result<usize, Error> {
-        Ok(open_store().purge(vmid.0)?)
+        let removed = open_store().purge(vmid.0)?;
+        // A create that failed part-way destroys its config; its marker goes
+        // with it, or the vmid's next owner would import on its first write.
+        let _ = std::fs::remove_file(run_dir().join(vmid.0.to_string()));
+        Ok(removed)
+    }
+
+    // -- the restore marker (`docs/DESIGN.md` §9) ----------------------------
+    //
+    // `write_config` cannot tell a restore from any other config write, but
+    // every restore (and create, and clone) begins with
+    // `create_and_lock_config`, in the same patched file. That hook leaves a
+    // node-local marker for the vmid; `write_config` consumes it on the first
+    // write that carries a block, or the first write of an unlocked config
+    // (a create keeps the config locked and writes it more than once), and
+    // imports a notes block only on the write that consumed it. A block
+    // pasted into a live guest's notes is therefore never imported by a plain
+    // `qm set`; `pve-meta scan-notes` is the explicit way in. Node-local
+    // because a restore runs entirely on one node, and in `/run` because a
+    // marker must not outlive a reboot.
+
+    /// Leaves the restore marker for `$vmid`. Called from the patched
+    /// `create_and_lock_config`, after PVE has written the initial config.
+    #[export]
+    pub fn mark_created(vmid: Vmid) -> Result<(), Error> {
+        let dir = run_dir();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(vmid.0.to_string()), b"")?;
+        Ok(())
+    }
+
+    /// Removes `$vmid`'s restore marker and says whether there was one.
+    /// Called from the patched `write_config` on a write that carries a
+    /// block or writes an unlocked config; only a `1` lets that write import
+    /// a notes block.
+    #[export]
+    pub fn take_created(vmid: Vmid) -> Result<bool, Error> {
+        match std::fs::remove_file(run_dir().join(vmid.0.to_string())) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Every vmid the store holds any file for -- a document, a snapshot

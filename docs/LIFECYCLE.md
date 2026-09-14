@@ -94,15 +94,26 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §9; decisio
   not parse, is not carried; the backup log gets a warning line and the backup runs.
 * **Restore on a host with pve-meta.** Every restore path of both guest types ends in
   `write_config`, in `PVE/AbstractConfig.pm`, the file already patched for the
-  lifecycle. The hook there costs every other config write one substring test; when
-  the notes carry the marker it calls `PVE::RS::Meta::notes_import($vmid, $notes,
-  'restore')` under the document's `cfs_lock_domain` lock, inside the guest lock the
-  caller holds — the same order create and destroy use — which writes the document
-  through the store's own lint gate and hands back the notes without the block, and
-  the config lands clean. The block wins over whatever document the vmid had: it is the
+  lifecycle. `write_config` cannot tell a restore from a `qm set`, but every restore
+  (and create, and clone) begins with `create_and_lock_config`, in that same file, so
+  that hook leaves a node-local marker for the vmid (`/run/pve-meta/<vmid>`). A create
+  or restore keeps the config locked until it is done and writes it several times on
+  the way — pve-container writes a bare `lock: create` skeleton mid-restore — so the
+  marker is taken (one `unlink` on tmpfs) by the first `write_config` that carries a
+  block, or by the first one of an unlocked config, and by nothing in between; only the
+  write that took it imports. A create ends with an unlocked write. That closes the obvious hole: a block pasted into a live guest's notes by
+  anyone with `VM.Config.Options` — the same privilege as full write on the document,
+  but a path with no audit attribution — is never imported by an ordinary config
+  write. When the marked write's notes carry the header it calls
+  `PVE::RS::Meta::notes_import($vmid, $notes, 'restore')` under the document's
+  `cfs_lock_domain` lock, inside the guest lock the caller holds — the same order
+  create and destroy use — which writes the document through the store's own lint
+  gate and hands back the notes without the block, and the config lands clean. The block wins over whatever document the vmid had: it is the
   backup being restored. Enforced schemas are not applied, since a restore is not an
   edit. An error (a block someone mangled, YAML the store refuses) warns and leaves the
-  notes as they are, block included; nothing here can fail a restore.
+  notes as they are, block included, for `pve-meta scan-notes`; nothing here can fail a
+  restore. Until that scan, a clone of such a guest copies the block and imports it on
+  its own first write, since a clone begins with a create too.
 * **Restore on a host without pve-meta.** The block stays in the notes. It renders on
   the Summary panel as a marked YAML code block, so the operator can see what the guest
   had, and it is deletable like any other notes text. QEMU's restore passes `#` lines
@@ -120,7 +131,8 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §9; decisio
   because `/etc/pve` is one filesystem: one install covers the cluster, and a later
   install on another node finds documents everywhere and blocks nowhere. The write goes
   to the config's own node path, not through `write_config`, which would write under the
-  installing node's name.
+  installing node's name; the guest lock is taken for this node's own guests only, since
+  it is node-local and would serialise nothing for a guest another node owns.
 
 The block's exact shape, the size cap and the parser live in
 `crates/pve-meta-core/src/backup.rs`.

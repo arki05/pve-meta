@@ -8,19 +8,32 @@
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -65,6 +66,36 @@
+@@ -65,6 +66,49 @@
  sub write_config {
      my ($class, $vmid, $conf) = @_;
  
 +    # pve-meta: a config restored from a backup carries the guest's metadata document
 +    # in its notes, appended there by the patched vzdump assemble (docs/LIFECYCLE.md).
 +    # Every restore path ends in this write, so this is where the document goes back
-+    # into /etc/pve/meta and the block leaves the notes -- under the document's own
-+    # lock, the one every other writer takes, inside the guest lock the caller holds,
-+    # the same order create and destroy use. The substring test keeps every other
-+    # config write at one string scan; only a block does any work. An error leaves the
-+    # notes as they are, block included, and never fails the write.
-+    if (defined($conf->{description}) && index($conf->{description}, '[pve-meta v') != -1) {
++    # into /etc/pve/meta and the block leaves the notes -- but only while the marker
++    # create_and_lock_config left for the vmid is there: this cannot tell a restore
++    # from a `qm set`, the marker can. A create or restore keeps the config locked
++    # until it is done and writes it several times on the way (pve-container writes a
++    # bare `lock: create` skeleton mid-restore), so the marker is taken by the first
++    # write that carries a block, or by the first write of an unlocked config, and by
++    # nothing in between. A create that carried no block ends with an unlocked write,
++    # so it leaves nothing behind for a later paste to use.
++    # The import runs under the document's own lock, the one every other writer takes,
++    # inside the guest lock the caller holds, the same order create and destroy use.
++    # An error leaves the notes as they are, block included, and never fails the write.
++    my $meta_block = defined($conf->{description})
++        && index($conf->{description}, '[pve-meta v') != -1;
++    my $meta_created;
++    if ($meta_block || !$conf->{lock}) {
++        $meta_created = eval { PVE::RS::Meta::take_created($vmid) };
++        warn "pve-meta: take_created($vmid) failed: $@" if $@;
++    }
++    if ($meta_created && $meta_block) {
 +        my $meta_err;
 +        eval {
 +            PVE::Cluster::cfs_lock_domain(
@@ -45,7 +58,7 @@
      my $cfspath = $class->cfs_config_path($vmid);
  
      PVE::Cluster::cfs_write_file($cfspath, $conf);
-@@ -267,6 +298,34 @@
+@@ -267,6 +311,41 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -77,10 +90,17 @@
 +        $meta_err = $@ if !$meta_err;
 +        warn "pve-meta: on_create($vmid) failed: $meta_err" if $meta_err;
 +    }
++
++    # pve-meta: the next write of this config is the one a restore ends in, so mark the
++    # vmid (node-locally, under /run) and let write_config import a backup's notes
++    # block on that write alone. A block pasted into a live guest's notes is never
++    # imported by an ordinary config write; `pve-meta scan-notes` is the way in.
++    eval { PVE::RS::Meta::mark_created($vmid) };
++    warn "pve-meta: mark_created($vmid) failed: $@" if $@;
  }
  
  # destroys configuration, only applicable for configs owned by the callers node.
-@@ -276,6 +335,31 @@
+@@ -276,6 +355,31 @@
  
      my $config_fn = $class->config_file($vmid, $nodename);
      unlink $config_fn or die "failed to remove config file: $!\n";
@@ -112,7 +132,7 @@
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -876,6 +960,9 @@
+@@ -876,6 +980,9 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
@@ -122,7 +142,7 @@
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1139,9 @@
+@@ -1052,6 +1159,9 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -132,7 +152,7 @@
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1304,9 @@
+@@ -1214,6 +1324,9 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);

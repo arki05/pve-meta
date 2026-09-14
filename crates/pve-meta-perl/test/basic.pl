@@ -27,6 +27,8 @@ my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
 $ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
+my $rundir = tempdir(CLEANUP => 1);
+$ENV{PVE_META_RUN_DIR} = $rundir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -128,6 +130,18 @@ is(PVE::RS::Meta::on_create("9302"), 1, '... and on_create');
 ok(!file_exists('9302.yaml'), '... acting on the right vmid');
 $res = eval { PVE::RS::Meta::on_create("not-a-vmid") };
 ok(!defined($res) && $@ =~ /not a vmid/, 'a string that is not a vmid dies');
+
+# --- the restore marker ---------------------------------------------------
+# create_and_lock_config leaves one, the next write_config takes it, destroy
+# removes it. Node-local, under $PVE_META_RUN_DIR here.
+is(PVE::RS::Meta::take_created(9303), 0, 'no marker until a create');
+PVE::RS::Meta::mark_created("9303");
+ok(-f "$rundir/9303", 'mark_created leaves the marker file');
+is(PVE::RS::Meta::take_created(9303), 1, 'take_created takes it');
+is(PVE::RS::Meta::take_created(9303), 0, '... once');
+PVE::RS::Meta::mark_created(9303);
+PVE::RS::Meta::on_destroy(9303);
+ok(!-f "$rundir/9303", 'on_destroy removes a marker a failed create left');
 
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };

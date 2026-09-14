@@ -390,9 +390,12 @@ sub cmd_rm {
 #
 # The write goes to the config's own node path, never through write_config: that
 # would write under this node's name, and the restore hook it carries has nothing
-# left to do once the block is stripped. The guest lock is node-local, so for a
-# guest another node owns it serialises nothing; the meta lock serialises the
-# document, and the config write is the whole-file replace pmxcfs makes atomic. An
+# left to do once the block is stripped. The guest lock is node-local, so it is
+# taken for this node's own guests only; for a guest another node owns it would
+# serialise nothing and leave a stray lock file. There, the meta lock serialises
+# the document and the config write is the whole-file replace pmxcfs makes atomic;
+# a write on the owning node in that same instant could lose one side, and the
+# owning node's next scan or restore would import the same text again. An
 # install-time pass over the handful of guests that carry a block is the one place
 # this is accepted.
 sub cmd_scan_notes {
@@ -400,9 +403,11 @@ sub cmd_scan_notes {
     usage('too many arguments') if @args;
 
     require PVE::Cluster;
+    require PVE::INotify;
     require PVE::QemuConfig;
     require PVE::LXC::Config;
 
+    my $local_node = PVE::INotify::nodename();
     PVE::Cluster::cfs_update();
     my $vmlist = PVE::Cluster::get_vmlist() || {};
     my $ids = $vmlist->{ids} // {};
@@ -422,10 +427,7 @@ sub cmd_scan_notes {
         next if index($conf->{description}, '[pve-meta v') == -1;
 
         my $action = 'none';
-        eval {
-            $class->lock_config(
-                $vmid,
-                sub {
+        my $import = sub {
                     $conf = PVE::Cluster::cfs_read_file($path);
                     return if !$conf || !defined($conf->{description});
                     return if index($conf->{description}, '[pve-meta v') == -1;
@@ -448,8 +450,13 @@ sub cmd_scan_notes {
                         delete $conf->{description};
                     }
                     PVE::Cluster::cfs_write_file($path, $conf);
-                },
-            );
+        };
+        eval {
+            if ($node eq $local_node) {
+                $class->lock_config($vmid, $import);
+            } else {
+                $import->();
+            }
         };
         if (my $err = $@) {
             chomp $err;

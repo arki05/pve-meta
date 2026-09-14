@@ -47,3 +47,41 @@ says the document was not carried). `ceilings.toml` and the watcher track four p
 A restore over an existing guest now replaces its document from the backup. Clone is
 still not carried, and the live config still never carries metadata, so nothing about
 snapshots, migration or the API changes.
+
+Things this costs or leaves open, on purpose:
+
+* **The notes are a way into the store, so the automatic import is gated.** Editing a
+  guest's notes needs `VM.Config.Options`, which is already full write on the document
+  (§5), so a pasted block grants nothing new; what it would lose is attribution, since
+  the block's header names a vmid and a time its author chose and no authid. So
+  `write_config` imports only while the node-local marker `create_and_lock_config` left
+  is there — a restore, a create, a clone — and the marker is taken by the first write
+  that carries a block or the first write of an unlocked config, since a create keeps
+  the config locked and writes it more than once. An ordinary config write never
+  imports. `pve-meta scan-notes` is the explicit, root-only way in for anything
+  else. Signing the block with a cluster key was considered and not done: it would not
+  close the one residual below, and a principal who can restore a guest can already
+  craft its whole config.
+* **The residual: a clone of a guest whose notes still carry a block.** A block stays
+  in the live notes only when a restore's import failed, or after a restore on a host
+  without pve-meta that no scan has visited yet. In that window a clone copies the notes
+  and imports the block on its own first write, because a clone begins with a create. A
+  scan closes the window.
+* **A backup taken before pve-meta carries no block, and a restore from it over an
+  existing guest keeps that guest's current document.** That is "metadata from now",
+  the outcome this record's context calls wrong, and it is accepted for the one case
+  where the backup has no opinion. Writing an empty block into every backup of a guest
+  without a document would fix it at the price of a block in every restored guest's
+  notes on stock hosts.
+* **On a stock host, a block above the notes limit blocks notes editing until it is
+  deleted.** Both guest schemas cap the notes at 8 KiB on API writes; restore does not
+  check, so a larger block lands and renders, but the Notes editor refuses to save until
+  the block is removed. The cap stays at 16 KiB because on a pve-meta host the block is
+  stripped before any limit applies, and the cap should not penalise that path to spare
+  the fallback. A non-ASCII document also grows in the config file, up to threefold per
+  escaped byte, which pmxcfs does not mind.
+* **The install scan writes other nodes' configs.** `/etc/pve` is one filesystem and
+  the write is the whole-file replace pmxcfs makes atomic, but the guest lock is
+  node-local, so a write on the owning node in the same instant could lose one side. The
+  owning node's next scan or restore imports the same text again. Accepted for a
+  one-time pass over the few guests that carry a block.

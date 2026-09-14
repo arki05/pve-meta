@@ -42,6 +42,12 @@
 //! line (every top-level line starts with a key from the charset, nested
 //! lines are indented, the marker and fence lines start with a bracket or a
 //! backtick), and [`render`] refuses rather than emit one if it ever did.
+//!
+//! Two more facts about the transit, checked against both guest parsers:
+//! a notes line keeps its trailing whitespace (only the end of the whole
+//! notes text is trimmed, and the block's last line is its end line), and
+//! a document line that is itself one of the block's delimiters is refused
+//! by [`render`], so a block scalar can never end the block early.
 
 use serde::Serialize;
 
@@ -165,13 +171,27 @@ pub fn render(vmid: u32, yaml: &str, digest: &str, now: u64) -> Result<String> {
             )));
         }
     }
+    // The block's own delimiters may not occur inside it either: a block
+    // scalar holding a line that is exactly the end line would end the block
+    // early, and a header line inside it would be a second header. Neither
+    // is likely from a document; both are made impossible here.
+    for line in yaml.lines() {
+        let l = line.trim_end();
+        if l == END_LINE || l.starts_with(BEGIN_PREFIX) {
+            return Err(Error::InvalidName(format!(
+                "a document line may not be a block delimiter: {line:?}"
+            )));
+        }
+    }
     Ok(block)
 }
 
-/// Finds the block in a notes text, if there is one. The first header line
-/// wins; a header without an end line, or one whose fences are not where
-/// the format puts them, is malformed and reported rather than silently
-/// treated as absent.
+/// Finds the block in a notes text, if there is one. A block is a header
+/// line with an end line somewhere after it; the first such header wins.
+/// A header line with no end line after it is not a block at all — someone
+/// wrote `[pve-meta v1]` in their notes — and is never reported, since the
+/// report would repeat on every config write of that guest. A block whose
+/// fences are not where the format puts them is malformed and reported.
 ///
 /// # Errors
 /// [`Error::Parse`] for a malformed block.
@@ -181,12 +201,15 @@ pub fn find(description: &str) -> Result<Option<Found>> {
     }) else {
         return Ok(None);
     };
+    let rest = &description[start..];
+    if !rest.split('\n').any(|l| l.trim_end() == END_LINE) {
+        return Ok(None);
+    }
     let malformed = |msg: &str| Error::Parse {
         format: crate::format::Format::Yaml,
         msg: format!("malformed pve-meta notes block: {msg}"),
         at: None,
     };
-    let rest = &description[start..];
     let mut lines = rest.split('\n');
     let header_line = lines.next().unwrap_or_default();
     let header = parse_header(header_line).ok_or_else(|| malformed("unreadable header line"))?;
@@ -459,21 +482,41 @@ mod tests {
     fn no_block_is_none_and_a_mention_is_not_a_block() {
         assert_eq!(find("").unwrap(), None);
         assert_eq!(find("see [pve-meta v1] for details").unwrap(), None);
-        assert_eq!(
-            find("[pve-meta v1 vmid=1]\nnot a fence")
-                .unwrap_err()
-                .to_string()
-                .contains("opening fence"),
-            true
-        );
-        assert!(find("[pve-meta v1]\n````yaml\na: 1\n````\n")
+        // A header with no end line after it is a mention, not a block, and
+        // must never warn: it would warn on every config write.
+        assert_eq!(find("[pve-meta v1 vmid=1]\nnot a fence").unwrap(), None);
+        assert_eq!(find("[pve-meta v1]\n````yaml\na: 1\n````\n").unwrap(), None);
+        // With an end line, the shape between is checked.
+        assert!(find("[pve-meta v1 vmid=1]\nnot a fence\n[/pve-meta]")
             .unwrap_err()
             .to_string()
-            .contains("no end line"));
+            .contains("opening fence"));
         assert!(find("[pve-meta v2 vmid=1]\n````yaml\n````\n[/pve-meta]")
             .unwrap_err()
             .to_string()
             .contains("v2"));
+    }
+
+    #[test]
+    fn render_refuses_a_document_line_that_is_a_delimiter() {
+        // The guard mirrors `find`: a delimiter is a whole, unindented line.
+        // A document cannot produce one (its top level is a map, and a
+        // block scalar's lines are indented), so these are not documents,
+        // just the text that would break the block if it ever were.
+        assert!(matches!(
+            render(1, "[/pve-meta]\n", "", 0),
+            Err(Error::InvalidName(_))
+        ));
+        assert!(matches!(
+            render(1, "a: 1\n[pve-meta v1 vmid=9]\n", "", 0),
+            Err(Error::InvalidName(_))
+        ));
+        // Indented, a delimiter is neither found by `find` nor refused here.
+        let indented = "note: |\n  [/pve-meta]\n  [pve-meta v1 vmid=9]\n";
+        let block = render(1, indented, "", 0).unwrap();
+        assert_eq!(find(&block).unwrap().unwrap().yaml, indented.trim_end());
+        let inline = "note: '[pve-meta v1] is the marker'\n";
+        assert!(render(1, inline, "", 0).is_ok());
     }
 
     #[test]
