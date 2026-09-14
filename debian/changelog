@@ -1,3 +1,26 @@
+pve-meta (0.1.2-1) unstable; urgency=medium
+
+  * Backups carry the guest's metadata document, and restores bring it back.
+    vzdump appends the document to the archive's copy of the guest's notes as
+    one marked block of plain YAML; a restore on a host with pve-meta reads it
+    into /etc/pve/meta and strips it before the config lands, on the config
+    write that follows the guest's create and on no other. Works for VMs with
+    disks, containers, PBS, vma, tar and external providers alike. A host
+    without pve-meta restores the block as readable notes text. A document
+    above 16 KiB is not carried and the backup log says so. A restore over an
+    existing guest now replaces its document from the backup.
+  * pve-meta scan-notes reads every such block left in the cluster's guest
+    configs into the store and strips it; the package install runs it once.
+  * The lifecycle hooks now fire for QEMU guests. qemu-server hands the vmid
+    to Perl as a string, which the bindings refused, so create, destroy and
+    the snapshot hooks had been warning and doing nothing on every qm
+    operation since 0.1.0.
+  * Two more managed patches, one file each in qemu-server and pve-container
+    (the vzdump assemble hooks), tracked by the ceiling watcher alongside
+    libpve-guest-common-perl.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Sun, 14 Sep 2026 15:00:00 +0200
+
 pve-meta (0.1.1-1) unstable; urgency=medium
 
   * Schema checks: type, enum and minimum/maximum are independent, and enum
