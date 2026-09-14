@@ -118,6 +118,17 @@ ok(!file_exists('9301.yaml'), 'a guest created at a recycled vmid inherits nothi
 ok(!file_exists('9301.snapB.yaml'), '... not even an old snapshot copy');
 is(PVE::RS::Meta::on_create(9301), 0, 'on_create on a clean vmid is a no-op');
 
+# The vmid crosses the boundary as whatever scalar the caller holds: qemu-server
+# passes the API parameter through as a string, pve-container as a number. Both
+# must work, or every hook is a silent no-op for one guest type.
+write_file('9302.yaml', "k: v\n");
+is(PVE::RS::Meta::on_snapshot("9302", 'str'), 1, 'a vmid given as a string is accepted (on_snapshot)');
+is(PVE::RS::Meta::on_delsnap("9302", 'str'), 1, '... and on_delsnap');
+is(PVE::RS::Meta::on_create("9302"), 1, '... and on_create');
+ok(!file_exists('9302.yaml'), '... acting on the right vmid');
+$res = eval { PVE::RS::Meta::on_create("not-a-vmid") };
+ok(!defined($res) && $@ =~ /not a vmid/, 'a string that is not a vmid dies');
+
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
@@ -196,6 +207,10 @@ is($res->{action}, 'imported', 'install imports where there is no document');
 is($res->{description}, "kept\nalso kept", '... and the notes around the block survive');
 is(read_file('9402.yaml'), $backed_up, '... into the store');
 
+$res = PVE::RS::Meta::notes_import("9405", $block, 'restore');
+is($res->{action}, 'imported', 'notes_import takes a string vmid too');
+like(PVE::RS::Meta::export_for_backup("9405"), qr/^\[pve-meta v1 vmid=9405 /, 'export_for_backup takes a string vmid too');
+
 $res = eval { PVE::RS::Meta::notes_import(9402, $block, 'bogus') };
 ok(!defined($res), 'notes_import dies on an unknown mode');
 
@@ -208,7 +223,7 @@ write_file('9404.yaml', "k: [unclosed\n");
 $res = eval { PVE::RS::Meta::export_for_backup(9404) };
 ok(!defined($res) && $@ =~ /does not parse/, 'export_for_backup dies for a document that does not parse');
 
-unlink("$root/9400.yaml", "$root/9401.yaml", "$root/9402.yaml", "$root/9404.yaml");
+unlink("$root/9400.yaml", "$root/9401.yaml", "$root/9402.yaml", "$root/9404.yaml", "$root/9405.yaml");
 
 # =========================================================================
 # The perlmod boundary: native hashes and arrays.
