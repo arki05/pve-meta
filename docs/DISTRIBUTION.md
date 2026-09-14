@@ -75,13 +75,15 @@ The patched packages carry a *tested ceiling*, not a dependency pin, so
 [tested]
 pve-manager = "9.2.11"
 libpve-guest-common-perl = "6.0.5"
+qemu-server = "9.2.7"
+pve-container = "6.1.14"
 ```
 
 Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manual
 `workflow_dispatch`) `scripts/watch-pve/check.sh`:
 
 1. fetches the Proxmox no-subscription `Packages` index for `trixie`;
-2. for each of the two tracked packages, compares its current version there (via
+2. for each of the four tracked packages, compares its current version there (via
    `dpkg --compare-versions`) against `ceilings.toml`'s ceiling;
 3. for every package strictly newer than its ceiling: downloads the `.deb`, extracts it
    with `dpkg-deb -x`, and runs `pve-ext-patch --root <extracted> verify <manifest>`
@@ -89,10 +91,10 @@ Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manu
    against the pristine copy it can find under `--root`, never touching anything):
    - **pve-manager**: verifies pve-ext's own manifest,
      `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
-   - **libpve-guest-common-perl**: verifies `patches/lifecycle.toml` (pve-meta's one
-     guest-lifecycle diff — one file carries the whole lifecycle, see
-     `docs/LIFECYCLE.md`), filtered down first to that package's own `[[file]]`
-     entries (a no-op today, kept for a future entry);
+   - **libpve-guest-common-perl**, **qemu-server**, **pve-container**: verifies
+     `patches/lifecycle.toml` (pve-meta's guest-lifecycle manifest: one file in
+     each of the three, see `docs/LIFECYCLE.md`), filtered down first to that
+     package's own `[[file]]` entries;
 4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
    packages with any failure get **one GitHub issue** (label `pve-upgrade`) carrying the
    full `pve-ext-patch verify` output, plus a `TODO(llm-fix)` block marking the hand-off

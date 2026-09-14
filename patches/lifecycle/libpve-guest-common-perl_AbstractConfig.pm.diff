@@ -8,15 +8,53 @@
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -267,6 +268,33 @@
+@@ -65,6 +66,36 @@
+ sub write_config {
+     my ($class, $vmid, $conf) = @_;
+ 
++    # pve-meta: a config restored from a backup carries the guest's metadata document
++    # in its notes, appended there by the patched vzdump assemble (docs/LIFECYCLE.md).
++    # Every restore path ends in this write, so this is where the document goes back
++    # into /etc/pve/meta and the block leaves the notes -- under the document's own
++    # lock, the one every other writer takes, inside the guest lock the caller holds,
++    # the same order create and destroy use. The substring test keeps every other
++    # config write at one string scan; only a block does any work. An error leaves the
++    # notes as they are, block included, and never fails the write.
++    if (defined($conf->{description}) && index($conf->{description}, '[pve-meta v') != -1) {
++        my $meta_err;
++        eval {
++            PVE::Cluster::cfs_lock_domain(
++                "pve-meta-$vmid",
++                10,
++                sub {
++                    my $res = PVE::RS::Meta::notes_import($vmid, $conf->{description}, 'restore');
++                    return if !defined($res->{description});
++                    if (length($res->{description})) {
++                        $conf->{description} = $res->{description};
++                    } else {
++                        delete $conf->{description};
++                    }
++                },
++            );
++            $meta_err = $@;
++        };
++        $meta_err = $@ if !$meta_err;
++        warn "pve-meta: notes_import($vmid) failed: $meta_err" if $meta_err;
++    }
++
+     my $cfspath = $class->cfs_config_path($vmid);
+ 
+     PVE::Cluster::cfs_write_file($cfspath, $conf);
+@@ -267,6 +298,34 @@
              $class->write_config($vmid, $conf);
          },
      );
 +
 +    # pve-meta: a genuinely new guest starts with no inherited metadata. Only when
 +    # $allow_existing is false, i.e. when check_vmid_unused() above has just asserted
-+    # this vmid was free -- a restore *over* an existing guest keeps its document,
-+    # since a backup does not carry one and clearing it would be data loss.
++    # this vmid was free -- a restore *over* an existing guest keeps its document here;
++    # the restore then replaces it from the backup's notes block (write_config below),
++    # or leaves it if the backup carried none.
 +    if (!$allow_existing) {
 +        # pve-meta: under the document's own lock -- the one every other writer
 +        # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`). Without it the
@@ -42,7 +80,7 @@
  }
  
  # destroys configuration, only applicable for configs owned by the callers node.
-@@ -276,6 +304,31 @@
+@@ -276,6 +335,31 @@
  
      my $config_fn = $class->config_file($vmid, $nodename);
      unlink $config_fn or die "failed to remove config file: $!\n";
@@ -74,7 +112,7 @@
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -876,6 +929,9 @@
+@@ -876,6 +960,9 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
@@ -84,7 +122,7 @@
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1108,9 @@
+@@ -1052,6 +1139,9 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -94,7 +132,7 @@
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1273,9 @@
+@@ -1214,6 +1304,9 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);

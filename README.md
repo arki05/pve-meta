@@ -23,8 +23,8 @@ reads `backup.retention`. Several of them share one document safely, because eac
 declares the prefix it owns, can attach a schema to it, and can be given a token that
 sees and writes nothing else. The document is removed when the guest is destroyed,
 cleared when its vmid is reused, and snapshotted and rolled back with the guest;
-migration needs nothing, since the file is cluster-wide. Backups do not include it
-(back up `/etc/pve`), and clone does not copy it.
+migration needs nothing, since the file is cluster-wide. A backup carries it in the
+archive's copy of the guest's notes and a restore reads it back; clone does not copy it.
 
 ## What it looks like
 
@@ -89,9 +89,10 @@ apt update && apt install pve-meta
 amd64 and arm64, PVE 9 on Debian trixie. Three packages come along: `pve-ext` (the
 extension layer that mounts the API module and the tab, its own package),
 `libpve-meta-rs-perl` (the Rust core, as a Perl module) and `pve-meta` itself. The
-install applies one managed patch to `libpve-guest-common-perl` for the lifecycle hooks,
-verified with `perl -c` and re-applied when that package is upgraded. Removing
-`pve-meta` restores the pristine file and leaves the documents alone.
+install applies three managed patches, one file each in `libpve-guest-common-perl`,
+`qemu-server` and `pve-container`, for the lifecycle and backup hooks, verified with
+`perl -c` and re-applied when those packages are upgraded. Removing `pve-meta` restores
+the pristine files and leaves the documents alone.
 
 ## Use
 

@@ -6,9 +6,9 @@
 # manifest (pages/pve-meta.json) pve-ext-loader.js discovers on its own,
 # and its API module (perl/PVE/API2/Ext/Meta.pm) is discovered by
 # PVE::API2::Ext at pvedaemon/pveproxy startup -- neither needs anything
-# from this script. The one thing this package still applies itself is
-# its guest-lifecycle managed-patch manifest (see patches/lifecycle.toml),
-# via pve-ext's own `pve-ext-patch` tool.
+# from this script. What this package applies itself is its guest-lifecycle
+# managed-patch manifest (see patches/lifecycle.toml), via pve-ext's own
+# `pve-ext-patch` tool, and the one-time notes scan below.
 #
 # Re-running `pve-ext-patch apply` is safe and idempotent. Never allowed
 # to fail the package install/configure -- `pve-ext-patch verify`/`status`
@@ -41,6 +41,22 @@ apply_lifecycle_patch() {
     fi
 }
 
+# A guest restored from a backup on a host without pve-meta carries its
+# metadata document in its notes, as the block every backup taken with
+# pve-meta appends (docs/LIFECYCLE.md). Once, here, read every such block
+# in the cluster back into /etc/pve/meta and strip it -- cluster-wide, so
+# one install covers the cluster and a later install on another node finds
+# nothing left to do. Idempotent and cheap: a guest without a block costs
+# one config read. Best-effort: never fails the install, and the same
+# command can be run again by hand.
+scan_notes() {
+    if [ -d /etc/pve/local ] && command -v pve-meta >/dev/null 2>&1; then
+        pve-meta scan-notes || {
+            echo "pve-meta: warning: 'pve-meta scan-notes' did not finish cleanly, see above; run it again by hand." >&2
+        }
+    fi
+}
+
 # The lifecycle patch changes files pvedaemon has already loaded into
 # memory, so restart both PVE daemons to pick the change up.
 # `deb-systemd-invoke reload-or-try-restart` (not a raw `systemctl
@@ -64,6 +80,7 @@ case "$1" in
         ensure_dropdirs
         apply_lifecycle_patch
         restart_pve_services
+        scan_notes
         ;;
     triggered)
         # $2 is the whitespace-separated list of trigger names that fired

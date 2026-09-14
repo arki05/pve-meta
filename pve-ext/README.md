@@ -348,8 +348,9 @@ by construction — they simply never name the same file.
 
 `pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
 project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
-is a worked example of all four steps, for the one guest-lifecycle file it
-patches (the whole guest lifecycle is one file; see `docs/LIFECYCLE.md`).
+is a worked example of all four steps, for the three files it patches (one each
+in `libpve-guest-common-perl`, `qemu-server` and `pve-container`; see
+`docs/LIFECYCLE.md`).
 
 ## Summary: what pve-ext ships
 

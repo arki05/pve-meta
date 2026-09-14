@@ -19,6 +19,9 @@
 //!   authorization, the lint, `touched` reporting) that
 //!   `PVE::RS::Meta`'s `api_*` functions export to
 //!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8).
+//! - [`backup`] — the notes block: a document rendered into, and read back
+//!   out of, a guest config's notes, which is how it rides through a vzdump
+//!   backup and restore (`docs/DESIGN.md` §9).
 //! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
 //!   most-specific first: what governs a path, what its schema says
 //!   (`docs/DESIGN.md` §3). Schemas shadow.
@@ -174,6 +177,7 @@ macro_rules! warn_line {
 }
 
 pub mod api;
+pub mod backup;
 pub mod digest;
 pub mod edit;
 pub mod error;
