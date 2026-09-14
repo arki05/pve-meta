@@ -27,6 +27,8 @@ my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
 $ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
+my $rundir = tempdir(CLEANUP => 1);
+$ENV{PVE_META_RUN_DIR} = $rundir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -118,16 +120,39 @@ ok(!file_exists('9301.yaml'), 'a guest created at a recycled vmid inherits nothi
 ok(!file_exists('9301.snapB.yaml'), '... not even an old snapshot copy');
 is(PVE::RS::Meta::on_create(9301), 0, 'on_create on a clean vmid is a no-op');
 
+# The vmid crosses the boundary as whatever scalar the caller holds: qemu-server
+# passes the API parameter through as a string, pve-container as a number. Both
+# must work, or every hook is a silent no-op for one guest type.
+write_file('9302.yaml', "k: v\n");
+is(PVE::RS::Meta::on_snapshot("9302", 'str'), 1, 'a vmid given as a string is accepted (on_snapshot)');
+is(PVE::RS::Meta::on_delsnap("9302", 'str'), 1, '... and on_delsnap');
+is(PVE::RS::Meta::on_create("9302"), 1, '... and on_create');
+ok(!file_exists('9302.yaml'), '... acting on the right vmid');
+$res = eval { PVE::RS::Meta::on_create("not-a-vmid") };
+ok(!defined($res) && $@ =~ /not a vmid/, 'a string that is not a vmid dies');
+
+# --- the restore marker ---------------------------------------------------
+# create_and_lock_config leaves one, the next write_config takes it, destroy
+# removes it. Node-local, under $PVE_META_RUN_DIR here.
+is(PVE::RS::Meta::take_created(9303), 0, 'no marker until a create');
+PVE::RS::Meta::mark_created("9303");
+ok(-f "$rundir/9303", 'mark_created leaves the marker file');
+is(PVE::RS::Meta::take_created(9303), 1, 'take_created takes it');
+is(PVE::RS::Meta::take_created(9303), 0, '... once');
+PVE::RS::Meta::mark_created(9303);
+PVE::RS::Meta::on_destroy(9303);
+ok(!-f "$rundir/9303", 'on_destroy removes a marker a failed create left');
+
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# These lifecycle exports are gone. `on_destroy` and `api_permissions` are not in
-# this list: those names exist again, but as the create/destroy hook and the
-# grant-file listing behind GET /meta/permissions, respectively.
-for my $gone (qw(on_clone export_for_backup import_from_backup
-                 list_snapshots has_document)) {
+# These lifecycle exports are gone. `on_destroy`, `api_permissions` and
+# `export_for_backup` are not in this list: those names exist again, as the
+# create/destroy hook, the grant-file listing behind GET /meta/permissions, and
+# the backup side of the notes block, respectively.
+for my $gone (qw(on_clone import_from_backup list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
@@ -156,6 +181,63 @@ for my $gone (qw(gc gc_candidates gc_purge)) {
 }
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$root/9200.old.yaml");
+
+# =========================================================================
+# export_for_backup / notes_import -- the two ends of a backup (docs/DESIGN.md §9):
+# the block vzdump's patched `assemble` appends to the archive's copy of the notes,
+# and what the patched `write_config` (mode 'restore') and `pve-meta scan-notes`
+# (mode 'install') do with it on the way back.
+# =========================================================================
+
+is(PVE::RS::Meta::export_for_backup(9400), undef, 'export_for_backup is undef without a document');
+my $backed_up = "traefik:\n  spec: {host: web.example}\n";
+write_file('9400.yaml', $backed_up);
+my $block = PVE::RS::Meta::export_for_backup(9400);
+like(
+    $block,
+    qr/^\[pve-meta v1 vmid=9400 time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ sha256=[0-9a-f]{64}\]\n````yaml\ntraefik:\n  spec: \{host: web\.example\}\n````\n\[\/pve-meta\]$/,
+    'the block is the document text under a marker, verbatim'
+);
+
+# Restore: to another vmid, over a document that was there -- the backup wins.
+write_file('9401.yaml', "old: true\n");
+$res = PVE::RS::Meta::notes_import(9401, "web01\n\n$block", 'restore');
+is($res->{action}, 'imported', 'restore imports the block');
+is($res->{description}, 'web01', '... and hands back the notes without it');
+is(read_file('9401.yaml'), $backed_up, '... the document is the backed-up text');
+
+$res = PVE::RS::Meta::notes_import(9401, 'plain notes', 'restore');
+is($res->{action}, 'none', 'notes without a block are nothing to do');
+ok(!defined($res->{description}), '... and the notes are left alone');
+
+# Install: a document already there is kept, the block still goes.
+$res = PVE::RS::Meta::notes_import(9401, $block, 'install');
+is($res->{action}, 'stripped', 'install keeps a document that is there');
+is($res->{description}, '', '... and strips the block, to empty notes here');
+is(read_file('9401.yaml'), $backed_up, '... the document is untouched');
+
+$res = PVE::RS::Meta::notes_import(9402, "kept\n$block\nalso kept", 'install');
+is($res->{action}, 'imported', 'install imports where there is no document');
+is($res->{description}, "kept\nalso kept", '... and the notes around the block survive');
+is(read_file('9402.yaml'), $backed_up, '... into the store');
+
+$res = PVE::RS::Meta::notes_import("9405", $block, 'restore');
+is($res->{action}, 'imported', 'notes_import takes a string vmid too');
+like(PVE::RS::Meta::export_for_backup("9405"), qr/^\[pve-meta v1 vmid=9405 /, 'export_for_backup takes a string vmid too');
+
+$res = eval { PVE::RS::Meta::notes_import(9402, $block, 'bogus') };
+ok(!defined($res), 'notes_import dies on an unknown mode');
+
+my $bad = "[pve-meta v1 vmid=1 sha256=0]\n````yaml\n- not: a map\n````\n[/pve-meta]";
+$res = eval { PVE::RS::Meta::notes_import(9403, $bad, 'restore') };
+ok(!defined($res), 'a block the store would refuse dies rather than importing');
+ok(!file_exists('9403.yaml'), '... and writes nothing');
+
+write_file('9404.yaml', "k: [unclosed\n");
+$res = eval { PVE::RS::Meta::export_for_backup(9404) };
+ok(!defined($res) && $@ =~ /does not parse/, 'export_for_backup dies for a document that does not parse');
+
+unlink("$root/9400.yaml", "$root/9401.yaml", "$root/9402.yaml", "$root/9404.yaml", "$root/9405.yaml");
 
 # =========================================================================
 # The perlmod boundary: native hashes and arrays.

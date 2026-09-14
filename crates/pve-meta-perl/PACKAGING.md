@@ -21,16 +21,17 @@ gated and installed is `docs/BUILD.md`.
     Depends: ${shlibs:Depends}, ${misc:Depends}, ${perl:Depends}
     Description: pve-meta store bindings for PVE (Rust, perlmod)
      PVE::RS::Meta, a Perl binding (via perlmod) to pve-meta's guest metadata
-     store: the snapshot/rollback/delsnap hooks called from
-     libpve-guest-common-perl and the api_* functions behind
-     PVE::API2::Ext::Meta.
+     store: the lifecycle hooks called from libpve-guest-common-perl, the backup
+     hooks called from qemu-server and pve-container, and the api_* functions
+     behind PVE::API2::Ext::Meta.
     ```
 
     (`debian/control` is owned by the packaging work, not by this crate; the
-    stanza above is what this crate's contents ask for. Every hook the bindings
-    export — create, destroy, snapshot, rollback, delsnap — is called from one
-    patched file in `libpve-guest-common-perl`; `pve-container` and `qemu-server`
-    are not patched at all.)
+    stanza above is what this crate's contents ask for. The lifecycle hooks the
+    bindings export — create, destroy, snapshot, rollback, delsnap — and the
+    restore side of backup are called from one patched file in
+    `libpve-guest-common-perl`; the backup side, `export_for_backup`, from one
+    patched file each in `qemu-server` and `pve-container`.)
 
 * **Root `Makefile`**:
   * `build:` runs `$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release`

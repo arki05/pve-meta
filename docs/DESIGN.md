@@ -225,8 +225,10 @@ generated from one spec.
 
 ## 9. Guest lifecycle
 
-One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), managed by
-`pve-ext-patch`:
+Three patched files, managed by `pve-ext-patch`: `PVE/AbstractConfig.pm`
+(`libpve-guest-common-perl`) for the lifecycle and the restore side of backup, and the
+vzdump plugins `PVE/VZDump/QemuServer.pm` (`qemu-server`) and `PVE/VZDump/LXC.pm`
+(`pve-container`) for the backup side.
 
 * `create_and_lock_config` calls `on_create` when PVE has just asserted the vmid was
   unused, clearing any document and snapshot copies left there.
@@ -235,10 +237,41 @@ One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), managed 
 * `snapshot`, `rollback`, `delsnapshot` copy, restore and remove
   `<vmid>.<snapname>.yaml`. Rollback to a snapshot that had no document removes the
   live document.
+* **Backup.** `assemble` in both vzdump plugins appends the document to the archive's
+  copy of the guest's notes, as one marked block (`pve_meta_core::backup`):
 
-All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation.
-Migration needs nothing (the document is cluster-wide). Clone and backup are not
-carried; back up `/etc/pve`.
+  ```text
+  [pve-meta v1 vmid=105 time=2026-09-14T03:00:12Z sha256=<digest of the file text>]
+  ````yaml
+  <the document, verbatim>
+  ````
+  [/pve-meta]
+  ```
+
+  Only that copy: the live config never carries it. Every archive kind carries the
+  config, so this covers VMs with disks, containers, PBS, vma, tar and external
+  providers alike. Plain YAML, no encoding: PVE's notes encoder escapes what needs
+  escaping per line and its decoder restores it. A document above 16 KiB, or one that
+  does not parse, is not carried, and the backup log says so.
+* **Restore.** `write_config`, which every restore path ends in, finds the block,
+  writes the document and strips the block from the notes before the config lands.
+  Only while the marker `create_and_lock_config` left for the vmid under
+  `/run/pve-meta` is there. A create or restore keeps the config locked and writes it
+  more than once on the way, so the marker is taken by the first write that carries a
+  block, or by the first write of an unlocked config, and by nothing in between; only
+  the write that took it imports. A create ends with an unlocked write, so a block
+  pasted into a live guest's notes afterwards is never imported by an ordinary config
+  write. The block wins over whatever
+  document the vmid had: it is the backup being restored. Enforced schemas do not
+  apply; a restore is not an edit. A host without pve-meta restores the block as
+  notes text, readable and harmless. `pve-meta scan-notes`, run once by the package
+  install and by hand for a block a restore left behind, reads every such block in
+  the cluster's guest configs into the store and strips it; where a document is
+  already there it is kept and the block only stripped.
+
+All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation, a
+backup or a restore. Migration needs nothing (the document is cluster-wide). Clone is
+not carried.
 
 There is no sweeper. A guest config removed out of band leaves an orphan; `pve-meta ls
 --orphans` lists them and `pve-meta rm <vmid>` removes one under the document's lock
@@ -257,6 +290,7 @@ hook script during boot.
 | `delete <id> [<view>] [--digest]` | the API's `DELETE`; exit 2 when nothing was there |
 | `ls [--orphans] [--format plain\|json]` | document ids; with `--orphans`, vmids with files but no guest |
 | `rm <vmid>` | remove an orphan's files; refuses a live guest |
+| `scan-notes` | read every backup notes block in the cluster's guest configs into the store and strip it; the package install runs it once |
 
 Writes go through the same Rust functions as the API — lint, digest, enforced schemas,
 audit line — and skip only permissions, because root can already write the file.
@@ -319,14 +353,14 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 ## 13. Repository layout
 
 ```
-crates/pve-meta-core     model, paths, formats, patch, view, registry, scopes, shape, edit, store, api
-crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, stored_vmids, the api_* exports
+crates/pve-meta-core     model, paths, formats, patch, view, registry, scopes, shape, edit, store, api, backup
+crates/pve-meta-perl     PVE::RS::Meta: lifecycle and backup hooks, stored_vmids, the api_* exports
 crates/pve-meta-wasm     the core for the browser, behind a JSON-string ABI
 perl/PVE/API2/Ext/Meta.pm  the REST module
 bin/pve-meta             the CLI
 pages/                   the two page manifests
 examples/                the hook script and the example prefix, installed as documentation
-patches/                 the lifecycle patch manifest and diff
+patches/                 the lifecycle patch manifest and its three diffs
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor and its offline and headless tests
 scripts/perl-stubs/      stub PVE modules so perl -c runs anywhere

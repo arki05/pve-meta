@@ -97,9 +97,9 @@ install: js
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
-	# pve-ext managed-patch manifest for the guest-lifecycle hooks
+	# pve-ext managed-patch manifest for the guest-lifecycle and backup hooks
 	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
-	# the whole lifecycle is one patched file, see docs/LIFECYCLE.md).
+	# three patched files in three packages, see docs/LIFECYCLE.md).
 	# Installed under its own declared `id` (patches/lifecycle.toml's
 	# top-level `id = "..."` field), not its checkout filename -- so that
 	# pve-ext-patch's claim identity, read from the manifest's own content
