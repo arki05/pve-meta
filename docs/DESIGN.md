@@ -151,16 +151,23 @@ rules:                         # optional; a file with none grants nothing
 * A document that **cannot be read back** (§7) is repaired only by a root `replace` or a
   root `DELETE`, and only with full write.
 * Registry documents (§6) get no scopes: read is open to every authenticated user,
-  write is `Sys.Modify` on `/`.
+  write is `Sys.Modify` on `/`, and on `/nodes/<node>` for a node's prefix file.
 
 ## 6. Registry files are documents
 
-A prefix or permission file is addressed as a document with id `prefixes/<name>` or
-`permissions/<name>`, through the same `view`, `format`, `mode`, `digest`, `dry_run`
-machinery as a guest document. Four things are specific to them:
+A prefix or permission file is addressed as a document with id `prefixes/<name>`,
+`nodes/<node>/prefixes/<name>` or `permissions/<name>`, through the same `view`,
+`format`, `mode`, `digest`, `dry_run` machinery as a guest document. Four things are
+specific to them:
 
-* **Writes land in the cluster directory.** Editing a packaged prefix creates the
-  cluster override; deleting the override reverts to the packaged file.
+* **Writes land in the cluster directory**, or the node's for a node id. Editing a
+  packaged prefix creates the cluster override; deleting the override reverts to the
+  packaged file. A node id is that node's file and nothing else: it never reads through
+  to the cluster file, and deleting it reverts the node's guests to the cluster or
+  packaged file. The node must be of PVE's node-name format (400), and no path is built
+  from any other name. Creating a file needs the node in the cluster nodelist (404);
+  reading or removing one does not, so what a removed node left behind is an ordinary
+  file.
 * **The result must parse as its kind**, using the loader's own parser
   (`registry::parse_prefix` / `parse_permission`), on every write including `dry_run`
   and a narrow `DELETE ?view=`. A 200 must never make a file the loader would skip.
@@ -183,13 +190,14 @@ affordance, not the validator; a test keeps its required keys equal to the parse
   write that changes nothing rewrites nothing.
 * **One lint** runs on the planned document: top level is a map, no nulls, keys match
   the charset, comment keys are strings. A failure is a 400 naming the path.
-* **Enforced schemas.** If a prefix that reaches the guest says `enforce: true` (for
-  itself, or on a schema node under it: §3), a write that would leave the enforced part
-  of its subtree not matching the schema — for the findings the write introduces or
-  touches, never for what was already wrong elsewhere — is a 422 naming the paths,
-  unless the request carries `force=1`. Anyone who may write may force. `type`, `enum`
-  and `minimum`/`maximum` are independent checks, every stated one applied, and `enum`
-  membership is by value (`"1"` is not `1`). `format:` checks are never enforced.
+* **Enforced schemas.** If a prefix that reaches the guest — in the set for its node,
+  §3 — says `enforce: true` (for itself, or on a schema node under it: §3), a write
+  that would leave the enforced part of its subtree not matching the schema — for the
+  findings the write introduces or touches, never for what was already wrong elsewhere
+  — is a 422 naming the paths, unless the request carries `force=1`. Anyone who may
+  write may force. `type`, `enum` and `minimum`/`maximum` are independent checks, every
+  stated one applied, and `enum` membership is by value (`"1"` is not `1`). `format:`
+  checks are never enforced.
 * **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
   `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
   else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
@@ -213,25 +221,32 @@ Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only. Tokens of different scope are not comparable |
+| GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only (below). Tokens of different scope are not comparable |
 | GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of; `node`/`name`/`tags` only with `VM.Audit` |
 | GET | `/meta/guests/{vmid}` | `view`, `format` | `{ id, view, digest, data \| text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
 | GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, overrides }]`, most-specific first, plus `{ prefix, origin, error }` for a file that did not load |
+| GET | `/meta/prefixes` | `id`, `all` | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, node?, overrides }]`, most-specific first, plus `{ prefix, origin, node?, error }` for a file that did not load. By default the cluster-wide set, one row per name; with `id` (a vmid), the set in effect for that guest on its current node; with `all`, the cluster-wide set plus every node's own files (below). `id` and `all` together are a 400 |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules, origin, overrides }]`, plus `{ name, origin, error }` rows |
-| GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>` |
+| GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/nodes/{node}/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>`, `nodes/<node>/prefixes/<name>`, `permissions/<name>` |
 | GET | `/meta/schemas` | — | `{ prefix, permission }` |
 
-A vmid absent from the vmlist is 404 for GET, PUT and DELETE. Errors from Rust are
-`"NNN: message"`, re-raised by Perl as a `PVE::Exception`; there is no second error
-vocabulary. Everything crosses the Perl/Rust boundary as native structures except the
+The scoped version token of a guest also covers its current node's prefix directory and
+hashes the node's name, so a migration moves it; that of a node prefix id covers its
+node's directory. In the `all` listing a packaged file that a cluster file shadows is not
+a row of its own, as in the cluster-wide set: the cluster row says `overrides`. Node rows
+carry `origin: node` and `node`.
+
+A vmid absent from the vmlist is 404 for GET, PUT and DELETE (and for `GET
+/meta/prefixes?id=`); a PUT of a node prefix file whose node is absent from the nodelist
+is 404 too. Errors from Rust are `"NNN: message"`, re-raised by Perl as a
+`PVE::Exception`; there is no second error vocabulary. Everything crosses the Perl/Rust boundary as native structures except the
 client's `data` string.
 
-Implementation: `perl/PVE/API2/Ext/Meta.pm` does parameters, PVE ACL checks, the
-vmlist, guest tags and the per-document lock, and calls `PVE::RS::Meta::api_*`;
-`pve_meta_core::api` does everything else. The three get/put/delete families are
+Implementation: `perl/PVE/API2/Ext/Meta.pm` does parameters, PVE ACL checks, the vmlist
+and nodelist, guest tags and node, the per-document lock, and calls
+`PVE::RS::Meta::api_*`; `pve_meta_core::api` does everything else. The three get/put/delete families are
 generated from one spec.
 
 ## 9. Guest lifecycle
@@ -299,12 +314,14 @@ hook script during boot.
 | `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force]` | the API's `PUT mode=replace`, under the document's lock |
 | `merge ...` | the same with `mode=merge` |
 | `delete <id> [<view>] [--digest]` | the API's `DELETE`; exit 2 when nothing was there |
-| `ls [--orphans] [--format plain\|json]` | document ids; with `--orphans`, vmids with files but no guest |
+| `ls [--orphans] [--format plain\|json]` | document ids, every node's prefix files included; with `--orphans`, vmids with files but no guest |
 | `rm <vmid>` | remove an orphan's files; refuses a live guest |
 | `scan-notes` | read every backup notes block in the cluster's guest configs into the store and strip it; the package install runs it once |
 
-Writes go through the same Rust functions as the API — lint, digest, enforced schemas,
-audit line — and skip only permissions, because root can already write the file.
+`<id>` is a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
+`permissions/<name>`. Writes go through the same Rust functions as the API — lint,
+digest, enforced schemas for the guest's node, audit line — and skip only permissions,
+because root can already write the file.
 
 ## 11. Extension seams (`pve-ext`)
 

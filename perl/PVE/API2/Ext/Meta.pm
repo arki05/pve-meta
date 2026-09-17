@@ -45,10 +45,12 @@ sub ext_path { return 'meta' }
 # `docs/DESIGN.md` §5: `full_read` = `VM.Audit` on `/vms/<vmid>`,
 # `full_write` = `VM.Config.Options`. Rust adds the scopes from the permission
 # files whose authid is the caller and whose selector matches the guest's tags
-# -- which is why the tags travel with the ACL. A registry document (a prefix
-# or permission file) is readable by every authenticated user and written with
-# `Sys.Modify` on `/`; scopes never apply to one, and Rust enforces that rather
-# than trusting an empty list here.
+# -- which is why the tags travel with the ACL -- and takes the guest's node from
+# it too, because that node's prefix files join the cluster's for this guest. A
+# registry document (a prefix or permission file) is readable by every
+# authenticated user and written with `Sys.Modify` on `/` -- on `/nodes/<node>`
+# for a node's prefix file; scopes never apply to one, and Rust enforces that
+# rather than trusting an empty list here.
 
 # A guest's PVE tags, as an array ref. `get_guest_config_properties` is the
 # cluster-wide cached property fetch `list_guests` already used for the display
@@ -74,6 +76,7 @@ sub _guest_acl {
         read => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1) ? 1 : 0,
         write => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Config.Options'], 1) ? 1 : 0,
         tags => $tags // _guest_tags($vmid),
+        node => _guest_node($vmid),
     };
 }
 
@@ -89,12 +92,17 @@ sub _guest_acl {
 # registry document no scopes, so an operator holding `rw` on some prefix
 # cannot edit the permission file that gave it that prefix, nor the prefix that
 # declares it. Self-registration is refused by there being no way to express it.
+#
+# A node's prefix file is the same, with write on that node rather than the whole
+# cluster: it reaches only that node's guests. `$node` has passed the `pve-node`
+# format before it gets here.
 sub _registry_acl {
-    my ($rpcenv, $authuser) = @_;
+    my ($rpcenv, $authuser, $node) = @_;
+    my $path = defined($node) ? "/nodes/$node" : '/';
     return {
         authid => $authuser,
         read => 1,
-        write => $rpcenv->check($authuser, '/', ['Sys.Modify'], 1) ? 1 : 0,
+        write => $rpcenv->check($authuser, $path, ['Sys.Modify'], 1) ? 1 : 0,
         tags => [],
     };
 }
@@ -164,6 +172,27 @@ sub _assert_guest_exists {
     my ($vmid) = @_;
     return if _vmlist_ids()->{$vmid};
     raise("guest '$vmid' does not exist\n", code => 404);
+}
+
+# The node a guest is on right now, from the vmlist, or undef. Which node's prefix
+# files apply to the guest is decided per request from this, so a migrated guest
+# simply gets the other node's (docs/DESIGN.md §3).
+sub _guest_node {
+    my ($vmid) = @_;
+    return (_vmlist_ids()->{$vmid} // {})->{node};
+}
+
+# Creating a node's prefix file creates a directory under /etc/pve/nodes, so a PUT
+# needs one of the cluster's nodes, not merely a name shaped like one (the `pve-node`
+# format is the 400, this is the 404). Reading or removing needs only the shape: a
+# file that is not there is an absent document, and what a node that has left the
+# cluster still holds is an ordinary file. Rust checks the shape again on its own and
+# never builds a path from a name that fails it.
+sub _assert_node_exists {
+    my ($node) = @_;
+    my $nodelist = PVE::Cluster::get_nodelist() // [];
+    return if grep { $_ eq $node } @$nodelist;
+    raise("node '$node' does not exist\n", code => 404);
 }
 
 # Picks the PUT payload's wire format and text out of `data` (a JSON
@@ -365,12 +394,14 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Watch just this document: a vmid, "
-                    . "'prefixes/<name>' or 'permissions/<name>'. The token then covers "
-                    . "that document plus the prefix and permission directories, and "
-                    . "nothing else -- which is what an open editor watches, at a cost "
-                    . "that does not grow with the number of guests. Tokens from "
-                    . "different 'id' are not comparable with each other or with the "
-                    . "unscoped one; poll with a fixed 'id' and compare against your own "
+                    . "'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or "
+                    . "'permissions/<name>'. The token then covers that document plus the "
+                    . "prefix and permission directories -- for a guest, its current node's "
+                    . "prefix directory and that node's name as well, so it moves when the "
+                    . "guest migrates -- and nothing else, which is what an open editor "
+                    . "watches, at a cost that does not grow with the number of guests. "
+                    . "Tokens from different 'id' are not comparable with each other or with "
+                    . "the unscoped one; poll with a fixed 'id' and compare against your own "
                     . "previous answer.",
             },
         },
@@ -390,7 +421,11 @@ __PACKAGE__->register_method({
                 items => {
                     type => 'object',
                     properties => {
-                        id => { type => 'string', description => "A vmid, 'prefixes/<name>' or 'permissions/<name>'." },
+                        id => {
+                            type => 'string',
+                            description => "A vmid, 'prefixes/<name>', "
+                                . "'nodes/<node>/prefixes/<name>' or 'permissions/<name>'.",
+                        },
                         digest => { type => 'string' },
                     },
                 },
@@ -402,8 +437,12 @@ __PACKAGE__->register_method({
         # No ACL check, and none is needed: a token is a hash over content the
         # 'detail' listing already hands to every authenticated user unfiltered
         # (docs/DESIGN.md §1), and a bad id is refused by the one id parser
-        # rather than falling back to the whole store.
-        return _call(\&PVE::RS::Meta::api_version, $param->{detail} ? 1 : 0, $param->{id});
+        # rather than falling back to the whole store. A vmid's token covers its
+        # node's prefix files, so the node rides along; a vmid not in the vmlist
+        # has none, and its token is the document's and the cluster registry's.
+        my $id = $param->{id};
+        my $node = defined($id) && $id =~ m/^\d+$/ ? _guest_node($id) : undef;
+        return _call(\&PVE::RS::Meta::api_version, $param->{detail} ? 1 : 0, $id, $node);
     },
 });
 
@@ -428,7 +467,8 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "The document to ask about, as an id: a vmid, "
-                    . "'prefixes/<name>' or 'permissions/<name>'. Omit for the registry.",
+                    . "'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or "
+                    . "'permissions/<name>'. Omit for the registry.",
             },
         },
     },
@@ -469,6 +509,14 @@ __PACKAGE__->register_method({
         if ($id =~ m{^(prefixes|permissions)/}) {
             return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
         }
+        # The shape before the name reaches an ACL path; a name that is not one falls
+        # through to the id parser's 400.
+        if ($id =~ m{^nodes/([^/]*)/prefixes/} && PVE::JSONSchema::pve_verify_node_name($1, 1)) {
+            my $node = $1;
+            return _call(
+                \&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser, $node),
+            );
+        }
         if ($id =~ m{^\d+$}) {
             _assert_guest_exists($id);
             return _call(
@@ -491,24 +539,44 @@ __PACKAGE__->register_method({
             . "(docs/DESIGN.md §1) and is what the editor needs to render typed rows.",
         user => 'all',
     },
-    description => "Every prefix (docs/DESIGN.md §3): the files in "
-        . "/usr/share/pve-meta/prefixes and /etc/pve/meta.d/prefixes, with a cluster "
-        . "file overriding the packaged one of the same name. The file name is the "
-        . "prefix. Sorted most-specific first, which is the order that resolves which "
-        . "prefix governs a path -- longest prefix wins and schemas never merge. A file "
-        . "that did not load -- unreadable, or not valid as a prefix -- still appears "
-        . "here: it is named ('prefix' is its file name) and carries 'error' instead of "
+    description => "Prefixes (docs/DESIGN.md §3): the files in "
+        . "/usr/share/pve-meta/prefixes, /etc/pve/meta.d/prefixes and "
+        . "/etc/pve/nodes/<node>/meta.d/prefixes. The file name is the prefix. By "
+        . "default, the cluster-wide set: a cluster file overrides the packaged file of "
+        . "the same name, one row per name. With 'id', the set in effect for that guest "
+        . "on the node it is on now, where that node's file overrides both. With 'all', "
+        . "the cluster-wide set plus every node's own files, each row saying where it came "
+        . "from ('origin', and 'node' for a node's file), so one prefix may appear more "
+        . "than once. Sorted "
+        . "most-specific first, which is the order that resolves which prefix governs a "
+        . "path -- longest prefix wins and schemas never merge. A file that did not load "
+        . "-- unreadable, or not valid as a prefix -- still appears here: it is named "
+        . "('prefix' is its file name) and carries 'error' instead of "
         . "'selector'/'schema', so it can be found and repaired at /meta/prefixes/{name} "
-        . "rather than quietly not existing.",
+        . "or /meta/nodes/{node}/prefixes/{name} rather than quietly not existing.",
     parameters => {
         additionalProperties => 0,
-        properties => {},
+        properties => {
+            id => get_standard_option('pve-vmid', {
+                optional => 1,
+                description => "The guest whose prefix set to return: its node is read "
+                    . "from the vmlist per request, so a migrated guest gets the other "
+                    . "node's.",
+            }),
+            all => {
+                type => 'boolean',
+                optional => 1,
+                default => 0,
+                description => "The cluster-wide set plus every node's own files, instead "
+                    . "of a resolved set. Not together with 'id'.",
+            },
+        },
     },
     returns => {
         type => 'array',
-        # `{ prefix, description?, selector, enforce, hidden, schema?, origin, overrides }`
+        # `{ prefix, description?, selector, enforce, hidden, schema?, origin, node?, overrides }`
         # for a loaded prefix -- `schema` is a free-form PVE::JSONSchema-dialect subtree -- or
-        # `{ prefix, origin, error }` for one that did not load.
+        # `{ prefix, origin, node?, error }` for one that did not load.
         items => {
             type => 'object',
             additionalProperties => 1,
@@ -518,14 +586,23 @@ __PACKAGE__->register_method({
                     optional => 1,
                     description => "Present only on an entry for a file that did not load: "
                         . "the parser's or the filesystem's own message. 'prefix' is still "
-                        . "the file name and 'origin' still says packaged or cluster, so the "
-                        . "row can be opened and repaired the same way a loaded one can.",
+                        . "the file name and 'origin' (and 'node') still say which file it "
+                        . "is, so the row can be opened and repaired the same way a loaded one "
+                        . "can.",
                 },
             },
         },
     },
     code => sub {
-        return _call(\&PVE::RS::Meta::api_prefixes);
+        my ($param) = @_;
+        raise_param_exc({ all => "not together with 'id'" })
+            if defined($param->{id}) && $param->{all};
+        my $node;
+        if (defined($param->{id})) {
+            _assert_guest_exists($param->{id});
+            $node = _guest_node($param->{id});
+        }
+        return _call(\&PVE::RS::Meta::api_prefixes, $node, $param->{all} ? 1 : 0);
     },
 });
 
@@ -625,12 +702,15 @@ __PACKAGE__->register_method({
 #             Runs before a read and *inside* the lock before a write, so a
 #             guest destroyed in between is a 404 and not a resurrected file;
 #             and before the ACL is computed, so a 404 costs no ACL lookups.
+#   check_put optional, $param -> the same, for PUT alone and after `check`: what
+#             only creating a file needs.
 #   describe  { get, put, delete } -> the method descriptions
 #   perms     { get, put, delete } -> the permission descriptions
 sub _register_document_methods {
     my ($spec) = @_;
     my ($name, $path, $params) = @$spec{qw(name path params)};
     my $check = $spec->{check} // sub { };
+    my $check_put = $spec->{check_put} // sub { };
 
     my $caller = sub {
         my ($param) = @_;
@@ -682,6 +762,7 @@ sub _register_document_methods {
             my ($param) = @_;
             return _locked($spec->{lock}->($param), sub {
                 $check->($param);
+                $check_put->($param);
                 return $put_view->($spec->{id}->($param), $param, $caller->($param));
             });
         },
@@ -730,7 +811,8 @@ my $REGISTRY_NAME_SCHEMA = {
 };
 
 # A prefix and a permission file are the same document to everything but the
-# parser that validates what is written (`api::check_registry_shape`).
+# parser that validates what is written (`api::check_registry_shape`). A node's
+# prefix file, below, is a third registry document of the prefix kind.
 for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
     my ($dir, $one) = @$kind;
     my $where = $one eq 'prefix'
@@ -770,6 +852,37 @@ for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
         },
     });
 }
+
+_register_document_methods({
+    name => 'node_prefix',
+    path => 'nodes/{node}/prefixes/{name}',
+    params => { node => get_standard_option('pve-node'), name => $REGISTRY_NAME_SCHEMA },
+    id => sub { "nodes/$_[0]->{node}/prefixes/$_[0]->{name}" },
+    # A node name has no '.', so the first one ends it: no two documents share a lock.
+    lock => sub { "node-$_[0]->{node}.prefix-$_[0]->{name}" },
+    acl => sub { _registry_acl($_[0], $_[1], $_[2]->{node}) },
+    check_put => sub { _assert_node_exists($_[0]->{node}) },
+    perms => {
+        get => "Readable by every authenticated user, exactly as the "
+            . "GET /meta/prefixes listing is (docs/DESIGN.md §1).",
+        put => "Requires Sys.Modify on /nodes/{node}: the file reaches only that node's "
+            . "guests (docs/DESIGN.md §5). A node that is not in the cluster is 404.",
+        delete => "Requires Sys.Modify on /nodes/{node}, same as PUT.",
+    },
+    describe => {
+        get => "Gets one node's prefix file as a document (or a view/prefix of it): "
+            . "/etc/pve/nodes/{node}/meta.d/prefixes/{name}.yaml, and never the cluster "
+            . "or packaged file of the same name it overrides. Includes a file the loader "
+            . "would skip, so a malformed one can be seen and repaired.",
+        put => "Writes one node's prefix file (or a view/prefix of it), in "
+            . "/etc/pve/nodes/{node}/meta.d/prefixes. For the guests on that node it "
+            . "overrides the cluster or packaged file of the same name. The result must "
+            . "parse as a prefix: a file the loader would skip is refused with a 400.",
+        delete => "Removes one node's prefix file, or the subtree at 'view'. Removing the "
+            . "file reverts that node's guests to the cluster or packaged file of the same "
+            . "name, if there is one.",
+    },
+});
 
 # -- guests -------------------------------------------------------------
 
