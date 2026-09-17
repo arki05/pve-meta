@@ -299,7 +299,11 @@ Ext.define('PVE.meta.RegistryGrid', {
                     // `digest: ''` is "this file must not exist yet", so two
                     // administrators creating the same name is a 409 rather than one
                     // silently overwriting the other.
-                    params: { data: Ext.encode(plan.content), mode: 'replace', digest: '' },
+                    params: PVE.meta.Doc.docParams({
+                        data: Ext.encode(plan.content),
+                        mode: 'replace',
+                        digest: '',
+                    }),
                     failure: fail(gettext('writing the file')),
                     success: function () {
                         me.reload();

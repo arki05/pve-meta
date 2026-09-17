@@ -17,6 +17,15 @@ PVE.meta.Doc = {
         return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
     },
 
+    // The parameters of every read and write of a document, with `comments: 1`.
+    // Without it the server leaves the comment keys out of a read and keeps the
+    // stored ones through a replace (DESIGN §2, §7); this editor shows them as the
+    // description column and edits them, so it always asks for them, and what it
+    // writes is the subtree with its notes.
+    docParams: function (params) {
+        return Ext.apply({ comments: 1 }, params);
+    },
+
     // The document id of a registry file: `<kind>/<name>`, or for a node's prefix
     // file `nodes/<node>/prefixes/<name>` -- its own document, never the cluster file
     // of the same name (`api::parse_id`).
@@ -228,7 +237,7 @@ PVE.meta.Doc = {
             function () {
                 me.request({
                     url: me.urlFor(me.docId),
-                    params: { format: 'yaml' },
+                    params: me.docParams({ format: 'yaml' }),
                     success: function (response) {
                         let d = response.result.data || {};
                         // The server could read the bytes but they are not a
@@ -323,7 +332,7 @@ PVE.meta.Doc = {
     // --- writes -------------------------------------------------------------
 
     write: function (docId, params, onSuccess) {
-        this.submit({ url: this.urlFor(docId), method: 'PUT', params: params }, onSuccess);
+        this.submit({ url: this.urlFor(docId), method: 'PUT', params: this.docParams(params) }, onSuccess);
     },
 
     submit: function (opts, onSuccess) {

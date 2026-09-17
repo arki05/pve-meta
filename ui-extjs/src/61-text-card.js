@@ -119,7 +119,7 @@ PVE.meta.TextCard = {
         Proxmox.Utils.setErrorMask(me, true);
         me.request({
             url: me.urlFor(me.docId),
-            params: { format: 'yaml' },
+            params: me.docParams({ format: 'yaml' }),
             success: function (response) {
                 let d = response.result.data || {};
                 me.setDigest(me.docId, d.digest);
@@ -311,7 +311,7 @@ PVE.meta.TextCard = {
             if (force) {
                 params.force = 1; // the "Save anyway" tick, see the tree's Apply
             }
-            me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
+            me.write(me.docId, params, function () {
                 me.pending = PVE.meta.EditSet.empty();
                 me.refreshText();
             });
@@ -509,7 +509,7 @@ PVE.meta.TextCard = {
         let me = this;
         me.request({
             url: me.urlFor(me.docId),
-            params: { format: 'yaml' },
+            params: me.docParams({ format: 'yaml' }),
             success: function (response) {
                 let d = response.result.data || {};
                 me.setDigest(me.docId, d.digest);

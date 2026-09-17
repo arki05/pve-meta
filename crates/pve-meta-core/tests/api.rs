@@ -113,7 +113,8 @@ fn get(
     fmt: &str,
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, ApiError> {
-    get_document(store, &regs(), id, view, fmt, acl)
+    // `comments`: every rule below but the notes' own is about the stored content.
+    get_document(store, &regs(), id, view, fmt, true, acl)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -147,7 +148,8 @@ fn put_with(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     put_document(
-        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, acl,
+        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, true,
+        acl,
     )
 }
 
@@ -725,6 +727,279 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
         get(&store, "100", Some("alpha"), "yaml", &full()).unwrap().text.as_deref(),
         Some("2\n")
     );
+}
+
+// -- comment keys are notes (docs/DESIGN.md §2, §7) ---------------------
+
+/// A read that did not ask for the notes.
+fn get_bare(store: &MetaStore, id: &str, view: Option<&str>, fmt: &str, acl: &CallerAcl) -> Result<ApiViewDocument, ApiError> {
+    get_document(store, &regs(), id, view, fmt, false, acl)
+}
+
+/// A JSON write with `comments` as given, against `permission_files` and `prefixes`.
+#[allow(clippy::too_many_arguments)]
+fn put_notes(
+    store: &MetaStore,
+    permission_files: &[Permission],
+    prefixes: &[PrefixDef],
+    id: &str,
+    view: Option<&str>,
+    payload: &str,
+    mode: &str,
+    dry_run: bool,
+    comments: bool,
+    acl: &CallerAcl,
+) -> Result<ApiPutResult, ApiError> {
+    put_document(store, permission_files, prefixes, id, view, "json", payload, mode, None, dry_run, false, comments, acl)
+}
+
+fn touched_paths(r: &ApiPutResult) -> Vec<String> {
+    let mut v: Vec<String> = r.touched.iter().map(|t| format!("{} {}", t.op, t.path)).collect();
+    v.sort();
+    v
+}
+
+const NOTED: &str = "__: the whole document\n\
+backup:\n\
+\x20 __: the backup job's settings\n\
+\x20 retention: 7\n\
+\x20 retention__: days\n\
+\x20 targets:\n\
+\x20 - host: nas\n\
+\x20   host__: the only one\n\
+traefik__: about traefik\n\
+traefik:\n\
+\x20 host__: public name\n\
+\x20 host: web\n\
+netbird__: about netbird\n\
+netbird:\n\
+\x20 groups:\n\
+\x20 - lan\n";
+
+#[test]
+fn a_read_carries_no_comment_key_unless_it_asks() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let digest = store.digest_of(&DocId::Guest(100)).unwrap().unwrap();
+    let bare = json!({
+        "backup": {"retention": 7, "targets": [{"host": "nas"}]},
+        "traefik": {"host": "web"},
+        "netbird": {"groups": ["lan"]},
+    });
+
+    // At any depth, array members included, in both formats; YAML is the
+    // canonical dump of what is left, never the file's text. The digest is the file's.
+    let json_read = get_bare(&store, "100", None, "json", &full()).unwrap();
+    assert_eq!((json_read.data.unwrap(), json_read.digest), (bare.clone(), digest.clone()));
+    let yaml_read = get_bare(&store, "100", None, "yaml", &full()).unwrap();
+    assert_eq!(
+        yaml_read.text.as_deref(),
+        Some("backup:\n  retention: 7\n  targets:\n  - host: nas\ntraefik:\n  host: web\nnetbird:\n  groups:\n  - lan\n")
+    );
+    assert_eq!(yaml_read.digest, digest);
+    assert_eq!(
+        get_bare(&store, "100", Some("backup"), "yaml", &full()).unwrap().text.as_deref(),
+        Some("retention: 7\ntargets:\n- host: nas\n")
+    );
+    // A scoped reader's union is stripped the same way.
+    assert_eq!(
+        get_bare(&store, "100", None, "json", &scoped(&["traefik"])).unwrap().data.unwrap(),
+        json!({"traefik": {"host": "web"}, "netbird": {"groups": ["lan"]}})
+    );
+    // Naming a note is asking for it: without `comments` that is a 400.
+    for view in ["traefik__", "traefik.host__", "__"] {
+        let err = get_bare(&store, "100", Some(view), "json", &full()).unwrap_err();
+        assert_eq!(status(&err), 400, "{view}: {err}");
+        assert!(err.msg.contains("comments=1"), "{err}");
+    }
+
+    // With `comments`, the read is what it always was: the file's own text for a
+    // full reader's root view, the notes everywhere else.
+    assert_eq!(get(&store, "100", None, "yaml", &full()).unwrap().text.as_deref(), Some(NOTED));
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host__": "public name", "host": "web"})
+    );
+    assert_eq!(get(&store, "100", Some("traefik__"), "json", &full()).unwrap().data.unwrap(), json!("about traefik"));
+}
+
+#[test]
+fn a_registry_document_hides_its_notes_the_same_way() {
+    let (_dir, store) = store();
+    seed(&store, "prefixes/traefik", "selector__: every guest for now\nselector:\n  all: true\n");
+    assert_eq!(
+        get_bare(&store, "prefixes/traefik", None, "json", &full()).unwrap().data.unwrap(),
+        json!({"selector": {"all": true}})
+    );
+    assert_eq!(
+        get_bare(&store, "prefixes/traefik", None, "yaml", &full()).unwrap().text.as_deref(),
+        Some("selector:\n  all: true\n")
+    );
+    assert!(get(&store, "prefixes/traefik", None, "yaml", &full()).unwrap().text.unwrap().contains("selector__"));
+}
+
+#[test]
+fn an_unrecoverable_document_shows_its_text_only_to_a_read_that_asks_for_notes() {
+    let (dir, store) = store();
+    std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
+    assert!(get(&store, "100", None, "yaml", &full()).unwrap().parse_error.is_some());
+    assert_eq!(status(&get_bare(&store, "100", None, "yaml", &full()).unwrap_err()), 422);
+}
+
+#[test]
+fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+
+    // A stripped read written straight back changes nothing, touches nothing and
+    // rewrites nothing.
+    let bare = get_bare(&store, "100", None, "json", &full()).unwrap().data.unwrap().to_string();
+    let r = put_notes(&store, &regs(), &[], "100", None, &bare, "replace", false, false, &full()).unwrap();
+    assert!(r.touched.is_empty(), "{:?}", r.touched);
+    assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
+
+    // An edit keeps every note whose subject it keeps, where it was.
+    let edited = bare.replace("\"retention\":7", "\"retention\":14");
+    let r = put_notes(&store, &regs(), &[], "100", None, &edited, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set backup.retention"]);
+    assert_eq!(read_raw(&store, "100").unwrap(), NOTED.replace("retention: 7", "retention: 14"));
+
+    // A note whose subject the write drops goes with it -- and says so; a map's
+    // own `__` stays while the map does. A view's payload is judged the same way.
+    let dry = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
+    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__", "set backup.targets"]);
+    assert_eq!(touched_paths(&dry), touched_paths(&r), "a dry run plans the same write");
+    assert_eq!(
+        get(&store, "100", Some("backup"), "json", &full()).unwrap().data.unwrap(),
+        json!({"__": "the backup job's settings", "targets": [{"host": "nas", "host__": "the only one"}, {"host": "tape"}]})
+    );
+    // Replacing a scalar keeps the note beside it, which is outside the view anyway.
+    put_notes(&store, &regs(), &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host__": "public name", "host": "www"})
+    );
+}
+
+#[test]
+fn a_replace_without_comments_may_not_carry_or_name_a_note() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    for (view, payload, path) in [
+        (None, r#"{"traefik": {"host": "web", "host__": "new"}}"#, "traefik.host__"),
+        (Some("backup"), r#"{"targets": [{"host": "nas", "host__": "x"}]}"#, "backup.targets.0.host__"),
+        (Some("traefik.host__"), r#""new""#, "traefik.host__"),
+    ] {
+        let err = put_notes(&store, &regs(), &[], "100", view, payload, "replace", false, false, &full()).unwrap_err();
+        assert_eq!(status(&err), 400, "{view:?} {payload}: {err}");
+        assert!(err.msg.starts_with(path), "{err}");
+    }
+    assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
+}
+
+#[test]
+fn a_replace_with_comments_is_the_whole_subtree_notes_included() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host": "web", "port__": "later"}"#, "replace", false, true, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.host__", "set traefik.port__"]);
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host": "web", "port__": "later"})
+    );
+}
+
+#[test]
+fn a_merge_is_the_same_with_or_without_comments() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    // It names what it changes: a note it writes is written, a note it does not
+    // name is left, and a key it deletes takes its note along.
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host__": "renamed", "port": 80}"#, "merge", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host__", "set traefik.port"]);
+    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"retention": null}"#, "merge", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__"]);
+    // ... unless the same patch says what becomes of the note.
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"port": null, "port__": "was 80"}"#, "merge", false, true, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.port", "set traefik.port__"]);
+}
+
+#[test]
+fn a_note_is_named_only_by_a_caller_that_asks_and_a_broken_one_says_so() {
+    let (dir, store) = store();
+    seed(&store, "100", NOTED);
+    let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+    let err = list_guests(&store, &regs(), "root@pam", &rows, Some("traefik__")).unwrap_err();
+    assert_eq!(status(&err), 400, "{err}");
+
+    // A stored note that is not a string, from out of band: a replace that did
+    // not ask for notes kept it, and the lint says what it is.
+    std::fs::write(dir.path().join("100.yaml"), "a__: 5\na: 1\n").unwrap();
+    let err = put_notes(&store, &regs(), &[], "100", None, r#"{"a": 2}"#, "replace", false, false, &full()).unwrap_err();
+    assert_eq!(status(&err), 400);
+    assert!(err.msg.contains("a stored note; fix it with comments=1"), "{err}");
+
+    // An unrecoverable file tells a reader without notes how to see it.
+    std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
+    let err = get_bare(&store, "100", None, "yaml", &full()).unwrap_err();
+    assert!(err.msg.contains("format=yaml&comments=1 (CLI: --comments)"), "{err}");
+}
+
+#[test]
+fn a_delete_takes_the_note_about_what_it_removes() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.host", "delete traefik.host__", "delete traefik__"]);
+    // The scope on `traefik` covers `traefik__`, so its holder may do the same.
+    seed(&store, "101", NOTED);
+    del(&store, "101", Some("traefik"), None, &scoped(&["traefik"])).unwrap();
+    assert!(!read_raw(&store, "101").unwrap().contains("traefik"));
+}
+
+#[test]
+fn a_replace_without_comments_drops_what_it_cannot_place_and_answers_for_it() {
+    let (_dir, store) = store();
+    seed(&store, "100", "__: the whole document\nlist:\n- k: 1\n  k__: one\n- k: 2\n  k__: two\nm:\n  __: about m\n  x: 1\n");
+    // The first member removed: the second is unchanged and keeps its note, the
+    // removed one's goes with it -- as a change.
+    let r = put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 2}]"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set list"]);
+    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 2, "k__": "two"}]));
+    // A member that changed keeps nothing.
+    put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 3}]"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 3}]));
+    // `{}` stores an empty map: its own `__` does not survive it.
+    let r = put_notes(&store, &regs(), &[], "100", Some("m"), "{}", "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete m.__", "delete m.x"]);
+    assert_eq!(get(&store, "100", Some("m"), "json", &full()).unwrap().data.unwrap(), json!({}));
+}
+
+#[test]
+fn a_kept_note_is_not_a_change_to_authorize_or_enforce() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    // VM.Audit and `traefik` rw: it reads the whole document without the notes and
+    // writes it back with one value changed. `netbird__` and `__` are outside what
+    // it may write; kept, they are no touched path, so the write is its own.
+    let mut doc = get_bare(&store, "100", None, "json", &auditor(&["traefik"])).unwrap().data.unwrap();
+    doc["traefik"]["host"] = json!("www");
+    let r = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, false, &auditor(&["traefik"])).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
+    // The same body sent as the whole truth drops every note, which it may not.
+    let err = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, true, &auditor(&["traefik"])).unwrap_err();
+    assert_eq!(status(&err), 403, "{err}");
+
+    // An enforcing schema that says nothing about notes finds nothing in one kept.
+    let strict = vec![registry::parse_prefix(
+        "traefik",
+        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {host: {type: string}}}\n",
+    )
+    .unwrap()];
+    let r = put_notes(&store, &regs(), &strict, "100", Some("traefik"), r#"{"host": "web"}"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
+    assert!(read_raw(&store, "100").unwrap().contains("host__: public name"));
 }
 
 #[test]

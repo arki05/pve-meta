@@ -417,16 +417,19 @@ mod pve_rs_meta {
 
     /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
     /// a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
-    /// `permissions/<name>`).
+    /// `permissions/<name>`). `$comments` (optional, trailing) keeps the comment
+    /// keys, which a read otherwise leaves out.
     #[export]
     pub fn api_get(
         id: &str,
         view: Option<&str>,
         format: &str,
         acl: CallerAcl,
+        comments: Option<bool>,
     ) -> Result<api::ApiViewDocument, api::ApiError> {
         let store = open_store();
-        api::get_document(&store, &open_permissions(&store), id, view, format, &acl)
+        let comments = comments.unwrap_or(false);
+        api::get_document(&store, &open_permissions(&store), id, view, format, comments, &acl)
     }
 
     /// `PUT /meta/guests/{vmid}` and the registry documents' `PUT`.
@@ -434,7 +437,9 @@ mod pve_rs_meta {
     /// `$payload` is the only string crossing: the client's `data` (JSON) or
     /// `text` (YAML) parameter, decoded once in Rust. `$force` (optional,
     /// trailing) stores the result even where a prefix declares
-    /// `enforce: true` and it would not match that prefix's schema. The
+    /// `enforce: true` and it would not match that prefix's schema. `$comments`
+    /// (optional, trailing) makes a replace's payload the subtree notes included;
+    /// without it the payload carries none and the stored ones are kept. The
     /// prefixes enforced for a guest are those in effect on `$acl`'s `node`.
     ///
     /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
@@ -453,6 +458,7 @@ mod pve_rs_meta {
         dry_run: bool,
         acl: CallerAcl,
         force: Option<bool>,
+        comments: Option<bool>,
     ) -> Result<api::ApiPutResult, api::ApiError> {
         let store = open_store();
         let prefixes = api::effective_prefixes(store.registry(), &api::parse_id(id)?, &acl);
@@ -468,6 +474,7 @@ mod pve_rs_meta {
             digest,
             dry_run,
             force.unwrap_or(false),
+            comments.unwrap_or(false),
             &acl,
         )
     }

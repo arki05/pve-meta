@@ -264,6 +264,19 @@ my $FORCE_SCHEMA = {
         . "This is what the editor's \"Save anyway\" tick sends.",
 };
 
+my $COMMENTS_SCHEMA = {
+    type => 'boolean',
+    optional => 1,
+    default => 0,
+    description => "Include comment keys (a key ending in '__', a note about its sibling; "
+        . "docs/DESIGN.md §2). Without it a read leaves them out at any depth, 'text' is "
+        . "the canonical YAML of what is left, and a 'view' naming one is a 400; a "
+        . "'replace' may carry none and keeps every stored note whose subject it keeps "
+        . "(in a list, the notes of an unchanged member). "
+        . "With it a read returns them and a 'replace' payload is the subtree, notes "
+        . "included. 'merge' is the same either way.",
+};
+
 my $SCOPES_RETURNS = {
     type => 'array',
     description => "The caller's prefix scopes for this document, from the operator "
@@ -284,18 +297,22 @@ my $VIEW_RETURNS = {
         view => { type => 'string' },
         digest => { type => 'string' },
         data => { type => 'object', optional => 1, description => "Present when format=json." },
-        text => { type => 'string', optional => 1, description => "Present when format=yaml." },
+        text => {
+            type => 'string',
+            optional => 1,
+            description => "Present when format=yaml: the file's own text for a full reader's "
+                . "whole document with 'comments', a canonical dump otherwise.",
+        },
         parse_error => {
             type => 'string',
             optional => 1,
             description => "Present only when the stored document's content could not be "
                 . "recovered (docs/DESIGN.md §7): it is not valid YAML, it is above the "
                 . "store's read cap, or it parses to something that is not a mapping. "
-                . "'text' is then the file's raw text, so an administrator can repair it "
-                . "with a whole-document PUT (no 'view', mode=replace) or remove it with "
-                . "DELETE -- nothing narrower is accepted. With format=json, for a caller "
-                . "without full read, and whenever the bytes were never read at all, the "
-                . "same condition is a 422 instead.",
+                . "'text' is the raw file only for a full reader with format=yaml and "
+                . "'comments'; otherwise the same condition is a 422. It is repaired with a "
+                . "whole-document PUT (no 'view', mode=replace) or removed with DELETE -- "
+                . "nothing narrower is accepted.",
         },
     },
 };
@@ -325,6 +342,7 @@ my $get_view = sub {
     my ($id, $param, $acl) = @_;
     return _call(
         \&PVE::RS::Meta::api_get, $id, $param->{view}, $param->{format} // 'json', $acl,
+        ($param->{comments} ? 1 : 0),
     );
 };
 
@@ -335,6 +353,7 @@ my $put_view = sub {
         \&PVE::RS::Meta::api_put,
         $id, $param->{view}, $format, $payload, $param->{mode} // 'replace',
         $param->{digest}, ($param->{dry_run} ? 1 : 0), $acl, ($param->{force} ? 1 : 0),
+        ($param->{comments} ? 1 : 0),
     );
 };
 
@@ -727,7 +746,12 @@ sub _register_document_methods {
         description => $spec->{describe}{get},
         parameters => {
             additionalProperties => 0,
-            properties => { %$params, view => $VIEW_SCHEMA, format => $FORMAT_SCHEMA },
+            properties => {
+                %$params,
+                view => $VIEW_SCHEMA,
+                format => $FORMAT_SCHEMA,
+                comments => $COMMENTS_SCHEMA,
+            },
         },
         returns => $VIEW_RETURNS,
         code => sub {
@@ -755,6 +779,7 @@ sub _register_document_methods {
                 digest => get_standard_option('pve-config-digest'),
                 dry_run => $DRY_RUN_SCHEMA,
                 force => $FORCE_SCHEMA,
+                comments => $COMMENTS_SCHEMA,
             },
         },
         returns => $PUT_RETURNS,
@@ -905,7 +930,7 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Only list guests whose *visible* data has something at this "
-                    . "dotted path.",
+                    . "dotted path. Naming a comment key is a 400: a note is not data.",
             },
         },
     },

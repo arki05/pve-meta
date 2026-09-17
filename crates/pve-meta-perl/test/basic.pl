@@ -635,13 +635,44 @@ is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data}, $before_
 # A scope on `traefik` covers the sibling comment key `traefik__` -- the one
 # comment-key rule left (docs/DESIGN.md §4).
 PVE::RS::Meta::api_put('9400', 'traefik__', 'json', '"the ingress config"', 'replace', undef, 0,
-    scoped_acl('traefik'));
-is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'))->{data},
+    scoped_acl('traefik'), 0, 1);
+is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'), 1)->{data},
     'the ingress config', 'a scoped principal can write its own comment key');
 $res = eval { PVE::RS::Meta::api_put('9400', 'netbird__', 'json', '"nope"', 'replace', undef, 0,
-        scoped_acl('traefik')) };
+        scoped_acl('traefik'), 0, 1) };
 ok(!defined($res), '... but not another key\'s comment (netbird is ro)');
+like($@, api_error_status(403), '... with 403:');
 PVE::RS::Meta::api_delete('9400', 'traefik__', undef, scoped_acl('traefik'));
+
+# Comment keys are notes (docs/DESIGN.md §2, §7): a read leaves them out unless
+# `$comments`, and a replace without it carries none and keeps the stored ones.
+write_file('9403.yaml', "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n");
+is_deeply(PVE::RS::Meta::api_get('9403', undef, 'json', $FULL)->{data},
+    { web => { host => 'a', port => 80 } }, 'api_get leaves comment keys out by default');
+is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL)->{text}, "web:\n  host: a\n  port: 80\n",
+    '... and format=yaml is the canonical dump of what is left');
+is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL, 1)->{text},
+    "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n",
+    'with $comments a full reader gets the file itself');
+$res = eval { PVE::RS::Meta::api_get('9403', 'web.host__', 'json', $FULL) };
+like($@, api_error_status(400), 'a view naming a comment key without $comments is 400:');
+my $kept = PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"b"}', 'replace', undef, 0, $FULL);
+is_deeply([sort map { "$_->{op} $_->{path}" } @{ $kept->{touched} }],
+    ['delete web.port', 'set web.host'], 'a replace without $comments reports only what it changed');
+is(read_file('9403.yaml'), "__: the guest\nweb:\n  host__: public name\n  host: b\n",
+    '... and keeps the notes whose subject it kept');
+$res = eval { PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c","host__":"x"}', 'replace',
+        undef, 0, $FULL) };
+like($@, api_error_status(400), 'a replace without $comments may not carry a comment key');
+PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c"}', 'replace', undef, 0, $FULL, 0, 1);
+is(read_file('9403.yaml'), "__: the guest\nweb:\n  host: c\n",
+    'with $comments the payload is the subtree, notes included');
+write_file('9403.yaml', "web__: the site\nweb:\n  host: c\n");
+PVE::RS::Meta::api_delete('9403', 'web', undef, $FULL);
+is(read_file('9403.yaml'), "{}\n", 'a DELETE of a view takes its note along');
+$res = eval { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9403, read => 1 }], 'web__') };
+like($@, api_error_status(400), 'has= naming a comment key is 400:');
+unlink("$root/9403.yaml");
 
 # Scopes never apply to a registry document.
 my $reg_scoped = PVE::RS::Meta::api_access('prefixes/traefik', scoped_acl('traefik'));
@@ -760,7 +791,7 @@ for my $case (
     my ($view, $mode, $payload, $re) = @$case;
     for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
         my ($label, $a) = @$who;
-        $res = eval { PVE::RS::Meta::api_put('9400', $view, 'json', $payload, $mode, undef, 0, $a) };
+        $res = eval { PVE::RS::Meta::api_put('9400', $view, 'json', $payload, $mode, undef, 0, $a, 0, 1) };
         ok(!defined($res), "[$label] a $mode of $payload at $view is refused");
         like($@, api_error_status(400), "[$label] ... with 400:");
         like($@, $re, "[$label] ... naming the rule");
@@ -778,13 +809,13 @@ for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
 }
 unlink("$root/9502.yaml");
 
-# An unparseable document: yaml + parse_error for a full reader, 422 for json
-# and for anyone else, repaired by a root replace (docs/DESIGN.md §7).
+# An unparseable document: yaml + parse_error for a full reader asking for
+# comments, 422 for json and for anyone else, repaired by a root replace (docs/DESIGN.md §7).
 for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: [\n") {
     (my $label = $broken) =~ s/\n/\\n/g;
     write_file('9500.yaml', $broken);
 
-    my $doc = PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL);
+    my $doc = PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL, 1);
     ok(defined($doc->{parse_error}), "[$label] a full reader gets parse_error");
     is($doc->{text}, $broken, "[$label] ... with the raw text to repair from");
     isnt($doc->{digest}, '', "[$label] ... and the real digest");
@@ -792,8 +823,10 @@ for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: 
     $res = eval { PVE::RS::Meta::api_get('9500', undef, 'json', $FULL) };
     ok(!defined($res), "[$label] format=json is refused");
     like($@, api_error_status(422), "[$label] ... with 422:");
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL) };
+    like($@, api_error_status(422), "[$label] ... and so is yaml without comments");
 
-    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', scoped_acl('traefik')) };
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', scoped_acl('traefik'), 1) };
     ok(!defined($res), "[$label] and a scoped reader never gets the bytes");
     like($@, api_error_status(422), "[$label] ... 422 there too");
 
@@ -821,7 +854,7 @@ for my $text ("", "# only a comment\n", "- a\n- b\n", "just a scalar\n") {
     (my $label = $text) =~ s/\n/\\n/g;
     write_file('9505.yaml', $text);
 
-    my $doc = PVE::RS::Meta::api_get('9505', undef, 'yaml', $FULL);
+    my $doc = PVE::RS::Meta::api_get('9505', undef, 'yaml', $FULL, 1);
     ok(defined($doc->{parse_error}), "[$label] a full reader is told it is not a document");
     is($doc->{text}, $text, "[$label] ... with the raw text to repair from");
 

@@ -146,10 +146,10 @@ pub struct Document {
     /// The raw file text.
     pub raw: String,
     /// The parsed value, or the **empty document** when [`Document::parse_error`]
-    /// is set. Comment keys (`foo__`) are ordinary data and stay in it: nothing
-    /// strips them, and what a caller may see of one is decided further up by
+    /// is set. Comment keys (`foo__`) stay in it: the store holds the file, and
+    /// what a caller sees of one is decided further up, by
     /// [`crate::view::filter`], where [`crate::scopes::covers`] makes a scope on
-    /// `foo` cover `foo__` as well.
+    /// `foo` cover `foo__` as well, and by [`crate::view::strip_comments`].
     pub value: Value,
     /// `Some(message)` when the file's text is not valid YAML at all, in
     /// which case [`Document::value`] is the empty document

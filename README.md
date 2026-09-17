@@ -34,11 +34,13 @@ traefik:
   spec: { host: web.example, port: 8080 }
 backup:
   retention: 7
-  retention__: days; read by the nightly job     # a comment key documents its sibling
+  retention__: days; read by the nightly job     # a comment key: a note about its sibling
 ```
 
 That is all a document is, and it works with nothing else in place: no prefix, no
-schema, no permission file. Any key, any depth, edited in the tab or written by a
+schema, no permission file. A comment key is for whoever edits the document: the tab
+shows it as the row's description, and a read leaves it out unless it asks for
+`comments`. Any key, any depth, edited in the tab or written by a
 script. Everything below is opt-in, layered on where you want a guarantee.
 
 A **prefix** file says what a prefix is (the file name is the prefix). Declare one to

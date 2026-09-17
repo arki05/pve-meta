@@ -38,7 +38,8 @@
 #
 #   pve-meta get 201 homelab.owner     -> arki          (a scalar, bare, no quotes)
 #   pve-meta get 201 homelab           -> YAML          (anything with structure)
-#   pve-meta get 201                   -> the whole document as YAML
+#   pve-meta get 201                   -> the whole document as YAML, without comment keys
+#   pve-meta get 201 --comments        -> the file as it is written, notes and all
 #   pve-meta get prefixes/traefik      -> a prefix definition, same as any document
 #   pve-meta get nodes/pve1/prefixes/gpu -> one node's prefix file, likewise
 #   pve-meta ls                        -> every document id, one per line
@@ -61,6 +62,7 @@ use warnings;
 
 use Getopt::Long qw(GetOptionsFromArray);
 use JSON::PP;
+use List::Util;
 
 use PVE::RS::Meta;
 
@@ -72,8 +74,8 @@ sub usage {
     my ($msg) = @_;
     print STDERR "$SELF: $msg\n\n" if $msg;
     print STDERR <<"EOF";
-usage: $SELF get <id> [<view>] [--format yaml|json]
-       $SELF set <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force]
+usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
+       $SELF set <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force] [--comments]
        $SELF merge <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force]
        $SELF delete <id> [<view>] [--digest <d>]
        $SELF ls [--orphans] [--format plain|json]
@@ -83,9 +85,12 @@ usage: $SELF get <id> [<view>] [--format yaml|json]
   <id>    a vmid, 'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or 'permissions/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
-  set     replace the view with the payload ({} stores an empty map; use delete to remove)
+  get     print the view; comment keys (key__, a note about key) only with --comments
+  set     replace the view with the payload ({} stores an empty map; use delete to remove);
+          it may carry no comment key and keeps the stored ones whose key it keeps, unless
+          --comments makes it the whole subtree, notes included
   merge   apply the payload as a merge patch (a JSON null deletes a key)
-  delete  remove the view, or the whole document
+  delete  remove the view and its note (<view>__), or the whole document
   --file  read the payload from a file, or '-' for stdin; .json is JSON, anything else YAML
   --force store the result even where a prefix's schema is enforced and it does not match
 
@@ -201,6 +206,7 @@ sub cmd_write {
     GetOptionsFromArray(\@args,
         'data=s' => \$opts{data}, 'text=s' => \$opts{text}, 'file=s' => \$opts{file},
         'digest=s' => \$opts{digest}, 'dry-run' => \$opts{dry_run}, 'force' => \$opts{force},
+        ($mode eq 'set' ? ('comments' => \$opts{comments}) : ()),
     ) or usage('bad options');
     my ($id, $view) = @args;
     usage("$mode needs an id") if !defined($id);
@@ -213,9 +219,25 @@ sub cmd_write {
         return PVE::RS::Meta::api_put(
             $id, $view, $format, $text, $mode eq 'merge' ? 'merge' : 'replace',
             $opts{digest}, ($opts{dry_run} ? 1 : 0), acl_for($id), ($opts{force} ? 1 : 0),
+            ($opts{comments} ? 1 : 0),
         );
     }, 1);
     report_write($opts{dry_run} ? 'would write' : 'wrote', $id, $view, $res);
+
+    # A replace without --comments keeps the notes it did not carry; say so, since
+    # the file still holds something the payload did not.
+    if ($mode eq 'set' && !$opts{comments} && !$opts{dry_run}) {
+        my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, 1) };
+        my $kept = $doc ? count_notes($doc->{data}) : 0;
+        print STDERR "$SELF: kept $kept note(s) (use --comments to replace them)\n" if $kept;
+    }
+}
+
+sub count_notes {
+    my ($v) = @_;
+    return 0 if !ref($v);
+    return List::Util::sum(0, map { count_notes($_) } @$v) if ref($v) eq 'ARRAY';
+    return List::Util::sum(0, map { (/__$/ ? 1 : 0) + count_notes($v->{$_}) } keys %$v);
 }
 
 sub cmd_delete {
@@ -250,7 +272,9 @@ sub call {
 sub cmd_get {
     my (@args) = @_;
     my $format = 'yaml';
-    GetOptionsFromArray(\@args, 'format=s' => \$format) or usage('bad options');
+    my $comments = 0;
+    GetOptionsFromArray(\@args, 'format=s' => \$format, 'comments' => \$comments)
+        or usage('bad options');
     usage("unknown format '$format'") if $format !~ /^(yaml|json)$/;
 
     my ($id, $view) = @args;
@@ -259,7 +283,7 @@ sub cmd_get {
 
     # Read as JSON first: it is the form that says whether the value has
     # structure, which decides how it should be printed.
-    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL) });
+    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) });
     my $data = $doc->{data};
 
     # A view the document does not have comes back as the empty document, which
@@ -292,7 +316,7 @@ sub cmd_get {
         print defined($data) ? "$data\n" : "\n";
         return;
     }
-    my $yaml = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL) });
+    my $yaml = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL, $comments) });
     print $yaml->{text};
 }
 

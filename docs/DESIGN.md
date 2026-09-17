@@ -28,9 +28,13 @@ two rules on top:
   same keys and values in different orders are the same document, a reordering stages
   nothing in the editor, and no lookup, selector or permission depends on it. A
   reordering typed in Text mode is written only when applied from Text mode.
-* **Comment keys.** A key ending in `__` is a string note about its sibling (`host__`
-  documents `host`; a bare `__` documents the containing map). Comment keys are
-  ordinary data; the UI shows them as the row's description.
+* **Comment keys are notes.** A key ending in `__` is a string note about its sibling
+  (`host__` documents `host`; a bare `__` documents the containing map). They are
+  stored, permitted, linted and diffed like any key, and the UI shows them as the
+  row's description, but a read leaves them out unless it asks with `comments=1`,
+  and a write that did not ask keeps every one whose subject it keeps (§7). What carries the file rather
+  than a view of it — the backup block, `scan-notes`, the version detail's digests —
+  carries them as written.
 
 Object keys match `^[A-Za-z0-9_@!-]+$`. No key is reserved. There is no datacenter-level
 document; a `datacenter.yaml` an earlier release left behind is a stray file the store
@@ -157,8 +161,8 @@ rules:                         # optional; a file with none grants nothing
 
 A prefix or permission file is addressed as a document with id `prefixes/<name>`,
 `nodes/<node>/prefixes/<name>` or `permissions/<name>`, through the same `view`,
-`format`, `mode`, `digest`, `dry_run` machinery as a guest document. Four things are
-specific to them:
+`format`, `mode`, `digest`, `dry_run` and `comments` machinery as a guest document.
+Four things are specific to them:
 
 * **Writes land in the cluster directory**, or the node's for a node id. Editing a
   packaged prefix creates the cluster override; deleting the override reverts to the
@@ -181,13 +185,27 @@ affordance, not the validator; a test keeps its required keys equal to the parse
 ## 7. Documents on the wire
 
 * Reads: `format=json` returns `data`, a native structure (unordered, booleans as
-  `1`/`0` per PVE convention); `format=yaml` returns `text`, the file's own text for a
-  full reader's root view and a canonical dump otherwise. The editor reads YAML.
+  `1`/`0` per PVE convention); `format=yaml` returns `text`, a canonical dump. Without
+  `comments=1` neither carries a comment key, at any depth, and a `view` naming one is
+  a 400; with it, a full reader's root view in YAML is the file's own text. `digest` is
+  the file's either way. The editor reads YAML with `comments=1`.
 * Writes: `data` (a JSON string) or `text` (YAML), with `mode=replace` (the view's
   subtree replaced; `{}` stores an empty map) or `mode=merge` (RFC 7386 merge patch,
   `null` deletes). `digest` is the compare-and-swap precondition (409 on mismatch;
   `""` matches a missing document). `dry_run=1` plans and validates without writing. A
   write that changes nothing rewrites nothing.
+* **Notes survive a caller that cannot see them.** A `replace` without `comments=1`
+  may carry no comment key and name none as its view (400); before it is planned, the
+  stored notes under the view whose subject survives are put back where they stood: a
+  `k__` whose `k` was in the stored map and is in the payload's (a note whose subject
+  was already gone is not revived), a bare `__` whose map is not empty (`{}` stores an
+  empty map), and in a list the notes of a member the payload has unchanged — at its
+  index, or else the first unused equal member. A kept note is no touched path, so it
+  needs no write permission and meets no enforced schema; every other note goes, and is
+  touched. With `comments=1` the payload is the subtree, notes included. A `merge` is
+  the same either way.
+* **A key's note goes with the key.** A `DELETE` of view `k`, and a `merge` setting
+  `k: null`, also remove `k__` beside it, unless that merge names `k__` itself.
 * **One lint** runs on the planned document: top level is a map, no nulls, keys match
   the charset, comment keys are strings. A failure is a 400 naming the path.
 * **Enforced schemas.** If a prefix that reaches the guest — in the set for its node,
@@ -199,8 +217,8 @@ affordance, not the validator; a test keeps its required keys equal to the parse
   stated one applied, and `enum` membership is by value (`"1"` is not `1`). `format:`
   checks are never enforced.
 * **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
-  `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
-  else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
+  `format=yaml` with `comments=1` for a full reader returns the raw `text` plus
+  `parse_error`; everything else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
   accepted. Per document, never cluster-wide.
 * YAML is read strictly — no anchors, aliases, explicit tags or complex keys; the YAML
   1.1 words `yes`/`no`/`on`/`off` stay strings — and written canonically (block style,
@@ -222,9 +240,9 @@ Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
 | Method | Path | Params | Returns |
 |---|---|---|---|
 | GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only (below). Tokens of different scope are not comparable |
-| GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of; `node`/`name`/`tags` only with `VM.Audit` |
-| GET | `/meta/guests/{vmid}` | `view`, `format` | `{ id, view, digest, data \| text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }` |
+| GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of, and whose visible data has `has` (naming a comment key is a 400); `node`/`name`/`tags` only with `VM.Audit` |
+| GET | `/meta/guests/{vmid}` | `view`, `format`, `comments` | `{ id, view, digest, data \| text, parse_error? }` |
+| PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force`, `comments` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
 | GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
 | GET | `/meta/prefixes` | `id`, `all` | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, node?, overrides }]`, most-specific first, plus `{ prefix, origin, node?, error }` for a file that did not load. By default the cluster-wide set, one row per name; with `id` (a vmid), the set in effect for that guest on its current node; with `all`, the cluster-wide set plus every node's own files (below). `id` and `all` together are a 400 |
@@ -310,8 +328,8 @@ hook script during boot.
 
 | Command | Does |
 |---|---|
-| `get <id> [<view>] [--format yaml\|json]` | a scalar prints bare, structure prints YAML; exit 2 when not there |
-| `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force]` | the API's `PUT mode=replace`, under the document's lock |
+| `get <id> [<view>] [--format yaml\|json] [--comments]` | a scalar prints bare, structure prints YAML; comment keys only with `--comments`; exit 2 when not there |
+| `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force] [--comments]` | the API's `PUT mode=replace`, under the document's lock; `--comments` is `comments=1` |
 | `merge ...` | the same with `mode=merge` |
 | `delete <id> [<view>] [--digest]` | the API's `DELETE`; exit 2 when nothing was there |
 | `ls [--orphans] [--format plain\|json]` | document ids, every node's prefix files included; with `--orphans`, vmids with files but no guest |
@@ -352,7 +370,7 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
   /meta/prefixes?id=<vmid>` — the set for the node the guest is on now, so a reload
   after a migration gets the new node's; declared-but-unset rows are greyed with their default and a **Set to default** action.
   Columns: key, value, description (the row's comment key), access (every rule covering
-  the row).
+  the row). Every read and write of a document carries `comments=1`.
 * **Edits are staged** and one **Apply** writes them as a single `replace` at the
   narrowest view covering every staged path (a single delete is a `DELETE`). Staged
   rows render like a pending PVE config change. **Revert** drops them.

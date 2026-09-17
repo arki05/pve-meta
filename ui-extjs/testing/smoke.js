@@ -2391,6 +2391,58 @@ eq('an empty value is empty', U.previewText(undefined), '');
     eq('and so does the description', root.children.notes.children.body.grammarDescription, 'Free text');
 }
 
+console.log('\n--- the editor reads and writes the notes: every document request says comments=1 ---');
+// The server leaves comment keys out of a read, and keeps the stored ones through a
+// replace, unless asked (DESIGN §2, §7). This editor shows them as the description
+// column and edits them, so it asks on every read and every write of a document.
+{
+    const sent = [];
+    const T = ctx.PVE.meta.TreePanel;
+    const fake = (extra) => Object.assign(
+        {
+            docId: '201',
+            docState: { 201: { digest: 'd0', data: { a: 1, a__: 'about a' } } },
+            urlFor: T.urlFor,
+            docParams: T.docParams,
+            digestOf: T.digestOf,
+            dataOf: T.dataOf,
+            setDigest: T.setDigest,
+            write: T.write,
+            request: (opts) => sent.push(Object.assign({ method: 'GET' }, opts)),
+            submit: (opts) => sent.push(opts),
+        },
+        extra,
+    );
+    eq('docParams adds comments=1 and keeps the rest', T.docParams({ format: 'yaml' }), { comments: 1, format: 'yaml' });
+
+    T.refreshText.call(fake({ textOriginal: '' }));
+    let req = sent.pop();
+    eq('the Text card reads with comments=1', [req.method, req.url, req.params], ['GET', '/meta/guests/201', { comments: 1, format: 'yaml' }]);
+
+    const planned = { a: 2, a__: 'about a, edited' };
+    T.confirmAndApply.call(fake({
+        pending: new EditSet([{ path: 'a', op: 'set', value: 2 }, { path: 'a__', op: 'set', value: 'about a, edited' }]),
+        plannedData: () => planned,
+        applyFindingsFor: () => [],
+    }));
+    req = sent.pop();
+    eq('the tree\'s Apply writes the subtree with its notes, comments=1',
+        [req.method, req.url, req.params.comments, JSON.parse(req.params.data), req.params.digest],
+        ['PUT', '/meta/guests/201', 1, planned, 'd0']);
+
+    T.applyText.call(fake({
+        textEditor: { getValue: () => 'a: 3\na__: typed\n' },
+        textBuffer: () => ({ editor: { getValue: () => 'a: 3\na__: typed\n' }, lang: 'yaml', original: 'a: 1\n' }),
+        textLang: 'yaml',
+        textFindings: () => [],
+    }));
+    req = sent.pop();
+    eq('the Text card\'s Apply sends the buffer, comments=1',
+        [req.method, req.url, req.params],
+        ['PUT', '/meta/guests/201', { comments: 1, mode: 'replace', digest: 'd0', text: 'a: 3\na__: typed\n' }]);
+    eq('nothing else was sent', sent.length, 0);
+}
+
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
 // keys (DESIGN §7) that must become ordinary rows, not resolve through the

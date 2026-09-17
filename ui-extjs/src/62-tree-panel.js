@@ -1507,7 +1507,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (force) {
                 params.force = 1;
             }
-            me.submit({ url: me.urlFor(me.docId), method: 'PUT', params: params }, function () {
+            me.write(me.docId, params, function () {
                 me.pending = PVE.meta.EditSet.empty();
             });
         };
