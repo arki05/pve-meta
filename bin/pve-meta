@@ -38,8 +38,10 @@
 #
 #   pve-meta get 201 homelab.owner     -> arki          (a scalar, bare, no quotes)
 #   pve-meta get 201 homelab           -> YAML          (anything with structure)
-#   pve-meta get 201                   -> the whole document as YAML
+#   pve-meta get 201                   -> the whole document as YAML, without comment keys
+#   pve-meta get 201 --comments        -> the file as it is written, notes and all
 #   pve-meta get prefixes/traefik      -> a prefix definition, same as any document
+#   pve-meta get nodes/pve1/prefixes/gpu -> one node's prefix file, likewise
 #   pve-meta ls                        -> every document id, one per line
 #   pve-meta ls --orphans              -> vmids with files but no guest in the vmlist
 #   pve-meta rm 999500                 -> remove an orphan's document and snapshot copies
@@ -60,6 +62,7 @@ use warnings;
 
 use Getopt::Long qw(GetOptionsFromArray);
 use JSON::PP;
+use List::Util;
 
 use PVE::RS::Meta;
 
@@ -71,20 +74,23 @@ sub usage {
     my ($msg) = @_;
     print STDERR "$SELF: $msg\n\n" if $msg;
     print STDERR <<"EOF";
-usage: $SELF get <id> [<view>] [--format yaml|json]
-       $SELF set <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force]
+usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
+       $SELF set <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force] [--comments]
        $SELF merge <id> [<view>] (--data <json> | --text <yaml> | --file <path>) [--digest <d>] [--dry-run] [--force]
        $SELF delete <id> [<view>] [--digest <d>]
        $SELF ls [--orphans] [--format plain|json]
        $SELF rm <vmid>
        $SELF scan-notes
 
-  <id>    a vmid, 'prefixes/<name>' or 'permissions/<name>'
+  <id>    a vmid, 'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or 'permissions/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
-  set     replace the view with the payload ({} stores an empty map; use delete to remove)
+  get     print the view; comment keys (key__, a note about key) only with --comments
+  set     replace the view with the payload ({} stores an empty map; use delete to remove);
+          it may carry no comment key and keeps the stored ones whose key it keeps, unless
+          --comments makes it the whole subtree, notes included
   merge   apply the payload as a merge patch (a JSON null deletes a key)
-  delete  remove the view, or the whole document
+  delete  remove the view and its note (<view>__), or the whole document
   --file  read the payload from a file, or '-' for stdin; .json is JSON, anything else YAML
   --force store the result even where a prefix's schema is enforced and it does not match
 
@@ -99,9 +105,11 @@ EOF
 }
 
 # The one caller here is root on the node, reading files it already owns. For
-# a guest the ACL carries the guest's tags, because a prefix's selector and its
-# `enforce` are resolved against them (docs/DESIGN.md section 3) -- exactly
-# as PVE::API2::Ext::Meta passes them.
+# a guest the ACL carries the guest's tags and its current node, because a
+# prefix's selector and its `enforce` are resolved against the tags, and the
+# node decides whose prefix files join the cluster's (docs/DESIGN.md section 3)
+# -- exactly as PVE::API2::Ext::Meta passes them. Called inside `locked`, after
+# its cfs_update().
 my $ROOT_ACL = { authid => 'root@pam', read => 1, write => 1, tags => [] };
 
 sub acl_for {
@@ -111,7 +119,9 @@ sub acl_for {
     my $props = eval { PVE::Cluster::get_guest_config_properties(['tags'], $id) } || {};
     my $raw = (($props->{$id} // {})->{tags}) // '';
     my @tags = grep { length($_) } split(/[;,\s]+/, $raw);
-    return { %$ROOT_ACL, tags => \@tags };
+    my $vmlist = PVE::Cluster::get_vmlist() || {};
+    my $node = ((($vmlist->{ids} // {})->{$id}) // {})->{node};
+    return { %$ROOT_ACL, tags => \@tags, node => $node };
 }
 
 # The lock every write to this document holds, on the API and here: one domain
@@ -119,17 +129,20 @@ sub acl_for {
 sub lock_id_for {
     my ($id) = @_;
     return $id if $id =~ /^\d+$/;
+    return "node-$1.prefix-$2" if $id =~ m{^nodes/([^/]*)/prefixes/(.*)$};
     my ($dir, $name) = split(m{/}, $id, 2);
     my $one = $dir eq 'prefixes' ? 'prefix' : 'permission';
     return "$one-$name";
 }
 
-# Runs $code under the document's cluster lock, with the same two things the
-# API checks inside it: a guest id must be in the vmlist (a write must never
-# create a file for a vmid that does not exist), and the digest is re-checked by
-# the Rust call itself. cfs_lock_domain reports through $@ rather than dying.
+# Runs $code under the document's cluster lock, with the same things the API
+# checks inside it: a guest id must be in the vmlist (a write must never create a
+# file for a vmid that does not exist), a set or merge of a node's prefix file must
+# name a node in the cluster (a write must never create a directory for one that is
+# not), and the digest is re-checked by the Rust call itself. cfs_lock_domain
+# reports through $@ rather than dying.
 sub locked {
-    my ($id, $code) = @_;
+    my ($id, $code, $may_create) = @_;
     require PVE::Cluster;
     my $res = PVE::Cluster::cfs_lock_domain(
         "pve-meta-" . lock_id_for($id),
@@ -139,6 +152,11 @@ sub locked {
                 PVE::Cluster::cfs_update();
                 my $vmlist = PVE::Cluster::get_vmlist() || {};
                 die "guest '$id' does not exist\n" if !(($vmlist->{ids} // {})->{$id});
+            } elsif ($may_create && $id =~ m{^nodes/([^/]*)/}) {
+                my $node = $1;
+                PVE::Cluster::cfs_update();
+                die "node '$node' does not exist\n"
+                    if !grep { $_ eq $node } @{ PVE::Cluster::get_nodelist() // [] };
             }
             return $code->();
         },
@@ -188,6 +206,7 @@ sub cmd_write {
     GetOptionsFromArray(\@args,
         'data=s' => \$opts{data}, 'text=s' => \$opts{text}, 'file=s' => \$opts{file},
         'digest=s' => \$opts{digest}, 'dry-run' => \$opts{dry_run}, 'force' => \$opts{force},
+        ($mode eq 'set' ? ('comments' => \$opts{comments}) : ()),
     ) or usage('bad options');
     my ($id, $view) = @args;
     usage("$mode needs an id") if !defined($id);
@@ -200,9 +219,25 @@ sub cmd_write {
         return PVE::RS::Meta::api_put(
             $id, $view, $format, $text, $mode eq 'merge' ? 'merge' : 'replace',
             $opts{digest}, ($opts{dry_run} ? 1 : 0), acl_for($id), ($opts{force} ? 1 : 0),
+            ($opts{comments} ? 1 : 0),
         );
-    });
+    }, 1);
     report_write($opts{dry_run} ? 'would write' : 'wrote', $id, $view, $res);
+
+    # A replace without --comments keeps the notes it did not carry; say so, since
+    # the file still holds something the payload did not.
+    if ($mode eq 'set' && !$opts{comments} && !$opts{dry_run}) {
+        my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, 1) };
+        my $kept = $doc ? count_notes($doc->{data}) : 0;
+        print STDERR "$SELF: kept $kept note(s) (use --comments to replace them)\n" if $kept;
+    }
+}
+
+sub count_notes {
+    my ($v) = @_;
+    return 0 if !ref($v);
+    return List::Util::sum(0, map { count_notes($_) } @$v) if ref($v) eq 'ARRAY';
+    return List::Util::sum(0, map { (/__$/ ? 1 : 0) + count_notes($v->{$_}) } keys %$v);
 }
 
 sub cmd_delete {
@@ -237,7 +272,9 @@ sub call {
 sub cmd_get {
     my (@args) = @_;
     my $format = 'yaml';
-    GetOptionsFromArray(\@args, 'format=s' => \$format) or usage('bad options');
+    my $comments = 0;
+    GetOptionsFromArray(\@args, 'format=s' => \$format, 'comments' => \$comments)
+        or usage('bad options');
     usage("unknown format '$format'") if $format !~ /^(yaml|json)$/;
 
     my ($id, $view) = @args;
@@ -246,7 +283,7 @@ sub cmd_get {
 
     # Read as JSON first: it is the form that says whether the value has
     # structure, which decides how it should be printed.
-    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL) });
+    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) });
     my $data = $doc->{data};
 
     # A view the document does not have comes back as the empty document, which
@@ -279,7 +316,7 @@ sub cmd_get {
         print defined($data) ? "$data\n" : "\n";
         return;
     }
-    my $yaml = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL) });
+    my $yaml = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL, $comments) });
     print $yaml->{text};
 }
 
@@ -327,7 +364,8 @@ sub cmd_ls {
     }
 
     # The store's own walk (docs/DESIGN.md section 8), so this lists a document
-    # whether or not it parses -- the one an administrator most needs to find.
+    # whether or not it parses -- the one an administrator most needs to find --
+    # and every node's prefix files as well as the cluster's.
     my $version = call(sub { PVE::RS::Meta::api_version(1, undef) });
     my @docs = @{ $version->{documents} || [] };
     if ($format eq 'json') {

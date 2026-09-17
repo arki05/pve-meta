@@ -14,9 +14,11 @@ pub type Value = serde_json::Value;
 /// the sibling key `foo` (which need not exist); the bare key `__` documents
 /// the containing map itself. Comment key values must be strings.
 ///
-/// Comment keys are **ordinary data** (`docs/DESIGN.md` §2). They travel with
-/// the subtree they sit in, and the only rule about them anywhere else is that
-/// a scope on `p` also covers `p__` ([`crate::scopes::covers`]).
+/// Comment keys are **notes** (`docs/DESIGN.md` §2). They are stored, linted
+/// and diffed like any key and travel with the subtree they sit in; a scope on
+/// `p` also covers `p__` ([`crate::scopes::covers`]); and the API leaves them
+/// out of a read and keeps them through a replace unless the caller asks for
+/// them ([`crate::view::strip_comments`], [`crate::view::keep_comments`]).
 pub const COMMENT_SUFFIX: &str = "__";
 
 /// `true` if `k` is a comment key, i.e. ends with [`COMMENT_SUFFIX`].

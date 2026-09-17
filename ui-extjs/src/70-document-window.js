@@ -14,7 +14,7 @@ Ext.define('PVE.meta.DocumentWindow', {
     width: 860,
     height: 560,
     layout: 'fit',
-    // configs: docId ('prefixes/<name>' or 'permissions/<name>')
+    // configs: docId ('prefixes/<name>', 'nodes/<node>/prefixes/<name>' or 'permissions/<name>')
 
     initComponent: function () {
         let me = this;

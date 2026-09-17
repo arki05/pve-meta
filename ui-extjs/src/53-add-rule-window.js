@@ -25,7 +25,12 @@ Ext.define('PVE.meta.AddRuleWindow', {
 
     initComponent: function () {
         let me = this;
-        let declared = (me.prefixes || []).map((p) => [p.prefix, p.prefix]);
+        // One entry per prefix: the unscoped listing names a prefix once per file, and
+        // a cluster file and a node file of one name are one prefix to a rule.
+        let seen = Object.create(null);
+        let declared = (me.prefixes || [])
+            .filter((p) => !seen[p.prefix] && (seen[p.prefix] = true))
+            .map((p) => [p.prefix, p.prefix]);
         Ext.apply(me, {
             items: [
                 {

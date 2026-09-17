@@ -57,7 +57,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Permission, PrefixDef, RegistryFailure, RegistryKind};
+use crate::registry::{self, NodeName, Permission, PrefixDef, PrefixSet, Registry, RegistryFailure, RegistryKind};
 use crate::scopes::Effective;
 use crate::shape::{self, Shape};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
@@ -92,7 +92,7 @@ impl std::error::Error for ApiError {}
 
 /// Maps a [`CoreError`] to its status: `409` digest mismatch, `404` not
 /// found, `400` lint/parse/invalid-path/invalid-name/registration/too-large,
-/// `500` everything else.
+/// `503` the cluster filesystem is not there, `500` everything else.
 impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         let status: u16 = match &err {
@@ -104,6 +104,7 @@ impl From<CoreError> for ApiError {
             | CoreError::InvalidName(_)
             | CoreError::Registry(_)
             | CoreError::TooLarge { .. } => 400,
+            CoreError::Unavailable(_) => 503,
             CoreError::Io(_) | CoreError::Other(_) => 500,
         };
         // An empty digest is what a *missing* document reports; render it
@@ -150,7 +151,7 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
         DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
         // A registry document is governed by ACLs alone: a permission that
         // could reach the permission files would be able to widen itself.
-        DocId::Registry(..) => Vec::new(),
+        DocId::Registry(..) | DocId::NodePrefix { .. } => Vec::new(),
     };
     Effective {
         full_read: acl.read,
@@ -160,15 +161,30 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
 }
 
 /// Parses an API `id` into a [`DocId`]: a vmid, or a registry document as
-/// `prefixes/<name>` / `permissions/<name>`.
+/// `prefixes/<name>` / `permissions/<name>` / `nodes/<node>/prefixes/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
 /// [`registry::is_valid_file_name`]: dotted, because **the file name is the
 /// prefix** and `homelab.docker` is a legitimate prefix, but never a slash,
 /// a leading dot or a `..`, so an id can never address a file outside its
-/// directory.
+/// directory. `<node>` becomes a [`NodeName`] for the same reason; whether that
+/// node is in the cluster is Perl's check.
 pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
+    if let Some(rest) = id.strip_prefix("nodes/") {
+        let Some((node, name)) =
+            rest.split_once('/').and_then(|(node, tail)| Some((node, tail.strip_prefix("prefixes/")?)))
+        else {
+            return Err(bad_request(format!(
+                "invalid id '{id}': a node's registry document is 'nodes/<node>/prefixes/<name>'"
+            )));
+        };
+        let node = node_name(node)?;
+        if !registry::is_valid_file_name(name) {
+            return Err(bad_request(format!("invalid id '{id}': '{name}' is not a valid prefixes name")));
+        }
+        return Ok(DocId::NodePrefix { node, name: name.to_string() });
+    }
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
             "prefixes" => RegistryKind::PrefixDef,
@@ -189,9 +205,15 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'prefixes/<name>' or 'permissions/<name>'"
+            "invalid id '{id}': must be a vmid, 'prefixes/<name>', \
+             'nodes/<node>/prefixes/<name>' or 'permissions/<name>'"
         ))
     })
+}
+
+/// `node` as a [`NodeName`], or a 400.
+fn node_name(node: &str) -> Result<NodeName, ApiError> {
+    NodeName::new(node).map_err(|_| bad_request(format!("invalid node name '{node}'")))
 }
 
 /// Parses a `view` parameter (a dotted/slash path, or absent = the whole
@@ -329,16 +351,23 @@ fn touched_out(touched: &[Touched]) -> Vec<ApiTouched> {
 /// With `id`, the token covers that document plus the registry directories and
 /// nothing else ([`MetaStore::version_of`]) — what an open editor is actually
 /// watching, at a cost that does not grow with the number of guests in the
-/// cluster. A scoped and an unscoped token are not comparable, which is a
+/// cluster. For a guest, `node` is its current node: that node's prefix
+/// directory is in the token, and so is the node's name, so a migration moves
+/// it. A scoped and an unscoped token are not comparable, which is a
 /// caller's business: each poller compares a token against its own previous
 /// one.
+///
+/// # Errors
+/// `400:` an invalid id or node name.
 pub fn version(
     store: &MetaStore,
     detail: bool,
     id: Option<&str>,
+    node: Option<&str>,
 ) -> Result<ApiVersion, ApiError> {
     let doc_id = id.map(parse_id).transpose()?;
-    let v = store.version_of(doc_id.as_ref())?;
+    let node = node.map(node_name).transpose()?;
+    let v = store.version_of(doc_id.as_ref(), node.as_ref())?;
     Ok(ApiVersion {
         token: v.token,
         changed: unix_secs(v.changed),
@@ -396,8 +425,45 @@ pub fn permissions_list(
         .collect()
 }
 
-/// `GET /meta/prefixes`: every prefix, most-specific first, readable by
-/// every authenticated user, plus every file that did not load (see
+/// `GET /meta/prefixes`: the cluster-wide set, packaged and cluster files
+/// resolved by name; with `node`, the set in effect for a guest on that node;
+/// with `all`, every file there is -- packaged, cluster and every node's -- each
+/// row saying where it came from ([`Registry::list_prefixes`]). Each with the
+/// files that did not load. Without either the answer is what it was before
+/// node files existed, so a client that knows nothing of them sees no change.
+///
+/// # Errors
+/// `400:` `node` is not a node name, or `node` and `all` are both given. `500:`
+/// a prefix directory that cannot be listed.
+pub fn prefixes(registry: &Registry, node: Option<&str>, all: bool) -> Result<Vec<PrefixEntry>, ApiError> {
+    let node = node.map(node_name).transpose()?;
+    let set = match (&node, all) {
+        (Some(_), true) => return Err(bad_request("'node' and 'all' are mutually exclusive")),
+        (Some(node), false) => PrefixSet::Node(node),
+        (None, true) => PrefixSet::All,
+        (None, false) => PrefixSet::Cluster,
+    };
+    let (loaded, failures) = registry.list_prefixes(set)?;
+    Ok(prefixes_list(&loaded, &failures))
+}
+
+/// The prefixes `put_document` enforces for `doc_id`: for a guest, the set in
+/// effect on the caller's `node` ([`Registry::load_prefixes`]) -- packaged,
+/// cluster and that node's files, resolved by name. Nothing for a registry
+/// document, which has its own gate.
+///
+/// # Errors
+/// `500:` a prefix directory that cannot be listed.
+pub fn effective_prefixes(registry: &Registry, doc_id: &DocId, acl: &CallerAcl) -> Result<Vec<PrefixDef>, ApiError> {
+    match doc_id {
+        DocId::Guest(_) => Ok(registry.load_prefixes(acl.node.as_ref())?),
+        DocId::Registry(..) | DocId::NodePrefix { .. } => Ok(Vec::new()),
+    }
+}
+
+/// `GET /meta/prefixes`' rows: every prefix given, in the order given
+/// (most-specific first, as the registry loads them), readable by every
+/// authenticated user, plus every file that did not load (see
 /// [`permissions_list`], the same reasoning applies here).
 pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Vec<PrefixEntry> {
     prefixes
@@ -415,8 +481,11 @@ pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Ve
 /// `node`/`name`/`tags` are returned only to a caller with `VM.Audit` on that
 /// guest (`docs/DESIGN.md` §8).
 ///
+/// A `has` that names a comment key is a `400`, as a view naming one is without
+/// `comments`: a note is not something a guest has.
+///
 /// # Errors
-/// `400:` if `has` is not a valid path.
+/// `400:` if `has` is not a valid path, or names a comment key.
 pub fn list_guests(
     store: &MetaStore,
     permission_files: &[Permission],
@@ -425,6 +494,11 @@ pub fn list_guests(
     has: Option<&str>,
 ) -> Result<Vec<GuestListEntry>, ApiError> {
     let has_path = has.map(DocPath::parse).transpose()?;
+    if let Some(path) = has_path.as_ref().filter(|p| view::names_comment(p)) {
+        return Err(bad_request(format!(
+            "{path}: a comment key is a note, not something a guest has"
+        )));
+    }
 
     let mut out = Vec::with_capacity(guests.len());
     for guest in guests {
@@ -433,6 +507,8 @@ pub fn list_guests(
             read: guest.read,
             write: guest.write,
             tags: guest.tags.clone(),
+            // A listing decides no prefix set.
+            node: None,
         };
         let g = effective(permission_files, &DocId::Guest(guest.vmid), &acl);
         let readable = g.readable_prefixes();
@@ -472,28 +548,41 @@ pub fn list_guests(
 ///
 /// **A document whose content could not be recovered** (`docs/DESIGN.md` §7
 /// and [`Stored::unrecoverable`] — it does not parse, it is above the read
-/// cap, or it is not a mapping): `format=yaml` for a full reader answers
-/// `200` with the file's raw text plus `parse_error`, so an administrator can
-/// see what to repair. Everyone else — `format=json`, any caller without full
-/// read, and anyone at all when the bytes were never read — gets `422`
+/// cap, or it is not a mapping): `format=yaml` with `comments` for a full
+/// reader answers `200` with the file's raw text plus `parse_error`, so an
+/// administrator can see what to repair. Everyone else — `format=json`, a read
+/// without `comments`, any caller without full read, and anyone at all when
+/// the bytes were never read — gets `422`
 /// naming the condition. It is reported, never rendered as an empty document:
 /// the file is there, and the caller has to know that before writing over it.
 ///
+/// **Comment keys are notes** (`docs/DESIGN.md` §2): without `comments` the
+/// answer carries none, at any depth, and `format=yaml` is the canonical dump of
+/// what is left; a `view` naming one is a `400`. With `comments` the answer is
+/// the stored content, and a full reader's root view in YAML the file's own
+/// text. `digest` is the file's either way.
+///
 /// # Errors
-/// `400:` invalid id/view/format. `403:` no read grant, or a `view` that is
-/// not readable. `422:` the stored document's content could not be recovered.
+/// `400:` invalid id/view/format, or a view naming a comment key without
+/// `comments`. `403:` no read grant, or a `view` that is not readable. `422:`
+/// the stored document's content could not be recovered.
+#[allow(clippy::too_many_arguments)] // matches the GET endpoint's parameter set 1:1 (docs/DESIGN.md §8)
 pub fn get_document(
     store: &MetaStore,
     permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     format_name: &str,
+    comments: bool,
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, ApiError> {
     let doc_id = parse_id(id)?;
     let access = effective(permission_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
+    if !comments {
+        refuse_comment(&Value::Null, &view_path)?;
+    }
 
     let readable = access.readable_prefixes();
     if readable.is_empty() {
@@ -506,7 +595,7 @@ pub fn get_document(
     let stored = read_stored(store, &doc_id)?;
 
     if let Some(err) = &stored.unrecoverable {
-        if fmt == Format::Yaml && access.full_read {
+        if fmt == Format::Yaml && access.full_read && comments {
             if let Some(raw) = &stored.raw {
                 return Ok(ApiViewDocument {
                     id: doc_id.to_string(),
@@ -522,7 +611,8 @@ pub fn get_document(
             status: 422,
             msg: format!(
                 "the stored document cannot be rendered: {err} \
-                 (replace it with a full document (no 'view', mode=replace) or delete it)"
+                 (read it raw with format=yaml&comments=1 (CLI: --comments); \
+                 replace it with a full document (no 'view', mode=replace) or delete it)"
             ),
         });
     }
@@ -532,13 +622,14 @@ pub fn get_document(
     } else {
         view::filter(&stored.value, &readable)
     };
+    let result_value = if comments { result_value } else { view::strip_comments(&result_value) };
 
     let (data, text) = match fmt {
         Format::Json => (Some(result_value), None),
-        // The root view of a full reader renders the file's own text; every
-        // other view is a canonical dump of what they may see.
+        // The root view of a full reader who asked for the notes renders the
+        // file's own text; every other read is a canonical dump of what it sees.
         Format::Yaml => {
-            let own_text = stored.raw.as_deref().filter(|raw| !raw.is_empty());
+            let own_text = stored.raw.as_deref().filter(|raw| !raw.is_empty() && comments);
             let text = if let (None, true, Some(raw)) = (view, access.full_read, own_text) {
                 raw.to_string()
             } else {
@@ -556,6 +647,18 @@ pub fn get_document(
         text,
         parse_error: None,
     })
+}
+
+/// A `400` naming the first comment key in `value` placed at `view_path` (the
+/// view itself, when it names one): what a read or a `replace` that did not ask
+/// for `comments` may not name or carry (`docs/DESIGN.md` §7).
+fn refuse_comment(value: &Value, view_path: &DocPath) -> Result<(), ApiError> {
+    match view::first_comment(value, view_path) {
+        Some(path) => Err(bad_request(format!(
+            "{path}: a comment key is read and written only with comments=1"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Refuses every write against a document whose content could not be
@@ -668,10 +771,13 @@ fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), A
 /// The lint lives here, before the `dry_run` branch, so a dry run validates
 /// exactly what the write validates — and it is the same lint for every
 /// caller, on the whole planned document, naming the offending path
-/// (`docs/DESIGN.md` §7).
+/// (`docs/DESIGN.md` §7). With `kept_notes` -- a `replace` that did not ask for
+/// `comments`, whose payload carried none -- a finding on a comment key is about
+/// a stored note, and says how to reach it.
 fn plan_write(
     planned: &mut Value,
     access: &Effective,
+    kept_notes: bool,
     mutate: impl FnOnce(&mut Value) -> Result<Vec<Touched>, ApiError>,
 ) -> Result<Vec<Touched>, ApiError> {
     let touched = mutate(planned)?;
@@ -684,7 +790,13 @@ fn plan_write(
     if !lints.is_empty() {
         let detail = lints
             .iter()
-            .map(ToString::to_string)
+            .map(|l| {
+                if kept_notes && view::names_comment(&l.path) {
+                    format!("{l} (a stored note; fix it with comments=1)")
+                } else {
+                    l.to_string()
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ");
         return Err(bad_request(format!("document failed validation: {detail}")));
@@ -706,8 +818,11 @@ fn plan_write(
 /// Guest documents have no shape beyond `model::lint`: they
 /// hold whatever an administrator puts in them, which is the point of them.
 fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
-    let DocId::Registry(kind, name) = doc_id else {
-        return Ok(());
+    let (kind, name) = match doc_id {
+        DocId::Guest(_) => return Ok(()),
+        DocId::Registry(kind, name) => (kind, name),
+        // A node's prefix file is a prefix, read by the same loader.
+        DocId::NodePrefix { name, .. } => (&RegistryKind::PrefixDef, name),
     };
     let parsed = match kind {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
@@ -731,7 +846,8 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// `payload` wholesale — an empty object stores an empty map) or `"merge"`
 /// (RFC 7386-style merge-patch relative to the view, where `null` deletes).
 ///
-/// `prefixes` are the declared prefixes: the ones that reach this guest and
+/// `prefixes` are the declared prefixes in effect for this guest's node
+/// ([`effective_prefixes`]): the ones that reach this guest and
 /// say `enforce: true` refuse a write that would leave their subtree not
 /// matching their schema -- for the paths the write changed, never for
 /// what was already wrong elsewhere in the document -- unless `force`. That
@@ -739,10 +855,19 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// write: enforcement makes a mismatch a deliberate act, not an impossible
 /// one, so a drifted schema can never lock an administrator out (§7).
 ///
+/// **A `replace` without `comments` keeps the notes it could not see**
+/// (`docs/DESIGN.md` §7): its payload may carry no comment key, and every
+/// stored note under the view whose subject the payload keeps is put back
+/// ([`view::keep_comments`]) before the write is planned, so it is neither lost
+/// nor a touched path. A note whose subject the payload drops goes with it.
+/// With `comments` the payload is the subtree, notes included. A `merge`
+/// names what it changes and is the same either way.
+///
 /// # Errors
-/// `400:` invalid id/view/format/mode/payload, or the planned document fails
-/// the lint. `409:` digest mismatch. `403:` the view is not writable, or a
-/// planned touched path is outside the caller's write permissions. `422:`
+/// `400:` invalid id/view/format/mode/payload, a comment key in a `replace`
+/// without `comments`, or the planned document fails the lint. `409:` digest
+/// mismatch. `403:` the view is not writable, or a planned touched path is
+/// outside the caller's write permissions. `422:`
 /// the write introduces a finding under an enforcing prefix and `force` is
 /// not set.
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
@@ -758,6 +883,7 @@ pub fn put_document(
     digest: Option<&str>,
     dry_run: bool,
     force: bool,
+    comments: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id)?;
@@ -784,6 +910,10 @@ pub fn put_document(
     } else {
         view::parse(payload, fmt)?
     };
+    let keep_notes = !is_merge && !comments;
+    if keep_notes {
+        refuse_comment(&payload_value, &view_path)?;
+    }
 
     store.check_precondition(&doc_id, digest)?;
     let stored = read_stored(store, &doc_id)?;
@@ -792,11 +922,15 @@ pub fn put_document(
     // (2) Plan the mutation against a *copy*; the stored document is only
     //     touched once the plan has passed every check.
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &access, |v| {
+    let touched = plan_write(&mut planned, &access, keep_notes, |v| {
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(ApiError::from)
         } else {
-            view::replace(v, &view_path, payload_value.clone()).map_err(ApiError::from)
+            let subtree = match view::extract(v, &view_path) {
+                Some(old) if keep_notes => view::keep_comments(&old, payload_value.clone()),
+                _ => payload_value.clone(),
+            };
+            view::replace(v, &view_path, subtree).map_err(ApiError::from)
         }
     })?;
 
@@ -916,7 +1050,7 @@ pub fn delete_document(
     check_repairable(&stored, &access, &view_path, false)?;
 
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &access, |v| {
+    let touched = plan_write(&mut planned, &access, false, |v| {
         view::remove(v, &view_path).map_err(ApiError::from)
     })?;
 

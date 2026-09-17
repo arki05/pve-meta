@@ -36,7 +36,9 @@
  * Editing is a modal row editor (Edit, double-click, or Enter), the field chosen from
  * the grammar type and falling back to the value's own type; editability is per row from
  * `GET /meta/access`. Edits are staged (`PVE.meta.EditSet`) and one Apply writes them:
- *   PUT /meta/guests/{vmid}?view=<narrowest covering path>&mode=replace&data=<json>&digest=<d>
+ *   PUT /meta/guests/{vmid}?view=<narrowest covering path>&mode=replace&data=<json>&digest=<d>&comments=1
+ * Every read and write of a document carries `comments=1`: the comment keys are the
+ * description column, and without it the server would leave them out.
  * 409 (digest mismatch) reloads and reports the API's message verbatim. A 5 s poll of
  * `GET /meta/version?id=<docid>` — this document plus the registry, never the whole
  * store — refreshes the tree when the content token changed, and never while a row

@@ -72,8 +72,13 @@ make -C crates/pve-meta-perl check               # test/basic.pl over the built 
 
 The Rust suites take their paths from the environment — `PVE_META_ROOT` for the store,
 `PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` (colon-separated, lowest
-precedence first) for the two registry directories — and `test/basic.pl` sets all three
-to temp dirs, so nothing here touches `/etc/pve`.
+precedence first) for the two registry directories, `PVE_META_NODES_DIR` for the
+directory holding each node's prefix files — and `test/basic.pl` sets all four to temp
+dirs, so nothing here touches `/etc/pve`. A store rooted under `/etc/pve` refuses every
+operation unless `/etc/pve/local` is a symlink (pmxcfs is mounted);
+`PVE_META_CLUSTER_MARKER` names the symlink to check instead, for any root, and set to
+nothing checks none. `test/basic.pl` points it at a temp path to exercise the refusal;
+the Rust suites use `MetaStore::with_cluster_marker`.
 
 ## Debian package
 

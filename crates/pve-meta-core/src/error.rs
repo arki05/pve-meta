@@ -75,6 +75,13 @@ pub enum Error {
     #[error("invalid registry file: {0}")]
     Registry(String),
 
+    /// The store's filesystem is not there to answer: `/etc/pve` without
+    /// pmxcfs mounted on it is an empty directory, and "no documents" read off
+    /// it is a wrong answer, not an empty one (`docs/DESIGN.md` §7). See
+    /// [`crate::store::MetaStore::check_available`].
+    #[error("cluster filesystem not available: {0}")]
+    Unavailable(String),
+
     /// An underlying I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::registry::{Origin, Permission, PrefixDef, RegistryFailure};
+use crate::registry::{NodeName, Origin, Permission, PrefixDef, RegistryFailure};
 use crate::scopes::Scope;
 
 /// The caller, as `PVE::API2::Ext::Meta` computes it: their authid, the two
@@ -31,6 +31,12 @@ pub struct CallerAcl {
     /// The guest's PVE tags. Empty for a registry document.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The guest's current node, from the vmlist: whose prefix files join the
+    /// packaged and cluster ones for this guest (`docs/DESIGN.md` §3). Absent
+    /// for a registry document, and then no node's files apply. A name that is
+    /// not a node name does not deserialize.
+    #[serde(default)]
+    pub node: Option<NodeName>,
 }
 
 /// `GET /meta/version`.
@@ -55,7 +61,8 @@ pub struct ApiVersion {
 /// One row of `GET /meta/version?detail=1`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiDocumentDigest {
-    /// A vmid, `prefixes/<name>` or `permissions/<name>`.
+    /// A vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
+    /// `permissions/<name>`.
     pub id: String,
     pub digest: String,
 }
@@ -180,18 +187,20 @@ pub enum PrefixEntry {
 
 /// A prefix file that did not load, keyed like a loaded [`PrefixDef`]
 /// (`prefix`, not `name`) so one array can mix both and a reader can find
-/// either by the same field. No filesystem path: `origin` already says
-/// packaged or cluster, which is what a repair needs (`docs/DESIGN.md` §1).
+/// either by the same field. No filesystem path: `origin` (and `node`) already
+/// say which file it is, which is what a repair needs (`docs/DESIGN.md` §1).
 #[derive(Debug, Clone, Serialize)]
 pub struct FailedPrefix {
     pub prefix: String,
     pub origin: Origin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeName>,
     pub error: String,
 }
 
 impl From<RegistryFailure> for FailedPrefix {
     fn from(f: RegistryFailure) -> Self {
-        FailedPrefix { prefix: f.name, origin: f.origin, error: f.error }
+        FailedPrefix { prefix: f.name, origin: f.origin, node: f.node, error: f.error }
     }
 }
 

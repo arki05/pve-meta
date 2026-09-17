@@ -7,6 +7,8 @@
 //! merge-patch, both scoped to the prefix); [`remove`] deletes it.
 //! [`filter`] builds the "no view" read: the union of several readable
 //! prefixes, unstripped and in the document's own order.
+//! [`strip_comments`] and [`keep_comments`] are what a read and a `replace`
+//! that did not ask for comment keys do with them (`docs/DESIGN.md` §7).
 //! [`render`]/[`parse`]/[`parse_patch`] convert a view's value to and from
 //! wire text (YAML/JSON), independent of the whole-document
 //! [`crate::format`] contract (a view's value need not itself be an object;
@@ -224,7 +226,8 @@ pub fn merge(doc: &mut Value, prefix: &Path, patch_value: &Value) -> Result<Vec<
 }
 
 /// Removes the subtree at `prefix` (empties the document, if `prefix` is
-/// root). A no-op (no touched paths) if nothing exists there.
+/// root), and the note about it, `<key>__` beside it. A no-op (no touched
+/// paths) if neither exists.
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
@@ -244,33 +247,41 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
     let Some(map) = parent.as_object_mut() else {
         return Err(blocked(prefix));
     };
-    match map.shift_remove(&key) {
+    // A key's note goes with it (`docs/DESIGN.md` §7), reported like the key.
+    let mut touched = Vec::new();
+    let note = format!("{key}{}", model::COMMENT_SUFFIX);
+    if map.shift_remove(&note).is_some() {
+        touched.push(Touched { path: parent_path.join(note), op: Op::Delete });
+    }
+    let own = match map.shift_remove(&key) {
         Some(Value::Object(old_map)) => {
             // Report *below* `prefix`, so a write-scope check can catch
             // removed content outside the caller's scope even when it is
             // nested under `prefix`.
-            let mut touched = Vec::new();
+            let mut below = Vec::new();
             patch::diff_at(
                 &Value::Object(old_map),
                 &Value::Object(Map::new()),
                 prefix,
-                &mut touched,
+                &mut below,
             );
             // Removing an existing (but empty) map is still a change.
-            if touched.is_empty() {
-                touched.push(Touched {
+            if below.is_empty() {
+                below.push(Touched {
                     path: prefix.clone(),
                     op: Op::Delete,
                 });
             }
-            Ok(touched)
+            below
         }
-        Some(_) => Ok(vec![Touched {
+        Some(_) => vec![Touched {
             path: prefix.clone(),
             op: Op::Delete,
-        }]),
-        None => Ok(Vec::new()),
-    }
+        }],
+        None => Vec::new(),
+    };
+    touched.extend(own);
+    Ok(touched)
 }
 
 /// Builds the "no view" read: the union of `readable_prefixes`, unstripped
@@ -323,6 +334,128 @@ fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<S
         }
     }
     out
+}
+
+/// `value` without its comment keys, at any depth, array members included: what
+/// a read answers unless it asks for `comments` (`docs/DESIGN.md` §2). A
+/// scalar is itself.
+pub fn strip_comments(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(k, _)| !model::is_comment_key(k))
+                .map(|(k, v)| (k.clone(), strip_comments(v)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip_comments).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `true` if a segment of `path` is a comment key: a path that names a note.
+pub fn names_comment(path: &Path) -> bool {
+    path.segments().iter().any(|s| model::is_comment_key(s))
+}
+
+/// The first comment key in `value` placed at `at`, as a document path --
+/// `at` itself when it [`names_comment`]: what a read or a write that did not
+/// ask for `comments` refuses to name or carry (`docs/DESIGN.md` §7).
+pub fn first_comment(value: &Value, at: &Path) -> Option<Path> {
+    if names_comment(at) {
+        return Some(at.clone());
+    }
+    fn walk(value: &Value, at: &Path) -> Option<Path> {
+        match value {
+            Value::Object(map) => map.iter().find_map(|(k, v)| {
+                let child = at.join(k.clone());
+                if model::is_comment_key(k) {
+                    Some(child)
+                } else {
+                    walk(v, &child)
+                }
+            }),
+            Value::Array(items) => {
+                items.iter().enumerate().find_map(|(i, v)| walk(v, &at.join(i.to_string())))
+            }
+            _ => None,
+        }
+    }
+    walk(value, at)
+}
+
+/// `new` (which carries no comment key) with the notes of `old` put back where
+/// their subject survives, so a note a `replace` that did not ask for `comments`
+/// never saw is neither lost nor a change (`docs/DESIGN.md` §7):
+///
+/// * in a map both sides have, a `k__` whose `k` is in `old` **and** in `new` --
+///   a note whose subject was already gone is not brought back -- and a bare
+///   `__` while the map is not empty;
+/// * in a list both sides have, the notes of a member only where that member is
+///   unchanged: the `old` member at the same index, or else the first unused one,
+///   whose notes stripped equal the `new` member. A member that changed, moved
+///   into another's place or is new keeps none, so a dropped note is a touched
+///   path like any other.
+///
+/// A kept note goes after the nearest key that preceded it in `old` and is still
+/// there, or first, so a stripped read written back is the same bytes: no
+/// rewrite, and no version change.
+pub fn keep_comments(old: &Value, new: Value) -> Value {
+    match (old, new) {
+        (Value::Object(om), Value::Object(nm)) => {
+            let mut out: Vec<(String, Value)> = nm
+                .into_iter()
+                .map(|(k, v)| match om.get(&k) {
+                    Some(ov) => {
+                        let v = keep_comments(ov, v);
+                        (k, v)
+                    }
+                    None => (k, v),
+                })
+                .collect();
+            let keys: Vec<&String> = om.keys().collect();
+            let has_data = !out.is_empty();
+            for (i, (k, v)) in om.iter().enumerate() {
+                let Some(subject) = k.strip_suffix(model::COMMENT_SUFFIX) else { continue };
+                let alive = if subject.is_empty() {
+                    has_data
+                } else {
+                    om.contains_key(subject) && out.iter().any(|(n, _)| n == subject)
+                };
+                if !alive || out.iter().any(|(n, _)| n == k) {
+                    continue;
+                }
+                let at = keys[..i]
+                    .iter()
+                    .rev()
+                    .find_map(|prev| out.iter().position(|(n, _)| n == *prev))
+                    .map_or(0, |p| p + 1);
+                out.insert(at, (k.clone(), v.clone()));
+            }
+            Value::Object(out.into_iter().collect())
+        }
+        (Value::Array(oa), Value::Array(na)) => {
+            let bare: Vec<Value> = oa.iter().map(strip_comments).collect();
+            let mut used = vec![false; oa.len()];
+            let items = na
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let same = (i < oa.len() && !used[i] && bare[i] == v)
+                        .then_some(i)
+                        .or_else(|| (0..oa.len()).find(|&j| !used[j] && bare[j] == v));
+                    match same {
+                        Some(j) => {
+                            used[j] = true;
+                            oa[j].clone()
+                        }
+                        None => v,
+                    }
+                })
+                .collect();
+            Value::Array(items)
+        }
+        (_, new) => new,
+    }
 }
 
 /// Renders `value` (a view's extracted subtree, or a whole document) as
@@ -871,6 +1004,85 @@ mod tests {
     fn filter_empty_maps_stay() {
         let doc = json!({"a": {}});
         assert_eq!(filter(&doc, &[p("a")]), json!({"a": {}}));
+    }
+
+    // -- comment keys -------------------------------------------------------
+
+    #[test]
+    fn strip_comments_reaches_every_depth_and_leaves_the_rest() {
+        let doc = json!({"__": "d", "a__": "n", "a": {"b__": "n", "b": [{"c__": "n", "c": 1}, 2]}, "s": "x__"});
+        assert_eq!(strip_comments(&doc), json!({"a": {"b": [{"c": 1}, 2]}, "s": "x__"}));
+        assert_eq!(strip_comments(&json!("x")), json!("x"));
+    }
+
+    #[test]
+    fn first_comment_names_the_document_path() {
+        assert_eq!(first_comment(&json!({"a": [{"b__": "n"}]}), &p("v")), Some(p("v.a.0.b__")));
+        assert_eq!(first_comment(&json!(1), &p("v.x__")), Some(p("v.x__")));
+        assert_eq!(first_comment(&json!({"a": "b__"}), &Path::root()), None);
+    }
+
+    #[test]
+    fn keep_comments_keeps_a_note_where_its_subject_survives_and_where_it_stood() {
+        let old = json!({"__": "map", "z": 1, "a__": "about a", "a": 2, "gone__": "g", "gone": 3, "m": {"x__": "x", "x": 1}});
+        let new = json!({"z": 1, "a": 5, "m": {"x": 2}});
+        let kept = keep_comments(&old, new);
+        assert_eq!(kept, json!({"__": "map", "z": 1, "a__": "about a", "a": 5, "m": {"x__": "x", "x": 2}}));
+        let keys: Vec<&str> = kept.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["__", "z", "a__", "a", "m"]);
+        // A predecessor that is gone: the note goes first, before its subject.
+        let kept = keep_comments(&json!({"c": 1, "a__": "n", "a": 2}), json!({"a": 2}));
+        let keys: Vec<&str> = kept.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["a__", "a"]);
+        // A shape change keeps nothing below it.
+        assert_eq!(keep_comments(&json!({"a__": "n", "a": 1}), json!([1])), json!([1]));
+    }
+
+    #[test]
+    fn keep_comments_brings_back_no_stale_note_and_no_note_for_an_empty_map() {
+        // `b__` documents a `b` the old map did not have: it is not revived by a
+        // write that happens to add a `b`.
+        assert_eq!(keep_comments(&json!({"b__": "stale", "a": 1}), json!({"a": 1, "b": 2})), json!({"a": 1, "b": 2}));
+        // `{}` stores an empty map, its own `__` included.
+        assert_eq!(keep_comments(&json!({"__": "map", "a": 1}), json!({})), json!({}));
+    }
+
+    #[test]
+    fn keep_comments_keeps_a_list_members_notes_only_where_the_member_is_unchanged() {
+        let old = json!([{"k": 1, "k__": "one"}, {"k": 2, "k__": "two"}, {"k": 3}]);
+        // The first member removed: the others moved, unchanged, and keep theirs.
+        assert_eq!(
+            keep_comments(&old, json!([{"k": 2}, {"k": 3}])),
+            json!([{"k": 2, "k__": "two"}, {"k": 3}])
+        );
+        // Reordered: each member finds itself.
+        assert_eq!(
+            keep_comments(&old, json!([{"k": 3}, {"k": 2}, {"k": 1}])),
+            json!([{"k": 3}, {"k": 2, "k__": "two"}, {"k": 1, "k__": "one"}])
+        );
+        // A changed member keeps nothing, even at its own index: no note lands on
+        // something it was not written about.
+        assert_eq!(
+            keep_comments(&old, json!([{"k": 9}, {"k": 2}, {"k": 3}])),
+            json!([{"k": 9}, {"k": 2, "k__": "two"}, {"k": 3}])
+        );
+        // Two equal members take the old ones in order, each once.
+        let twins = json!([{"k": 1, "k__": "a"}, {"k": 1, "k__": "b"}]);
+        assert_eq!(keep_comments(&twins, json!([{"k": 1}])), json!([{"k": 1, "k__": "a"}]));
+        assert_eq!(
+            keep_comments(&twins, json!([{"k": 0}, {"k": 1}, {"k": 1}])),
+            json!([{"k": 0}, {"k": 1, "k__": "b"}, {"k": 1, "k__": "a"}])
+        );
+    }
+
+    #[test]
+    fn remove_takes_the_keys_note_with_it() {
+        let mut doc = json!({"a": {"x": 1}, "a__": "about a", "b__": "stale"});
+        let touched = remove(&mut doc, &p("a")).unwrap();
+        assert_eq!(doc, json!({"b__": "stale"}));
+        assert_eq!(paths(&touched), vec!["a.x", "a__"]);
+        let touched = remove(&mut doc, &p("b")).unwrap();
+        assert_eq!((doc, paths(&touched)), (json!({}), vec!["b__".to_string()]));
     }
 
     // -- render / parse -----------------------------------------------------

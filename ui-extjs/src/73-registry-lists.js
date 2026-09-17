@@ -3,7 +3,8 @@
 //
 // A grid rather than a tree, because the interesting facts about these files are
 // *columns*: which guests a prefix reaches, whether it carries a schema, and
-// whether what you are looking at is a package's file or your own on top of one.
+// whether what you are looking at is a package's file, the cluster's on top of one,
+// or one node's on top of either.
 // A tree could show none of that, and showed a packaged definition and a cluster
 // override as the same thing.
 // ---------------------------------------------------------------------------
@@ -33,7 +34,8 @@ Ext.define('PVE.meta.RegistryGrid', {
                     let name = kind === 'permissions' ? e.name : e.prefix;
                     return {
                         name: name,
-                        id: kind + '/' + name,
+                        id: PVE.meta.Doc.registryId(kind, name, e.node),
+                        node: e.node || '',
                         error: e.error,
                         description: e.error,
                         authid: '',
@@ -63,7 +65,8 @@ Ext.define('PVE.meta.RegistryGrid', {
                 }
                 return {
                     name: e.prefix,
-                    id: 'prefixes/' + e.prefix,
+                    id: PVE.meta.Doc.registryId(kind, e.prefix, e.node),
+                    node: e.node || '',
                     description: e.description || '',
                     selector: U.selectorText(e.selector),
                     schema: e.schema ? gettext('yes') : '',
@@ -75,12 +78,16 @@ Ext.define('PVE.meta.RegistryGrid', {
             });
         },
 
-        // What the Origin column says. Three states, not two: a cluster file that
-        // displaced a package's is the one where Remove does not remove anything --
-        // it reverts to what the package ships.
+        // What the Origin column says. A cluster file that displaced a package's is
+        // the one where Remove does not remove anything -- it reverts to what the
+        // package ships -- and a node file that displaced a cluster-wide one reverts
+        // that node's guests to the cluster or packaged file.
         originText: function (row) {
             if (row.origin === 'packaged') {
                 return gettext('packaged');
+            }
+            if (row.origin === 'node') {
+                return row.overrides ? gettext('node (overrides cluster or packaged)') : gettext('node');
             }
             return row.overrides ? gettext('cluster (overrides packaged)') : gettext('cluster');
         },
@@ -90,9 +97,9 @@ Ext.define('PVE.meta.RegistryGrid', {
         let me = this;
         let isPrefix = me.kind === 'prefixes';
         me.store = Ext.create('Ext.data.Store', {
-            fields: ['name', 'id', 'authid', 'description', 'selector', 'schema', 'enforce', 'hidden', 'summary', 'origin', 'overrides'],
+            fields: ['name', 'id', 'node', 'authid', 'description', 'selector', 'schema', 'enforce', 'hidden', 'summary', 'origin', 'overrides'],
             data: [],
-            sorters: [{ property: 'name' }],
+            sorters: [{ property: 'name' }, { property: 'node' }],
         });
         me.access = { write: 0 };
 
@@ -113,6 +120,13 @@ Ext.define('PVE.meta.RegistryGrid', {
         ];
         if (isPrefix) {
             columns.push(
+                {
+                    text: gettext('Node'),
+                    dataIndex: 'node',
+                    width: 110,
+                    renderer: Ext.htmlEncode,
+                    tooltip: gettext('A node file reaches only the guests on that node'),
+                },
                 { text: gettext('Applies to'), dataIndex: 'selector', flex: 1, renderer: Ext.htmlEncode },
                 { text: gettext('Schema'), dataIndex: 'schema', width: 90, renderer: Ext.htmlEncode },
                 {
@@ -193,12 +207,19 @@ Ext.define('PVE.meta.RegistryGrid', {
                 btn.setDisabled(disabled);
             }
         };
+        // Add writes to the cluster directory by default, which is Sys.Modify on `/`.
         set('addBtn', !may);
-        // A packaged file is editable: the write creates the cluster override rather
-        // than touching the package's copy (DESIGN §6). Removing one is not, since
-        // there would be nothing of ours to remove.
-        set('editBtn', !rec || !may);
-        set('removeBtn', !rec || !may || rec.data.origin === 'packaged');
+        // Any file opens: read is open to everyone, and the document editor asks
+        // about write for that one id. A packaged file is editable -- the write
+        // creates the cluster override rather than touching the package's copy
+        // (DESIGN §6) -- and removing one is not, since there would be nothing of
+        // ours to remove. A node file's write is Sys.Modify on that node, which the
+        // registry answer does not say, so its Remove is left to the server's 403.
+        set('editBtn', !rec);
+        set(
+            'removeBtn',
+            !rec || rec.data.origin === 'packaged' || (rec.data.origin !== 'node' && !may),
+        );
     },
 
     request: function (opts) {
@@ -220,6 +241,8 @@ Ext.define('PVE.meta.RegistryGrid', {
         });
         me.request({
             url: '/meta/' + me.kind,
+            // Every file, a node's beside the cluster's, rather than a resolved set.
+            params: me.kind === 'prefixes' ? { all: 1 } : {},
             success: function (response) {
                 me.store.setData(PVE.meta.RegistryGrid.rowsFrom(me.kind, response.result.data || []));
                 me.syncButtons();
@@ -271,12 +294,16 @@ Ext.define('PVE.meta.RegistryGrid', {
 
             let writeFile = function (secret) {
                 req({
-                    url: '/meta/' + me.kind + '/' + encodeURIComponent(plan.file),
+                    url: PVE.meta.Doc.urlFor(plan.id),
                     method: 'PUT',
                     // `digest: ''` is "this file must not exist yet", so two
                     // administrators creating the same name is a 409 rather than one
                     // silently overwriting the other.
-                    params: { data: Ext.encode(plan.content), mode: 'replace', digest: '' },
+                    params: PVE.meta.Doc.docParams({
+                        data: Ext.encode(plan.content),
+                        mode: 'replace',
+                        digest: '',
+                    }),
                     failure: fail(gettext('writing the file')),
                     success: function () {
                         me.reload();
@@ -284,7 +311,7 @@ Ext.define('PVE.meta.RegistryGrid', {
                             PVE.meta.ServiceToken.showSecret(plan, secret);
                             return;
                         }
-                        me.editOne({ data: { id: me.kind + '/' + plan.file } });
+                        me.editOne({ data: { id: plan.id } });
                     },
                 });
             };
@@ -353,20 +380,34 @@ Ext.define('PVE.meta.RegistryGrid', {
         if (!rec || rec.data.origin === 'packaged') {
             return;
         }
-        // Say which of the two things this is. Removing an override does not remove
-        // the prefix -- the packaged file underneath comes back.
-        let question = rec.data.overrides
-            ? Ext.String.format(
-                  gettext('Remove the cluster file for "{0}"? The packaged one takes over again.'),
-                  Ext.htmlEncode(rec.data.name),
-              )
-            : Ext.String.format(gettext('Remove "{0}"?'), Ext.htmlEncode(rec.data.name));
+        // Say which of the things this is. Removing an override does not remove the
+        // prefix -- the file underneath comes back, for every guest or for the guests
+        // on that node.
+        let name = Ext.htmlEncode(rec.data.name);
+        let node = Ext.htmlEncode(rec.data.node || '');
+        let question;
+        if (rec.data.origin === 'node') {
+            question = rec.data.overrides
+                ? Ext.String.format(
+                      gettext('Remove the file for "{0}" on node {1}? The cluster or packaged file takes over again there.'),
+                      name,
+                      node,
+                  )
+                : Ext.String.format(gettext('Remove "{0}" from node {1}?'), name, node);
+        } else {
+            question = rec.data.overrides
+                ? Ext.String.format(
+                      gettext('Remove the cluster file for "{0}"? The packaged one takes over again.'),
+                      name,
+                  )
+                : Ext.String.format(gettext('Remove "{0}"?'), name);
+        }
         Ext.Msg.confirm(gettext('Confirm'), question, function (btn) {
             if (btn !== 'yes') {
                 return;
             }
             Proxmox.Utils.API2Request({
-                url: '/meta/' + rec.data.id,
+                url: PVE.meta.Doc.urlFor(rec.data.id),
                 method: 'DELETE',
                 waitMsgTarget: me,
                 success: () => me.reload(),

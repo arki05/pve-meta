@@ -42,7 +42,9 @@
 //!   documents, snapshot copies, and content-hashed version polling.
 //! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
-//!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
+//!   operations (`docs/DESIGN.md` §2), [`view::strip_comments`]/
+//!   [`view::keep_comments`] for the notes a caller did not ask for, plus
+//!   [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
 //! - [`metaschema`] — the two registry file formats, written as schemas in the
 //!   same dialect a prefix uses, so the editor can show a prefix or grant
