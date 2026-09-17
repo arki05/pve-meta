@@ -70,7 +70,7 @@ jobs:
           "$HOME/.cargo/bin/rustup" show active-toolchain
 
       - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
