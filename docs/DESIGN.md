@@ -46,9 +46,11 @@ and are never reachable through the API.
 ## 3. Prefixes — what a prefix is
 
 `/etc/pve/meta.d/prefixes/<prefix>.yaml`, with packaged defaults under
-`/usr/share/pve-meta/prefixes/<prefix>.yaml`; a cluster file overrides the packaged file
-of the same name. **The file name is the prefix**: `homelab.docker.yaml` declares
-`homelab.docker`. Names are dotted segments of the key charset, at most 128 bytes.
+`/usr/share/pve-meta/prefixes/<prefix>.yaml` and one node's files under
+`/etc/pve/nodes/<node>/meta.d/prefixes/<prefix>.yaml`. For a guest a node file
+overrides the cluster file of the same name, which overrides the packaged file.
+**The file name is the prefix**: `homelab.docker.yaml` declares `homelab.docker`. Names
+are dotted segments of the key charset, at most 128 bytes.
 
 ```yaml
 description: Traefik dynamic configuration   # optional
@@ -66,12 +68,20 @@ schema:                                      # optional, PVE::JSONSchema dialect
 ```
 
 * A prefix names **no principal**. Declaring one is useful on its own.
+* **A node file reaches only the guests on its node**: the node the vmlist names for the
+  guest when the request is made. A guest's prefixes are the packaged, cluster and that
+  node's files, one per name, and everything that consumes them — declared rows,
+  `hidden`, `enforce` — uses that set; selectors apply on top. Another node's files do
+  not exist for it. A guest that migrates gets the other node's set and its document is
+  untouched: a key declared only on the old node is an ordinary undeclared key.
 * The **selector** decides which guests the prefix reaches, and therefore where its
   declared-but-unset rows appear and where `enforce` applies. Tag membership is the
   guest's PVE tags from the cluster's cached guest properties.
 * **Most-specific wins; schemas never merge.** The governing prefix of a path is the
   longest declared prefix that contains it. A parent's schema for a key a child prefix
-  owns is shadowed, silently. A prefix with no `schema` still governs its subtree.
+  owns is shadowed, silently. A prefix with no `schema` still governs its subtree. This
+  is the only way the layers compose: a cluster `gpu` and a node `gpu.devices` both
+  apply on that node, each governing its own subtree.
 * The schema dialect the editor consumes: `type`, `properties`, `description`,
   `default`, `enum`, `minimum`, `maximum`, `format` (a PVE::JSONSchema format name,
   validated by proxmoxlib's own vtype in the editor), the editor hints `multiline` and
@@ -97,9 +107,9 @@ schema:                                      # optional, PVE::JSONSchema dialect
 
 ## 4. Permissions — who may touch a prefix
 
-`/etc/pve/meta.d/permissions/<name>.yaml`. **Cluster-only: there is no packaged
-permissions directory**, so an operator's package can declare a prefix but never grant
-itself access.
+`/etc/pve/meta.d/permissions/<name>.yaml`. **Cluster-only: there is no packaged or
+node-level permissions directory**, so an operator's package can declare a prefix but
+never grant itself access.
 
 ```yaml
 authid: svc@pve!traefik        # a PVE user or token id
@@ -114,14 +124,15 @@ rules:                         # optional; a file with none grants nothing
   `homelab.docker`. A rule on `p` also covers the sibling comment key `p__`; that is the
   only comment-key access rule.
 * Permissions apply to **guest documents only**.
-* Both directories are parsed strictly (`deny_unknown_fields`) and independently. A
+* Every directory is parsed strictly (`deny_unknown_fields`) and independently. A
   malformed file contributes nothing, is logged, and **is still listed** by `GET
-  /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, error }`, so it
-  can be found and repaired.
+  /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, node?, error }`,
+  so it can be found and repaired.
 * **Precedence is by presence.** A cluster file is the file for its name whether or not
-  it parses: a malformed override is listed as a failure and the packaged file it
-  shadows stays out of effect until the override is repaired or deleted. The listing
-  has one row per name, and `GET prefixes/<name>` opens the file the loader judged.
+  it parses, and a node file likewise for its node's guests: a malformed override is
+  listed as a failure and the file it shadows stays out of effect until the override is
+  repaired or deleted. The cluster-wide listing and the listing for one node have one
+  row per name, and `GET prefixes/<name>` opens the file the loader judged.
 
 ## 5. Effective access for one request
 

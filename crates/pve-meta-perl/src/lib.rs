@@ -31,7 +31,8 @@
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
 //! `test/basic.pl`); the prefix and permission directories likewise with
-//! `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`.
+//! `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`, and the nodes directory
+//! holding each node's prefix files with `PVE_META_NODES_DIR`.
 
 use std::path::PathBuf;
 
@@ -145,10 +146,10 @@ mod pve_rs_meta {
         store.registry().load_permissions()
     }
 
-    // No `open_prefixes` counterpart: nothing here decides anything from a
-    // prefix (a prefix names no principal, so it never gates a read or
-    // write), and `api_prefixes` below reads `Registry::list_prefixes`
-    // directly because it -- alone -- needs the files that failed to load too.
+    // No `open_prefixes` counterpart: a prefix names no principal, so it never
+    // gates a read or write, and the two exports that read prefixes want
+    // different sets -- `api_prefixes` the listing with its failures,
+    // `api_put` the set for the guest's node (`api::effective_prefixes`).
 
     // -- snapshot hooks (`docs/DESIGN.md` §9) -----------------------------
     //
@@ -330,10 +331,12 @@ mod pve_rs_meta {
     // needs the error type to be `Display`, so this needs no conversion back
     // to `anyhow::Error`.
     //
-    // `$acl` is a native hash: `{ authid, read, write, tags => [...] }`,
+    // `$acl` is a native hash: `{ authid, read, write, tags => [...], node }`,
     // where `read`/`write` are the PVE ACL answers for the document being
-    // addressed and `tags` are the guest's PVE tags, which resolve the
-    // registrations' selectors. Rust computes the caller's scopes from it.
+    // addressed, `tags` are the guest's PVE tags, which resolve the
+    // registrations' selectors, and `node` is the guest's current node, whose
+    // prefix files join the packaged and cluster ones. Rust computes the
+    // caller's scopes from it.
 
     /// `GET /meta/version` -> `{ token, changed }`, plus `documents`
     /// (`[{ id, digest }]`, sorted) when `$detail` is true.
@@ -341,9 +344,15 @@ mod pve_rs_meta {
     /// With `$id`, the token covers that one document plus the registry
     /// directories instead of the whole store — the cheap poll an open editor
     /// wants, and the only form whose cost does not grow with the cluster.
+    /// `$node` (optional, trailing) is a guest's current node from the vmlist:
+    /// its prefix directory and its name join that guest's token.
     #[export]
-    pub fn api_version(detail: bool, id: Option<&str>) -> Result<api::ApiVersion, api::ApiError> {
-        api::version(&open_store(), detail, id)
+    pub fn api_version(
+        detail: bool,
+        id: Option<&str>,
+        node: Option<&str>,
+    ) -> Result<api::ApiVersion, api::ApiError> {
+        api::version(&open_store(), detail, id, node)
     }
 
     /// `GET /meta/permissions` -> every permission, as native hashes, plus a
@@ -361,14 +370,18 @@ mod pve_rs_meta {
         Ok(api::permissions_list(&permissions, &failures))
     }
 
-    /// `GET /meta/prefixes` -> every prefix, most-specific first, plus a row
-    /// for any file that failed to load. See [`api_permissions`] -- the same
-    /// reasoning, and the same `Registry::list_prefixes` shape.
+    /// `GET /meta/prefixes` -> the cluster-wide prefixes, most-specific first;
+    /// with `$node`, the prefixes in effect for a guest on that node; with `$all`
+    /// (optional, trailing), every prefix file there is, each with its `origin`
+    /// (and `node`). Each plus a row for any file that failed to load. See
+    /// [`api_permissions`] -- the same reasoning. The caller has checked that
+    /// `$node` is in the cluster; Rust checks its shape, and refuses both at once.
     #[export]
-    pub fn api_prefixes() -> Result<Vec<api::PrefixEntry>, Error> {
-        let store = open_store();
-        let (prefixes, failures) = store.registry().list_prefixes();
-        Ok(api::prefixes_list(&prefixes, &failures))
+    pub fn api_prefixes(
+        node: Option<&str>,
+        all: Option<bool>,
+    ) -> Result<Vec<api::PrefixEntry>, api::ApiError> {
+        api::prefixes(open_store().registry(), node, all.unwrap_or(false))
     }
 
     /// `GET /meta/schemas` -> `{ prefix, permission }`, the two registry file
@@ -381,7 +394,8 @@ mod pve_rs_meta {
 
     /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
     /// with the permissions' selectors already resolved against `$acl`'s
-    /// tags. `$id` is a vmid, `prefixes/<name>` or `permissions/<name>`.
+    /// tags. `$id` is a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>`
+    /// or `permissions/<name>`.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, Error> {
         let doc_id = api::parse_id(id)?;
@@ -402,7 +416,8 @@ mod pve_rs_meta {
     }
 
     /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
-    /// a vmid, `prefixes/<name>` or `permissions/<name>`).
+    /// a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
+    /// `permissions/<name>`).
     #[export]
     pub fn api_get(
         id: &str,
@@ -419,7 +434,8 @@ mod pve_rs_meta {
     /// `$payload` is the only string crossing: the client's `data` (JSON) or
     /// `text` (YAML) parameter, decoded once in Rust. `$force` (optional,
     /// trailing) stores the result even where a prefix declares
-    /// `enforce: true` and it would not match that prefix's schema.
+    /// `enforce: true` and it would not match that prefix's schema. The
+    /// prefixes enforced for a guest are those in effect on `$acl`'s `node`.
     ///
     /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
     /// `cfs_lock_domain` lock: the digest precondition is re-checked inside
@@ -439,10 +455,11 @@ mod pve_rs_meta {
         force: Option<bool>,
     ) -> Result<api::ApiPutResult, api::ApiError> {
         let store = open_store();
+        let prefixes = api::effective_prefixes(store.registry(), &api::parse_id(id)?, &acl);
         api::put_document(
             &store,
             &open_permissions(&store),
-            &store.registry().load_prefixes(),
+            &prefixes,
             id,
             view,
             format,

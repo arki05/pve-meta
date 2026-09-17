@@ -10,7 +10,10 @@
 //!
 //! * `/usr/share/pve-meta/prefixes/<prefix>.yaml` — packaged defaults, dropped
 //!   in by an operator's own `.deb`;
-//! * `/etc/pve/meta.d/prefixes/<prefix>.yaml` — cluster overrides, by file name.
+//! * `/etc/pve/meta.d/prefixes/<prefix>.yaml` — cluster overrides, by file name;
+//! * `/etc/pve/nodes/<node>/meta.d/prefixes/<prefix>.yaml` — one node's
+//!   overrides, which reach only the guests currently on that node
+//!   (`docs/decisions/020-node-level-prefixes.md`).
 //!
 //! **Precedence is by presence.** The highest-precedence directory that has a
 //! file of a name is the file for that name, whether or not it parses: a
@@ -22,6 +25,16 @@
 //! is that rule, and it is the one both the loader and the document store
 //! ([`crate::store::MetaStore`]) apply, so the file `GET /meta/prefixes/{name}`
 //! opens for repair is always the one the loader judged.
+//!
+//! A node's directory is the third and highest of those directories, and it
+//! exists only for a guest on that node: the set a guest sees is
+//! [`Registry::load_prefixes`] for its node, the packaged and cluster files
+//! with that node's on top, resolved by name as above. A node file shadows the
+//! cluster file of its name whole, like a cluster file shadows a packaged one;
+//! between different names the one composition there is stays the
+//! most-specific-prefix rule, so a cluster `gpu` and a node `gpu.devices` both
+//! apply. Another node's files do not exist for that guest at all. There is no
+//! node-level permissions directory: access is the cluster's alone.
 //!
 //! **The file name is the prefix.** `homelab.docker.yaml` declares the prefix
 //! `homelab.docker`, so a definition and its prefix are one thing and there is
@@ -102,6 +115,13 @@ pub const PERMISSION_CLUSTER_DIR: &str = "/etc/pve/meta.d/permissions";
 pub const PREFIX_DIRS_ENV: &str = "PVE_META_PREFIX_DIRS";
 /// Environment variable overriding the permissions directories, likewise.
 pub const PERMISSION_DIRS_ENV: &str = "PVE_META_PERMISSION_DIRS";
+/// The cluster's per-node directories (pmxcfs). A node's prefix files are
+/// `<this>/<node>/meta.d/prefixes/<prefix>.yaml`, next to the node's guest
+/// configs, and pmxcfs replicates them like everything else in `/etc/pve`.
+pub const NODES_DIR: &str = "/etc/pve/nodes";
+/// Environment variable overriding [`NODES_DIR`]; set to nothing, no node
+/// directory is read or written at all. Tests and `test/basic.pl`.
+pub const NODES_DIR_ENV: &str = "PVE_META_NODES_DIR";
 
 /// Which of the two drop directories a [`crate::store::DocId::Registry`] document lives in
 /// .
@@ -236,10 +256,15 @@ pub struct PrefixDef {
     pub hidden: bool,
     /// Which directory this one was read from. Not part of the file.
     pub origin: Origin,
+    /// The node whose directory it was read from, for [`Origin::Node`] and
+    /// only then. Not part of the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeName>,
     /// `true` when a lower-precedence directory holds a file of the same name that
-    /// this one displaced. With the two configured directories that is exactly "a
-    /// cluster file written over a packaged one"; with three or more (only reachable
-    /// through `PVE_META_PREFIX_DIRS`) a packaged file can displace another packaged
+    /// this one displaced. With the configured directories that is exactly "a
+    /// cluster file written over a packaged one", or "a node file written over
+    /// either"; with more prefix directories (only reachable through
+    /// `PVE_META_PREFIX_DIRS`) a packaged file can displace another packaged
     /// file and this is true of it too. Nothing keys off the combination -- the UI
     /// and the write path both ask [`Origin`] -- so it stays the plain fact it says.
     pub overrides: bool,
@@ -260,6 +285,9 @@ pub enum Origin {
     Packaged,
     /// From the cluster directory (`/etc/pve/meta.d/...`).
     Cluster,
+    /// From one node's directory (`/etc/pve/nodes/<node>/meta.d/prefixes`):
+    /// in effect only for the guests on that node. Prefixes only.
+    Node,
 }
 
 /// One `rules:` entry.
@@ -313,6 +341,9 @@ pub struct RegistryFailure {
     /// The file name without `.yaml`, which for a prefix IS the prefix.
     pub name: String,
     pub origin: Origin,
+    /// The node whose directory holds it, for [`Origin::Node`] and only then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeName>,
     /// Why it did not load, as the parser or the filesystem put it.
     pub error: String,
 }
@@ -584,6 +615,58 @@ pub fn is_valid_file_name(name: &str) -> bool {
 /// stops loading because of this bound.
 pub const MAX_FILE_NAME_LEN: usize = 128;
 
+/// A PVE node name: `PVE::JSONSchema::pve_verify_node_name`'s
+/// `[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?`, transliterated, checked when one is
+/// made.
+///
+/// It is the one check between a request and a directory name under
+/// [`NODES_DIR`], so nothing that could name another directory -- a dot, a
+/// slash, an empty string -- is one. Making or deserializing one is the check,
+/// so a node name that reaches a path, a prefix set or a version token was one,
+/// and there is no path by which a name that is not quietly means "no node".
+/// Whether the node is in the cluster is a question for the caller that holds
+/// the nodelist (`PVE::API2::Ext::Meta`, `pve-meta`); this is the shape only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct NodeName(String);
+
+impl NodeName {
+    /// # Errors
+    /// [`Error::InvalidName`] when `s` is not a node name.
+    pub fn new(s: &str) -> Result<NodeName> {
+        let bytes = s.as_bytes();
+        let ok = match (bytes.first(), bytes.last()) {
+            (Some(first), Some(last)) => {
+                first.is_ascii_alphanumeric()
+                    && last.is_ascii_alphanumeric()
+                    && bytes.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'-')
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(Error::InvalidName(s.to_string()));
+        }
+        Ok(NodeName(s.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for NodeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeName {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        NodeName::new(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Parses one prefix file. `name` is the file's base name, which **is** the
 /// prefix.
 ///
@@ -617,6 +700,7 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
         // origin over these. The defaults are what a hand-parsed file is -- the
         // cluster's, displacing nothing.
         origin: Origin::Cluster,
+        node: None,
         overrides: false,
         prefix,
         description: raw.description,
@@ -695,35 +779,57 @@ pub fn permission_dirs() -> Vec<PathBuf> {
     dirs_from(PERMISSION_DIRS_ENV, &[PERMISSION_CLUSTER_DIR])
 }
 
-/// Owns the two drop-directory lists. Everything that needs to know where a
+/// The nodes directory, from [`NODES_DIR_ENV`] or [`NODES_DIR`]. `None` when
+/// the variable is set to nothing: no node directory is read.
+pub fn nodes_dir() -> Option<PathBuf> {
+    match std::env::var_os(NODES_DIR_ENV) {
+        Some(v) if v.is_empty() => None,
+        Some(v) => Some(PathBuf::from(v)),
+        None => Some(PathBuf::from(NODES_DIR)),
+    }
+}
+
+/// Owns the drop-directory lists. Everything that needs to know where a
 /// prefix or permission file lives -- `MetaStore`, the perlmod bindings, a
 /// test -- is handed one of these rather than reading
-/// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` (or the environment at
-/// all) on its own: two callers reading the same variable independently agree
-/// only because nothing changes it mid-process, and that was never a
-/// guarantee, just an accident of everything running in one process.
+/// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`/`PVE_META_NODES_DIR` (or
+/// the environment at all) on its own: two callers reading the same variable
+/// independently agree only because nothing changes it mid-process, and that
+/// was never a guarantee, just an accident of everything running in one process.
 #[derive(Debug, Clone)]
 pub struct Registry {
     prefix_dirs: Vec<PathBuf>,
     permission_dirs: Vec<PathBuf>,
+    nodes_dir: Option<PathBuf>,
 }
 
 impl Registry {
-    /// Reads `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` (or the
-    /// compiled-in defaults) once. See [`crate::store::MetaStore::new`]'s doc
-    /// comment for why that has to happen exactly once per store rather than
+    /// Reads `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`/`PVE_META_NODES_DIR`
+    /// (or the compiled-in defaults) once. See [`crate::store::MetaStore::new`]'s
+    /// doc comment for why that has to happen exactly once per store rather than
     /// wherever a directory list happens to be needed next.
     pub fn from_env() -> Self {
-        Registry { prefix_dirs: prefix_dirs(), permission_dirs: permission_dirs() }
+        Registry {
+            prefix_dirs: prefix_dirs(),
+            permission_dirs: permission_dirs(),
+            nodes_dir: nodes_dir(),
+        }
     }
 
-    /// Explicit directories, lowest precedence first -- for tests and
-    /// sandboxes that must not consult the environment.
+    /// Explicit directories, lowest precedence first, and no nodes directory --
+    /// for tests and sandboxes that must not consult the environment.
     pub fn new(prefix_dirs: Vec<PathBuf>, permission_dirs: Vec<PathBuf>) -> Self {
-        Registry { prefix_dirs, permission_dirs }
+        Registry { prefix_dirs, permission_dirs, nodes_dir: None }
     }
 
-    /// The directories of `kind`, lowest precedence first.
+    /// This registry with `dir` as its nodes directory ([`NODES_DIR`]'s place).
+    pub fn with_nodes_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.nodes_dir = Some(dir.into());
+        self
+    }
+
+    /// The directories of `kind`, lowest precedence first. Cluster-wide ones
+    /// only; a node's prefix directory is [`Registry::node_prefix_dir`].
     pub fn dirs(&self, kind: RegistryKind) -> &[PathBuf] {
         match kind {
             RegistryKind::PrefixDef => &self.prefix_dirs,
@@ -744,6 +850,34 @@ impl Registry {
         self.dirs(kind).last().cloned()
     }
 
+    /// `node`'s prefix directory, `<nodes dir>/<node>/meta.d/prefixes`: where
+    /// its files are read from and written to, the one directory of its kind.
+    /// `None` when no nodes directory is configured.
+    pub fn node_prefix_dir(&self, node: &NodeName) -> Option<PathBuf> {
+        Some(self.nodes_dir.as_ref()?.join(node.as_str()).join("meta.d").join("prefixes"))
+    }
+
+    /// Every node that has a directory under the nodes directory, sorted. A
+    /// directory whose name is not a node name is not a node. What the
+    /// every-file listing and the unscoped version token walk; which nodes are
+    /// in the cluster is Perl's question, and a removed node's leftover
+    /// directory is listed as the files it still holds.
+    pub fn nodes(&self) -> Vec<NodeName> {
+        let Some(dir) = &self.nodes_dir else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<NodeName> = entries
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| NodeName::new(&e.file_name().to_string_lossy()).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
     /// The file for `name` of `kind`, if any directory has one: the
     /// highest-precedence one that does ([`effective_file`]). What the store
     /// reads, and what the loader parses -- the same file, by construction.
@@ -751,9 +885,12 @@ impl Registry {
         effective_file(self.dirs(kind), name).map(|(_, path)| path)
     }
 
-    /// [`load_prefixes`] over this registry's own prefix directories.
-    pub fn load_prefixes(&self) -> Vec<PrefixDef> {
-        self.list_prefixes().0
+    /// The prefixes in effect for a guest on `node` -- or, without one, the
+    /// cluster-wide set: the packaged and cluster files with `node`'s on top,
+    /// one per name, most-specific first. What decides `enforce` for that guest.
+    pub fn load_prefixes(&self, node: Option<&NodeName>) -> Vec<PrefixDef> {
+        // Drops the failures, as the free `load_prefixes` does and for its reason.
+        self.list_prefixes(node.map_or(PrefixSet::Cluster, PrefixSet::Node)).0
     }
 
     /// [`load_permissions`] over this registry's own permission directories.
@@ -761,11 +898,41 @@ impl Registry {
         self.list_permissions().0
     }
 
-    /// Every prefix, plus every file that did not load, from one walk of this
-    /// registry's own prefix directories. `GET /meta/prefixes`'s source: the
-    /// one listing where a failure has to survive (see [`RegistryFailure`]).
-    pub fn list_prefixes(&self) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
-        prefixes_with_failures(self.dirs(RegistryKind::PrefixDef))
+    /// The prefixes of `set`, plus every file in it that did not load: `GET
+    /// /meta/prefixes`' source. In a resolved set `overrides` is decided within
+    /// that set, so a node file says whether it displaced a cluster or packaged
+    /// file of its name. [`PrefixSet::All`] is not a set any guest sees -- two
+    /// rows may name the same prefix -- and a node row's `overrides` there is
+    /// what it would be in that node's set.
+    pub fn list_prefixes(&self, set: PrefixSet<'_>) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
+        let node = match set {
+            PrefixSet::Cluster => None,
+            PrefixSet::Node(node) => Some(node),
+            PrefixSet::All => return self.list_every_file(),
+        };
+        let mut layers = cluster_layers(self.dirs(RegistryKind::PrefixDef));
+        if let Some((node, dir)) = node.and_then(|n| Some((n, self.node_prefix_dir(n)?))) {
+            layers.push((dir, Source::Node(node.clone())));
+        }
+        prefixes_with_failures(&layers)
+    }
+
+    fn list_every_file(&self) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
+        let base = self.dirs(RegistryKind::PrefixDef);
+        let (mut loaded, mut failures) = self.list_prefixes(PrefixSet::Cluster);
+        for node in self.nodes() {
+            let Some(dir) = self.node_prefix_dir(&node) else { continue };
+            // The node's directory alone: re-reading the cluster-wide files once
+            // per node would parse, and log, every broken one of them again.
+            let (mut own, own_failures) = prefixes_with_failures(&[(dir, Source::Node(node))]);
+            for p in &mut own {
+                p.overrides = effective_file(base, &p.prefix.to_string()).is_some();
+            }
+            loaded.extend(own);
+            failures.extend(own_failures);
+        }
+        loaded.sort_by(|a, b| by_specificity(&a.prefix, &b.prefix).then_with(|| a.node.cmp(&b.node)));
+        (loaded, failures)
     }
 
     /// Every permission, plus every file that did not load, likewise --
@@ -773,6 +940,54 @@ impl Registry {
     pub fn list_permissions(&self) -> (Vec<Permission>, Vec<RegistryFailure>) {
         permissions_with_failures(self.dirs(RegistryKind::Permission))
     }
+}
+
+/// Which prefix files [`Registry::list_prefixes`] is over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixSet<'a> {
+    /// The packaged and cluster files, one per name.
+    Cluster,
+    /// The same with one node's files on top: the set for a guest on that node.
+    Node(&'a NodeName),
+    /// Every file -- packaged, cluster and every node's -- each where it came from.
+    All,
+}
+
+/// Where one directory's files come from: what `load_dirs` stamps on each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    Packaged,
+    Cluster,
+    Node(NodeName),
+}
+
+impl Source {
+    fn origin(&self) -> Origin {
+        match self {
+            Source::Packaged => Origin::Packaged,
+            Source::Cluster => Origin::Cluster,
+            Source::Node(_) => Origin::Node,
+        }
+    }
+
+    fn node(&self) -> Option<NodeName> {
+        match self {
+            Source::Node(node) => Some(node.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// `dirs` (lowest precedence first) as layers: the last one is the cluster's --
+/// [`Registry::write_dir`]'s rule -- and every one below it packaged.
+fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Source)> {
+    dirs.iter()
+        .enumerate()
+        .map(|(i, dir)| {
+            let source = if i + 1 == dirs.len() { Source::Cluster } else { Source::Packaged };
+            (dir.clone(), source)
+        })
+        .collect()
 }
 
 /// The file for `name` among `dirs` (lowest precedence first): the one in
@@ -790,60 +1005,61 @@ pub fn effective_file(dirs: &[PathBuf], name: &str) -> Option<(usize, PathBuf)> 
         .find(|(_, path)| path.is_file())
 }
 
-/// Loads one drop-directory list, later directories overriding earlier by file
-/// name, and stamps each survivor with where it came from.
+/// Loads one drop-directory list, later layers overriding earlier by file
+/// name, and stamps each survivor with the [`Source`] of its layer.
 ///
 /// One row per name, loaded or failed: every name any directory holds is
 /// resolved to its one effective file ([`effective_file`]), and only that
 /// file is read and parsed. A file it shadows is not looked at -- not loaded,
 /// and not reported either, since nothing it says is in effect.
 ///
-/// Which directory is writable -- and so, here, which is `Origin::Cluster`
-/// rather than `Origin::Packaged` -- is decided in exactly one place,
-/// [`Registry::write_dir`]; this just derives the same last-directory-wins
-/// fact for every entry as it folds them in.
-///
 /// Returns the failures alongside the parsed items -- an unreadable file and
 /// an unparseable one both count -- so a caller that needs to show them (`GET
 /// /meta/prefixes`, `GET /meta/permissions`) can have both from one walk of
 /// the directories, instead of two.
 fn load_dirs<T>(
-    dirs: &[PathBuf],
+    layers: &[(PathBuf, Source)],
     kind: &str,
     parse: impl Fn(&str, &str) -> Result<T>,
-    stamp: impl Fn(&mut T, Origin, bool),
+    stamp: impl Fn(&mut T, &Source, bool),
 ) -> (Vec<(String, T)>, Vec<RegistryFailure>) {
+    let dirs: Vec<PathBuf> = layers.iter().map(|(dir, _)| dir.clone()).collect();
     // Every name, and how many directories hold it -- the `overrides` fact.
     let mut holders: BTreeMap<String, usize> = BTreeMap::new();
-    for dir in dirs {
+    for dir in &dirs {
         for (name, _) in yaml_files(dir) {
             *holders.entry(name).or_insert(0) += 1;
         }
     }
-    let last = dirs.len().saturating_sub(1);
     let mut parsed_out = Vec::new();
     let mut failures = Vec::new();
     for (name, count) in holders {
         // The file `yaml_files` just listed can have vanished since; then the
         // name is simply not there to load.
-        let Some((index, path)) = effective_file(dirs, &name) else { continue };
-        let origin = if index == last { Origin::Cluster } else { Origin::Packaged };
+        let Some((index, path)) = effective_file(&dirs, &name) else { continue };
+        let source = &layers[index].1;
+        let fail = |name: String, error: String| RegistryFailure {
+            name,
+            origin: source.origin(),
+            node: source.node(),
+            error,
+        };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
                 crate::warn_line!("skipping unreadable {kind} file {}: {e}", path.display());
-                failures.push(RegistryFailure { name, origin, error: e.to_string() });
+                failures.push(fail(name, e.to_string()));
                 continue;
             }
         };
         match parse(&name, &text) {
             Ok(mut parsed) => {
-                stamp(&mut parsed, origin, count > 1);
+                stamp(&mut parsed, source, count > 1);
                 parsed_out.push((name, parsed));
             }
             Err(e) => {
                 crate::warn_line!("skipping malformed {kind} file {}: {e}", path.display());
-                failures.push(RegistryFailure { name, origin, error: e.to_string() });
+                failures.push(fail(name, e.to_string()));
             }
         }
     }
@@ -852,11 +1068,12 @@ fn load_dirs<T>(
 
 /// [`load_dirs`] for prefixes, plus the most-specific-first sort the listing
 /// promises (`docs/DESIGN.md` §8) -- shared by [`load_prefixes`] (which drops
-/// the failures) and [`Registry::list_prefixes`] (which keeps them), so the
+/// the failures) and the [`Registry`] listings (which keep them), so the
 /// two can never compute the sort differently.
-fn prefixes_with_failures(dirs: &[PathBuf]) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
-    let (parsed, failures) = load_dirs(dirs, "prefix", parse_prefix, |p, origin, over| {
-        p.origin = origin;
+fn prefixes_with_failures(layers: &[(PathBuf, Source)]) -> (Vec<PrefixDef>, Vec<RegistryFailure>) {
+    let (parsed, failures) = load_dirs(layers, "prefix", parse_prefix, |p, source, over| {
+        p.origin = source.origin();
+        p.node = source.node();
         p.overrides = over;
     });
     let mut out: Vec<PrefixDef> = parsed.into_iter().map(|(_, ns)| ns).collect();
@@ -872,16 +1089,17 @@ pub fn load_prefixes(dirs: &[PathBuf]) -> Vec<PrefixDef> {
     // parse is not a prefix, and it must never reach a `Shape`, which decides
     // what a document's shape *is*. `Registry::list_prefixes` is the one
     // place the same failure survives, for the listing that has to show it.
-    prefixes_with_failures(dirs).0
+    prefixes_with_failures(&cluster_layers(dirs)).0
 }
 
 /// [`load_dirs`] for permissions, split out for the same reason as
 /// [`prefixes_with_failures`].
 fn permissions_with_failures(dirs: &[PathBuf]) -> (Vec<Permission>, Vec<RegistryFailure>) {
-    let (parsed, failures) = load_dirs(dirs, "permission", parse_permission, |g, origin, over| {
-        g.origin = origin;
-        g.overrides = over;
-    });
+    let (parsed, failures) =
+        load_dirs(&cluster_layers(dirs), "permission", parse_permission, |g, source, over| {
+            g.origin = source.origin();
+            g.overrides = over;
+        });
     (parsed.into_iter().map(|(_, g)| g).collect(), failures)
 }
 
@@ -1219,7 +1437,7 @@ rules:
         write(cluster.path(), "broken.yaml", "selector: {all: true}\n");
         let dirs = [packaged.path().to_path_buf(), cluster.path().to_path_buf()];
 
-        let (loaded, failures) = prefixes_with_failures(&dirs);
+        let (loaded, failures) = prefixes_with_failures(&cluster_layers(&dirs));
         assert_eq!(
             loaded.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
             vec!["broken"],
@@ -1233,6 +1451,120 @@ rules:
         // The file the store would open for repair is the same one.
         assert_eq!(effective_file(&dirs, "traefik").unwrap().1, cluster.path().join("traefik.yaml"));
         assert_eq!(effective_file(&dirs, "netbird"), None);
+    }
+
+    /// Packaged, cluster and one node's directory, as `Registry::from_env`
+    /// lays them out, under one tempdir.
+    fn three_layers() -> (tempfile::TempDir, Registry) {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["packaged", "cluster", "nodes/pve1/meta.d/prefixes", "nodes/pve2/meta.d/prefixes"] {
+            std::fs::create_dir_all(dir.path().join(sub)).unwrap();
+        }
+        let reg = Registry::new(vec![dir.path().join("packaged"), dir.path().join("cluster")], vec![])
+            .with_nodes_dir(dir.path().join("nodes"));
+        (dir, reg)
+    }
+
+    fn node_dir(dir: &tempfile::TempDir, node: &str) -> PathBuf {
+        dir.path().join("nodes").join(node).join("meta.d/prefixes")
+    }
+
+    /// Node over cluster over packaged, whole file by name, precedence by
+    /// presence -- the rule the two cluster-wide layers already follow, one
+    /// layer higher, and only for the guests on that node.
+    #[test]
+    fn a_node_file_shadows_the_cluster_file_which_shadows_the_packaged_one() {
+        let (dir, reg) = three_layers();
+        write(&dir.path().join("packaged"), "gpu.yaml", "description: packaged\nselector: {all: true}\n");
+        write(&dir.path().join("cluster"), "gpu.yaml", "description: cluster\nselector: {all: true}\n");
+        write(&node_dir(&dir, "pve1"), "gpu.yaml", "description: pve1\nselector: {all: true}\n");
+        write(&dir.path().join("packaged"), "onlypkg.yaml", "selector: {all: true}\n");
+        write(&node_dir(&dir, "pve1"), "local.yaml", "selector: {all: true}\n");
+
+        let n = |s: &str| NodeName::new(s).unwrap();
+        let on = |node: Option<&str>| reg.load_prefixes(node.map(n).as_ref());
+        let by = |set: &[PrefixDef], name: &str| set.iter().find(|p| p.prefix.to_string() == name).cloned();
+
+        let pve1 = on(Some("pve1"));
+        let gpu = by(&pve1, "gpu").unwrap();
+        assert_eq!(gpu.description.as_deref(), Some("pve1"), "the node file wins");
+        assert_eq!((gpu.origin, gpu.node, gpu.overrides), (Origin::Node, Some(n("pve1")), true));
+        assert_eq!(by(&pve1, "onlypkg").unwrap().origin, Origin::Packaged, "the lower layers still apply");
+        let local = by(&pve1, "local").unwrap();
+        assert!(!local.overrides, "a node file with no namesake below displaces nothing");
+
+        // pve2 has no files of its own: the cluster file is in effect, and
+        // pve1's files do not exist for a guest there.
+        let pve2 = on(Some("pve2"));
+        assert_eq!(by(&pve2, "gpu").unwrap().description.as_deref(), Some("cluster"));
+        assert_eq!(by(&pve2, "gpu").unwrap().node, None);
+        assert!(by(&pve2, "local").is_none(), "another node's file is invisible");
+        assert_eq!(on(None), pve2, "no node is the cluster-wide set");
+
+        // A malformed node file shadows the cluster file of its name and is
+        // the failure listed for it, naming its node -- it never falls back.
+        write(&node_dir(&dir, "pve1"), "gpu.yaml", "selector: {nonsense: true}\n");
+        let (loaded, failures) = reg.list_prefixes(PrefixSet::Node(&n("pve1")));
+        assert!(loaded.iter().all(|p| p.prefix.to_string() != "gpu"), "{loaded:?}");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            (failures[0].name.as_str(), failures[0].origin, failures[0].node.as_ref().map(NodeName::as_str)),
+            ("gpu", Origin::Node, Some("pve1")),
+        );
+        assert_eq!(by(&on(Some("pve2")), "gpu").unwrap().description.as_deref(), Some("cluster"));
+    }
+
+    /// The `all` listing: the cluster-wide set, resolved as ever -- a packaged
+    /// file a cluster file shadows is not a row of its own, the cluster row says
+    /// `overrides` -- and each node's own files beside it, where they came from.
+    #[test]
+    fn the_all_listing_is_the_cluster_wide_set_plus_every_nodes_files() {
+        let (dir, reg) = three_layers();
+        write(&dir.path().join("packaged"), "gpu.yaml", "selector: {all: true}\n");
+        write(&dir.path().join("cluster"), "gpu.yaml", "selector: {all: true}\n");
+        write(&node_dir(&dir, "pve2"), "gpu.yaml", "selector: {all: true}\n");
+        write(&node_dir(&dir, "pve1"), "gpu.yaml", "selector: {all: true}\n");
+        write(&node_dir(&dir, "pve1"), "gpu.devices.yaml", "selector: {all: true}\n");
+        write(&node_dir(&dir, "pve1"), "broken.yaml", "selector: {nonsense: true}\n");
+        std::fs::create_dir_all(dir.path().join("nodes/not_a_node/meta.d/prefixes")).unwrap();
+        write(&dir.path().join("nodes/not_a_node/meta.d/prefixes"), "x.yaml", "selector: {all: true}\n");
+
+        let names: Vec<String> = reg.nodes().iter().map(NodeName::to_string).collect();
+        assert_eq!(names, ["pve1", "pve2"], "a directory that is not a node name is not a node");
+        let (loaded, failures) = reg.list_prefixes(PrefixSet::All);
+        let rows: Vec<(String, Origin, Option<&str>, bool)> = loaded
+            .iter()
+            .map(|p| (p.prefix.to_string(), p.origin, p.node.as_ref().map(NodeName::as_str), p.overrides))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("gpu.devices".to_string(), Origin::Node, Some("pve1"), false),
+                // Packaged and cluster `gpu`: one row, the cluster's, overriding.
+                ("gpu".to_string(), Origin::Cluster, None, true),
+                ("gpu".to_string(), Origin::Node, Some("pve1"), true),
+                ("gpu".to_string(), Origin::Node, Some("pve2"), true),
+            ],
+            "most-specific first, the cluster-wide row before the nodes' of the same name",
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!((failures[0].origin, failures[0].node.as_ref().map(NodeName::as_str)), (Origin::Node, Some("pve1")));
+    }
+
+    #[test]
+    fn a_node_name_is_pves_node_name_and_never_a_path() {
+        for good in ["pve1", "PVE-node-3", "a", "1"] {
+            assert!(NodeName::new(good).is_ok(), "{good} was refused");
+        }
+        for bad in ["", ".", "..", "../pve1", "pve1/..", "a.b", "-a", "a-", "a b", "a_b", "pve1\0"] {
+            assert!(NodeName::new(bad).is_err(), "{bad:?} was accepted");
+            // Deserializing is the same check: a wire value is never an unchecked name.
+            assert!(serde_json::from_value::<NodeName>(json!(bad)).is_err(), "{bad:?} deserialized");
+        }
+        let pve1 = NodeName::new("pve1").unwrap();
+        let reg = Registry::new(vec![], vec![]).with_nodes_dir("/nodes");
+        assert_eq!(reg.node_prefix_dir(&pve1), Some(PathBuf::from("/nodes/pve1/meta.d/prefixes")));
+        assert_eq!(Registry::new(vec![], vec![]).node_prefix_dir(&pve1), None, "no nodes directory, no node files");
     }
 
     #[test]
@@ -1308,7 +1640,7 @@ rules:
         write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
         let reg = Registry::new(vec![dir.path().to_path_buf()], vec![]);
 
-        let (parsed, failures) = reg.list_prefixes();
+        let (parsed, failures) = reg.list_prefixes(PrefixSet::Cluster);
         assert_eq!(
             parsed.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
             vec!["traefik"],
@@ -1321,7 +1653,7 @@ rules:
         assert_eq!(failures[0].origin, Origin::Cluster);
 
         // What `governing`/the write path actually consult must never see it.
-        assert_eq!(reg.load_prefixes(), parsed);
+        assert_eq!(reg.load_prefixes(None), parsed);
     }
 
     #[test]

@@ -44,7 +44,7 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
 pub use crate::registry::RegistryKind;
-use crate::registry::Registry;
+use crate::registry::{NodeName, Registry};
 
 /// Warn threshold for document size (informational only; reported through
 /// [`crate::warn`]).
@@ -98,34 +98,40 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 /// document is governed by ACLs alone (`api::effective` gives it no scopes -- a
 /// permission file that could widen its own grants would be self-registration), and
 /// its content must additionally parse as the kind it claims to be, which
-/// `api::put_document` checks before writing.
+/// `api::put_document` checks before writing. A node's prefix file is a registry
+/// document in both respects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
     Guest(u32),
     /// A prefix or permission file, named `<name>.yaml` in its kind's directory.
-    /// The name is a single path segment (`crate::path::is_valid_segment`), so
+    /// The name is dotted segments (`crate::registry::is_valid_file_name`), so
     /// it can never contain a slash or escape that directory.
     Registry(RegistryKind, String),
+    /// One node's prefix file, `<name>.yaml` in that node's prefix directory
+    /// (`crate::registry::Registry::node_prefix_dir`) and nowhere else. With
+    /// no nodes directory configured the store refuses every one.
+    NodePrefix { node: NodeName, name: String },
 }
 
 impl DocId {
     fn base_name(&self) -> String {
         match self {
             DocId::Guest(vmid) => vmid.to_string(),
-            DocId::Registry(_, name) => name.clone(),
+            DocId::Registry(_, name) | DocId::NodePrefix { name, .. } => name.clone(),
         }
     }
 }
 
 /// The id as the API spells it and as `parse_id` reads it back: `105`,
-/// `prefixes/<name>`, `permissions/<name>`. The one string
-/// form of a document id, used on the wire and in error messages alike.
+/// `prefixes/<name>`, `permissions/<name>`, `nodes/<node>/prefixes/<name>`. The
+/// one string form of a document id, used on the wire and in error messages alike.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DocId::Guest(vmid) => write!(f, "{vmid}"),
             DocId::Registry(kind, name) => write!(f, "{kind}/{name}"),
+            DocId::NodePrefix { node, name } => write!(f, "nodes/{node}/prefixes/{name}"),
         }
     }
 }
@@ -360,15 +366,33 @@ impl MetaStore {
             .unwrap_or_else(|| self.root.join("meta.d").join(kind.as_str()))
     }
 
+    /// `node`'s prefix directory: [`Registry::node_prefix_dir`], the same one
+    /// the loader reads.
+    ///
+    /// With no nodes directory configured -- `PVE_META_NODES_DIR` set to
+    /// nothing, or a [`Registry::new`] given none -- there is no such directory
+    /// and no fallback: a write the loader would never read back is refused, and
+    /// the cluster directories' fallback inside `root` is not repeated here for
+    /// a file nothing would load.
+    ///
+    /// # Errors
+    /// [`Error::Registry`] when no nodes directory is configured.
+    fn node_prefix_dir(&self, node: &NodeName) -> Result<PathBuf> {
+        self.registry
+            .node_prefix_dir(node)
+            .ok_or_else(|| Error::Registry("no nodes directory is configured".to_string()))
+    }
+
     /// Where `id` is **written**, and where it is read from unless a
     /// lower-precedence registry directory is the only one that has it (see
     /// [`MetaStore::read_path_for`]).
-    fn path_for(&self, id: &DocId) -> PathBuf {
+    fn path_for(&self, id: &DocId) -> Result<PathBuf> {
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-        match id {
+        Ok(match id {
             DocId::Registry(kind, _) => self.registry_write_dir(*kind).join(file),
-            _ => self.root.join(file),
-        }
+            DocId::NodePrefix { node, .. } => self.node_prefix_dir(node)?.join(file),
+            DocId::Guest(_) => self.root.join(file),
+        })
     }
 
     /// Where `id` is **read** from. For a registry document that is
@@ -376,12 +400,15 @@ impl MetaStore {
     /// has the file, parseable or not, which is the same rule the loader
     /// applies, so the document opened for repair is the one in effect.
     /// Falls back to [`MetaStore::path_for`] when none has it, so a "not
-    /// found" error names the place a write would create it.
-    fn read_path_for(&self, id: &DocId) -> PathBuf {
+    /// found" error names the place a write would create it. A node's prefix
+    /// file is read from its node's directory only: `nodes/<node>/prefixes/<name>`
+    /// is that file, never the cluster file of the same name it shadows.
+    fn read_path_for(&self, id: &DocId) -> Result<PathBuf> {
         match id {
-            DocId::Registry(kind, name) => {
-                self.registry.locate(*kind, name).unwrap_or_else(|| self.path_for(id))
-            }
+            DocId::Registry(kind, name) => match self.registry.locate(*kind, name) {
+                Some(path) => Ok(path),
+                None => self.path_for(id),
+            },
             _ => self.path_for(id),
         }
     }
@@ -526,7 +553,7 @@ impl MetaStore {
         // Deliberately no `locate` first: an `is_file()` followed by a read
         // is a check-then-act pair, and the racing loser of that pair would
         // otherwise surface as an `Error::Io` (HTTP 500) instead of a 404.
-        self.read_document(id, &self.read_path_for(id))
+        self.read_document(id, &self.read_path_for(id)?)
     }
 
     /// `id`'s current content identity without parsing (or even keeping) the
@@ -539,7 +566,7 @@ impl MetaStore {
     /// compute. Above the read cap it is a surrogate over `(len, mtime)`, so
     /// this never reads a file the store refuses to read.
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
-        identify(&self.read_path_for(id))
+        identify(&self.read_path_for(id)?)
     }
 
     /// The digest precondition, enforced in exactly one place: `None`
@@ -600,8 +627,8 @@ impl MetaStore {
         // For a registry document shadowing a packaged one they are not: the
         // precondition is checked against the content the caller actually saw
         // (the packaged file), and the write creates the cluster override.
-        let path = self.path_for(id);
-        let read_path = self.read_path_for(id);
+        let path = self.path_for(id)?;
+        let read_path = self.read_path_for(id)?;
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
 
         // The *old* content is only read to diff against, so it is parsed
@@ -670,7 +697,7 @@ impl MetaStore {
     /// `api::delete_document` says so rather than reporting a deletion that
     /// did not happen.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
-        Ok(gone_is_none(fs::remove_file(self.path_for(id)))?.is_some())
+        Ok(gone_is_none(fs::remove_file(self.path_for(id)?))?.is_some())
     }
 
     /// Every vmid the store holds *any* file for — a live document, a
@@ -749,7 +776,7 @@ impl MetaStore {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))))? else {
+        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))?))? else {
             return Ok(false);
         };
         self.write_atomic(&self.snapshot_path(vmid, name), &bytes)?;
@@ -766,7 +793,7 @@ impl MetaStore {
             return Err(Error::InvalidName(name.to_string()));
         }
         let snap = self.snapshot_path(vmid, name);
-        let target = self.path_for(&DocId::Guest(vmid));
+        let target = self.path_for(&DocId::Guest(vmid))?;
         if let Some(bytes) = gone_is_none(fs::read(&snap))? {
             self.write_atomic(&target, &bytes)?;
             Ok(RollbackOutcome::Restored)
@@ -829,7 +856,7 @@ impl MetaStore {
     /// against a concurrent `DELETE` or `pve-meta rm`, and a poll must not 500
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
-        self.version_of(None)
+        self.version_of(None, None)
     }
 
     /// [`MetaStore::version`], restricted to the one document a caller is
@@ -857,7 +884,17 @@ impl MetaStore {
     /// answer a question about one guest. At four guests that is invisible; at
     /// three hundred with snapshots it is a thousand pmxcfs round-trips every
     /// five seconds, per open editor.
-    pub fn version_of(&self, only: Option<&DocId>) -> Result<StoreVersion> {
+    ///
+    /// `node` is the one a guest document's prefixes come from. The unscoped
+    /// token covers every node's prefix directory. A guest's
+    /// scoped token covers `node`'s -- the one whose files join that guest's
+    /// prefix set -- and hashes `node` itself as well, so the token moves when
+    /// the guest migrates even between two nodes whose directories hold the same
+    /// files: its set came from somewhere else, and an open editor has to rebuild
+    /// its rows from the other node's listing. A node prefix document's token
+    /// covers the cluster-wide directories and its own node's; `node` is
+    /// ignored there and for every other id.
+    pub fn version_of(&self, only: Option<&DocId>, node: Option<&NodeName>) -> Result<StoreVersion> {
         let mut entries: Vec<(String, String)> = Vec::new();
         // A map, not a list: a prefix present in both the packaged and the
         // cluster directory is *one* document, and the effective one is the
@@ -869,12 +906,21 @@ impl MetaStore {
         let mut documents: BTreeMap<DocId, String> = BTreeMap::new();
         let mut latest: Option<SystemTime> = None;
 
+        // The node directories this token walks, by node name.
+        let mut node_dirs: Vec<NodeName> = Vec::new();
         match only {
             // A registry document's own file is one the registry walk below
             // already covers, and no guest document can affect it: the store
             // root is not read at all.
             Some(DocId::Registry(..)) => {}
+            Some(DocId::NodePrefix { node, .. }) => node_dirs.push(node.clone()),
             Some(id) => {
+                if let Some(node) = node {
+                    // Not a file: a pseudo-entry no file name can collide with,
+                    // since every real entry is a name or starts with a directory.
+                    entries.push(("\0node".to_string(), node.to_string()));
+                    node_dirs.push(node.clone());
+                }
                 let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
                 self.add_version_entry(
                     &self.root.join(&file),
@@ -886,14 +932,17 @@ impl MetaStore {
                     &document_id,
                 )?;
             }
-            None => self.scan_for_version(
-                &self.root.clone(),
-                "",
-                &mut entries,
-                &mut documents,
-                &mut latest,
-                &document_id,
-            )?,
+            None => {
+                self.scan_for_version(
+                    &self.root.clone(),
+                    "",
+                    &mut entries,
+                    &mut documents,
+                    &mut latest,
+                    &document_id,
+                )?;
+                node_dirs = self.registry.nodes();
+            }
         }
         for kind in [RegistryKind::PrefixDef, RegistryKind::Permission] {
             for dir in self.registry.dirs(kind) {
@@ -910,6 +959,19 @@ impl MetaStore {
                     &|name| registry_document_id(kind, name),
                 )?;
             }
+        }
+        for node in &node_dirs {
+            // refuses one before it gets here.
+            let Some(dir) = self.registry.node_prefix_dir(node) else { continue };
+            let prefix = format!("{}/", dir.display());
+            self.scan_for_version(
+                &dir,
+                &prefix,
+                &mut entries,
+                &mut documents,
+                &mut latest,
+                &|name| node_prefix_document_id(node, name),
+            )?;
         }
 
         entries.sort();
@@ -1018,6 +1080,14 @@ impl MetaStore {
 fn registry_document_id(kind: RegistryKind, name: &str) -> Option<DocId> {
     let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
     crate::registry::is_valid_file_name(stem).then(|| DocId::Registry(kind, stem.to_string()))
+}
+
+/// The [`DocId`] a file name in `node`'s prefix directory addresses, by the
+/// same filter as [`registry_document_id`].
+fn node_prefix_document_id(node: &NodeName, name: &str) -> Option<DocId> {
+    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
+    crate::registry::is_valid_file_name(stem)
+        .then(|| DocId::NodePrefix { node: node.clone(), name: stem.to_string() })
 }
 
 fn document_id(name: &str) -> Option<DocId> {

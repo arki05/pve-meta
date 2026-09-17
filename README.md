@@ -61,6 +61,9 @@ schema:                           # PVE::JSONSchema dialect; drives the editor's
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
+A file of the same name in `/etc/pve/nodes/<node>/meta.d/prefixes/` overrides it for the
+guests on that node.
+
 A **permission** file gives a token a prefix, on the guests its selector matches, so
 one document can be shared by several tools that cannot step on each other. Cluster-only,
 so a package can declare a prefix but never grant itself access:

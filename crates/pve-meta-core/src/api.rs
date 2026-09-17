@@ -57,7 +57,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, Permission, PrefixDef, RegistryFailure, RegistryKind};
+use crate::registry::{self, NodeName, Permission, PrefixDef, PrefixSet, Registry, RegistryFailure, RegistryKind};
 use crate::scopes::Effective;
 use crate::shape::{self, Shape};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
@@ -150,7 +150,7 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
         DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
         // A registry document is governed by ACLs alone: a permission that
         // could reach the permission files would be able to widen itself.
-        DocId::Registry(..) => Vec::new(),
+        DocId::Registry(..) | DocId::NodePrefix { .. } => Vec::new(),
     };
     Effective {
         full_read: acl.read,
@@ -160,15 +160,30 @@ pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAc
 }
 
 /// Parses an API `id` into a [`DocId`]: a vmid, or a registry document as
-/// `prefixes/<name>` / `permissions/<name>`.
+/// `prefixes/<name>` / `permissions/<name>` / `nodes/<node>/prefixes/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
 /// [`registry::is_valid_file_name`]: dotted, because **the file name is the
 /// prefix** and `homelab.docker` is a legitimate prefix, but never a slash,
 /// a leading dot or a `..`, so an id can never address a file outside its
-/// directory.
+/// directory. `<node>` becomes a [`NodeName`] for the same reason; whether that
+/// node is in the cluster is Perl's check.
 pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
+    if let Some(rest) = id.strip_prefix("nodes/") {
+        let Some((node, name)) =
+            rest.split_once('/').and_then(|(node, tail)| Some((node, tail.strip_prefix("prefixes/")?)))
+        else {
+            return Err(bad_request(format!(
+                "invalid id '{id}': a node's registry document is 'nodes/<node>/prefixes/<name>'"
+            )));
+        };
+        let node = node_name(node)?;
+        if !registry::is_valid_file_name(name) {
+            return Err(bad_request(format!("invalid id '{id}': '{name}' is not a valid prefixes name")));
+        }
+        return Ok(DocId::NodePrefix { node, name: name.to_string() });
+    }
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
             "prefixes" => RegistryKind::PrefixDef,
@@ -189,9 +204,15 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'prefixes/<name>' or 'permissions/<name>'"
+            "invalid id '{id}': must be a vmid, 'prefixes/<name>', \
+             'nodes/<node>/prefixes/<name>' or 'permissions/<name>'"
         ))
     })
+}
+
+/// `node` as a [`NodeName`], or a 400.
+fn node_name(node: &str) -> Result<NodeName, ApiError> {
+    NodeName::new(node).map_err(|_| bad_request(format!("invalid node name '{node}'")))
 }
 
 /// Parses a `view` parameter (a dotted/slash path, or absent = the whole
@@ -329,16 +350,23 @@ fn touched_out(touched: &[Touched]) -> Vec<ApiTouched> {
 /// With `id`, the token covers that document plus the registry directories and
 /// nothing else ([`MetaStore::version_of`]) — what an open editor is actually
 /// watching, at a cost that does not grow with the number of guests in the
-/// cluster. A scoped and an unscoped token are not comparable, which is a
+/// cluster. For a guest, `node` is its current node: that node's prefix
+/// directory is in the token, and so is the node's name, so a migration moves
+/// it. A scoped and an unscoped token are not comparable, which is a
 /// caller's business: each poller compares a token against its own previous
 /// one.
+///
+/// # Errors
+/// `400:` an invalid id or node name.
 pub fn version(
     store: &MetaStore,
     detail: bool,
     id: Option<&str>,
+    node: Option<&str>,
 ) -> Result<ApiVersion, ApiError> {
     let doc_id = id.map(parse_id).transpose()?;
-    let v = store.version_of(doc_id.as_ref())?;
+    let node = node.map(node_name).transpose()?;
+    let v = store.version_of(doc_id.as_ref(), node.as_ref())?;
     Ok(ApiVersion {
         token: v.token,
         changed: unix_secs(v.changed),
@@ -396,8 +424,41 @@ pub fn permissions_list(
         .collect()
 }
 
-/// `GET /meta/prefixes`: every prefix, most-specific first, readable by
-/// every authenticated user, plus every file that did not load (see
+/// `GET /meta/prefixes`: the cluster-wide set, packaged and cluster files
+/// resolved by name; with `node`, the set in effect for a guest on that node;
+/// with `all`, every file there is -- packaged, cluster and every node's -- each
+/// row saying where it came from ([`Registry::list_prefixes`]). Each with the
+/// files that did not load. Without either the answer is what it was before
+/// node files existed, so a client that knows nothing of them sees no change.
+///
+/// # Errors
+/// `400:` `node` is not a node name, or `node` and `all` are both given.
+pub fn prefixes(registry: &Registry, node: Option<&str>, all: bool) -> Result<Vec<PrefixEntry>, ApiError> {
+    let node = node.map(node_name).transpose()?;
+    let set = match (&node, all) {
+        (Some(_), true) => return Err(bad_request("'node' and 'all' are mutually exclusive")),
+        (Some(node), false) => PrefixSet::Node(node),
+        (None, true) => PrefixSet::All,
+        (None, false) => PrefixSet::Cluster,
+    };
+    let (loaded, failures) = registry.list_prefixes(set);
+    Ok(prefixes_list(&loaded, &failures))
+}
+
+/// The prefixes `put_document` enforces for `doc_id`: for a guest, the set in
+/// effect on the caller's `node` ([`Registry::load_prefixes`]) -- packaged,
+/// cluster and that node's files, resolved by name. Nothing for a registry
+/// document, which has its own gate.
+pub fn effective_prefixes(registry: &Registry, doc_id: &DocId, acl: &CallerAcl) -> Vec<PrefixDef> {
+    match doc_id {
+        DocId::Guest(_) => registry.load_prefixes(acl.node.as_ref()),
+        DocId::Registry(..) | DocId::NodePrefix { .. } => Vec::new(),
+    }
+}
+
+/// `GET /meta/prefixes`' rows: every prefix given, in the order given
+/// (most-specific first, as the registry loads them), readable by every
+/// authenticated user, plus every file that did not load (see
 /// [`permissions_list`], the same reasoning applies here).
 pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Vec<PrefixEntry> {
     prefixes
@@ -433,6 +494,8 @@ pub fn list_guests(
             read: guest.read,
             write: guest.write,
             tags: guest.tags.clone(),
+            // A listing decides no prefix set.
+            node: None,
         };
         let g = effective(permission_files, &DocId::Guest(guest.vmid), &acl);
         let readable = g.readable_prefixes();
@@ -706,8 +769,11 @@ fn plan_write(
 /// Guest documents have no shape beyond `model::lint`: they
 /// hold whatever an administrator puts in them, which is the point of them.
 fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
-    let DocId::Registry(kind, name) = doc_id else {
-        return Ok(());
+    let (kind, name) = match doc_id {
+        DocId::Guest(_) => return Ok(()),
+        DocId::Registry(kind, name) => (kind, name),
+        // A node's prefix file is a prefix, read by the same loader.
+        DocId::NodePrefix { name, .. } => (&RegistryKind::PrefixDef, name),
     };
     let parsed = match kind {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
@@ -731,7 +797,8 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// `payload` wholesale — an empty object stores an empty map) or `"merge"`
 /// (RFC 7386-style merge-patch relative to the view, where `null` deletes).
 ///
-/// `prefixes` are the declared prefixes: the ones that reach this guest and
+/// `prefixes` are the declared prefixes in effect for this guest's node
+/// ([`effective_prefixes`]): the ones that reach this guest and
 /// say `enforce: true` refuse a write that would leave their subtree not
 /// matching their schema -- for the paths the write changed, never for
 /// what was already wrong elsewhere in the document -- unless `force`. That

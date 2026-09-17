@@ -27,6 +27,8 @@ my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
 $ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
+my $nodesdir = tempdir(CLEANUP => 1);
+$ENV{PVE_META_NODES_DIR} = $nodesdir;
 my $rundir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_RUN_DIR} = $rundir;
 
@@ -1011,5 +1013,79 @@ for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'oper
     ok(!defined($res), "api_get refuses the id '$bad'");
     like($@, api_error_status(400), "... with a 400");
 }
+
+# -- node prefix files: a third layer, per node --------------------------------
+#
+# `nodes/<node>/prefixes/<name>` is a prefix file in that node's directory, a
+# registry document like the other two, and in effect only for the guests the
+# ACL hash says are on that node. The node crosses as `node` in the hash.
+
+my $pve1dir = "$nodesdir/pve1/meta.d/prefixes";
+my $gpu_put = PVE::RS::Meta::api_put(
+    'nodes/pve1/prefixes/gpu', undef, 'yaml',
+    "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n",
+    'replace', '', 0, $ADMIN,
+);
+is($gpu_put->{id}, 'nodes/pve1/prefixes/gpu', 'api_put creates a node prefix document');
+ok(-f "$pve1dir/gpu.yaml", '... in that node\'s directory');
+ok(!-e "$nsdir/gpu.yaml", '... and not in the cluster directory');
+is(PVE::RS::Meta::api_get('nodes/pve1/prefixes/gpu', undef, 'json', $ADMIN)->{digest},
+    $gpu_put->{digest}, 'api_get reads it back by the same id');
+is(PVE::RS::Meta::api_get('nodes/pve2/prefixes/gpu', undef, 'json', $ADMIN)->{digest}, '',
+    '... and the same name on another node is another, absent, document');
+
+ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes() }),
+    'the default listing is the cluster-wide set, as before node files existed');
+my ($gpu_row) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes(undef, 1) };
+is($gpu_row->{origin}, 'node', 'the all=1 listing says where a node file came from');
+is($gpu_row->{node}, 'pve1', '... and which node');
+ok((grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve1') }),
+    "api_prefixes('pve1') includes the node's file");
+ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
+    "api_prefixes('pve2') does not");
+ok((grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
+    '... though it has the cluster files');
+$res = eval { PVE::RS::Meta::api_prefixes('../pve1') };
+ok(!defined($res), 'api_prefixes refuses a node that is not a node name');
+like($@, api_error_status(400), '... with a 400');
+$res = eval { PVE::RS::Meta::api_prefixes('pve1', 1) };
+ok(!defined($res), 'api_prefixes refuses node and all together');
+like($@, api_error_status(400), '... with a 400');
+
+# The node crosses as a checked node name: the ACL hash refuses one that is not.
+$res = eval { PVE::RS::Meta::api_put('9600', 'x', 'json', '1', 'replace', undef, 0, { %$ADMIN, node => '../pve1' }) };
+ok(!defined($res), 'an ACL hash whose node is not a node name is refused');
+ok(!exists(PVE::RS::Meta::api_access('9600', { %$ADMIN, node => 'pve1' })->{node}),
+    'api_access does not hand the node back: the prefix listing resolves it by id');
+
+# enforce follows the guest's node.
+my $on_pve1 = { %$ADMIN, node => 'pve1' };
+my $on_pve2 = { %$ADMIN, node => 'pve2' };
+$res = eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve1) };
+ok(!defined($res), "a node prefix's enforce refuses a write for a guest on that node");
+like($@, api_error_status(422), '... with a 422');
+ok(defined(eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve2) }),
+    '... and does not reach a guest on another node');
+
+# The guest's token covers its node's directory and its node's name.
+my $tok1 = PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token};
+isnt(PVE::RS::Meta::api_version(0, '9600', 'pve2')->{token}, $tok1, 'a migrated guest has another token');
+is(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node is a stable input');
+PVE::RS::Meta::api_put('nodes/pve1/prefixes/gpu', 'description', 'json', '"GPUs"', 'replace', undef, 0, $ADMIN);
+isnt(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node prefix change moves its guests\' token');
+ok((grep { $_->{id} eq 'nodes/pve1/prefixes/gpu' } @{ PVE::RS::Meta::api_version(1, undef)->{documents} }),
+    'the unscoped detail lists the node prefix document');
+$res = eval { PVE::RS::Meta::api_version(0, '9600', 'a/b') };
+like($@, api_error_status(400), 'a node that is not a node name is a 400 on the poll too');
+
+for my $bad ('nodes/../prefixes/gpu', 'nodes/pve.1/prefixes/gpu', 'nodes/pve1/permissions/ops') {
+    $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
+    ok(!defined($res), "api_get refuses the id '$bad'");
+    like($@, api_error_status(400), "... with a 400");
+}
+
+is(PVE::RS::Meta::api_delete('nodes/pve1/prefixes/gpu', undef, undef, $ADMIN)->{digest}, '',
+    'api_delete removes a node prefix file');
+ok(!-e "$pve1dir/gpu.yaml", '... and the file is gone');
 
 done_testing();

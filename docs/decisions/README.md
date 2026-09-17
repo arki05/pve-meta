@@ -26,6 +26,7 @@ new record; the old one stays and is marked superseded.
 | [017](017-data-is-a-native-structure.md) | `data` on a read is a native structure, in PVE's spelling | accepted |
 | [018](018-hidden-declarations.md) | A declaration can say it is not a row; `hidden` and `enforce` are inherited per schema node | accepted |
 | [019](019-backup-carries-the-document-in-the-notes.md) | A backup carries the document in the archive's copy of the guest's notes | accepted |
+| [020](020-node-level-prefixes.md) | A node's own prefix files reach the guests on that node | accepted |
 
 Related records kept in their own files: [`../WASM-CORE.md`](../WASM-CORE.md) (how the
 core reaches the browser) and [`../LIFECYCLE.md`](../LIFECYCLE.md) (the

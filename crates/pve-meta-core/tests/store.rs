@@ -3,6 +3,7 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
+use pve_meta_core::registry::{NodeName, PrefixSet, Registry};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind, RollbackOutcome, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -721,14 +722,14 @@ fn a_malformed_override_is_the_file_a_read_opens_and_the_loader_reports() {
     assert_eq!(read.path, cluster_file, "the read opens the override");
     assert_eq!(read.raw, "selector: {nonsense: true}\n");
 
-    let (loaded, failures) = store.registry().list_prefixes();
+    let (loaded, failures) = store.registry().list_prefixes(PrefixSet::Cluster);
     assert!(loaded.is_empty(), "the packaged file is shadowed, not re-activated");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].name, "traefik");
 
     // Removing the override is the repair: the packaged file is in effect again.
     assert!(store.delete(&prefix("traefik")).unwrap());
-    let (loaded, failures) = store.registry().list_prefixes();
+    let (loaded, failures) = store.registry().list_prefixes(PrefixSet::Cluster);
     assert_eq!(loaded.len(), 1);
     assert!(failures.is_empty());
 }
@@ -811,4 +812,27 @@ fn a_nested_prefix_is_a_dotted_file_name_and_still_one_document() {
         "the nested prefix is missing from {:?}",
         v.documents,
     );
+}
+
+// --- node prefix documents (DocId::NodePrefix) -------------------------------
+
+#[test]
+fn a_node_prefix_document_lives_where_the_loader_reads_or_nowhere() {
+    let (dir, store) = store();
+    // With no nodes directory configured there is nowhere the loader would read
+    // a node file from, so the store has nowhere to write one either.
+    let pve1 = NodeName::new("pve1").unwrap();
+    let good = DocId::NodePrefix { node: pve1.clone(), name: "gpu".to_string() };
+    assert!(matches!(store.put_raw(&good, "selector: {all: true}\n", None), Err(Error::Registry(_))));
+    assert!(!dir.path().join("nodes").exists(), "nothing was written inside the root");
+
+    // With one, the store writes where the loader reads.
+    let registry = Registry::new(vec![cluster_prefix_dir(dir.path())], vec![])
+        .with_nodes_dir(dir.path().join("nodes"));
+    let store = MetaStore::with_registry(dir.path(), registry);
+    let written = store.put_raw(&good, "selector: {all: true}\n", None).unwrap();
+    assert_eq!(written.document.path, dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml"));
+    assert_eq!(store.registry().load_prefixes(Some(&pve1)).len(), 1);
+    assert_eq!(store.read(&good).unwrap().raw, "selector: {all: true}\n");
+    assert!(store.delete(&good).unwrap());
 }

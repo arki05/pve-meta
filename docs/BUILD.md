@@ -72,8 +72,9 @@ make -C crates/pve-meta-perl check               # test/basic.pl over the built 
 
 The Rust suites take their paths from the environment — `PVE_META_ROOT` for the store,
 `PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` (colon-separated, lowest
-precedence first) for the two registry directories — and `test/basic.pl` sets all three
-to temp dirs, so nothing here touches `/etc/pve`.
+precedence first) for the two registry directories, `PVE_META_NODES_DIR` for the
+directory holding each node's prefix files — and `test/basic.pl` sets all four to temp
+dirs, so nothing here touches `/etc/pve`.
 
 ## Debian package
 
