@@ -6,10 +6,5 @@
         "dc"
     ],
     "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",
-    "xtype": "pveMetaDatacenterPanel",
-    "requires": {
-        "dc": [
-            "Sys.Audit"
-        ]
-    }
+    "xtype": "pveMetaDatacenterPanel"
 }

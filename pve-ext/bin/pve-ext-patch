@@ -1,83 +1,10 @@
 #!/bin/bash
 #
-# pve-ext-patch - apply/remove/verify/status for pve-ext's generic
-# managed-patch seam (see pve-ext/README.md, "Managed patches").
-#
-# A TOML-manifest-driven tool that patches an arbitrary number of files
-# across an arbitrary number of packages, described declaratively instead
-# of hardcoded per file:
-#   1. dpkg-divert each file away (suffix ".pve-ext-orig", owned by the
-#      package "pve-ext" - never by whatever package a manifest names in
-#      its `package` field, which is informational/for status output
-#      only), so the pristine file its real owning package ships (now and
-#      on future upgrades) always lands at the diverted path, and the
-#      "real" path is ours to (re)write.
-#   2. Regenerate the "real" file as: pristine original + the manifest
-#      entry's unified diff, applied with `patch -p1 --fuzz=0` into a
-#      scratch copy - never in place, and never touching the diverted
-#      pristine backup itself (only ever read). `--fuzz=0` is deliberate:
-#      GNU patch's default fuzz=2 will happily slide a hunk onto the
-#      wrong one of several near-identical anchors (several of the
-#      lifecycle-patch targets have exactly this shape) and report
-#      success - a corruption that "works" is worse than a hunk that
-#      fails loudly. No manifest may claim a path another manifest has
-#      already diverted (checked via a small per-path claim marker next
-#      to the diversion) - stacking two manifests on one file is refused
-#      with a clear error, not attempted (documented limitation, see
-#      pve-ext/README.md).
-#   3. Gate installation on the entry's `check`:
-#        - "perl":     `perl -c` reporting "syntax OK" as the LAST line
-#                       of its output (a pre-existing "Subroutine ...
-#                       redefined" warning is expected noise, never the
-#                       verdict, which perl always prints last).
-#        - "template": the entry's `marker` string (normally the exact
-#                       inserted tag) must appear in the rendered file
-#                       EXACTLY once, and `</body>` must still be present
-#                       - a "did this render into garbage" check, used for
-#                       HTML templates like index.html.tpl.
-#   4. `install -m 0644` the scratch file over the real path, only after
-#      both the dry-run and the check gate pass. Best-effort per file:
-#      one file's anchors moving must never block the others in the same
-#      (or a different) manifest.
-#
-# Manifests are TOML files, normally at /usr/share/pve-ext/patches/<name>.toml
-# (installed by whichever package owns that patch - pve-ext ships its own
-# two-file manifest, pve-meta ships its seven-file lifecycle manifest, and
-# so on for any future package that needs to patch stock PVE):
-#
-#   id = "pve-manager"                    # this manifest's stable claim identity
-#
-#   [[file]]
-#   path = "/usr/share/perl5/PVE/API2.pm"
-#   package = "pve-manager"
-#   diff = "pve-manager_API2.pm.diff"    # relative to the manifest's own directory
-#   marker = "PVE::API2::Ext->register_all();"
-#   check = "perl"                        # "perl" (default) or "template"
-#
-# The top-level `id` is what claim_file_for()'s per-path ".claimed-by"
-# marker records (see below) - a stable name for "this manifest", so that
-# invoking the SAME manifest content under two different paths/basenames
-# (e.g. a checkout's "patches/lifecycle.toml" vs. its installed name
-# "pve-meta-lifecycle.toml") claims files under the same identity instead
-# of refusing itself. A manifest with no `id` falls back to its filename
-# basename, with a warning - support for that predates this field and
-# exists only for manifests that haven't added it yet.
-#
-# Parsed by a small awk reader below - no TOML library, no Perl TOML
-# module (none ship with PVE) - just dpkg-divert, patch and perl, exactly
-# like the two tools this generalizes. It understands exactly the subset
-# of TOML these manifests use: an optional top-level `id = "value"`
-# assignment before the first table, repeated [[file]] array-of-tables
-# blocks, each holding a handful of `key = "value"` (or `key = 'value'`)
-# string assignments, blank lines, and '#' comments running to
-# end-of-line (assumed to never appear as literal text inside a
-# manifest's own string values - true for every manifest this project
-# ships).
-#
-# Intended to be installed as /usr/sbin/pve-ext-patch and invoked from
-# postinst/triggers (both pve-ext's own and every consumer package's -
-# see pve-ext/README.md), but also runs fine ad hoc from a checkout.
-#
+# pve-ext-patch - apply/remove/verify/status for pve-ext's managed-patch
+# seam: dpkg-divert a stock PVE file, rebuild it from the pristine backup
+# plus a manifest's diff, gate on a syntax/template check, then install.
+# See pve-ext/README.md ("Managed patches") for the manifest format and
+# the full picture; this header stays short per CONTRIBUTING.md.
 set -u
 
 PKG="pve-ext"
@@ -108,11 +35,8 @@ cleanup_scratch() {
 
 # --- manifest directory / resolution -----------------------------------
 
-# Where manifests (and, by convention, the diffs they reference) live:
-# prefer the canonical packaged location (under --root, if given), fall
-# back to ../patches next to this script (the checkout / ad-hoc case,
-# where this script sits at pve-ext/bin/pve-ext-patch and manifests at
-# pve-ext/patches/*.toml).
+# Canonical packaged location (under --root), else ../patches next to this
+# script (checkout / ad-hoc use).
 manifest_dir() {
     local canon="${ROOT_DIR}${CANON_MANIFEST_DIR}"
     if [ -d "$canon" ]; then
@@ -151,60 +75,8 @@ resolve_manifest() {
     esac
 }
 
-# Reads a manifest's own claim identity: a top-level `id = "..."` key,
-# declared once, before the manifest's first `[[file]]` table (never inside
-# one - a `[[file]]` entry's own fields are unrelated to this). This is what
-# claim_file_for()/apply_one()/remove_one() use as the manifest's identity,
-# so that two different names for the *same* manifest content (a checkout
-# path like "patches/lifecycle.toml" vs. its installed name
-# "pve-meta-lifecycle.toml") claim the same files instead of silently
-# refusing each other (see pve-ext/README.md, "Managed patches").
-# Echoes the id and returns 0, or returns 1 with nothing echoed when the
-# manifest has none (an older manifest predating this field) - the caller
-# falls back to the filename basename in that case, with a warning.
-manifest_id() {
-    local manifest="$1" id
-    id="$(awk '
-        function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
-        function unquote(s,    n, c) {
-            s = trim(s)
-            n = length(s)
-            if (n >= 2) {
-                c = substr(s, 1, 1)
-                if ((c == "\"" || c == "'\''") && substr(s, n, 1) == c) {
-                    s = substr(s, 2, n - 2)
-                }
-            }
-            return s
-        }
-        /^[ \t]*\[\[file\]\]/ { exit }
-        {
-            line = $0
-            sub(/#.*/, "", line)
-            t = trim(line)
-            if (match(t, /^id[ \t]*=/)) { print unquote(substr(t, RSTART + RLENGTH)); exit }
-        }
-    ' "$manifest")"
-    [ -n "$id" ] || return 1
-    echo "$id"
-}
-
-# Resolves a manifest's claim identity: its own declared `id` field, or (with
-# a warning - see manifest_id()) its filename basename as a fallback for a
-# manifest that predates the field.
-manifest_claim_name() {
-    local manifest="$1" id
-    if id="$(manifest_id "$manifest")"; then
-        echo "$id"
-        return 0
-    fi
-    warn "$manifest: no top-level 'id' field found; falling back to the filename-derived claim identity '$(basename "$manifest" .toml)' (a manifest referenced under two different paths/names then claims its files under two different identities - add an 'id' field to fix this, see pve-ext/README.md)"
-    basename "$manifest" .toml
-}
-
-# Populates the global array MANIFESTS with resolved manifest file paths:
-# either the given names/paths, or (with none given) every *.toml in the
-# manifest directory.
+# Populates the global array MANIFESTS: the given names/paths, or (with
+# none given) every *.toml in the manifest directory.
 select_manifests() {
     MANIFESTS=()
     if [ "$#" -eq 0 ]; then
@@ -224,11 +96,11 @@ select_manifests() {
 }
 
 # --- tiny TOML reader ---------------------------------------------------
-#
-# Emits one line per [[file]] table found in $1, fields separated by
-# 0x1f (ASCII unit separator, never legal in a TOML bare/basic string we
-# care about here): path\x1fpackage\x1fdiff\x1fmarker\x1fcheck
-# `check` defaults to "perl" when the table doesn't set it.
+
+# Emits one line per [[file]] table found in $1, fields separated by 0x1f:
+# path\x1fpackage\x1fdiff\x1fmarker\x1fcheck ("check" defaults to "perl").
+# Understands exactly the TOML subset these manifests use: no library,
+# just key = "value" pairs, [[file]] tables, blank lines and '#' comments.
 parse_manifest() {
     awk '
         function trim(s) {
@@ -280,105 +152,50 @@ set_dpkg_root_args() {
     fi
 }
 
-# All four of these take $1 = the manifest's own path (e.g.
-# "/usr/share/perl5/PVE/API2.pm"), NEVER a --root-prefixed one:
-# dpkg-divert's own --root already prepends ROOT_DIR to every path it
-# operates on (both for its diversions-database bookkeeping and for the
-# actual rename it performs), so passing an *already*-prefixed path here
-# too (e.g. what real_path_for()/diverted_path_for() return, meant for
-# this script's own plain `cp`/`[ -f ]`/etc., which know nothing about
-# --root) would double the prefix for the on-disk rename dpkg-divert
-# performs -- registering a diversion that "succeeds" (no error) but
-# never actually moves the real file, silently no-op'ing `apply`/`remove`
-# under --root while `status`/`verify`'s read-only lookups still appear
-# consistent (they double the same prefix on both sides).
+# $1 is always the manifest's own (unprefixed) path: dpkg-divert's --root
+# already prepends ROOT_DIR itself.
 divert_arg_diverted() { echo "$1.pve-ext-orig"; }
 
 is_diverted() {
-    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
     dpkg-divert "${DPKG_ROOT_ARGS[@]}" --truename "$1" 2>/dev/null | grep -qx "$(divert_arg_diverted "$1")"
 }
 
 diversion_owned_by_us() {
-    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
     dpkg-divert "${DPKG_ROOT_ARGS[@]}" --listpackage "$1" 2>/dev/null | grep -qx "$PKG"
 }
 
 dpkg_divert_add() {
-    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
     dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --add --rename --divert "$(divert_arg_diverted "$1")" "$1"
 }
 
 dpkg_divert_remove() {
-    # $1 = manifest path
     local -a DPKG_ROOT_ARGS=()
     set_dpkg_root_args
     dpkg-divert "${DPKG_ROOT_ARGS[@]}" --package "$PKG" --remove --rename --divert "$(divert_arg_diverted "$1")" "$1"
 }
 
-# Canonicalizes a directory to an absolute path. apply_one/verify_one/
-# status_one all `cd` into a scratch directory before reading a diff via
-# `<"$diff_path"`, so a manifest directory that was relative to the
-# caller's original cwd (possible when a manifest is named as an explicit
-# relative path/argument, rather than resolved via manifest_dir()) would
-# silently stop resolving the instant the subshell `cd`s elsewhere. Every
-# `mdir` this tool computes from a manifest path goes through this first.
+# Canonicalizes a directory before a scratch-dir `cd` changes the caller's
+# relative-path assumptions.
 abs_dir() { (cd "$1" 2>/dev/null && pwd) || echo "$1"; }
 
 real_path_for() { echo "${ROOT_DIR}$1"; }
 diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
-# The path used inside the scratch dir and inside each diff's a/ b/
-# headers: the real path with its leading '/' stripped, so `patch -p1`
-# (which strips exactly one leading path component) reconstructs it
-# regardless of where under / the file actually lives.
+# Real path minus its leading '/', matching what `patch -p1` reconstructs
+# from a diff's a/ b/ headers.
 relpath_for() { echo "${1#/}"; }
 
-# --- per-manifest claims (no stacking two manifests on one file) -------
-#
-# A diversion is owned by the "pve-ext" dpkg-divert package regardless of
-# which manifest created it (see the header comment), so dpkg-divert
-# itself cannot tell two manifests apart. This tiny marker file, living
-# next to the diversion (never touched by dpkg, so it survives package
-# upgrades untouched), records which manifest currently claims the path -
-# apply refuses to re-purpose a path for a different manifest, and remove
-# refuses to undivert a path a different manifest still claims.
-
-claim_file_for() { echo "$(diverted_path_for "$1").claimed-by"; }
-
-read_claim() {
-    # $1 = claim file
-    [ -f "$1" ] && cat "$1" 2>/dev/null
-}
-
-write_claim() {
-    # $1 = claim file, $2 = manifest name
-    printf '%s\n' "$2" >"$1" 2>/dev/null
-}
-
 # --- failure reporting ---------------------------------------------------
-#
-# apply_one's failure branches always print to stderr (visible when run
-# interactively or from a postinst that doesn't redirect it), but a
-# postinst failure is deliberately swallowed (never fails install/
-# configure - see pve-ext/README.md) so it can otherwise go completely
-# unnoticed. Leave a durable trail in two places a human or monitoring
-# actually looks: syslog, and a marker file `status`/an admin can check
-# for without having captured the original postinst output.
-#
-# A function, not a top-level assignment: --root is parsed inside main(),
-# on the very last line of the file, so a top-level `FAILURE_MARKER_DIR=
-# "${ROOT_DIR}/run/pve-ext-patch"` would evaluate during the initial pass
-# with ROOT_DIR still "" and bake the *real* /run/pve-ext-patch into every
-# later call, regardless of --root - exactly the isolation leak every
-# other root-derived path here (manifest_dir, real_path_for,
-# diverted_path_for, set_dpkg_root_args) already avoids by being a
-# function that re-reads $ROOT_DIR when called.
+
+# postinst/prerm swallow our exit code, so a failure needs a trail besides
+# stderr: syslog, and a status file an admin can check without having
+# captured the original output. A function, not a top-level assignment, so
+# it re-reads ROOT_DIR (set later, in main()) on every call.
 failure_marker_dir() { echo "${ROOT_DIR}/run/pve-ext-patch"; }
 
 record_failure() {
@@ -388,48 +205,27 @@ record_failure() {
     mkdir -p "$dir" 2>/dev/null
     printf '%s %s: %s\n' "$(date -Is 2>/dev/null || date)" "$1" "$2" \
         >>"${dir}/failed" 2>/dev/null
-    # Under --root (CI/dev verification against an extracted tree, or a
-    # scratch root for testing) the real host's syslog is not this run's
-    # concern at all - and writing to it would be exactly the kind of
-    # live-system side effect --root exists to avoid. Only reach for
-    # logger() when operating on the real system (no --root given).
+    # Never touch the real syslog under --root (a scratch/CI tree).
     if [ -z "$ROOT_DIR" ] && command -v logger >/dev/null 2>&1; then
         logger -t pve-ext-patch -p user.err -- "$1: $2" 2>/dev/null || true
     fi
 }
 
-# On any apply_one failure: if this run just created the diversion, undo
-# it (restores the file exactly as it was before this invocation - "leave
-# it untouched" for a brand-new apply). If the diversion pre-existed
-# (a re-apply after an upstream package upgrade replaced the diverted
-# pristine with a newer one), $real may still hold content patched
-# against the *old* pristine while the rest of the package was already
-# upgraded - restore the *current* pristine over it instead, so the node
-# runs a consistent, unpatched-but-current file rather than a silently
-# stale one. Best-effort: if even that copy fails, $real is left alone
-# and the failure is still recorded via record_failure by the caller.
+# On failure: undo a diversion this run just created (restores $real
+# exactly as found); otherwise restore the *current* pristine over $real,
+# so a re-apply failure after an upstream package upgrade never leaves
+# stale patched content in place.
 restore_on_failure() {
     # $1 = mpath, $2 = real, $3 = diverted, $4 = created_divert (0|1)
     local mpath="$1" real="$2" diverted="$3" created_divert="$4"
     if [ "$created_divert" -eq 1 ]; then
         log "$mpath: rolling back diversion created moments ago"
-        # dpkg-divert --remove --rename refuses to rename the diverted
-        # pristine backup back onto $real while $real already holds a
-        # regular file - and by the time any of apply_one's later failure
-        # branches reach here, $real always does (the pristine-placeholder
-        # restore a few lines below install runs unconditionally before
-        # the dry-run/patch/check gates, so a dry-run, patch or check
-        # failure leaves $real holding that placeholder copy). remove_one
-        # clears $real first for exactly this reason; do the same here -
-        # skipping it turns this "rollback" into a no-op that deletes the
-        # claim marker and logs success while the diversion stays live in
-        # dpkg's database.
+        # dpkg-divert --remove --rename refuses to rename the pristine
+        # backup back onto $real while $real still holds a regular file.
         rm -f "$real"
-        if dpkg_divert_remove "$mpath" >/dev/null 2>&1; then
-            rm -f "$(claim_file_for "$mpath")" 2>/dev/null
-        else
+        if ! dpkg_divert_remove "$mpath" >/dev/null 2>&1; then
             err "$mpath: FAILED to roll back the diversion just created - dpkg-divert --remove failed; the diversion is still in dpkg's database (owned by ${PKG}) and $real is now missing"
-            record_failure "$mpath" "failed to roll back a freshly created diversion after a later failure - diversion still registered, claim marker left in place, $real missing"
+            record_failure "$mpath" "failed to roll back a freshly created diversion after a later failure - diversion still registered, $real missing"
         fi
         return
     fi
@@ -500,16 +296,15 @@ check_verdict() {
 
 apply_one() {
     # $1 = manifest dir (diffs are relative to this), $2 = path, $3 = package,
-    # $4 = diff basename, $5 = marker, $6 = check, $7 = manifest name (claim owner)
-    local mdir="$1" mpath="$2" mpkg="$3" mdiff="$4" marker="$5" check="$6" mname="$7"
-    local real diverted diff_path work rel claim existing_claim created_divert=0
+    # $4 = diff basename, $5 = marker, $6 = check
+    local mdir="$1" mpath="$2" mpkg="$3" mdiff="$4" marker="$5" check="$6"
+    local real diverted diff_path work rel created_divert=0
 
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
     diff_path="${mdir}/${mdiff}"
     rel="$(relpath_for "$mpath")"
     work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_')"
-    claim="$(claim_file_for "$mpath")"
 
     [ -f "$diff_path" ] || {
         err "$mpath: diff not found: $diff_path"
@@ -523,14 +318,7 @@ apply_one() {
             record_failure "$mpath" "diverted by a different package - refused to touch it"
             return 1
         fi
-        existing_claim="$(read_claim "$claim")"
-        if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
-            err "$mpath: already diverted for manifest '$existing_claim' - pve-ext-patch does not support two manifests patching the same file (documented limitation, see pve-ext/README.md); refusing to touch it for manifest '$mname'"
-            record_failure "$mpath" "claim mismatch: already diverted for manifest '$existing_claim', refused for '$mname'"
-            return 1
-        fi
-        log "$mpath: diversion already in place (owned by ${PKG}, manifest ${existing_claim:-$mname}); reusing pristine copy at $diverted"
-        write_claim "$claim" "$mname"
+        log "$mpath: diversion already in place (owned by ${PKG}); reusing pristine copy at $diverted"
     else
         [ -f "$real" ] || {
             err "$mpath: expected file not found: $real (owning package: ${mpkg:-unknown})"
@@ -544,7 +332,6 @@ apply_one() {
             return 1
         fi
         created_divert=1
-        write_claim "$claim" "$mname"
     fi
 
     if [ ! -f "$diverted" ]; then
@@ -554,12 +341,10 @@ apply_one() {
         return 1
     fi
 
-    # A fresh divert physically moves $real away; some patched files are
-    # transitively `require`d by unrelated code while we're mid-way
-    # through applying a *different* file in the same run, so leaving
-    # $real briefly missing can cause spurious failures elsewhere. Restore
-    # the pristine placeholder for the duration of the check; `install`
-    # below replaces it with the real patched content once validated.
+    # Restore the pristine placeholder for the duration of the check: a
+    # fresh divert moves $real away, and other code mid-run may `require`
+    # it; `install` below replaces it with the patched content once
+    # validated.
     if [ ! -f "$real" ]; then
         if ! cp "$diverted" "$real"; then
             err "$mpath: failed to restore pristine placeholder at $real for the duration of the check"
@@ -582,6 +367,8 @@ apply_one() {
     fi
 
     local dry_out
+    # --fuzz=0: default fuzz can slide a hunk onto the wrong one of
+    # several near-identical anchors and report success.
     if ! dry_out="$(cd "$work" && patch -p1 --fuzz=0 --dry-run <"$diff_path" 2>&1)"; then
         err "$mpath: patch --dry-run failed - anchors may have moved upstream"
         printf '%s\n' "$dry_out" >&2
@@ -624,15 +411,14 @@ cmd_apply() {
     SCRATCH_ROOT="$(mktemp -d)" || die "mktemp -d failed"
     trap cleanup_scratch EXIT
 
-    local manifest mdir mname rc=0 count=0
+    local manifest mdir rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
         mdir="$(abs_dir "$(dirname "$manifest")")"
-        mname="$(manifest_claim_name "$manifest")"
-        log "manifest: $manifest (claim id: $mname)"
+        log "manifest: $manifest"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))
-            apply_one "$mdir" "$mpath" "$mpkg" "$mdiff" "$marker" "$check" "$mname" || rc=1
+            apply_one "$mdir" "$mpath" "$mpkg" "$mdiff" "$marker" "$check" || rc=1
         done < <(parse_manifest "$manifest")
     done
 
@@ -650,18 +436,12 @@ cmd_apply() {
 
 # --- remove ---------------------------------------------------------
 
-# Every failure here records a durable marker, for the same reason `apply_one`
-# does: `prerm` runs during a package removal whose exit code dpkg largely
-# swallows, so stderr is gone by the time anyone looks. A removal that half
-# happened leaves a PVE file in a state somebody has to find, and "it printed
-# something during an apt run last week" is not a way to find it.
 remove_one() {
-    # $1 = path, $2 = manifest name (claim owner)
-    local mpath="$1" mname="$2"
-    local real diverted claim existing_claim
+    # $1 = path
+    local mpath="$1"
+    local real diverted
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
-    claim="$(claim_file_for "$mpath")"
 
     if is_diverted "$mpath"; then
         if ! diversion_owned_by_us "$mpath"; then
@@ -669,16 +449,9 @@ remove_one() {
             record_failure "$mpath" "diverted by a different package - refused to remove it"
             return 1
         fi
-        existing_claim="$(read_claim "$claim")"
-        if [ -n "$existing_claim" ] && [ "$existing_claim" != "$mname" ]; then
-            err "$mpath: diverted for a different manifest ('$existing_claim') - refusing to remove (documented limitation: no stacking support, see pve-ext/README.md)"
-            record_failure "$mpath" "claim mismatch on removal: diverted for manifest '$existing_claim', asked to remove for '$mname'"
-            return 1
-        fi
         log "$mpath: restoring pristine file and removing diversion"
         # dpkg-divert --remove --rename refuses to rename the pristine
-        # backup onto the real path while the real path already holds
-        # something (our patched file always does) - clear it first.
+        # backup onto $real while $real already holds a regular file.
         rm -f "$real"
         if ! dpkg_divert_remove "$mpath"; then
             err "$mpath: dpkg-divert --remove failed"
@@ -691,7 +464,6 @@ remove_one() {
             fi
             return 1
         fi
-        rm -f "$claim"
     else
         log "$mpath: no diversion in place - nothing to restore"
     fi
@@ -702,14 +474,13 @@ cmd_remove() {
     require_cmd dpkg-divert
     [ "$(id -u)" -eq 0 ] || [ -n "$ROOT_DIR" ] || die "remove must be run as root (or with --root for a non-live tree)"
 
-    local manifest mname rc=0 count=0
+    local manifest rc=0 count=0
     for manifest in "${MANIFESTS[@]}"; do
-        mname="$(manifest_claim_name "$manifest")"
-        log "manifest: $manifest (claim id: $mname)"
+        log "manifest: $manifest"
         while IFS=$'\x1f' read -r mpath mpkg mdiff marker check; do
             [ -n "$mpath" ] || continue
             count=$((count + 1))
-            remove_one "$mpath" "$mname" || rc=1
+            remove_one "$mpath" || rc=1
         done < <(parse_manifest "$manifest")
     done
 
@@ -813,12 +584,10 @@ cmd_verify() {
 status_one() {
     # $1 = path, $2 = manifest dir, $3 = diff basename, $4 = marker, $5 = check, $6 = package
     local mpath="$1" mdir="$2" mdiff="$3" marker="$4" check="$5" mpkg="$6"
-    local real diverted diff_path claim claimed_by
+    local real diverted diff_path
     real="$(real_path_for "$mpath")"
     diverted="$(diverted_path_for "$mpath")"
     diff_path="${mdir}/${mdiff}"
-    claim="$(claim_file_for "$mpath")"
-    claimed_by="$(read_claim "$claim")"
 
     local diverted_flag=0 owned_flag=0 pristine_flag=0 patched_flag=0 insync_flag=0 insync_checked=0
 
@@ -829,19 +598,9 @@ status_one() {
     fi
     [ -f "$real" ] && grep -qF -- "$marker" "$real" && patched_flag=1
 
-    # "In sync" means: applying the diff to the *current* pristine backup
-    # reproduces $real byte-for-byte. Deliberately forward (pristine + diff
-    # -> candidate, then cmp against $real), not a reverse-apply of the
-    # diff against $real itself: a reverse dry-run only proves the diff's
-    # hunks *could* un-apply somewhere in $real - it says nothing about
-    # whether $real still matches the *current* pristine (e.g. after an
-    # unrelated package upgrade replaced the diverted pristine with a
-    # newer one while $real still holds content patched against the old
-    # one), so it can report "in sync: yes" against a file that is
-    # actually stale. A forward-rebuild-and-compare cannot make that
-    # mistake, and it also catches the marker being missing from a
-    # supposedly-applied file, since a missing/altered marker line means
-    # the candidate cannot match $real either.
+    # "In sync" rebuilds pristine+diff and compares to $real byte-for-byte
+    # (never a reverse-apply against $real, which cannot detect a pristine
+    # that moved on since $real was last patched).
     if [ "$diverted_flag" -eq 1 ] && [ "$pristine_flag" -eq 1 ] && [ -f "$real" ] \
         && [ -f "$diff_path" ] && [ -n "$SCRATCH_ROOT" ]; then
         local rel work
@@ -864,7 +623,6 @@ status_one() {
             echo "    diversion:       APPLIED (owned by a DIFFERENT package - unexpected!)"
         fi
         echo "    pristine backup: $([ "$pristine_flag" -eq 1 ] && echo "present ($diverted)" || echo "MISSING")"
-        echo "    claimed by:      ${claimed_by:-<none recorded>}"
     else
         echo "    diversion:       not applied"
     fi
@@ -904,28 +662,11 @@ cmd_status() {
     return "$rc"
 }
 
-# --- manifest-id ------------------------------------------------------
-#
-# Prints a manifest's own declared claim identity (its top-level `id`
-# field - see manifest_id()'s header comment) with NO basename fallback:
-# a caller of this subcommand wants the exact identity apply/remove will
-# claim files under, so a manifest that hasn't added `id` yet is an error
-# here rather than a silent guess. Exists so that anything needing that
-# identity outside this script - e.g. the root Makefile's `install`
-# target, which installs patches/lifecycle.toml under its declared id -
-# resolves it through this tool's own TOML reader instead of maintaining
-# a second, independently-drifting awk one-liner.
-cmd_manifest_id() {
-    [ "${#MANIFESTS[@]}" -eq 1 ] || die "manifest-id takes exactly one manifest argument"
-    manifest_id "${MANIFESTS[0]}" || die "${MANIFESTS[0]}: no top-level 'id' field found"
-}
-
 # --- usage / main -----------------------------------------------------
 
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...]
-       $(basename "$0") manifest-id <manifest-file>
 
   apply [manifest...]   Divert each entry's file (if not already), apply its
                         diff (patch -p1 --fuzz=0) into a scratch copy, gate
@@ -933,9 +674,8 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...
                         -c, or 'template': marker present exactly once +
                         </body> present), then install. Best-effort per
                         file: one file's anchors moving does not block the
-                        others. Refuses (with a clear error) to patch a
-                        file already diverted for a different manifest -
-                        two manifests can never stack on one file.
+                        others. Refuses to touch a file already diverted by
+                        a different package.
   remove [manifest...]  Restore each entry's pristine file and remove its
                         diversion.
   verify [manifest...]  'patch --dry-run' each entry's diff against its
@@ -943,13 +683,6 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...
                         the live file) and report hunks-would-apply vs.
                         hunks-failed. Makes no changes.
   status [manifest...]  Report per-file diversion/patched/in-sync state.
-  manifest-id <file>    Print the manifest's own declared claim identity
-                        (its top-level 'id' field; no basename fallback -
-                        errors if the field is absent). For build/install
-                        tooling that needs the exact identity apply/remove
-                        will claim files under, e.g. to install a manifest
-                        under its declared id without re-implementing this
-                        tool's TOML 'id' parsing.
 
   --root <dir>          Resolve every path this tool touches under <dir>
                         instead of /, and pass --root <dir> through to
@@ -1016,7 +749,6 @@ main() {
         remove) cmd_remove ;;
         verify) cmd_verify ;;
         status) cmd_status ;;
-        manifest-id) cmd_manifest_id ;;
         *)
             usage
             exit 2

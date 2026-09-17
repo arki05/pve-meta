@@ -99,22 +99,8 @@ install: js
 	else \
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
-	# pve-ext managed-patch manifest for the guest-lifecycle and backup hooks
-	# (see patches/lifecycle.toml, patches/lifecycle/, pve-ext/README.md;
-	# three patched files in three packages, see docs/LIFECYCLE.md).
-	# Installed under its own declared `id` (patches/lifecycle.toml's
-	# top-level `id = "..."` field), not its checkout filename -- so that
-	# pve-ext-patch's claim identity, read from the manifest's own content
-	# rather than whatever path/basename it was invoked with, is the same
-	# whether run against this checkout or the installed package (see
-	# pve-ext/bin/pve-ext-patch's header comment, "manifest_id"). Resolved
-	# via pve-ext-patch's own "manifest-id" subcommand rather than a second,
-	# independently-drifting awk parser of the same TOML rule (this
-	# Makefile's own copy had already drifted: it lacked the diff tool's
-	# trailing-comment strip and single-quote support when a review compared
-	# the two).
-	lifecycle_id="$$(pve-ext/bin/pve-ext-patch manifest-id patches/lifecycle.toml)" || exit 1; \
-	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/$$lifecycle_id.toml
+	# The lifecycle patch manifest, under the name the maintainer scripts apply it by.
+	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/pve-meta-lifecycle.toml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
 	# The local reader (bin/pve-meta, docs/DESIGN.md section 10). In sbin because

@@ -12,61 +12,25 @@ use PVE::Tools qw(file_get_contents);
 
 use base qw(PVE::RESTHandler);
 
-# `PVE::API2::Ext`: the generic Proxmox VE extension layer (see
-# `pve-ext/README.md`). `require`d, then explicitly driven by one
-# `PVE::API2::Ext->register_all();` call, from the very end of stock
-# `PVE/API2.pm` -- i.e. *after* every one of PVE::API2's own runtime
-# `register_method` calls have already run (see `patches/pve-manager.toml`
-# and the comment on `register_all()` below for why order matters here).
-# Two things happen, once, inside that explicit `register_all()` call:
-#
-#   1. This module registers itself into the API root at `ext`
-#      (`/api2/json/ext/...`), exposing three read-only endpoints of its
-#      own: `GET /ext` (index), `GET /ext/modules` (which extension API
-#      modules loaded, see below) and `GET /ext/pages` (the UI-tab
-#      manifests `js/pve-ext-loader.js` fetches).
-#   2. It scans `/usr/share/perl5/PVE/API2/Ext/*.pm` -- every other
-#      package's extension API module -- `require`s each one and mounts
-#      it directly into the API root at the path it declares via its own
-#      `ext_path` class method (e.g. `PVE::API2::Ext::Meta` declaring
-#      `sub ext_path { 'meta' }` ends up reachable at `/api2/json/meta`,
-#      exactly like any other native PVE::API2 subclass).
-#
-# A module that fails to `require`, that has no `ext_path`, or whose
-# `ext_path` collides with a path some other module (core or extension)
-# already holds -- including `ext` itself, always reserved for this
-# module -- is skipped with a `warn`, never a `die`: pvedaemon/pveproxy
-# load `PVE::API2` once at startup, so one broken or colliding extension
-# must never take either daemon down with it. Nothing here is refreshed
-# at runtime: the scan happens exactly once, when `register_all()` runs
-# (i.e. once per pvedaemon/pveproxy worker startup); installing a new
-# extension module (or page manifest -- see `GET /ext/pages` below, which
-# *does* re-read its directory on every request) needs a service restart
-# to be picked up, same as any other PVE::API2 module.
+# The generic Proxmox VE extension layer (see pve-ext/README.md).
+# `require`d, then explicitly driven by one `PVE::API2::Ext->register_all();`
+# call, from the very end of stock `PVE/API2.pm` (see patches/pve-manager.toml).
+# register_all() mounts this module at `ext` and scans
+# `/usr/share/perl5/PVE/API2/Ext/*.pm`, mounting each at its own `ext_path`.
 
 my $EXT_MODULE_DIR = '/usr/share/perl5/PVE/API2/Ext';
 my $EXT_PAGE_DIR = '/usr/share/pve-ext/pages';
 
-my $VALID_TARGETS = { lxc => 1, qemu => 1, node => 1, dc => 1 };
-
-# Path names no extension module may ever claim, regardless of whether
-# anything has registered them yet: `ext` is this module's own mount
-# point (registered by register_all() itself, guarded the same way as
-# any other module below), so a third-party module racing to claim it
-# first must never be allowed to win.
+# 'ext' is this module's own mount point; no other module may claim it.
 my $RESERVED_EXT_PATHS = { ext => 1 };
 
-# Set once register_all() has run, so a second call (there should never
-# be one -- see the comment there) is a no-op instead of double-scanning.
+# Set once register_all() has run, so a second call is a no-op.
 my $registered = 0;
 
-# Populated once by register_all(), below; `GET /ext/modules` reports
-# exactly this list, it never re-scans.
+# Populated once by register_all(); GET /ext/modules reports exactly this.
 my $loaded_modules = [];
 
 # /usr/share/perl5/PVE/API2/Ext/Foo/Bar.pm -> "PVE::API2::Ext::Foo::Bar".
-# Returns undef (never guesses) if $file isn't actually under the perl5
-# root this module scans, or doesn't look like a .pm file.
 sub _class_from_file {
     my ($file) = @_;
 
@@ -78,16 +42,9 @@ sub _class_from_file {
     return $rel;
 }
 
-# Registers $class (a subclass, e.g. an extension module) at $path,
-# refusing anything in $RESERVED_EXT_PATHS (the reserved list is for
-# *other* modules -- pve-ext's own self-registration goes through
-# _register_unchecked below instead, which skips this check by
-# construction) and anything already taken by anything else in the API
-# root's method table
-# (core PVE::API2 registrations, or an earlier extension module in this
-# same scan). Returns true on success; on any failure it warns (using
-# $what to describe what was being registered) and returns false -- never
-# dies, so the caller can keep going.
+# Registers $class at $path. A colliding path (core or another extension)
+# is a `warn`, never a `die` -- one broken/colliding module must never take
+# pvedaemon/pveproxy down with it.
 sub _register_guarded {
     my ($class, $path, $what) = @_;
 
@@ -99,11 +56,7 @@ sub _register_guarded {
     return _register_unchecked($class, $path, $what);
 }
 
-# The actual register_method call, with only the "already taken" guard --
-# no reserved-path check, since the one caller allowed to bypass it
-# (pve-ext registering itself at 'ext', the path the reserved list exists
-# to protect) needs exactly this. Not called directly for extension
-# modules; they always go through _register_guarded above.
+# Same as above with no reserved-path check, for pve-ext's own 'ext' mount.
 sub _register_unchecked {
     my ($class, $path, $what) = @_;
 
@@ -120,14 +73,9 @@ sub _scan_and_register {
     my @files = sort glob("$EXT_MODULE_DIR/*.pm");
 
     for my $file (@files) {
-        # pvedaemon/pveproxy run under `perl -T` (taint mode); glob()'s
-        # results are tainted, and a bare `require $file` on a tainted
-        # filename dies with "Insecure dependency in require while
-        # running with -T switch". A regex match's captured group is not
-        # tainted (standard Perl behaviour, see perlsec), so re-derive an
-        # untainted $file by matching it against exactly the shape this
-        # scan's own glob pattern can produce -- anything that doesn't
-        # match that shape is refused, never blindly untainted.
+        # pvedaemon/pveproxy run under `perl -T`; glob()'s results are
+        # tainted, so re-derive an untainted $file via a regex match
+        # against exactly this scan's own glob pattern.
         my ($untainted) = $file =~ m{^(\Q$EXT_MODULE_DIR\E/[A-Za-z0-9_]+\.pm)$};
         if (!$untainted) {
             warn "pve-ext: skipping '$file': unexpected filename shape, refusing to load it\n";
@@ -166,18 +114,9 @@ sub _scan_and_register {
     return;
 }
 
-# The single entry point stock PVE/API2.pm calls, once, from its own very
-# end -- i.e. after all of PVE::API2's own runtime `register_method` calls
-# have already populated the API root's method table (see
-# `patches/pve-manager.toml`'s pve-manager_API2.pm.diff). This is what
-# makes collisions safe in the direction that matters: an extension's
-# ext_path colliding with a *core* path always loses (core registered
-# first, so _register_guarded's eval-wrapped register_method call for the
-# extension fails and is warned-and-skipped) instead of the reverse.
-#
-# This guarded call is what makes a colliding ext_path (`ext` itself
-# included) a `warn`, never a fatal `die` that takes pvedaemon and
-# pveproxy down with it.
+# The single entry point stock PVE/API2.pm calls, once, after all of
+# PVE::API2's own core `register_method` calls -- so a core/extension
+# ext_path collision always resolves in core's favor (see patches/pve-manager.toml).
 sub register_all {
     my ($class) = @_;
 
@@ -187,12 +126,6 @@ sub register_all {
     }
     $registered = 1;
 
-    # Mount ourselves first, at the one path the reserved list exists to
-    # keep everyone else off of -- so this goes through
-    # _register_unchecked (skip the reserved-path check, which would
-    # otherwise refuse 'ext' to pve-ext itself), still guarded against an
-    # actual collision with a core path literally named 'ext' (not
-    # expected, but must never be fatal either).
     _register_unchecked(__PACKAGE__, 'ext', "pve-ext's own API ('ext')");
 
     _scan_and_register();
@@ -200,10 +133,10 @@ sub register_all {
     return;
 }
 
-# Reads and validates one page manifest (see pve-ext/README.md for the
-# shape). Returns the manifest hash on success, or undef (with a warning)
-# if the file isn't valid JSON or doesn't match the expected shape -- one
-# malformed manifest must never break the whole `GET /ext/pages` response.
+# Reads and validates one page manifest (see pve-ext/README.md). Returns
+# the manifest hash, or undef (with a warning) if it isn't valid JSON or
+# doesn't have the fields the loader needs -- one malformed manifest must
+# never break the whole GET /ext/pages response.
 sub _load_page_manifest {
     my ($file) = @_;
 
@@ -214,103 +147,40 @@ sub _load_page_manifest {
     }
 
     my $manifest = eval { decode_json($raw) };
-    if ($@) {
-        warn "pve-ext: skipping page manifest '$file': invalid JSON: $@";
+    if ($@ || ref($manifest) ne 'HASH') {
+        warn "pve-ext: skipping page manifest '$file': not a valid JSON object\n";
         return undef;
     }
 
-    if (ref($manifest) ne 'HASH') {
-        warn "pve-ext: skipping page manifest '$file': not a JSON object\n";
-        return undef;
-    }
-
-    for my $key (qw(id title targets)) {
-        if (!defined($manifest->{$key}) || (!ref($manifest->{$key}) && $manifest->{$key} eq '')) {
-            warn "pve-ext: skipping page manifest '$file': missing or empty '$key'\n";
+    for my $key (qw(id title script xtype)) {
+        if (!defined($manifest->{$key}) || $manifest->{$key} eq '') {
+            warn "pve-ext: skipping page manifest '$file': missing '$key'\n";
             return undef;
         }
     }
-
-    # A page's content is either a same-origin iframe (`url`) or a native
-    # ExtJS panel class (`script` + `xtype`, instantiated as the tab
-    # content instead of an iframe -- see js/pve-ext-loader.js). Exactly
-    # one of the two forms, never both, never neither.
-    my $has_url = defined($manifest->{url}) && $manifest->{url} ne '';
-    my $has_script = defined($manifest->{script}) && $manifest->{script} ne '';
-    my $has_xtype = defined($manifest->{xtype}) && $manifest->{xtype} ne '';
-
-    if ($has_script != $has_xtype) {
-        warn "pve-ext: skipping page manifest '$file': 'script' and 'xtype' must both be present or both absent\n";
-        return undef;
-    }
-    if ($has_url && $has_script) {
-        warn "pve-ext: skipping page manifest '$file': declares both 'url' and 'script'+'xtype' -- exactly one is allowed\n";
-        return undef;
-    }
-    if (!$has_url && !$has_script) {
-        warn "pve-ext: skipping page manifest '$file': must declare either 'url' or 'script'+'xtype'\n";
-        return undef;
-    }
-
     if (ref($manifest->{targets}) ne 'ARRAY' || !scalar(@{ $manifest->{targets} })) {
         warn "pve-ext: skipping page manifest '$file': 'targets' must be a non-empty array\n";
         return undef;
     }
-    for my $target (@{ $manifest->{targets} }) {
-        if (!$VALID_TARGETS->{$target // ''}) {
-            warn "pve-ext: skipping page manifest '$file': invalid target '"
-                . ($target // '<undef>')
-                . "' (must be one of: "
-                . join(', ', sort keys %$VALID_TARGETS)
-                . ")\n";
-            return undef;
-        }
-    }
 
-    if (defined($manifest->{requires}) && ref($manifest->{requires}) ne 'HASH') {
-        warn "pve-ext: skipping page manifest '$file': 'requires' must be an object\n";
-        return undef;
-    }
-    if (defined($manifest->{requires})) {
-        for my $cap (keys %{ $manifest->{requires} }) {
-            if (ref($manifest->{requires}->{$cap}) ne 'ARRAY') {
-                warn "pve-ext: skipping page manifest '$file': 'requires.$cap' must be an array\n";
-                return undef;
-            }
-        }
-    }
-
-    if (defined($manifest->{iconCls}) && ref($manifest->{iconCls})) {
-        warn "pve-ext: skipping page manifest '$file': 'iconCls' must be a string\n";
-        return undef;
-    }
-
-    # Cache-busting fingerprint for the file this manifest points at
-    # (`fingerprint`, appended by the loader as `?ver=`). Not cosmetic: pveproxy
-    # serves static files with `Last-Modified` and no `Cache-Control`/`ETag`, and
-    # dpkg installs them with the mtime clamped to the changelog date for
-    # reproducible builds -- so two different builds of the same package version
-    # are byte-different files with an *identical* `Last-Modified`, and a browser
-    # revalidating gets 304 and keeps the stale copy indefinitely. PVE has the
-    # same problem with its own bundle and solves it the same way
-    # (`pvemanagerlib.js?ver=...` in index.html.tpl).
-    $manifest->{fingerprint} = _asset_fingerprint($manifest->{script} // $manifest->{url});
+    # Cache-busting fingerprint of the file `script` resolves to (the
+    # loader appends it as `?ver=`) -- see _asset_fingerprint below.
+    $manifest->{fingerprint} = _asset_fingerprint($manifest->{script});
 
     return $manifest;
 }
 
-# A short content fingerprint of the static file `$url` resolves to, or undef
-# when it does not name one we can stat.
-#
-# `/pve2/js/...` is served from `/usr/share/pve-manager/js/...` (pveproxy's
-# `add_dirs()`), which is the only mapping pve-ext itself relies on; anything
-# else (an absolute URL, a path we do not know how to resolve) simply gets no
-# fingerprint rather than a wrong one.
+# A short content fingerprint of the static file `$url` resolves to, or
+# undef when it does not name one we can stat. pveproxy serves static
+# files with `Last-Modified` and no `Cache-Control`/`ETag`, and dpkg clamps
+# mtimes for reproducible builds, so two builds of the same package
+# version are byte-different files a browser cannot tell apart without
+# this. `/pve2/js/...` is served from `/usr/share/pve-manager/js/...`
+# (pveproxy's `add_dirs()`); anything else gets no fingerprint.
 sub _asset_fingerprint {
     my ($url) = @_;
 
     return undef if !defined($url) || $url eq '';
-    # Strip any query/fragment the manifest already carries.
     my ($path) = split(/[?#]/, $url, 2);
     return undef if $path !~ m|^/pve2/js/(.+)$|;
     my $file = "/usr/share/pve-manager/js/$1";
@@ -390,16 +260,12 @@ __PACKAGE__->register_method({
     method => 'GET',
     permissions => { user => 'all' },
     description => "List the UI-tab page manifests found under "
-        . "/usr/share/pve-ext/pages/*.json (see pve-ext/README.md). A "
-        . "manifest's content is either a same-origin iframe ('url') or a "
-        . "native ExtJS panel class ('script'+'xtype'); exactly one form "
-        . "is present. This endpoint only validates manifest *shape*; it "
-        . "does not enforce the 'requires' privileges itself -- "
-        . "js/pve-ext-loader.js does that client-side (so a user simply "
-        . "never sees a tab they can't use), and each page's own backend "
-        . "API enforces access server-side. Re-reads the directory on "
-        . "every call, so dropping in a new manifest takes effect "
-        . "immediately, without a service restart.",
+        . "/usr/share/pve-ext/pages/*.json (see pve-ext/README.md): a "
+        . "native ExtJS panel class ('script'+'xtype'), instantiated as "
+        . "the tab content by js/pve-ext-loader.js. Each page's own "
+        . "backend API is responsible for its own access control. "
+        . "Re-reads the directory on every call, so dropping in a new "
+        . "manifest takes effect immediately, without a service restart.",
     parameters => {
         additionalProperties => 0,
         properties => {},
@@ -413,10 +279,8 @@ __PACKAGE__->register_method({
                 title => { type => 'string' },
                 iconCls => { type => 'string', optional => 1 },
                 targets => { type => 'array', items => { type => 'string' } },
-                url => { type => 'string', optional => 1 },
-                script => { type => 'string', optional => 1 },
-                xtype => { type => 'string', optional => 1 },
-                requires => { type => 'object', optional => 1 },
+                script => { type => 'string' },
+                xtype => { type => 'string' },
             },
         },
     },
@@ -442,8 +306,6 @@ __PACKAGE__->register_method({
 });
 
 # -- mounting ourselves at 'ext' and discovering/mounting every other
-#    extension module happens in register_all(), above, called explicitly
-#    from the very end of stock PVE/API2.pm -- nothing runs as a side
-#    effect of `require`ing this file. ------------------------------------
+#    extension module happens in register_all(), above. ------------------
 
 1;

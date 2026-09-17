@@ -23,8 +23,8 @@ Description: Generic extension layer for the Proxmox VE web UI and API
     declares.
   * UI pages: pve-ext-loader.js fetches GET /api2/json/ext/pages and adds
     one tab per manifest (found under /usr/share/pve-ext/pages/*.json) to
-    the matching LXC/QEMU/node/Datacenter config panel, as a same-origin
-    iframe.
+    the matching LXC/QEMU/node/Datacenter config panel, as a native ExtJS
+    panel.
   * Managed patches: pve-ext-patch applies, verifies, removes and reports
     on a set of dpkg-diverted file patches described by TOML manifests
     under /usr/share/pve-ext/patches/*.toml.

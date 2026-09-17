@@ -1,11 +1,11 @@
 /*
  * pve-ext-loader.js
  *
- * The generic half of the pve-ext UI-page seam (see pve-ext/README.md).
  * Fetches GET /api2/json/ext/pages (served by PVE::API2::Ext from
  * /usr/share/pve-ext/pages/*.json) and, for each manifest, adds one tab -
- * a same-origin iframe, layout: 'fit' - to every matching target config
- * panel (PVE.lxc.Config / PVE.qemu.Config / PVE.node.Config / PVE.dc.Config).
+ * a native ExtJS panel built from its "script"+"xtype" - to every matching
+ * target config panel (PVE.lxc.Config / PVE.qemu.Config / PVE.node.Config /
+ * PVE.dc.Config). See pve-ext/README.md for the manifest format.
  *
  * The script tag is injected right after pvemanagerlib.js in
  * index.html.tpl. This is the part that must never be "simplified" back:
@@ -19,23 +19,6 @@
  * real browser against real pve-manager and must not be changed without
  * re-doing that verification.
  *
- * A manifest's tab content is either a same-origin iframe ("url") or a
- * native ExtJS panel class ("script" + "xtype"): the script is inserted
- * into the document as a <script> tag (once per URL, cached), and once
- * its xtype resolves to a defined class (waitForXtype() below - verified
- * against real ExtJS 7 classic that this needs the "widget." alias
- * lookup, not a bare Ext.ClassManager.isCreated(xtype)), the tab
- * instantiates "{ xtype, ...config }" in place of the iframe, with vmid/
- * type/node/dc passed as config properties (see buildInstanceConfig()).
- * PVE::API2::Ext validates that a manifest declares exactly one of the
- * two forms; this file trusts that already holds.
- *
- * Design goal: NEVER break the PVE UI. Every seam this script depends on
- * (Ext/PVE class shapes, the /ext/pages API, one page manifest's shape) is
- * individually try/catch-guarded; a failure anywhere logs to the console
- * (prefixed "[pve-ext]") and degrades to "that one thing doesn't happen",
- * never to a broken page.
- *
  * Plain ES2017, no build step, no external dependencies.
  */
 (function () {
@@ -48,14 +31,12 @@
     var LOG_PREFIX = '[pve-ext]';
     var PAGES_URL = '/api2/json/ext/pages';
 
-    // PVE.<target>.Config class name -> the loader's own target keyword,
-    // and the Ext.state.Manager.get('GuiCap') top-level key that carries
-    // the privileges relevant to that target (see checkRequires() below).
+    // PVE.<target>.Config class name -> the loader's own target keyword.
     var TARGETS = {
-        'PVE.lxc.Config': { target: 'lxc', capKey: 'vms' },
-        'PVE.qemu.Config': { target: 'qemu', capKey: 'vms' },
-        'PVE.node.Config': { target: 'node', capKey: 'nodes' },
-        'PVE.dc.Config': { target: 'dc', capKey: 'dc' },
+        'PVE.lxc.Config': 'lxc',
+        'PVE.qemu.Config': 'qemu',
+        'PVE.node.Config': 'node',
+        'PVE.dc.Config': 'dc',
     };
 
     function warn(msg, err) {
@@ -100,12 +81,8 @@
     }
 
     // --- Theme detection (same logic as pve-meta-loader.js) -------------
-    //
-    // Mirrors PVE's own color-theme picker (Proxmox.window.ThemeEditWindow
-    // in proxmoxlib.js), which stores the choice in the PVEThemeCookie
-    // cookie: 'crisp' -> light, 'proxmox-dark' -> dark, anything else
-    // (unset/'__default__'/a future theme) -> follow the OS/browser
-    // preference, same as PVE's own charts/gauges (checkThemeColors()).
+    // Mirrors PVE's PVEThemeCookie ('crisp' -> light, 'proxmox-dark' ->
+    // dark, anything else -> follow the OS/browser preference).
     function getPveTheme() {
         var cookieVal = '';
         try {
@@ -136,66 +113,15 @@
         return 'light';
     }
 
-    // --- Capability check (client-side filter only; each page's own API
-    //     is the actual server-side enforcement - see README.md) --------
-    //
-    // manifest.requires is e.g. { vms: ["VM.Audit"], dc: ["Sys.Audit"] }:
-    // per-capability-category lists of privileges, all of which must be
-    // present for the *category relevant to this target* (see TARGETS
-    // above) for the tab to be added. A category the manifest doesn't
-    // mention at all imposes no restriction for that target.
-    function hasRequiredCaps(manifest, capKey) {
-        var requires = manifest && manifest.requires;
-        if (!requires || typeof requires !== 'object') {
-            return true;
-        }
-        var need = requires[capKey];
-        if (!need) {
-            return true;
-        }
-        if (!Ext.isArray(need)) {
-            warn('page "' + manifest.id + '": requires.' + capKey + ' is not an array, ignoring it (failing open)');
-            return true;
-        }
-
-        var caps;
-        try {
-            caps = Ext.state.Manager.get('GuiCap');
-        } catch (e) {
-            warn('could not read GuiCap capabilities - skipping page "' + (manifest && manifest.id) + '"', e);
-            return false;
-        }
-        var bucket = caps && caps[capKey];
-        if (!bucket) {
-            return need.length === 0;
-        }
-        for (var i = 0; i < need.length; i++) {
-            if (!bucket[need[i]]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
     // --- GET /ext/pages, fetched once and cached ------------------------
     //
-    // Deliberately lazy (fetched on first use, not at script-load time)
-    // and deliberately synchronous: at script-load time (this file is
-    // loaded on every index.html.tpl render, including the pre-login
-    // screen) there is no authenticated session yet and the request would
-    // just 401. By the time any PVE.lxc.Config / PVE.qemu.Config /
-    // PVE.node.Config / PVE.dc.Config panel is actually *constructed*,
-    // the user must already be logged in (the resource tree these panels
-    // come from only exists post-login) - so deferring the fetch to that
-    // point means it succeeds, and doing it synchronously means the tab
-    // list is available in time for that very first panel's
-    // initComponent, with no async/race complexity. This is a same-origin
-    // call to pveproxy itself (typically sub-10ms); the one-time
-    // synchronous-XHR cost is judged worth avoiding an entire
-    // fetch-then-retroactively-patch-the-already-rendered-treelist design.
-    // Cached after the first attempt (success or failure) - never retried
-    // for the lifetime of the page, matching the "computed once" posture
-    // pve-meta-loader.js already documents for its iframe src.
+    // Deliberately lazy and synchronous: at script-load time (every
+    // index.html.tpl render, including pre-login) there is no session yet
+    // and the request would just 401; by the time a config panel is
+    // constructed the user is logged in, so a synchronous fetch here has
+    // the tab list ready for that panel's own initComponent with no
+    // async/race complexity. Same-origin call to pveproxy itself
+    // (typically sub-10ms). Cached after the first attempt, never retried.
     var pagesCache = null;
 
     function fetchPagesOnce() {
@@ -226,9 +152,8 @@
 
     // --- Placeholder substitution ----------------------------------------
 
-    // {query} is deliberately NOT handled here (see expandQueryPlaceholder,
-    // below): it substitutes to an already-encoded query string, not a
-    // single value, and must never be run through encodeURIComponent().
+    // {query} is handled separately (expandQueryPlaceholder, below): it
+    // substitutes an already-encoded query string, never re-encoded.
     function expandUrl(template, vars) {
         return String(template).replace(/\{(vmid|node|type|theme)\}/g, function (whole, name) {
             var v = vars[name];
@@ -236,9 +161,6 @@
         });
     }
 
-    // {query} is itself an already-encoded query string, not a single
-    // value - substitute it separately (raw, not re-encoded) after the
-    // single-value placeholders are done.
     function expandQueryPlaceholder(template, query) {
         return String(template).replace(/\{query\}/g, query);
     }
@@ -264,12 +186,10 @@
         );
     }
 
-    // ExtJS renders a panel's `title` as markup (Ext.panel.Title does not
-    // HTML-encode it), so a manifest's title must be escaped before it
-    // reaches buildTabItem below - manifests are root-owned today (see
-    // pve-ext/README.md), but a page manifest is still attacker-adjacent
-    // enough (any package that depends on pve-ext can drop one) to be
-    // worth not trusting blindly.
+    // ExtJS renders a panel's `title` as markup, so it must be escaped
+    // before use - manifests are root-owned, but a page manifest is still
+    // attacker-adjacent enough (any package depending on pve-ext can drop
+    // one) to be worth not trusting blindly.
     function escapeHtml(s) {
         return String(s).replace(/[&<>"']/g, function (c) {
             return (
@@ -278,53 +198,24 @@
         });
     }
 
-    // iconCls ends up as a CSS class list, not text content, so HTML
-    // escaping isn't the relevant defense - restrict it to characters
-    // that are actually legal in a class-list attribute value instead,
-    // falling back to the default icon for anything else.
+    // iconCls ends up as a CSS class list, not text content - restrict it
+    // to characters legal in a class-list attribute value instead.
     function sanitizeIconCls(cls) {
         var s = String(cls || '');
         return /^[A-Za-z0-9 _-]+$/.test(s) ? s : '';
     }
 
-    function buildTabItem(manifest, src) {
-        return {
-            xtype: 'panel',
-            itemId: 'pve-ext-' + manifest.id,
-            title: escapeHtml(manifest.title),
-            iconCls: sanitizeIconCls(manifest.iconCls) || 'fa fa-puzzle-piece',
-            layout: 'fit',
-            border: 0,
-            items: [
-                {
-                    xtype: 'component',
-                    autoEl: {
-                        tag: 'iframe',
-                        src: src,
-                        style: 'border:0;width:100%;height:100%',
-                    },
-                },
-            ],
-        };
-    }
-
-    // --- "script" + "xtype" pages: a native ExtJS panel instead of an
-    //     iframe -----------------------------------------------------
-    //
-    // Loads a page's script exactly once (per URL), regardless of how
-    // many tabs/targets reference it, and caches success/failure so a
-    // second reference never re-fetches or re-`<script>`-injects it.
-    // Queues every caller's callback while a load is in flight.
+    // Loads a page's script exactly once (per URL), regardless of how many
+    // tabs/targets reference it, and caches success/failure so a second
+    // reference never re-fetches or re-<script>-injects it. Queues every
+    // caller's callback while a load is in flight.
     var scriptLoadState = {}; // src -> 'loaded' | 'error' | [pending callbacks]
 
-    // Appends the manifest's `fingerprint` as `?ver=`, the way PVE versions its own
-    // bundle in index.html.tpl. Without it a UI upgrade is invisible to a browser that
-    // already has the old file: pveproxy sends `Last-Modified` with no `Cache-Control`
-    // or `ETag`, and dpkg installs with the mtime clamped to the changelog date for
-    // reproducible builds -- so a rebuilt file of the *same* package version has an
-    // identical `Last-Modified`, revalidates to 304, and the stale copy is kept
-    // indefinitely. No fingerprint (a URL the server could not resolve to a file)
-    // means no parameter, i.e. the previous behaviour.
+    // Appends the manifest's `fingerprint` as `?ver=`, the way PVE versions
+    // its own bundle - without it, a rebuilt file of the same package
+    // version revalidates to the browser's stale cached copy indefinitely
+    // (pveproxy sends Last-Modified with no Cache-Control/ETag, and dpkg
+    // clamps mtimes for reproducible builds).
     function withVersion(url, fingerprint) {
         if (!url || !fingerprint) {
             return url;
@@ -375,22 +266,16 @@
         }
     }
 
-    // Polls (simple setTimeout loop - no Ext.util.TaskManager dependency
-    // needed for this) until the manifest's xtype resolves to a defined
-    // class, or timeoutMs elapses.
+    // Polls until the manifest's xtype resolves to a defined class, or
+    // timeoutMs elapses. Ext.ClassManager.isCreated() takes a class name,
+    // not an xtype/alias - it only resolves through the "widget." alias
+    // namespace (getNameByAlias()); verified against real ExtJS 7 classic
+    // that isCreated(xtype) alone never works.
     function waitForXtype(xtype, timeoutMs, cb) {
         var deadline = Date.now() + timeoutMs;
         function poll() {
             var created = false;
             try {
-                // Ext.ClassManager.isCreated() takes a class *name*
-                // ("Foo.bar.Panel"), not an xtype/alias - an xtype only
-                // resolves to a name through the "widget." alias
-                // namespace ExtJS registers as part of Ext.define(), via
-                // getNameByAlias(). Verified against real ExtJS 7 classic:
-                // isCreated(xtype) and isCreated('widget.' + xtype) both
-                // always report false, even once the class is fully
-                // defined and instantiable.
                 var name = Ext.ClassManager && Ext.ClassManager.getNameByAlias('widget.' + xtype);
                 created = !!(name && Ext.ClassManager.isCreated(name));
             } catch (e) {
@@ -410,8 +295,7 @@
     }
 
     // vmid/type/node/dc as config properties on the instantiated xtype,
-    // matching whichever of them apply to this target - the same shape
-    // buildQuery() above encodes into a query string for the iframe form.
+    // matching whichever of them apply to this target.
     function buildInstanceConfig(target, vars) {
         var cfg = { type: vars.type };
         if (target === 'lxc' || target === 'qemu') {
@@ -491,11 +375,10 @@
             return [];
         }
 
-        var targetInfo = TARGETS[className];
-        if (!targetInfo) {
+        var target = TARGETS[className];
+        if (!target) {
             return []; // not a panel we care about (pool/storage/sdn/... config)
         }
-        var target = targetInfo.target;
 
         var vars = { theme: getPveTheme() };
         if (target === 'lxc' || target === 'qemu') {
@@ -526,33 +409,18 @@
         for (var i = 0; i < pages.length; i++) {
             var manifest = pages[i];
             try {
-                if (!manifest || !manifest.id || !manifest.title || !Ext.isArray(manifest.targets)) {
-                    warn('ignoring malformed page manifest (missing id/title/targets): ' + JSON.stringify(manifest));
-                    continue;
-                }
-                var isScriptForm = !!(manifest.script && manifest.xtype);
-                if (!manifest.url && !isScriptForm) {
-                    warn('ignoring page manifest "' + manifest.id + '": neither "url" nor "script"+"xtype" present');
+                if (!manifest || !manifest.id || !manifest.title || !manifest.script || !manifest.xtype || !Ext.isArray(manifest.targets)) {
+                    warn('ignoring malformed page manifest (missing id/title/script/xtype/targets): ' + JSON.stringify(manifest));
                     continue;
                 }
                 if (manifest.targets.indexOf(target) === -1) {
                     continue;
                 }
-                if (!hasRequiredCaps(manifest, targetInfo.capKey)) {
-                    continue; // user lacks a listed privilege - never add the tab
-                }
-                if (isScriptForm) {
-                    var scriptSrc = expandUrl(manifest.script, vars);
-                    scriptSrc = expandQueryPlaceholder(scriptSrc, query);
-                    scriptSrc = withVersion(scriptSrc, manifest.fingerprint);
-                    var instanceConfig = buildInstanceConfig(target, vars);
-                    items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
-                } else {
-                    var src = expandUrl(manifest.url, vars);
-                    src = expandQueryPlaceholder(src, query);
-                    src = withVersion(src, manifest.fingerprint);
-                    items.push(buildTabItem(manifest, src));
-                }
+                var scriptSrc = expandUrl(manifest.script, vars);
+                scriptSrc = expandQueryPlaceholder(scriptSrc, query);
+                scriptSrc = withVersion(scriptSrc, manifest.fingerprint);
+                var instanceConfig = buildInstanceConfig(target, vars);
+                items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
             } catch (e) {
                 warn('failed to build tab for page manifest "' + (manifest && manifest.id) + '", skipping it', e);
             }
@@ -561,12 +429,6 @@
     }
 
     // --- The actual patch -------------------------------------------------
-    //
-    // See the file header comment: patch PVE.panel.Config.prototype.
-    // initComponent directly (capture the original, invoke it via a plain
-    // .apply(), no Ext.override()/callParent() involved) - this is the one
-    // part of pve-meta-loader.js this file must keep byte-for-byte
-    // equivalent in spirit, proven against real ExtJS 7 classic.
     try {
         var configProto = PVE.panel.Config.prototype;
         var origInitComponent = configProto && configProto.initComponent;

@@ -1,14 +1,6 @@
-# pve-ext's own managed-patch manifest: the two generic seams into stock
-# pve-manager (see pve-ext/README.md, "Managed patches").
-#
-# Installed to /usr/share/pve-ext/patches/pve-manager.toml; the diffs it
-# references live alongside it in the same directory.
-#
-# `id` is this manifest's stable claim identity (see
-# pve-ext/bin/pve-ext-patch's header comment) - here it happens to equal
-# the installed filename already, but is declared explicitly so every
-# manifest this project ships follows the same convention.
-id = "pve-manager"
+# pve-ext's own managed-patch manifest: the two hooks into stock
+# pve-manager (see pve-ext/README.md, "Managed patches"). Installed as
+# /usr/share/pve-ext/patches/pve-manager.toml; diffs live alongside it.
 
 [[file]]
 path = "/usr/share/pve-manager/index.html.tpl"

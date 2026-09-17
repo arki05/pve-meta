@@ -7,10 +7,5 @@
         "qemu"
     ],
     "script": "/pve2/js/pve-meta-extjs/pve-meta-tree.js",
-    "xtype": "pveMetaTreePanel",
-    "requires": {
-        "vms": [
-            "VM.Audit"
-        ]
-    }
+    "xtype": "pveMetaTreePanel"
 }

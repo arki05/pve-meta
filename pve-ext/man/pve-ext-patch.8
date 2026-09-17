@@ -1,9 +1,9 @@
 .\" Copyright (C) 2026 Julius Arkenberg <julius@rkenberg.de>
 .\" SPDX-License-Identifier: AGPL-3.0-or-later
 .\"
-.\" Hand-written (no pandoc/pod2man step); keep this file and
-.\" `pve-ext-patch --help`'s usage() in sync when either changes.
-.TH PVE\-EXT\-PATCH 8 "2026-09-08" "pve-ext" "Proxmox VE"
+.\" Hand-written; keep this file and `pve-ext-patch --help`'s usage() in
+.\" sync when either changes.
+.TH PVE\-EXT\-PATCH 8 "2026-09-17" "pve-ext" "Proxmox VE"
 .SH NAME
 pve\-ext\-patch \- apply, verify, remove and report pve\-ext managed patches
 .SH SYNOPSIS
@@ -14,65 +14,28 @@ pve\-ext\-patch \- apply, verify, remove and report pve\-ext managed patches
 .RI [ manifest ...]
 .br
 .B pve\-ext\-patch
-.B manifest\-id
-.I manifest\-file
-.br
-.B pve\-ext\-patch
 .RB { \-h | \-\-help }
 .SH DESCRIPTION
 .B pve\-ext\-patch
-is
-.BR pve\-ext 's
-generic, TOML\-manifest\-driven managed\-patch tool (pve\-ext is Proxmox
-VE's generic extension layer for adding API modules, UI pages and file
-patches without a one\-off dpkg\-divert/\fBperl\ \-c\fR setup per project):
-it dpkg\-diverts a stock
-Proxmox VE file away, regenerates the "real" path as pristine original plus
-a unified diff in a scratch copy, gates installation on a syntax/template
-check, and only then installs the result over the real path. It replaces
-writing bespoke dpkg\-divert / \fBpatch\fR(1) / \fBperl\ \-c\fR machinery once
-per project with one declarative TOML manifest per set of patched files.
-.PP
-Manifests are TOML files, normally installed under
-.IR /usr/share/pve\-ext/patches/ *.toml
-by whichever package owns them (pve\-ext ships its own two\-file manifest;
-other packages, e.g.\& pve\-meta, ship their own). Each manifest may declare
-a top\-level
-.B id
-field (its stable claim identity, see "CLAIM IDENTITY" below) and any
-number of
-.B [[file]]
-tables, each with a
-.BR path ,
-optional
-.BR package " (informational only),"
-.BR diff " (a unified diff, relative to the manifest's own directory),"
-.BR marker " (a literal string used by status/verify and, for a template"
-check, as the exact tag expected exactly once in the output), and an
-optional
-.B check
-.RI ( perl ,
-the default, or
-.IR template ).
+dpkg\-diverts a stock Proxmox VE file away, regenerates the real path as
+pristine original plus a manifest's unified diff in a scratch copy, gates
+installation on a syntax/template check, and only then installs the
+result. Manifests are TOML files under
+.IR /usr/share/pve\-ext/patches/ *.toml .
 See
 .I pve\-ext/README.md
-in the pve\-meta source tree for the full manifest format and worked
-examples.
+in the pve\-meta source tree for the manifest format and worked examples.
 .SH COMMANDS
 .TP
 .BI apply\ [manifest...]
-Diverts each entry's file (if not already diverted), applies its diff with
-.B "patch \-p1 \-\-fuzz=0"
-into a scratch copy, gates on a clean \fB\-\-dry\-run\fR and then the
-entry's
+Diverts each entry's file (if not already), applies its diff with
+.B "patch \-p1 \-\-fuzz=0" ,
+gates on a clean \fB\-\-dry\-run\fR then the entry's
 .B check
-(perl\ \-c, or a template marker/\fB</body>\fR check), and only then
+(perl\ \-c, or a template marker/\fB</body>\fR check), then
 .BR install (1)s
-the result over the real path. Best\-effort per file: one file's anchors
-moving upstream never blocks the others in the same or a different
-manifest. Refuses \(em with a clear error, never a silent merge \(em to
-patch a file a \fIdifferent\fR manifest has already diverted (see
-"LIMITATIONS" below). Must run as root, unless
+the result. Best\-effort per file. Refuses to touch a file diverted by a
+different package. Must run as root, unless
 .B \-\-root
 is given.
 .TP
@@ -85,41 +48,21 @@ is given.
 .BI verify\ [manifest...]
 Dry\-runs
 .RI ( "patch \-\-dry\-run" )
-each entry's diff against its pristine copy (the diverted backup if
-applied, otherwise the live file, assumed pristine) and reports
-hunks\-would\-apply versus hunks\-failed. Makes no changes to the target
-tree; safe to run unprivileged and against
+each entry's diff against its pristine copy and reports hunks\-would\-apply
+versus hunks\-failed. Makes no changes; safe to run unprivileged and
+against
 .BR \-\-root .
 .TP
 .BI status\ [manifest...]
-Reports, per file: whether it is diverted and by whom, whether the
-pristine backup is present, which manifest currently claims it, whether
-the marker is present in the live file, and whether the live file is
-byte\-for\-byte in sync with pristine\ +\ diff.
-.TP
-.BI manifest\-id\ manifest\-file
-Prints the manifest's own declared claim identity (its top\-level
-.B id
-field, see "CLAIM IDENTITY" below) and exits non\-zero with an error if
-the field is absent \(em unlike
-.BR apply / remove ,
-this command never falls back to the filename basename, since a caller
-asking for the identity explicitly wants the real one, not a guess. For
-build/install tooling (e.g.\& the pve\-meta package's own top\-level
-.I Makefile )
-that needs to install a manifest under its declared id without
-reimplementing this tool's TOML
-.B id
-parsing a second time.
+Reports, per file: diversion state and owner, pristine backup presence,
+whether the marker is present, and whether the live file is byte\-for\-byte
+in sync with pristine\ +\ diff.
 .PP
 With no
 .I manifest
-arguments, every command other than
-.B manifest\-id
-acts on every
+arguments, every command acts on every
 .I *.toml
-file found under the manifest directory (see "FILES" below).
-A
+file under the manifest directory. A
 .I manifest
 argument is either a bare name (resolved to
 .IR name .toml
@@ -127,56 +70,17 @@ under that directory) or a path to a manifest file directly.
 .SH OPTIONS
 .TP
 .BI \-\-root\ dir
-Resolve every path this tool touches \(em including the files it patches,
-its dpkg\-divert diversions, its per\-path claim markers, its scratch
-backups on failure, and its failure log \(em under
+Resolve every path this tool touches \(em including dpkg\-divert
+diversions, scratch backups and the failure log \(em under
 .I dir
 instead of
 .IR / ,
-and pass
-.B "\-\-root dir"
-through to
+and pass it through to
 .BR dpkg\-divert (1).
-Intended for running
-.B verify
-(and
-.BR status )
-against an extracted package tree in CI without touching the live system;
-.B apply
-and
-.B remove
-also honor it for the same reason, and are safe to exercise this way
-against a scratch tree. Nothing this tool does under
-.B \-\-root
-writes to the real filesystem, the real dpkg diversion database, or the
-real syslog.
+Intended for CI/dev use against an extracted package tree.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
-.SH CLAIM IDENTITY
-A dpkg diversion is owned by the
-.B pve\-ext
-package name regardless of which manifest created it, so
-.BR dpkg\-divert (1)
-alone cannot tell two manifests apart. A small marker file next to each
-diversion
-.RI ( path .pve\-ext\-orig.claimed\-by ,
-never touched by dpkg) records which manifest currently claims that path.
-A manifest's claim identity is its own top\-level
-.B id
-field, not the filename or path it was invoked with \(em so the same
-manifest content reached under two different names (a checkout path
-versus its installed name) claims the same files instead of refusing
-itself. A manifest with no
-.B id
-field falls back to its filename basename, with a warning on every
-invocation.
-.SH LIMITATIONS
-No two manifests may patch the same file: this is a known, intentional
-limitation, not a bug. Composing two independent diffs on one file safely
-is real work this tool does not attempt; if two packages need to change
-the same file, fold the change into the manifest that already owns it, or
-patch a different file.
 .SH EXIT STATUS
 .B 0
 on success. Non\-zero if any selected file failed to apply/remove/verify,
@@ -186,9 +90,7 @@ entries were found, or for a usage error.
 .SH FILES
 .TP
 .I /usr/share/pve\-ext/patches/*.toml
-Installed manifests (searched first when
-.B \-\-root
-resolves it); in a checkout, falls back to
+Installed manifests; in a checkout, falls back to
 .I ../patches
 next to this script.
 .TP
@@ -196,23 +98,13 @@ next to this script.
 The pristine backup dpkg\-divert creates for a diverted
 .IR path .
 .TP
-.I <path>.pve\-ext\-orig.claimed\-by
-The claim marker recording which manifest currently owns
-.IR path .
-.TP
 .I <root>/run/pve\-ext\-patch/failed
 Append\-only failure log (never only stderr, which a postinst commonly
-swallows); \fB<root>\fR is
-.I /
-unless
-.B \-\-root
-was given.
+swallows).
 .SH SEE ALSO
 .BR dpkg\-divert (1),
 .BR patch (1);
 .I pve\-ext/README.md
-and
-.I docs/DESIGN.md
 in the pve\-meta source tree.
 .SH AUTHOR
 Julius Arkenberg <julius@rkenberg.de>
