@@ -26,6 +26,17 @@
 //! walks ([`MetaStore::version`], [`MetaStore::stored_vmids`],
 //! [`MetaStore::list_snapshots`]) skip an entry that vanished under them.
 //! There is deliberately no `exists()`-then-act pair left in this file.
+//!
+//! ## A store that is not there is an error, never an empty one
+//!
+//! Only *not found* is an outcome. Without pmxcfs mounted, `/etc/pve` is an
+//! ordinary empty directory on the root filesystem, and every walk of it would
+//! answer "no documents" -- the answer an operator deletes things on. So a store
+//! over the cluster filesystem checks that it is mounted before every operation
+//! ([`MetaStore::check_available`], [`Error::Unavailable`]), and any other I/O
+//! error reading a document or a directory is an error, not an absence. Neither
+//! is about a document's content, which a read still never fails on
+//! (`docs/decisions/005-reads-never-fail-on-content.md`).
 
 use std::fmt;
 use std::collections::BTreeMap;
@@ -224,13 +235,14 @@ pub fn is_valid_snapshot_name(name: &str) -> bool {
     snapshot_name_regex().is_match(name) && Format::from_ext(name).is_none()
 }
 
-/// `Ok(None)` for an `io::ErrorKind::NotFound`, `Ok(Some(v))` otherwise.
+/// `Ok(None)` for an `io::ErrorKind::NotFound`, `Ok(Some(v))` otherwise, and
+/// every other I/O error an error.
 ///
 /// The one idiom for "the file was not there (any more)": every caller in
-/// this module treats that as an outcome rather than an error, because a
-/// concurrent `DELETE` or `pve-meta rm` can remove a file between any two syscalls
-/// (see the module docs).
-fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
+/// this module and in [`crate::registry`]'s directory walks treats that as an
+/// outcome rather than an error, because a concurrent `DELETE` or `pve-meta rm`
+/// can remove a file between any two syscalls (see the module docs).
+pub(crate) fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -304,7 +316,20 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct MetaStore {
     root: PathBuf,
     registry: Registry,
+    marker: Option<PathBuf>,
 }
+
+/// The cluster filesystem's mount point: a store rooted below it is a store over
+/// pmxcfs.
+pub const CLUSTER_ROOT: &str = "/etc/pve";
+/// What says pmxcfs is mounted on [`CLUSTER_ROOT`]: the `local` symlink to this
+/// node's directory, which pmxcfs itself provides and which is not there
+/// otherwise. `PVE::Cluster::check_cfs_is_mounted` asks the same question.
+pub const CLUSTER_MARKER: &str = "/etc/pve/local";
+/// Environment variable naming the marker [`MetaStore::new`] checks instead of
+/// [`CLUSTER_MARKER`], for any root; set to nothing, no marker is checked. A test
+/// knob, so the check can be exercised under a temporary root.
+pub const CLUSTER_MARKER_ENV: &str = "PVE_META_CLUSTER_MARKER";
 
 impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
@@ -318,8 +343,12 @@ impl MetaStore {
     /// would get a store whose reads and writes disagree about where a file
     /// lives. Tests that want their own directories pass them explicitly with
     /// [`MetaStore::with_registry_dirs`].
+    ///
+    /// The cluster marker ([`MetaStore::check_available`]) is decided once too, by
+    /// every constructor alike: `$PVE_META_CLUSTER_MARKER` when it is set, otherwise
+    /// [`CLUSTER_MARKER`] for a root under [`CLUSTER_ROOT`] and none for any other.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        MetaStore { root: root.into(), registry: Registry::from_env() }
+        MetaStore::with_registry(root, Registry::from_env())
     }
 
     /// [`MetaStore::new`] with the registry directories given explicitly,
@@ -338,16 +367,61 @@ impl MetaStore {
     /// it apart into two `Vec<PathBuf>` just to satisfy
     /// [`MetaStore::with_registry_dirs`], which is defined in terms of this
     /// rather than the other way around.
+    ///
+    /// The cluster marker is decided from `root` as [`MetaStore::new`] decides it,
+    /// so no way of opening a store over `/etc/pve` skips the check.
     pub fn with_registry(root: impl Into<PathBuf>, registry: Registry) -> Self {
-        MetaStore { root: root.into(), registry }
+        let root = root.into();
+        let marker = match std::env::var_os(CLUSTER_MARKER_ENV) {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(PathBuf::from(v)),
+            None => root.starts_with(CLUSTER_ROOT).then(|| PathBuf::from(CLUSTER_MARKER)),
+        };
+        MetaStore { root, registry, marker }
+    }
+
+    /// This store, checking `marker` before every operation
+    /// ([`MetaStore::check_available`]).
+    pub fn with_cluster_marker(mut self, marker: impl Into<PathBuf>) -> Self {
+        self.marker = Some(marker.into());
+        self
+    }
+
+    /// `Ok` when the store's filesystem is there to answer: always, without a
+    /// cluster marker; with one, when the marker is a symlink. Every public
+    /// operation of the store calls this first, so no caller -- the API, the CLI,
+    /// the lifecycle hooks, an operator linking the core -- can read an unmounted
+    /// `/etc/pve` as an empty store.
+    ///
+    /// # Errors
+    /// [`Error::Unavailable`] when the marker is not a symlink, is not there, or
+    /// cannot be looked at: a pmxcfs that went away answers the `lstat` with
+    /// `ENOTCONN`, not with *not found*.
+    pub fn check_available(&self) -> Result<()> {
+        let Some(marker) = &self.marker else {
+            return Ok(());
+        };
+        match fs::symlink_metadata(marker) {
+            Ok(meta) if meta.file_type().is_symlink() => Ok(()),
+            Ok(_) => Err(Error::Unavailable(format!("{} is not a symlink; is pmxcfs mounted?", marker.display()))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(Error::Unavailable(format!("{} is not there; is pmxcfs mounted?", marker.display())))
+            }
+            Err(e) => Err(Error::Unavailable(format!("{}: {e}", marker.display()))),
+        }
     }
 
     /// The [`Registry`] this store reads and writes registry documents
     /// through, for a caller that needs the same directory lists (loading the
     /// prefixes or permissions themselves, say) rather than a second,
-    /// independently-read copy.
-    pub fn registry(&self) -> &Registry {
-        &self.registry
+    /// independently-read copy. Behind [`MetaStore::check_available`], like every
+    /// other way into the store's files.
+    ///
+    /// # Errors
+    /// [`Error::Unavailable`].
+    pub fn registry(&self) -> Result<&Registry> {
+        self.check_available()?;
+        Ok(&self.registry)
     }
 
     /// The one directory of `kind` a write may land in: the highest-precedence
@@ -550,6 +624,7 @@ impl MetaStore {
     /// [`Error::NotFound`] if it does not exist (or ceases to, mid-read);
     /// [`Error::TooLarge`] if the file is bigger than [`MAX_READ_BYTES`].
     pub fn read(&self, id: &DocId) -> Result<Document> {
+        self.check_available()?;
         // Deliberately no `locate` first: an `is_file()` followed by a read
         // is a check-then-act pair, and the racing loser of that pair would
         // otherwise surface as an `Error::Io` (HTTP 500) instead of a 404.
@@ -566,6 +641,7 @@ impl MetaStore {
     /// compute. Above the read cap it is a surrogate over `(len, mtime)`, so
     /// this never reads a file the store refuses to read.
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
+        self.check_available()?;
         identify(&self.read_path_for(id)?)
     }
 
@@ -627,6 +703,7 @@ impl MetaStore {
         // For a registry document shadowing a packaged one they are not: the
         // precondition is checked against the content the caller actually saw
         // (the packaged file), and the write creates the cluster override.
+        self.check_available()?;
         let path = self.path_for(id)?;
         let read_path = self.read_path_for(id)?;
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
@@ -697,6 +774,7 @@ impl MetaStore {
     /// `api::delete_document` says so rather than reporting a deletion that
     /// did not happen.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
+        self.check_available()?;
         Ok(gone_is_none(fs::remove_file(self.path_for(id)?))?.is_some())
     }
 
@@ -706,12 +784,13 @@ impl MetaStore {
     ///
     /// What `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §9).
     pub fn stored_vmids(&self) -> Result<Vec<u32>> {
+        self.check_available()?;
         let mut out = std::collections::BTreeSet::new();
-        if !self.root.is_dir() {
+        let Some(entries) = gone_is_none(fs::read_dir(&self.root))? else {
             return Ok(Vec::new());
-        }
+        };
         let suffix = format!(".{}", DISK_FORMAT.ext());
-        for entry in fs::read_dir(&self.root)? {
+        for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             // An entry that vanished between the `readdir` and the `stat` is
@@ -743,12 +822,13 @@ impl MetaStore {
 
     /// Lists a guest's snapshot names, sorted.
     pub fn list_snapshots(&self, vmid: u32) -> Result<Vec<String>> {
+        self.check_available()?;
         let mut out = Vec::new();
-        if !self.root.is_dir() {
+        let Some(entries) = gone_is_none(fs::read_dir(&self.root))? else {
             return Ok(out);
-        }
+        };
         let prefix = format!("{vmid}.");
-        for entry in fs::read_dir(&self.root)? {
+        for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') || !name.starts_with(&prefix) {
@@ -773,6 +853,7 @@ impl MetaStore {
     /// # Errors
     /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
     pub fn snapshot(&self, vmid: u32, name: &str) -> Result<bool> {
+        self.check_available()?;
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
@@ -789,6 +870,7 @@ impl MetaStore {
     /// # Errors
     /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
     pub fn rollback(&self, vmid: u32, name: &str) -> Result<RollbackOutcome> {
+        self.check_available()?;
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
@@ -810,6 +892,7 @@ impl MetaStore {
     /// # Errors
     /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
     pub fn delete_snapshot(&self, vmid: u32, name: &str) -> Result<bool> {
+        self.check_available()?;
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
@@ -895,6 +978,7 @@ impl MetaStore {
     /// covers the cluster-wide directories and its own node's; `node` is
     /// ignored there and for every other id.
     pub fn version_of(&self, only: Option<&DocId>, node: Option<&NodeName>) -> Result<StoreVersion> {
+        self.check_available()?;
         let mut entries: Vec<(String, String)> = Vec::new();
         // A map, not a list: a prefix present in both the packaged and the
         // cluster directory is *one* document, and the effective one is the
@@ -941,7 +1025,7 @@ impl MetaStore {
                     &mut latest,
                     &document_id,
                 )?;
-                node_dirs = self.registry.nodes();
+                node_dirs = self.registry.nodes()?;
             }
         }
         for kind in [RegistryKind::PrefixDef, RegistryKind::Permission] {
@@ -996,7 +1080,8 @@ impl MetaStore {
     /// An entry that disappears mid-walk is skipped rather than failing the
     /// poll, and a directory that does not exist contributes nothing -- the
     /// packaged prefix directory is absent on a node with no operator
-    /// package installed, which is not a condition to report.
+    /// package installed, which is not a condition to report. A directory that
+    /// cannot be read is an error.
     fn scan_for_version(
         &self,
         dir: &std::path::Path,
@@ -1006,10 +1091,10 @@ impl MetaStore {
         latest: &mut Option<SystemTime>,
         id_of: &dyn Fn(&str) -> Option<DocId>,
     ) -> Result<()> {
-        if !dir.is_dir() {
+        let Some(listing) = gone_is_none(fs::read_dir(dir))? else {
             return Ok(());
-        }
-        for entry in fs::read_dir(dir)? {
+        };
+        for entry in listing {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') {

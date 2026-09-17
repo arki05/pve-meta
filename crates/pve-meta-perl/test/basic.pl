@@ -1121,4 +1121,38 @@ is(PVE::RS::Meta::api_delete('nodes/pve1/prefixes/gpu', undef, undef, $ADMIN)->{
     'api_delete removes a node prefix file');
 ok(!-e "$pve1dir/gpu.yaml", '... and the file is gone');
 
+# =========================================================================
+# A store that is not there (docs/DESIGN.md §7): every export refuses, with
+# a 503 where the API has a status, instead of answering "no documents".
+# =========================================================================
+
+write_file('9700.yaml', "a: 1\n");
+{
+    local $ENV{PVE_META_CLUSTER_MARKER} = "$root/local";
+    for my $case (
+        ['api_get', sub { PVE::RS::Meta::api_get('9700', undef, 'json', $FULL) }],
+        ['api_put', sub { PVE::RS::Meta::api_put('9700', 'b', 'json', '1', 'replace', undef, 0, $FULL) }],
+        ['api_delete', sub { PVE::RS::Meta::api_delete('9700', undef, undef, $FULL) }],
+        ['api_version', sub { PVE::RS::Meta::api_version(1, undef) }],
+        ['api_list_guests', sub { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9700, read => 1 }], undef) }],
+        ['api_access', sub { PVE::RS::Meta::api_access('9700', $FULL) }],
+        ['api_prefixes', sub { PVE::RS::Meta::api_prefixes(undef) }],
+        ['api_permissions', sub { PVE::RS::Meta::api_permissions() }],
+    ) {
+        my ($name, $call) = @$case;
+        $res = eval { $call->() };
+        ok(!defined($res), "$name refuses while the cluster marker is missing");
+        like($@, qr/^503: cluster filesystem not available/, "... with a 503:");
+    }
+    $res = eval { PVE::RS::Meta::stored_vmids() };
+    like($@, qr/cluster filesystem not available/, 'stored_vmids refuses too, rather than listing nothing');
+    is(read_file('9700.yaml'), "a: 1\n", 'and nothing was written or removed');
+
+    symlink($root, "$root/local") or die "symlink: $!\n";
+    is_deeply(PVE::RS::Meta::api_get('9700', undef, 'json', $FULL)->{data}, { a => 1 },
+        'with the marker in place the same store answers');
+    unlink("$root/local");
+}
+unlink("$root/9700.yaml");
+
 done_testing();

@@ -92,7 +92,7 @@ impl std::error::Error for ApiError {}
 
 /// Maps a [`CoreError`] to its status: `409` digest mismatch, `404` not
 /// found, `400` lint/parse/invalid-path/invalid-name/registration/too-large,
-/// `500` everything else.
+/// `503` the cluster filesystem is not there, `500` everything else.
 impl From<CoreError> for ApiError {
     fn from(err: CoreError) -> Self {
         let status: u16 = match &err {
@@ -104,6 +104,7 @@ impl From<CoreError> for ApiError {
             | CoreError::InvalidName(_)
             | CoreError::Registry(_)
             | CoreError::TooLarge { .. } => 400,
+            CoreError::Unavailable(_) => 503,
             CoreError::Io(_) | CoreError::Other(_) => 500,
         };
         // An empty digest is what a *missing* document reports; render it
@@ -432,7 +433,8 @@ pub fn permissions_list(
 /// node files existed, so a client that knows nothing of them sees no change.
 ///
 /// # Errors
-/// `400:` `node` is not a node name, or `node` and `all` are both given.
+/// `400:` `node` is not a node name, or `node` and `all` are both given. `500:`
+/// a prefix directory that cannot be listed.
 pub fn prefixes(registry: &Registry, node: Option<&str>, all: bool) -> Result<Vec<PrefixEntry>, ApiError> {
     let node = node.map(node_name).transpose()?;
     let set = match (&node, all) {
@@ -441,7 +443,7 @@ pub fn prefixes(registry: &Registry, node: Option<&str>, all: bool) -> Result<Ve
         (None, true) => PrefixSet::All,
         (None, false) => PrefixSet::Cluster,
     };
-    let (loaded, failures) = registry.list_prefixes(set);
+    let (loaded, failures) = registry.list_prefixes(set)?;
     Ok(prefixes_list(&loaded, &failures))
 }
 
@@ -449,10 +451,13 @@ pub fn prefixes(registry: &Registry, node: Option<&str>, all: bool) -> Result<Ve
 /// effect on the caller's `node` ([`Registry::load_prefixes`]) -- packaged,
 /// cluster and that node's files, resolved by name. Nothing for a registry
 /// document, which has its own gate.
-pub fn effective_prefixes(registry: &Registry, doc_id: &DocId, acl: &CallerAcl) -> Vec<PrefixDef> {
+///
+/// # Errors
+/// `500:` a prefix directory that cannot be listed.
+pub fn effective_prefixes(registry: &Registry, doc_id: &DocId, acl: &CallerAcl) -> Result<Vec<PrefixDef>, ApiError> {
     match doc_id {
-        DocId::Guest(_) => registry.load_prefixes(acl.node.as_ref()),
-        DocId::Registry(..) | DocId::NodePrefix { .. } => Vec::new(),
+        DocId::Guest(_) => Ok(registry.load_prefixes(acl.node.as_ref())?),
+        DocId::Registry(..) | DocId::NodePrefix { .. } => Ok(Vec::new()),
     }
 }
 

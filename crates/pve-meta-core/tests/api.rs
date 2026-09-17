@@ -1678,7 +1678,7 @@ fn on_node(node: &str) -> CallerAcl {
 /// caller's node.
 fn put_on(store: &MetaStore, id: &str, view: &str, payload: &str, acl: &CallerAcl) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id).unwrap();
-    let prefixes = api::effective_prefixes(store.registry(), &doc_id, acl);
+    let prefixes = api::effective_prefixes(store.registry().unwrap(), &doc_id, acl).unwrap();
     put_with(store, &regs(), &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
 }
 
@@ -1711,7 +1711,7 @@ fn parse_id_reads_a_node_prefix_id_and_refuses_a_node_that_is_not_one() {
 
     let (_dir, store) = node_store();
     for bad in ["..", "pve1/../x", "a.b", ""] {
-        assert_eq!(status(&api::prefixes(store.registry(), Some(bad), false).unwrap_err()), 400, "{bad:?}");
+        assert_eq!(status(&api::prefixes(store.registry().unwrap(), Some(bad), false).unwrap_err()), 400, "{bad:?}");
         assert_eq!(status(&version(&store, false, Some("100"), Some(bad)).unwrap_err()), 400, "{bad:?}");
     }
 }
@@ -1748,7 +1748,7 @@ fn a_node_prefix_is_a_document_in_its_nodes_directory_only() {
     // DELETE removes the node's file; the cluster file is in effect on pve1 again.
     del(&store, "nodes/pve1/prefixes/gpu", None, None, &full()).unwrap();
     assert!(!dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml").exists());
-    let set = store.registry().load_prefixes(Some(&NodeName::new("pve1").unwrap()));
+    let set = store.registry().unwrap().load_prefixes(Some(&NodeName::new("pve1").unwrap())).unwrap();
     assert_eq!(set.len(), 1);
     assert_eq!((set[0].description.as_deref(), set[0].origin), (Some("cluster"), Origin::Cluster));
 }
@@ -1770,19 +1770,19 @@ fn a_cluster_prefix_and_a_node_child_prefix_compose_by_most_specific_wins() {
     );
     let p = |s: &str| DocPath::parse(s).unwrap();
     let governs = |node: &str, path: &str| {
-        let set = api::effective_prefixes(store.registry(), &DocId::Guest(100), &on_node(node));
+        let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node(node)).unwrap();
         Shape::of_guest(&set, &[]).governing(&p(path)).map(|d| d.prefix.to_string())
     };
     assert_eq!(governs("pve1", "gpu.devices.count").as_deref(), Some("gpu.devices"));
     assert_eq!(governs("pve1", "gpu.vendor").as_deref(), Some("gpu"), "the cluster prefix still governs its own keys");
     assert_eq!(governs("pve2", "gpu.devices.count").as_deref(), Some("gpu"), "on another node the child does not exist");
 
-    let set = api::effective_prefixes(store.registry(), &DocId::Guest(100), &on_node("pve1"));
+    let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node("pve1")).unwrap();
     let shape = Shape::of_guest(&set, &[]);
     assert_eq!(shape.schema_at(&p("gpu.devices.count")), Some(&json!({"type": "integer"})));
     assert!(shape.findings(&json!({"gpu": {"devices": {"count": 2}}})).is_empty(), "the parent's `devices: integer` is shadowed");
     // A registry document is given no prefixes to enforce.
-    assert!(api::effective_prefixes(store.registry(), &parse_id("prefixes/gpu").unwrap(), &on_node("pve1")).is_empty());
+    assert!(api::effective_prefixes(store.registry().unwrap(), &parse_id("prefixes/gpu").unwrap(), &on_node("pve1")).unwrap().is_empty());
 }
 
 #[test]
@@ -1818,7 +1818,7 @@ fn the_prefixes_listing_is_cluster_wide_by_default_a_nodes_set_with_node_and_eve
     put_node_prefix(&store, "nodes/pve2/prefixes/local", "selector: {all: true}\n");
 
     let rows_with = |node: Option<&str>, all: bool| -> Vec<serde_json::Value> {
-        api::prefixes(store.registry(), node, all).unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect()
+        api::prefixes(store.registry().unwrap(), node, all).unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect()
     };
     let rows = |node: Option<&str>| rows_with(node, node.is_none());
 
@@ -1827,7 +1827,7 @@ fn the_prefixes_listing_is_cluster_wide_by_default_a_nodes_set_with_node_and_eve
     let default = rows_with(None, false);
     assert_eq!(default.len(), 1, "{default:?}");
     assert_eq!((&default[0]["prefix"], &default[0]["origin"]), (&json!("gpu"), &json!("cluster")));
-    let err = api::prefixes(store.registry(), Some("pve1"), true).unwrap_err();
+    let err = api::prefixes(store.registry().unwrap(), Some("pve1"), true).unwrap_err();
     assert_eq!(status(&err), 400, "node and all together: {err}");
 
     let pve1 = rows(Some("pve1"));
@@ -1851,7 +1851,7 @@ fn the_prefixes_listing_is_cluster_wide_by_default_a_nodes_set_with_node_and_eve
 
     // A failed node file is listed keyed like a loaded one, with its node.
     let pve2 = NodeName::new("pve2").unwrap();
-    std::fs::write(store.registry().node_prefix_dir(&pve2).unwrap().join("broken.yaml"), "selector: {x: 1}\n").unwrap();
+    std::fs::write(store.registry().unwrap().node_prefix_dir(&pve2).unwrap().join("broken.yaml"), "selector: {x: 1}\n").unwrap();
     let failed: Vec<serde_json::Value> = rows(None).into_iter().filter(|r| r.get("error").is_some()).collect();
     assert_eq!(failed.len(), 1);
     assert_eq!((&failed[0]["prefix"], &failed[0]["origin"], &failed[0]["node"]), (&json!("broken"), &json!("node"), &json!("pve2")));
@@ -1884,4 +1884,37 @@ fn a_node_prefix_moves_the_token_of_a_guest_on_that_node_and_migration_moves_it_
     assert_eq!(ids, ["100", "nodes/pve1/prefixes/gpu"]);
     let ids: Vec<String> = version(&store, true, Some("100"), Some("pve2")).unwrap().documents.unwrap().into_iter().map(|d| d.id).collect();
     assert_eq!(ids, ["100"], "a guest on pve2 covers no pve1 file");
+}
+
+// -- a store that is not there (docs/DESIGN.md §7) ------------------------------
+
+#[test]
+fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
+    let (dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    let marker = dir.path().join("local");
+    let store = store.with_cluster_marker(&marker);
+    let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+    let unavailable = |status: u16, what: &str| assert_eq!(status, 503, "{what}");
+
+    unavailable(get(&store, "100", None, "json", &full()).unwrap_err().status, "get");
+    unavailable(get(&store, "prefixes/traefik", None, "yaml", &full()).unwrap_err().status, "get of a registry document");
+    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, true, &full()).unwrap_err().status, "dry run");
+    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, false, &full()).unwrap_err().status, "put");
+    unavailable(del(&store, "100", None, None, &full()).unwrap_err().status, "delete");
+    unavailable(version(&store, true, None, None).unwrap_err().status, "version");
+    unavailable(version(&store, false, Some("100"), None).unwrap_err().status, "scoped version");
+    unavailable(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap_err().status, "list");
+    let err = ApiError::from(store.registry().unwrap_err());
+    unavailable(err.status, "the registry, for the prefix and permission listings");
+    assert!(err.msg.starts_with("cluster filesystem not available"), "{err}");
+    assert_eq!(read_raw_unchecked(dir.path(), "100"), "traefik:\n  host: x\n");
+
+    std::os::unix::fs::symlink(dir.path(), &marker).unwrap();
+    assert_eq!(get(&store, "100", None, "json", &full()).unwrap().data.unwrap(), json!({"traefik": {"host": "x"}}));
+    assert_eq!(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap().len(), 1);
+}
+
+fn read_raw_unchecked(root: &std::path::Path, id: &str) -> String {
+    std::fs::read_to_string(root.join(format!("{id}.yaml"))).unwrap()
 }

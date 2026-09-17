@@ -12,7 +12,8 @@ configuration intent, not secrets.
 
 Scopes are a **blast-radius limiter**, not an adversarial boundary. In scope: a scoped
 principal does not read or write document content outside its granted prefixes; a
-concurrent write does not silently lose another's update. Out of scope: key-name
+concurrent write does not silently lose another's update; a cluster filesystem that is
+not mounted is never read as an empty store (§7). Out of scope: key-name
 disclosure through errors, digests or listings; any defence against a principal the
 administrator deliberately issued a token to. pve-meta gates nothing but access to
 metadata documents and never restricts a PVE permission the platform itself grants.
@@ -229,6 +230,16 @@ affordance, not the validator; a test keeps its required keys equal to the parse
 * Writes run under `PVE::Cluster::cfs_lock_domain("pve-meta-<id>")` with the digest
   check inside the lock; files are written atomically. Reads are unlocked: a file that
   vanishes under one is a 404, never a 500.
+* **No cluster filesystem, no answer.** A store under `/etc/pve` checks before every
+  operation that pmxcfs is mounted — the `/etc/pve/local` symlink pmxcfs provides, the
+  test `PVE::Cluster::check_cfs_is_mounted` makes — and refuses with `cluster
+  filesystem not available` (503; the CLI exits 1) rather than reading an unmounted
+  `/etc/pve` as an empty store. Every `MetaStore` constructor decides the marker from
+  its root; `registry::Registry` and the free loaders check nothing. Likewise any I/O
+  error other than not found reading a document, or listing a directory, is an error
+  and never an absence; one registry entry that cannot be looked at or read is a listed
+  failure (§4), and a node directory entry that cannot be looked at is skipped with a
+  warning. A read still never fails on a document's content.
 * Every write that changes a file logs one syslog line at `info`, tagged
   `pve-meta audit:`, with the authid, document, view, mode, touched count and digest.
 
