@@ -348,8 +348,9 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 (`crates/pve-meta-wasm`, see `WASM-CORE.md`); the editor reimplements none of them.
 
 * **Guest tab**: one tree of the document the caller can see. Rows are the union of
-  keys present and keys the governing prefixes declare and do not hide (§3);
-  declared-but-unset rows are greyed with their default and a **Set to default** action.
+  keys present and keys the governing prefixes declare and do not hide (§3), from `GET
+  /meta/prefixes?id=<vmid>` — the set for the node the guest is on now, so a reload
+  after a migration gets the new node's; declared-but-unset rows are greyed with their default and a **Set to default** action.
   Columns: key, value, description (the row's comment key), access (every rule covering
   the row).
 * **Edits are staged** and one **Apply** writes them as a single `replace` at the
@@ -370,9 +371,13 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 * A document that does not parse opens in Text mode only.
 * A version poll (`GET /meta/version?id=`) refreshes the tree, never while anything
   is staged or an editor is open. Every write carries the digest; a 409 reloads.
-* **Datacenter tab**: two grids, Prefixes and Permissions, with origin, selector,
-  schema and enforced columns. Editing a row opens the file in the same document
-  editor. **New** creates the smallest file the loader accepts, or a service token
+* **Datacenter tab**: two grids, Prefixes (`GET /meta/prefixes?all=1`) and Permissions,
+  with origin, node, selector, schema and enforced columns. Editing a row opens the file
+  in the same document editor, a node row its node's file; any row opens, and Remove
+  follows `Sys.Modify` on `/` except on a node's file, where the server decides. **New**
+  (gated on `Sys.Modify` on `/`, since its default location is the cluster) creates the
+  smallest file the loader accepts — a prefix in the cluster directory or a chosen
+  node's — or a service token
   (a `pve` user with no password, one token with privilege separation off, and an
   empty permission file naming the token). **Declare Key** writes one
   `schema.properties.<key>`; **Add Rule** appends to `rules`.

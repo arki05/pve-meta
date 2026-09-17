@@ -11,15 +11,23 @@ PVE.meta.Doc = {
     // --- documents -----------------------------------------------------------
 
     // The API path of a document, from its id. Total by construction: a registry id
-    // is `prefixes/<name>` -- the path it is served at -- and everything else is a
-    // vmid (`api::parse_id`).
+    // is `prefixes/<name>` or `nodes/<node>/prefixes/<name>` -- the path it is served
+    // at -- and everything else is a vmid (`api::parse_id`).
     urlFor: function (id) {
         return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
     },
 
-    // What kind of document an id names -- which decides what governs its rows.
+    // The document id of a registry file: `<kind>/<name>`, or for a node's prefix
+    // file `nodes/<node>/prefixes/<name>` -- its own document, never the cluster file
+    // of the same name (`api::parse_id`).
+    registryId: function (kind, name, node) {
+        return node ? 'nodes/' + node + '/prefixes/' + name : kind + '/' + name;
+    },
+
+    // What kind of document an id names -- which decides what governs its rows. A
+    // node's prefix file is a prefix, described by the same meta-schema.
     docKind: function (id) {
-        if (id.indexOf('prefixes/') === 0) {
+        if (id.indexOf('prefixes/') === 0 || /^nodes\/[^/]+\/prefixes\//.test(id)) {
             return 'prefix';
         }
         if (id.indexOf('permissions/') === 0) {
@@ -28,9 +36,10 @@ PVE.meta.Doc = {
         return 'guest';
     },
 
+    // The file name, which for a prefix is the prefix: whatever follows the last
+    // `/`, since a file name never contains one.
     docTitle: function (id) {
-        let cut = id.indexOf('/');
-        return cut === -1 ? id : id.slice(cut + 1);
+        return id.slice(id.lastIndexOf('/') + 1);
     },
 
     // The digest to send with a write, and the parsed document to build rows from.
@@ -112,6 +121,7 @@ PVE.meta.Doc = {
         let me = this;
         me.request({
             url: '/meta/prefixes',
+            params: me.prefixParams(),
             success: function (response) {
                 // The listing as served, failures included (the registry grid shows
                 // them). Which of these reach a guest, and in what order, is the
@@ -124,6 +134,15 @@ PVE.meta.Doc = {
                 next();
             },
         });
+    },
+
+    // What `loadPrefixes` asks for. A guest's rows come from the set in effect for
+    // it: the packaged and cluster files with its current node's on top, one per
+    // name, resolved by the server from the guest's id (DESIGN §3), so the reload a
+    // migration's token change causes gets the new node's set. A registry
+    // document's rule picker wants every file.
+    prefixParams: function () {
+        return this.registryDoc ? { all: 1 } : { id: this.docId };
     },
 
     loadPermissions: function (next) {

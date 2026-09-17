@@ -1376,6 +1376,26 @@ eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
 eq('kind of a permission file', P.docKind.call(P, 'permissions/scoped'), 'permission');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
+// A node's prefix file is its own document at its own path, and a prefix to
+// everything that renders one.
+eq('a node prefix id', P.urlFor.call(P, 'nodes/pve1/prefixes/gpu.devices'), '/meta/nodes/pve1/prefixes/gpu.devices');
+eq('kind of a node prefix', P.docKind.call(P, 'nodes/pve1/prefixes/gpu'), 'prefix');
+eq('... and nothing else under nodes/ is one', P.docKind.call(P, 'nodes/pve1'), 'guest');
+eq('its title is the file name too', P.docTitle.call(P, 'nodes/pve1/prefixes/gpu.devices'), 'gpu.devices');
+eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
+{
+    // A guest tab asks for its own set by id -- the server reads the node from the
+    // vmlist -- and a registry document for every file.
+    const asked = (panel) => {
+        let opts = null;
+        P.loadPrefixes.call(Object.assign({ request: (o) => (opts = o), prefixParams: P.prefixParams }, panel), () => {});
+        return opts.params;
+    };
+    eq('a guest tab lists its own prefix set by id', asked({ registryDoc: false, docId: '201' }), { id: '201' });
+    eq('a registry document lists every file', asked({ registryDoc: true, docId: 'permissions/ops' }), { all: 1 });
+    eq('a node id is shaped like the others', P.registryId('prefixes', 'gpu', 'pve1'), 'nodes/pve1/prefixes/gpu');
+    eq('... and a cluster-wide one has no node', P.registryId('prefixes', 'gpu'), 'prefixes/gpu');
+}
 
 // Per-document digests. One shared field would have sent a prefix's digest with a
 // write to another document, which is a 409 at best and the wrong document at worst.
@@ -1589,6 +1609,63 @@ console.log('\n--- the registry lists ---');
     );
     // An older API returns neither field; the list must still render.
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
+
+    // Node rows: the same prefix may be listed once per file, and each row opens
+    // its own file.
+    const nodeRows = G.rowsFrom('prefixes', [
+        { prefix: 'gpu', selector: { all: true }, origin: 'cluster', overrides: false },
+        { prefix: 'gpu', selector: { all: true }, origin: 'node', node: 'pve1', overrides: true },
+        { prefix: 'gpu.devices', selector: { all: true }, origin: 'node', node: 'pve2', overrides: false },
+        { prefix: 'broken', origin: 'node', node: 'pve2', error: 'missing selector' },
+    ]);
+    eq('a node row opens the node\'s file', nodeRows.map((r) => r.id), [
+        'prefixes/gpu',
+        'nodes/pve1/prefixes/gpu',
+        'nodes/pve2/prefixes/gpu.devices',
+        'nodes/pve2/prefixes/broken',
+    ]);
+    eq('the Node column is empty for a cluster-wide row', nodeRows.map((r) => r.node), ['', 'pve1', 'pve2', 'pve2']);
+    eq('a node file over a cluster or packaged one', G.originText(nodeRows[1]), 'node (overrides cluster or packaged)');
+    eq('a node file of its own', G.originText(nodeRows[2]), 'node');
+
+    // The buttons: any row opens, Remove is the registry answer's for the cluster's
+    // files and the server's for a node's, and a packaged file is never removed.
+    const Grid = ctx.PVE.meta.RegistryGrid;
+    const buttons = (row, may) => {
+        const state = {};
+        const grid = {
+            access: { write: may ? 1 : 0 },
+            getSelection: () => (row ? [{ data: row }] : []),
+            down: (sel) => ({ setDisabled: (d) => (state[sel.slice(1)] = d) }),
+        };
+        Grid.syncButtons.call(grid);
+        return [state.addBtn, state.editBtn, state.removeBtn];
+    };
+    const [clusterRow, nodeRow, pkgRow] = [
+        { origin: 'cluster' },
+        nodeRows[1],
+        { origin: 'packaged' },
+    ];
+    eq('with write on /: add, edit and remove a cluster file', buttons(clusterRow, true), [false, false, false]);
+    eq('without it: a cluster file still opens, and is not removable', buttons(clusterRow, false), [true, false, true]);
+    eq('a node file stays removable without it: the server decides', buttons(nodeRow, false), [true, false, false]);
+    eq('... and with it', buttons(nodeRow, true), [false, false, false]);
+    eq('a packaged file opens and is never removable', buttons(pkgRow, true), [false, false, true]);
+    eq('no selection: nothing to edit or remove', buttons(null, true), [false, true, true]);
+
+    // Remove asks, then deletes the row's own document.
+    const sent = [];
+    const [confirm, request] = [ctx.Ext.Msg.confirm, ctx.Proxmox.Utils.API2Request];
+    ctx.Ext.Msg.confirm = (title, question, cb) => {
+        sent.push(question);
+        cb('yes');
+    };
+    ctx.Proxmox.Utils.API2Request = (opts) => sent.push([opts.method, opts.url]);
+    Grid.removeOne.call({ reload() {} }, { data: nodeRow });
+    ctx.Ext.Msg.confirm = confirm;
+    ctx.Proxmox.Utils.API2Request = request;
+    eq('removing a node file deletes that node\'s document', sent[1], ['DELETE', '/meta/nodes/pve1/prefixes/gpu']);
+    eq('... after saying what comes back', /on node pve1.*cluster or packaged file/.test(sent[0]), true);
 }
 
 console.log('\n--- a key name is refused in the field, not after a round trip ---');
@@ -2025,6 +2102,25 @@ console.log('\n--- creating a registry file: the least that parses ---');
 {
     const plan = (kind, v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(kind, v);
     eq('a prefix with an "all" selector', plan('prefixes', { name: 'x', selector: 'all' }).content, { selector: { all: true } });
+
+    // Where it lands: the cluster by default, or one node's directory.
+    const CLUSTER = ctx.PVE.meta.NewRegistryWindow.statics.CLUSTER_LOCATION;
+    const cluster = plan('prefixes', { name: 'gpu', location: CLUSTER, selector: 'all' });
+    eq('the cluster is the default location', [cluster.id, cluster.node], ['prefixes/gpu', undefined]);
+    eq('... also when no location was asked', plan('prefixes', { name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
+    const onNode = plan('prefixes', { name: 'gpu.devices', location: 'pve1', selector: 'all' });
+    eq('a node location writes that node\'s file', [onNode.id, ctx.PVE.meta.Doc.urlFor(onNode.id), onNode.node], [
+        'nodes/pve1/prefixes/gpu.devices',
+        '/meta/nodes/pve1/prefixes/gpu.devices',
+        'pve1',
+    ]);
+    eq('the file itself does not change with where it lands', onNode.content, { selector: { all: true } });
+    eq('a permission file has no location', plan('permissions', { name: 'ops', principal: 'existing', authid: 'a@pve', location: 'pve1' }).id, 'permissions/ops');
+    eq(
+        'the locations are the cluster, then every node by name',
+        ctx.PVE.meta.NewRegistryWindow.statics.locationItems([{ node: 'pve2' }, { node: 'pve1' }]).map((i) => i[0]),
+        [CLUSTER, 'pve1', 'pve2'],
+    );
     eq('a prefix with a tag selector', plan('prefixes', { name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
