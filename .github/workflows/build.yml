@@ -1,6 +1,6 @@
 name: build
 
-# Every push and pull request builds and tests the three packages on amd64 and
+# Every push and pull request builds and tests the four packages on amd64 and
 # arm64. A tag `v<version>` additionally publishes the .debs as a GitHub
 # Release and asks apt.arki05.com to index them (docs/DISTRIBUTION.md).
 
@@ -95,7 +95,7 @@ jobs:
       - name: Build .deb packages
         run: make deb
 
-      # Both jobs build all three packages; only the compiled one differs by
+      # Both jobs build all four packages; only the two compiled ones differ by
       # architecture. The two `Architecture: all` packages are taken from the
       # amd64 job alone, so one file name never means two different files.
       - name: Collect

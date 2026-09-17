@@ -31,3 +31,16 @@ Description: pve-meta store bindings for PVE (Rust, perlmod)
  store: the lifecycle hooks called from libpve-guest-common-perl, the backup
  hooks called from qemu-server and pve-container, and the api_* functions
  behind PVE::API2::Ext::Meta.
+
+Package: pve-meta-publish
+Architecture: any
+Depends: pve-meta (= ${source:Version}),
+         pve-container,
+         ${shlibs:Depends}, ${misc:Depends}
+Description: Publish views of pve-meta documents into LXC containers as files
+ A per-node daemon that reads the publish key of each container's pve-meta
+ document and writes the views it names into that container as files, one
+ way, host to guest, so services inside read configuration managed in
+ pve-meta. Writes are atomic and idempotent; a file edited inside the
+ container, or one pve-meta-publish did not write, is left alone unless the
+ entry says otherwise. Ships the publish prefix and a systemd unit.

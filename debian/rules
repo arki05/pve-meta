@@ -23,16 +23,19 @@ ifneq ($(DEB_DISTRIBUTION),UNRELEASED)
 endif
 	dh_auto_configure
 
-# Two binary packages from this one source (see debian/control):
+# Three binary packages from this one source (see debian/control):
 #   - `pve-meta`:            top-level Makefile's `install` target
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own Makefile, its own DESTDIR
 #     (see crates/pve-meta-perl/PACKAGING.md, option 1) so its files never land in
 #     the other package's tree.
+#   - `pve-meta-publish`:    top-level Makefile's `install-publish` target, its own
+#     DESTDIR likewise; its unit is debian/pve-meta-publish.service.
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-meta PREFIX=/usr
 	$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(CURDIR)/debian/libpve-meta-rs-perl
+	$(MAKE) install-publish DESTDIR=$(CURDIR)/debian/pve-meta-publish PREFIX=/usr
 
 override_dh_auto_test:
-	# Rust tests run separately on the build host (cargo test -p pve-meta-core);
+	# Rust tests run separately on the build host (make test);
 	# skipped here since the packaging build runs with -d and no guaranteed
 	# network access for crates.io during a plain `dpkg-buildpackage`.

@@ -42,10 +42,11 @@ MONACO := $(UI_DIR)/monaco/vs
 WASM_TARGET := wasm32-unknown-unknown
 WASM := target/$(WASM_TARGET)/wasm/pve_meta_wasm.wasm
 
-.PHONY: build ui js wasm deb install clean check check-perl test doc
+.PHONY: build ui js wasm deb install install-publish clean check check-perl test doc
 
 build: wasm js
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
+	$(CARGO) build --release -p pve-meta-publish
 
 wasm:
 	$(CARGO) build -p pve-meta-wasm --target $(WASM_TARGET) --profile wasm
@@ -82,10 +83,11 @@ ui:
 #                     pve-ext-loader.js.
 #   - Managed patch: patches/lifecycle.toml + patches/lifecycle/*.diff, applied by
 #                     `pve-ext-patch apply pve-meta-lifecycle` from debian/pve-meta.postinst.
-# Two binary packages come from this source (see debian/control):
+# Three binary packages come from this source (see debian/control):
 #   - `pve-meta`:            install (below)
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own `install` target, invoked with
 #     its own DESTDIR directly from debian/rules (see crates/pve-meta-perl/PACKAGING.md).
+#   - `pve-meta-publish`:    install-publish (below), its own DESTDIR likewise.
 #
 # Everything in the `pve-meta` package: the native PVE::API2::Ext::Meta module
 # (docs/DESIGN.md section 8), the ExtJS editor tab with its core `.wasm` and
@@ -157,13 +159,25 @@ install: js
 		cp -a $(MONACO)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vs/; \
 	fi
 
+# Everything in the `pve-meta-publish` package (docs/DESIGN.md section 13): the
+# daemon and its commands, one binary, in sbin because it is root's tool and
+# writes into containers as root; and the `publish` prefix it reads, in the
+# packaged prefix directory pve-meta creates empty for exactly this. The
+# systemd unit is debian/pve-meta-publish.service, which dh_installsystemd
+# installs, enables and starts.
+install-publish:
+	install -D -m 0755 target/release/pve-meta-publish $(DESTDIR)$(PREFIX)/sbin/pve-meta-publish
+	install -D -m 0644 crates/pve-meta-publish/prefixes/publish.yaml \
+		$(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/publish.yaml
+
 # `make deb` builds every package this repo ships, in one call:
 #   - pve-ext:                    its own source package, built via `make -C pve-ext deb`.
 #     dpkg-buildpackage places pve-ext's artifacts in the parent of `pve-ext/`, i.e. this
 #     directory -- move them up one more level so they land next to pve-meta's own output
 #     (dpkg-buildpackage always drops artifacts in the parent of the source root it's
 #     invoked from).
-#   - pve-meta, libpve-meta-rs-perl: this source package's two binaries (see debian/control).
+#   - pve-meta, libpve-meta-rs-perl, pve-meta-publish: this source package's three binaries
+#     (see debian/control).
 #
 # lintian runs as part of this target, not as a separate step (see
 # docs/reference/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 13,
@@ -175,15 +189,15 @@ install: js
 # never blocks iterating locally; unconditionally fatal when $CI is set
 # (matches .github/workflows/build.yml, which sets it automatically) --
 # CI is the actual gate. `pve-ext`'s own artifacts were already moved into
-# ".." above, so all three packages' .debs are lintianed together here.
+# ".." above, so all four packages' .debs are lintianed together here.
 deb:
 	$(MAKE) -C pve-ext deb
 	for f in pve-ext_*.deb pve-ext_*.buildinfo pve-ext_*.changes; do [ -e "$$f" ] && mv -f "$$f" ..; done
 	dpkg-buildpackage -b -us -uc -d
 	if [ -n "$$CI" ]; then \
-		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-ext_*.deb; \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-publish_*.deb ../pve-ext_*.deb; \
 	else \
-		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-ext_*.deb || true; \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-publish_*.deb ../pve-ext_*.deb || true; \
 	fi
 
 # A broken intra-doc link is a stale doc comment pointing at something that no longer
@@ -193,7 +207,7 @@ deb:
 # nothing. Its own target as well as part of `check`: unlike clippy's whole-workspace
 # run it needs no libperl, so it works on a workstation.
 doc:
-	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps -p pve-meta-core
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps -p pve-meta-core -p pve-meta-publish
 
 check: doc wasm js
 	$(CARGO) clippy --workspace -- -D warnings
@@ -222,7 +236,7 @@ check-perl:
 	done
 
 test:
-	$(CARGO) test -p pve-meta-core -p pve-meta-wasm
+	$(CARGO) test -p pve-meta-core -p pve-meta-wasm -p pve-meta-publish
 
 clean:
 	$(CARGO) clean
