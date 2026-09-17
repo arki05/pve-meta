@@ -1,0 +1,20 @@
+[package]
+name = "pve-meta-publish"
+description = "pve-meta-publish: writes views of a container's pve-meta document into it as files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pve-meta-publish"
+path = "src/main.rs"
+
+[dependencies]
+pve-meta-core = { path = "../pve-meta-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true

@@ -255,6 +255,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pve-meta-publish"
+version = "0.1.2"
+dependencies = [
+ "anyhow",
+ "libc",
+ "pve-meta-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pve-meta-rs"
 version = "0.1.2"
 dependencies = [

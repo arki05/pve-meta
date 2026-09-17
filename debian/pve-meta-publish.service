@@ -1,0 +1,15 @@
+[Unit]
+Description=pve-meta-publish: write metadata documents into containers
+Documentation=https://github.com/arki05/pve-meta/blob/main/docs/DESIGN.md
+After=pve-cluster.service
+Wants=pve-cluster.service
+
+[Service]
+Type=simple
+Environment=LANG=C.UTF-8 LC_ALL=C.UTF-8
+ExecStart=/usr/sbin/pve-meta-publish daemon
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

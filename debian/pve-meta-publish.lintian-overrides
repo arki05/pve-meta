@@ -1,0 +1,6 @@
+# unsafe-libyaml, pulled in through pve-meta-core's serde_yaml_ng dependency,
+# is a Rust transliteration of libyaml statically linked into the binary; the
+# heuristic fires on libyaml's message text and symbol names, not on copied C
+# object code. The same override, and the same reasoning at more length, is in
+# debian/libpve-meta-rs-perl.lintian-overrides.
+pve-meta-publish: embedded-library libyaml [usr/sbin/pve-meta-publish]

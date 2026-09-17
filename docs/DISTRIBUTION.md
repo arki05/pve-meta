@@ -7,9 +7,10 @@ ceiling" for the patched upstream Proxmox packages stays current.
 
 `.github/workflows/build.yml` builds and tests every push on **amd64 and arm64** --
 native builds in a `debian:trixie` container on each architecture, because
-`libpve-meta-rs-perl` is a compiled Perl module and each architecture builds its own.
-The two `Architecture: all` packages (`pve-meta`, `pve-ext`) are taken from the amd64
-job alone, so one file name never means two different files.
+`libpve-meta-rs-perl` is a compiled Perl module and each architecture builds its own;
+`pve-meta-publish` is a compiled binary too. The two `Architecture: all` packages
+(`pve-meta`, `pve-ext`) are taken from the amd64 job alone, so one file name never means
+two different files.
 
 A tag `v<version>` runs the same build and then publishes:
 
@@ -64,6 +65,7 @@ apt update && apt install pve-meta
 ```
 
 `pve-meta` depends on `pve-ext` and `libpve-meta-rs-perl`, so apt installs all three.
+`pve-meta-publish` is not pulled in; `apt install pve-meta-publish` adds it.
 
 ## 3. Ceiling watcher
 
