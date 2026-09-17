@@ -255,7 +255,7 @@ Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
 | GET | `/meta/guests/{vmid}` | `view`, `format`, `comments` | `{ id, view, digest, data \| text, parse_error? }` |
 | PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force`, `comments` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
-| GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
+| GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` is empty without `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
 | GET | `/meta/prefixes` | `id`, `all` | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, node?, overrides }]`, most-specific first, plus `{ prefix, origin, node?, error }` for a file that did not load. By default the cluster-wide set, one row per name; with `id` (a vmid), the set in effect for that guest on its current node; with `all`, the cluster-wide set plus every node's own files (below). `id` and `all` together are a 400 |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules, origin, overrides }]`, plus `{ name, origin, error }` rows |
 | GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/nodes/{node}/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>`, `nodes/<node>/prefixes/<name>`, `permissions/<name>` |
