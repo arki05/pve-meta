@@ -1,0 +1,46 @@
+--- a/usr/share/perl5/PVE/VZDump/QemuServer.pm
++++ b/usr/share/perl5/PVE/VZDump/QemuServer.pm
+@@ -19,6 +19,7 @@
+ use PVE::JSONSchema;
+ use PVE::PBSClient;
+ use PVE::RESTEnvironment qw(log_warn);
++use PVE::RS::Meta;
+ use PVE::QMPClient;
+ use PVE::Storage::Plugin;
+ use PVE::Storage::PBSPlugin;
+@@ -238,6 +239,7 @@
+     my $found_snapshot;
+     my $found_pending;
+     my $found_special;
++    my $found_notes;
+     while (defined(my $line = <$conffd>)) {
+         next if $line =~ m/^\#vzdump\#/; # just to be sure
+         next if $line =~ m/^\#qmdump\#/; # just to be sure
+@@ -259,9 +261,27 @@
+         }
+         next if $line =~ m/^lock:/ || $line =~ m/^parent:/;
+ 
++        $found_notes = 1 if $line =~ m/^\#/;
+         print $outfd $line;
+     }
+ 
++    # pve-meta: carry the guest's metadata document in this copy of the notes, as one
++    # marked block after whatever notes the guest has (docs/LIFECYCLE.md). Only this
++    # copy: the live config never carries it. A restore on a host with pve-meta reads
++    # it back into /etc/pve/meta and strips it; any other host restores it as notes
++    # text. Written the way the notes are stored -- one encoded `#` line each -- so it
++    # survives restore_update_config_line verbatim. A document that cannot be carried
++    # (above the size cap, or not parseable) is a warning in this log, not a failure.
++    my $meta_block = eval { PVE::RS::Meta::export_for_backup($vmid) };
++    if (my $err = $@) {
++        chomp $err;
++        $self->log('warn', "pve-meta: metadata of $vmid not included in the backup: $err");
++    } elsif (defined($meta_block)) {
++        print $outfd "#\n" if $found_notes;
++        print $outfd '#' . PVE::Tools::encode_text($_) . "\n" for split(/\n/, $meta_block);
++        $self->loginfo("pve-meta: metadata of $vmid included in the backup notes");
++    }
++
+     foreach my $di (@{ $task->{disks} }) {
+         if ($di->{type} eq 'block' || $di->{type} eq 'file') {
+             my $storeid = $di->{storeid} || '';

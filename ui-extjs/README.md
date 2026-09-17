@@ -1,8 +1,10 @@
 # ui-extjs — the native ExtJS editor
 
-One file, `pve-meta-tree.js`, plain ES2017 with no build step of its own, plus the core
-(`pve-meta-core.wasm`, built by `make wasm` from `crates/pve-meta-wasm`) and `monaco/`
-(fetched by `make ui`, gitignored). It defines two panels that pve-ext's page loader
+One shipped script, `pve-meta-tree.js`, which `make js` generates from `src/*.js` --
+plain ES2017, one file per section, concatenated in name order with no bundler and no
+transform -- plus the core (`pve-meta-core.wasm`, built by `make wasm` from
+`crates/pve-meta-wasm`) and `monaco/` (fetched by `make ui`). The generated script and
+`monaco/` are gitignored; the sources are what is edited. It defines two panels that pve-ext's page loader
 instantiates as native tabs: `pveMetaTreePanel`, one document's editor, on every guest's
 config panel; and `pveMetaDatacenterPanel`, the two registry grids, Prefixes and
 Permissions, on the Datacenter panel, each row of which opens in that same editor.
@@ -174,8 +176,8 @@ first, which is what its `waitForXtype()` does.
 
 ## Verifying it
 
-* `node --check pve-meta-tree.js`
-* `node testing/smoke.js` — offline, no DOM, after `make wasm` (`make check` runs it
+* `make js` — generates `pve-meta-tree.js` and runs `node --check` on it.
+* `node testing/smoke.js` — offline, no DOM, after `make wasm js` (`make check` runs it
   when `node` is present). It loads the real file into `node:vm` behind a small
   `Ext`/`Proxmox` shim, instantiates the *built* `pve-meta-core.wasm` synchronously and
   hands it to `PVE.meta.Core.attach`, so the shipped bytes and the shipped glue are what
@@ -189,8 +191,9 @@ first, which is what its `waitForXtype()` does.
   colons, quotes, hashes, unicode, numeric-looking strings, booleans, nested maps and
   arrays), asserting `parse(dump(x))` deep-equals `x` with key order intact. The rules
   themselves are tested where they live, in Rust.
-* `testing/headless-tab-check.js` and `testing/headless-flows-check.js` run headless
-  Chromium against the real pve-manager SPA:
+* `testing/lab/` is not a test suite: the two scripts there need a live PVE host and
+  nothing in `make check` or CI runs them. `headless-tab-check.js` and
+  `headless-flows-check.js` run headless Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
   [--scoped] [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` and `GET /meta/permissions` payload; `--scoped` and
   `--ro` stub `GET /meta/access` so the restricted toolbar labels and the per-row
@@ -205,6 +208,6 @@ guest tree with staged edits, Text mode with the diff, the enforced-schema warni
 Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
 (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
 Anything else -- the row editor, the JSON view, a read-only or scoped caller's tab --
-is a run of `testing/headless-tab-check.js` away, which writes a full set into the
+is a run of `testing/lab/headless-tab-check.js` away, which writes a full set into the
 directory you give it; that set is not committed.
 

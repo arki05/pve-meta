@@ -23,8 +23,8 @@ reads `backup.retention`. Several of them share one document safely, because eac
 declares the prefix it owns, can attach a schema to it, and can be given a token that
 sees and writes nothing else. The document is removed when the guest is destroyed,
 cleared when its vmid is reused, and snapshotted and rolled back with the guest;
-migration needs nothing, since the file is cluster-wide. Backups do not include it
-(back up `/etc/pve`), and clone does not copy it.
+migration needs nothing, since the file is cluster-wide. A backup carries it in the
+archive's copy of the guest's notes and a restore reads it back; clone does not copy it.
 
 ## What it looks like
 
@@ -34,11 +34,13 @@ traefik:
   spec: { host: web.example, port: 8080 }
 backup:
   retention: 7
-  retention__: days; read by the nightly job     # a comment key documents its sibling
+  retention__: days; read by the nightly job     # a comment key: a note about its sibling
 ```
 
 That is all a document is, and it works with nothing else in place: no prefix, no
-schema, no permission file. Any key, any depth, edited in the tab or written by a
+schema, no permission file. A comment key is for whoever edits the document: the tab
+shows it as the row's description, and a read leaves it out unless it asks for
+`comments`. Any key, any depth, edited in the tab or written by a
 script. Everything below is opt-in, layered on where you want a guarantee.
 
 A **prefix** file says what a prefix is (the file name is the prefix). Declare one to
@@ -60,6 +62,9 @@ schema:                           # PVE::JSONSchema dialect; drives the editor's
         host: { type: string, format: dns-name }
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
+
+A file of the same name in `/etc/pve/nodes/<node>/meta.d/prefixes/` overrides it for the
+guests on that node.
 
 A **permission** file gives a token a prefix, on the guests its selector matches, so
 one document can be shared by several tools that cannot step on each other. Cluster-only,
@@ -89,9 +94,10 @@ apt update && apt install pve-meta
 amd64 and arm64, PVE 9 on Debian trixie. Three packages come along: `pve-ext` (the
 extension layer that mounts the API module and the tab, its own package),
 `libpve-meta-rs-perl` (the Rust core, as a Perl module) and `pve-meta` itself. The
-install applies one managed patch to `libpve-guest-common-perl` for the lifecycle hooks,
-verified with `perl -c` and re-applied when that package is upgraded. Removing
-`pve-meta` restores the pristine file and leaves the documents alone.
+install applies three managed patches, one file each in `libpve-guest-common-perl`,
+`qemu-server` and `pve-container`, for the lifecycle and backup hooks, verified with
+`perl -c` and re-applied when those packages are upgraded. Removing `pve-meta` restores
+the pristine files and leaves the documents alone.
 
 ## Use
 

@@ -10,13 +10,11 @@
 #   2. for pve-manager: runs `pve-ext-patch --root <extracted> verify` against
 #      pve-ext's own manifest (pve-ext/patches/pve-manager.toml), covering
 #      index.html.tpl and PVE/API2.pm;
-#   3. for libpve-guest-common-perl: the same `pve-ext-patch --root
-#      <extracted> verify`, against a copy of patches/lifecycle.toml
-#      filtered down to that package's own entries (the whole lifecycle
-#      is one file in one package, but the
-#      filter step is kept so a future entry doesn't require re-deriving
-#      this logic; see docs/DESIGN.md section 9 and
-#      docs/LIFECYCLE-PATCHES.md).
+#   3. for libpve-guest-common-perl, qemu-server and pve-container: the
+#      same `pve-ext-patch --root <extracted> verify`, against a copy of
+#      patches/lifecycle.toml filtered down to that package's own entries
+#      (one file in each; see docs/DESIGN.md section 9 and
+#      docs/LIFECYCLE.md).
 #
 # A package with a clean verify on every applicable check gets its ceiling
 # bumped and rolled into one PR. A package with any failure gets rolled into
@@ -44,7 +42,7 @@ PVE_COMPONENT="pve-no-subscription"
 PVE_ARCH="amd64"
 PACKAGES_URL="$PVE_REPO_BASE/dists/$PVE_SUITE/$PVE_COMPONENT/binary-$PVE_ARCH/Packages"
 
-TRACKED_PACKAGES=(pve-manager libpve-guest-common-perl)
+TRACKED_PACKAGES=(pve-manager libpve-guest-common-perl qemu-server pve-container)
 
 DRY_RUN="${PVE_META_DRY_RUN:-0}"
 
@@ -159,10 +157,8 @@ check_pve_manager() {
 check_lifecycle_manifest() {
     # check_lifecycle_manifest <pkg> <extracted>
     #
-    # patches/lifecycle.toml covers libpve-guest-common-perl only (see the
-    # file itself); filter it down to $pkg's own [[file]] blocks first
-    # (a no-op today, kept in case a future entry covers another package),
-    # into a scratch manifest that sits next to a symlink back to the real
+    # patches/lifecycle.toml covers three packages (see the file itself);
+    # filter it down to $pkg's own [[file]] blocks first, into a scratch manifest that sits next to a symlink back to the real
     # patches/lifecycle/ diff directory (each entry's `diff` path is
     # relative to the manifest's own directory).
     local pkg="$1" extracted="$2"

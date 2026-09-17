@@ -27,6 +27,10 @@ my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
 $ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
+my $nodesdir = tempdir(CLEANUP => 1);
+$ENV{PVE_META_NODES_DIR} = $nodesdir;
+my $rundir = tempdir(CLEANUP => 1);
+$ENV{PVE_META_RUN_DIR} = $rundir;
 
 sub write_file {
     my ($name, $content) = @_;
@@ -118,16 +122,39 @@ ok(!file_exists('9301.yaml'), 'a guest created at a recycled vmid inherits nothi
 ok(!file_exists('9301.snapB.yaml'), '... not even an old snapshot copy');
 is(PVE::RS::Meta::on_create(9301), 0, 'on_create on a clean vmid is a no-op');
 
+# The vmid crosses the boundary as whatever scalar the caller holds: qemu-server
+# passes the API parameter through as a string, pve-container as a number. Both
+# must work, or every hook is a silent no-op for one guest type.
+write_file('9302.yaml', "k: v\n");
+is(PVE::RS::Meta::on_snapshot("9302", 'str'), 1, 'a vmid given as a string is accepted (on_snapshot)');
+is(PVE::RS::Meta::on_delsnap("9302", 'str'), 1, '... and on_delsnap');
+is(PVE::RS::Meta::on_create("9302"), 1, '... and on_create');
+ok(!file_exists('9302.yaml'), '... acting on the right vmid');
+$res = eval { PVE::RS::Meta::on_create("not-a-vmid") };
+ok(!defined($res) && $@ =~ /not a vmid/, 'a string that is not a vmid dies');
+
+# --- the restore marker ---------------------------------------------------
+# create_and_lock_config leaves one, the next write_config takes it, destroy
+# removes it. Node-local, under $PVE_META_RUN_DIR here.
+is(PVE::RS::Meta::take_created(9303), 0, 'no marker until a create');
+PVE::RS::Meta::mark_created("9303");
+ok(-f "$rundir/9303", 'mark_created leaves the marker file');
+is(PVE::RS::Meta::take_created(9303), 1, 'take_created takes it');
+is(PVE::RS::Meta::take_created(9303), 0, '... once');
+PVE::RS::Meta::mark_created(9303);
+PVE::RS::Meta::on_destroy(9303);
+ok(!-f "$rundir/9303", 'on_destroy removes a marker a failed create left');
+
 # Error -> die behaviour.
 $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# These lifecycle exports are gone. `on_destroy` and `api_permissions` are not in
-# this list: those names exist again, but as the create/destroy hook and the
-# grant-file listing behind GET /meta/permissions, respectively.
-for my $gone (qw(on_clone export_for_backup import_from_backup
-                 list_snapshots has_document)) {
+# These lifecycle exports are gone. `on_destroy`, `api_permissions` and
+# `export_for_backup` are not in this list: those names exist again, as the
+# create/destroy hook, the grant-file listing behind GET /meta/permissions, and
+# the backup side of the notes block, respectively.
+for my $gone (qw(on_clone import_from_backup list_snapshots has_document)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
@@ -156,6 +183,63 @@ for my $gone (qw(gc gc_candidates gc_purge)) {
 }
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$root/9200.old.yaml");
+
+# =========================================================================
+# export_for_backup / notes_import -- the two ends of a backup (docs/DESIGN.md §9):
+# the block vzdump's patched `assemble` appends to the archive's copy of the notes,
+# and what the patched `write_config` (mode 'restore') and `pve-meta scan-notes`
+# (mode 'install') do with it on the way back.
+# =========================================================================
+
+is(PVE::RS::Meta::export_for_backup(9400), undef, 'export_for_backup is undef without a document');
+my $backed_up = "traefik:\n  spec: {host: web.example}\n";
+write_file('9400.yaml', $backed_up);
+my $block = PVE::RS::Meta::export_for_backup(9400);
+like(
+    $block,
+    qr/^\[pve-meta v1 vmid=9400 time=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ sha256=[0-9a-f]{64}\]\n````yaml\ntraefik:\n  spec: \{host: web\.example\}\n````\n\[\/pve-meta\]$/,
+    'the block is the document text under a marker, verbatim'
+);
+
+# Restore: to another vmid, over a document that was there -- the backup wins.
+write_file('9401.yaml', "old: true\n");
+$res = PVE::RS::Meta::notes_import(9401, "web01\n\n$block", 'restore');
+is($res->{action}, 'imported', 'restore imports the block');
+is($res->{description}, 'web01', '... and hands back the notes without it');
+is(read_file('9401.yaml'), $backed_up, '... the document is the backed-up text');
+
+$res = PVE::RS::Meta::notes_import(9401, 'plain notes', 'restore');
+is($res->{action}, 'none', 'notes without a block are nothing to do');
+ok(!defined($res->{description}), '... and the notes are left alone');
+
+# Install: a document already there is kept, the block still goes.
+$res = PVE::RS::Meta::notes_import(9401, $block, 'install');
+is($res->{action}, 'stripped', 'install keeps a document that is there');
+is($res->{description}, '', '... and strips the block, to empty notes here');
+is(read_file('9401.yaml'), $backed_up, '... the document is untouched');
+
+$res = PVE::RS::Meta::notes_import(9402, "kept\n$block\nalso kept", 'install');
+is($res->{action}, 'imported', 'install imports where there is no document');
+is($res->{description}, "kept\nalso kept", '... and the notes around the block survive');
+is(read_file('9402.yaml'), $backed_up, '... into the store');
+
+$res = PVE::RS::Meta::notes_import("9405", $block, 'restore');
+is($res->{action}, 'imported', 'notes_import takes a string vmid too');
+like(PVE::RS::Meta::export_for_backup("9405"), qr/^\[pve-meta v1 vmid=9405 /, 'export_for_backup takes a string vmid too');
+
+$res = eval { PVE::RS::Meta::notes_import(9402, $block, 'bogus') };
+ok(!defined($res), 'notes_import dies on an unknown mode');
+
+my $bad = "[pve-meta v1 vmid=1 sha256=0]\n````yaml\n- not: a map\n````\n[/pve-meta]";
+$res = eval { PVE::RS::Meta::notes_import(9403, $bad, 'restore') };
+ok(!defined($res), 'a block the store would refuse dies rather than importing');
+ok(!file_exists('9403.yaml'), '... and writes nothing');
+
+write_file('9404.yaml', "k: [unclosed\n");
+$res = eval { PVE::RS::Meta::export_for_backup(9404) };
+ok(!defined($res) && $@ =~ /does not parse/, 'export_for_backup dies for a document that does not parse');
+
+unlink("$root/9400.yaml", "$root/9401.yaml", "$root/9402.yaml", "$root/9404.yaml", "$root/9405.yaml");
 
 # =========================================================================
 # The perlmod boundary: native hashes and arrays.
@@ -551,13 +635,44 @@ is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data}, $before_
 # A scope on `traefik` covers the sibling comment key `traefik__` -- the one
 # comment-key rule left (docs/DESIGN.md §4).
 PVE::RS::Meta::api_put('9400', 'traefik__', 'json', '"the ingress config"', 'replace', undef, 0,
-    scoped_acl('traefik'));
-is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'))->{data},
+    scoped_acl('traefik'), 0, 1);
+is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'), 1)->{data},
     'the ingress config', 'a scoped principal can write its own comment key');
 $res = eval { PVE::RS::Meta::api_put('9400', 'netbird__', 'json', '"nope"', 'replace', undef, 0,
-        scoped_acl('traefik')) };
+        scoped_acl('traefik'), 0, 1) };
 ok(!defined($res), '... but not another key\'s comment (netbird is ro)');
+like($@, api_error_status(403), '... with 403:');
 PVE::RS::Meta::api_delete('9400', 'traefik__', undef, scoped_acl('traefik'));
+
+# Comment keys are notes (docs/DESIGN.md §2, §7): a read leaves them out unless
+# `$comments`, and a replace without it carries none and keeps the stored ones.
+write_file('9403.yaml', "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n");
+is_deeply(PVE::RS::Meta::api_get('9403', undef, 'json', $FULL)->{data},
+    { web => { host => 'a', port => 80 } }, 'api_get leaves comment keys out by default');
+is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL)->{text}, "web:\n  host: a\n  port: 80\n",
+    '... and format=yaml is the canonical dump of what is left');
+is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL, 1)->{text},
+    "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n",
+    'with $comments a full reader gets the file itself');
+$res = eval { PVE::RS::Meta::api_get('9403', 'web.host__', 'json', $FULL) };
+like($@, api_error_status(400), 'a view naming a comment key without $comments is 400:');
+my $kept = PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"b"}', 'replace', undef, 0, $FULL);
+is_deeply([sort map { "$_->{op} $_->{path}" } @{ $kept->{touched} }],
+    ['delete web.port', 'set web.host'], 'a replace without $comments reports only what it changed');
+is(read_file('9403.yaml'), "__: the guest\nweb:\n  host__: public name\n  host: b\n",
+    '... and keeps the notes whose subject it kept');
+$res = eval { PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c","host__":"x"}', 'replace',
+        undef, 0, $FULL) };
+like($@, api_error_status(400), 'a replace without $comments may not carry a comment key');
+PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c"}', 'replace', undef, 0, $FULL, 0, 1);
+is(read_file('9403.yaml'), "__: the guest\nweb:\n  host: c\n",
+    'with $comments the payload is the subtree, notes included');
+write_file('9403.yaml', "web__: the site\nweb:\n  host: c\n");
+PVE::RS::Meta::api_delete('9403', 'web', undef, $FULL);
+is(read_file('9403.yaml'), "{}\n", 'a DELETE of a view takes its note along');
+$res = eval { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9403, read => 1 }], 'web__') };
+like($@, api_error_status(400), 'has= naming a comment key is 400:');
+unlink("$root/9403.yaml");
 
 # Scopes never apply to a registry document.
 my $reg_scoped = PVE::RS::Meta::api_access('prefixes/traefik', scoped_acl('traefik'));
@@ -676,7 +791,7 @@ for my $case (
     my ($view, $mode, $payload, $re) = @$case;
     for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
         my ($label, $a) = @$who;
-        $res = eval { PVE::RS::Meta::api_put('9400', $view, 'json', $payload, $mode, undef, 0, $a) };
+        $res = eval { PVE::RS::Meta::api_put('9400', $view, 'json', $payload, $mode, undef, 0, $a, 0, 1) };
         ok(!defined($res), "[$label] a $mode of $payload at $view is refused");
         like($@, api_error_status(400), "[$label] ... with 400:");
         like($@, $re, "[$label] ... naming the rule");
@@ -694,13 +809,13 @@ for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
 }
 unlink("$root/9502.yaml");
 
-# An unparseable document: yaml + parse_error for a full reader, 422 for json
-# and for anyone else, repaired by a root replace (docs/DESIGN.md §7).
+# An unparseable document: yaml + parse_error for a full reader asking for
+# comments, 422 for json and for anyone else, repaired by a root replace (docs/DESIGN.md §7).
 for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: [\n") {
     (my $label = $broken) =~ s/\n/\\n/g;
     write_file('9500.yaml', $broken);
 
-    my $doc = PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL);
+    my $doc = PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL, 1);
     ok(defined($doc->{parse_error}), "[$label] a full reader gets parse_error");
     is($doc->{text}, $broken, "[$label] ... with the raw text to repair from");
     isnt($doc->{digest}, '', "[$label] ... and the real digest");
@@ -708,8 +823,10 @@ for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: 
     $res = eval { PVE::RS::Meta::api_get('9500', undef, 'json', $FULL) };
     ok(!defined($res), "[$label] format=json is refused");
     like($@, api_error_status(422), "[$label] ... with 422:");
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL) };
+    like($@, api_error_status(422), "[$label] ... and so is yaml without comments");
 
-    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', scoped_acl('traefik')) };
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', scoped_acl('traefik'), 1) };
     ok(!defined($res), "[$label] and a scoped reader never gets the bytes");
     like($@, api_error_status(422), "[$label] ... 422 there too");
 
@@ -737,7 +854,7 @@ for my $text ("", "# only a comment\n", "- a\n- b\n", "just a scalar\n") {
     (my $label = $text) =~ s/\n/\\n/g;
     write_file('9505.yaml', $text);
 
-    my $doc = PVE::RS::Meta::api_get('9505', undef, 'yaml', $FULL);
+    my $doc = PVE::RS::Meta::api_get('9505', undef, 'yaml', $FULL, 1);
     ok(defined($doc->{parse_error}), "[$label] a full reader is told it is not a document");
     is($doc->{text}, $text, "[$label] ... with the raw text to repair from");
 
@@ -929,5 +1046,113 @@ for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'oper
     ok(!defined($res), "api_get refuses the id '$bad'");
     like($@, api_error_status(400), "... with a 400");
 }
+
+# -- node prefix files: a third layer, per node --------------------------------
+#
+# `nodes/<node>/prefixes/<name>` is a prefix file in that node's directory, a
+# registry document like the other two, and in effect only for the guests the
+# ACL hash says are on that node. The node crosses as `node` in the hash.
+
+my $pve1dir = "$nodesdir/pve1/meta.d/prefixes";
+my $gpu_put = PVE::RS::Meta::api_put(
+    'nodes/pve1/prefixes/gpu', undef, 'yaml',
+    "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n",
+    'replace', '', 0, $ADMIN,
+);
+is($gpu_put->{id}, 'nodes/pve1/prefixes/gpu', 'api_put creates a node prefix document');
+ok(-f "$pve1dir/gpu.yaml", '... in that node\'s directory');
+ok(!-e "$nsdir/gpu.yaml", '... and not in the cluster directory');
+is(PVE::RS::Meta::api_get('nodes/pve1/prefixes/gpu', undef, 'json', $ADMIN)->{digest},
+    $gpu_put->{digest}, 'api_get reads it back by the same id');
+is(PVE::RS::Meta::api_get('nodes/pve2/prefixes/gpu', undef, 'json', $ADMIN)->{digest}, '',
+    '... and the same name on another node is another, absent, document');
+
+ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes() }),
+    'the default listing is the cluster-wide set, as before node files existed');
+my ($gpu_row) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes(undef, 1) };
+is($gpu_row->{origin}, 'node', 'the all=1 listing says where a node file came from');
+is($gpu_row->{node}, 'pve1', '... and which node');
+ok((grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve1') }),
+    "api_prefixes('pve1') includes the node's file");
+ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
+    "api_prefixes('pve2') does not");
+ok((grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
+    '... though it has the cluster files');
+$res = eval { PVE::RS::Meta::api_prefixes('../pve1') };
+ok(!defined($res), 'api_prefixes refuses a node that is not a node name');
+like($@, api_error_status(400), '... with a 400');
+$res = eval { PVE::RS::Meta::api_prefixes('pve1', 1) };
+ok(!defined($res), 'api_prefixes refuses node and all together');
+like($@, api_error_status(400), '... with a 400');
+
+# The node crosses as a checked node name: the ACL hash refuses one that is not.
+$res = eval { PVE::RS::Meta::api_put('9600', 'x', 'json', '1', 'replace', undef, 0, { %$ADMIN, node => '../pve1' }) };
+ok(!defined($res), 'an ACL hash whose node is not a node name is refused');
+ok(!exists(PVE::RS::Meta::api_access('9600', { %$ADMIN, node => 'pve1' })->{node}),
+    'api_access does not hand the node back: the prefix listing resolves it by id');
+
+# enforce follows the guest's node.
+my $on_pve1 = { %$ADMIN, node => 'pve1' };
+my $on_pve2 = { %$ADMIN, node => 'pve2' };
+$res = eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve1) };
+ok(!defined($res), "a node prefix's enforce refuses a write for a guest on that node");
+like($@, api_error_status(422), '... with a 422');
+ok(defined(eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve2) }),
+    '... and does not reach a guest on another node');
+
+# The guest's token covers its node's directory and its node's name.
+my $tok1 = PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token};
+isnt(PVE::RS::Meta::api_version(0, '9600', 'pve2')->{token}, $tok1, 'a migrated guest has another token');
+is(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node is a stable input');
+PVE::RS::Meta::api_put('nodes/pve1/prefixes/gpu', 'description', 'json', '"GPUs"', 'replace', undef, 0, $ADMIN);
+isnt(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node prefix change moves its guests\' token');
+ok((grep { $_->{id} eq 'nodes/pve1/prefixes/gpu' } @{ PVE::RS::Meta::api_version(1, undef)->{documents} }),
+    'the unscoped detail lists the node prefix document');
+$res = eval { PVE::RS::Meta::api_version(0, '9600', 'a/b') };
+like($@, api_error_status(400), 'a node that is not a node name is a 400 on the poll too');
+
+for my $bad ('nodes/../prefixes/gpu', 'nodes/pve.1/prefixes/gpu', 'nodes/pve1/permissions/ops') {
+    $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
+    ok(!defined($res), "api_get refuses the id '$bad'");
+    like($@, api_error_status(400), "... with a 400");
+}
+
+is(PVE::RS::Meta::api_delete('nodes/pve1/prefixes/gpu', undef, undef, $ADMIN)->{digest}, '',
+    'api_delete removes a node prefix file');
+ok(!-e "$pve1dir/gpu.yaml", '... and the file is gone');
+
+# =========================================================================
+# A store that is not there (docs/DESIGN.md §7): every export refuses, with
+# a 503 where the API has a status, instead of answering "no documents".
+# =========================================================================
+
+write_file('9700.yaml', "a: 1\n");
+{
+    local $ENV{PVE_META_CLUSTER_MARKER} = "$root/local";
+    for my $case (
+        ['api_get', sub { PVE::RS::Meta::api_get('9700', undef, 'json', $FULL) }],
+        ['api_put', sub { PVE::RS::Meta::api_put('9700', 'b', 'json', '1', 'replace', undef, 0, $FULL) }],
+        ['api_delete', sub { PVE::RS::Meta::api_delete('9700', undef, undef, $FULL) }],
+        ['api_version', sub { PVE::RS::Meta::api_version(1, undef) }],
+        ['api_list_guests', sub { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9700, read => 1 }], undef) }],
+        ['api_access', sub { PVE::RS::Meta::api_access('9700', $FULL) }],
+        ['api_prefixes', sub { PVE::RS::Meta::api_prefixes(undef) }],
+        ['api_permissions', sub { PVE::RS::Meta::api_permissions() }],
+    ) {
+        my ($name, $call) = @$case;
+        $res = eval { $call->() };
+        ok(!defined($res), "$name refuses while the cluster marker is missing");
+        like($@, qr/^503: cluster filesystem not available/, "... with a 503:");
+    }
+    $res = eval { PVE::RS::Meta::stored_vmids() };
+    like($@, qr/cluster filesystem not available/, 'stored_vmids refuses too, rather than listing nothing');
+    is(read_file('9700.yaml'), "a: 1\n", 'and nothing was written or removed');
+
+    symlink($root, "$root/local") or die "symlink: $!\n";
+    is_deeply(PVE::RS::Meta::api_get('9700', undef, 'json', $FULL)->{data}, { a => 1 },
+        'with the marker in place the same store answers');
+    unlink("$root/local");
+}
+unlink("$root/9700.yaml");
 
 done_testing();

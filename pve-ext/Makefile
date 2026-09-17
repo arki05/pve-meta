@@ -24,7 +24,7 @@ install:
 	mkdir -p $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext
 
 # lintian runs as part of this target, not as a separate step (see
-# docs/design/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 9,
+# docs/reference/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 9,
 # README.md "Building and packaging"), mirroring upstream pve-rs's plain
 # `lintian $(DEBS)` (no --fail-on override, so only an E: tag fails the
 # build; a W: is printed, not fatal, same as upstream). `|| true` for a

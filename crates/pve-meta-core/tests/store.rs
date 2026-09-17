@@ -3,6 +3,7 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
+use pve_meta_core::registry::{NodeName, PrefixSet, Registry};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind, RollbackOutcome, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -721,14 +722,14 @@ fn a_malformed_override_is_the_file_a_read_opens_and_the_loader_reports() {
     assert_eq!(read.path, cluster_file, "the read opens the override");
     assert_eq!(read.raw, "selector: {nonsense: true}\n");
 
-    let (loaded, failures) = store.registry().list_prefixes();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
     assert!(loaded.is_empty(), "the packaged file is shadowed, not re-activated");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].name, "traefik");
 
     // Removing the override is the repair: the packaged file is in effect again.
     assert!(store.delete(&prefix("traefik")).unwrap());
-    let (loaded, failures) = store.registry().list_prefixes();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(failures.is_empty());
 }
@@ -811,4 +812,117 @@ fn a_nested_prefix_is_a_dotted_file_name_and_still_one_document() {
         "the nested prefix is missing from {:?}",
         v.documents,
     );
+}
+
+// --- node prefix documents (DocId::NodePrefix) -------------------------------
+
+#[test]
+fn a_node_prefix_document_lives_where_the_loader_reads_or_nowhere() {
+    let (dir, store) = store();
+    // With no nodes directory configured there is nowhere the loader would read
+    // a node file from, so the store has nowhere to write one either.
+    let pve1 = NodeName::new("pve1").unwrap();
+    let good = DocId::NodePrefix { node: pve1.clone(), name: "gpu".to_string() };
+    assert!(matches!(store.put_raw(&good, "selector: {all: true}\n", None), Err(Error::Registry(_))));
+    assert!(!dir.path().join("nodes").exists(), "nothing was written inside the root");
+
+    // With one, the store writes where the loader reads.
+    let registry = Registry::new(vec![cluster_prefix_dir(dir.path())], vec![])
+        .with_nodes_dir(dir.path().join("nodes"));
+    let store = MetaStore::with_registry(dir.path(), registry);
+    let written = store.put_raw(&good, "selector: {all: true}\n", None).unwrap();
+    assert_eq!(written.document.path, dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml"));
+    assert_eq!(store.registry().unwrap().load_prefixes(Some(&pve1)).unwrap().len(), 1);
+    assert_eq!(store.read(&good).unwrap().raw, "selector: {all: true}\n");
+    assert!(store.delete(&good).unwrap());
+}
+
+// --- a store that is not there (docs/DESIGN.md §7) ---------------------------
+
+#[test]
+fn a_store_whose_cluster_marker_is_missing_refuses_every_operation() {
+    let (dir, store) = store();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "before").unwrap();
+    let marker = dir.path().join("local");
+    let store = store.with_cluster_marker(&marker);
+
+    // pmxcfs not mounted: the directory is right there, and holds what it holds,
+    // but nothing may be read off it as the store's answer.
+    let unavailable = |r: Result<(), Error>, what: &str| {
+        assert!(matches!(r, Err(Error::Unavailable(_))), "{what}: {r:?}");
+    };
+    unavailable(store.check_available(), "check_available");
+    unavailable(store.read(&DocId::Guest(100)).map(drop), "read");
+    unavailable(store.read(&prefix("traefik")).map(drop), "read of a registry document");
+    unavailable(store.digest_of(&DocId::Guest(100)).map(drop), "digest_of");
+    unavailable(store.check_precondition(&DocId::Guest(100), Some("")), "check_precondition");
+    unavailable(store.put_raw(&DocId::Guest(101), "b: 1\n", None).map(drop), "put_raw");
+    unavailable(store.delete(&DocId::Guest(100)).map(drop), "delete");
+    unavailable(store.stored_vmids().map(drop), "stored_vmids");
+    unavailable(store.list_snapshots(100).map(drop), "list_snapshots");
+    unavailable(store.snapshot(100, "again").map(drop), "snapshot");
+    unavailable(store.rollback(100, "before").map(drop), "rollback");
+    unavailable(store.delete_snapshot(100, "before").map(drop), "delete_snapshot");
+    unavailable(store.purge(100).map(drop), "purge");
+    unavailable(store.version().map(drop), "version");
+    unavailable(store.version_of(Some(&DocId::Guest(100)), None).map(drop), "scoped version");
+    unavailable(store.registry().map(drop), "registry");
+    // A marker that is there but is not what pmxcfs provides is no better.
+    std::fs::create_dir(&marker).unwrap();
+    unavailable(store.check_available(), "a directory where the symlink should be");
+    assert!(!dir.path().join("101.yaml").exists(), "nothing was written");
+
+    // Mounted: the same store answers.
+    std::fs::remove_dir(&marker).unwrap();
+    std::os::unix::fs::symlink(dir.path(), &marker).unwrap();
+    assert_eq!(store.read(&DocId::Guest(100)).unwrap().raw, "a: 1\n");
+    assert_eq!(store.stored_vmids().unwrap(), vec![100]);
+}
+
+#[test]
+fn a_directory_that_cannot_be_read_is_an_error_not_an_empty_one() {
+    // Not there is empty. Anything else -- here a file where a directory should
+    // be, which fails like an unreadable directory -- is the error it is.
+    let dir = tempdir().unwrap();
+    let not_a_dir = dir.path().join("file");
+    std::fs::write(&not_a_dir, "").unwrap();
+    let store = MetaStore::with_registry_dirs(&not_a_dir, vec![], vec![]);
+    assert!(matches!(store.stored_vmids(), Err(Error::Io(_))));
+    assert!(matches!(store.list_snapshots(100), Err(Error::Io(_))));
+    assert!(matches!(store.version(), Err(Error::Io(_))));
+
+    let store = MetaStore::with_registry_dirs(dir.path(), vec![not_a_dir.clone()], vec![not_a_dir.clone()]);
+    let registry = store.registry().unwrap();
+    assert!(matches!(registry.list_prefixes(PrefixSet::Cluster), Err(Error::Io(_))));
+    assert!(matches!(registry.load_permissions(), Err(Error::Io(_))));
+    assert!(matches!(store.version(), Err(Error::Io(_))));
+    let nodes = Registry::new(vec![], vec![]).with_nodes_dir(&not_a_dir);
+    assert!(matches!(nodes.nodes(), Err(Error::Io(_))));
+
+    // And a missing one is still nothing at all.
+    let gone = dir.path().join("gone");
+    let store = MetaStore::with_registry_dirs(&gone, vec![gone.clone()], vec![gone.clone()]);
+    assert_eq!(store.stored_vmids().unwrap(), Vec::<u32>::new());
+    assert!(store.registry().unwrap().load_permissions().unwrap().is_empty());
+    assert!(store.version().unwrap().documents.is_empty());
+}
+
+#[test]
+fn one_entry_that_cannot_be_looked_at_costs_that_entry_not_the_answer() {
+    // A symlink loop fails `stat` with ELOOP: there, and unreadable.
+    let (dir, store) = store();
+    let prefixes = cluster_prefix_dir(dir.path());
+    std::fs::create_dir_all(&prefixes).unwrap();
+    std::fs::write(prefixes.join("good.yaml"), "selector: {all: true}\n").unwrap();
+    std::os::unix::fs::symlink("loop.yaml", prefixes.join("loop.yaml")).unwrap();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(failures.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["loop"]);
+
+    let nodes = dir.path().join("nodes");
+    std::fs::create_dir_all(nodes.join("pve1")).unwrap();
+    std::os::unix::fs::symlink("pve2", nodes.join("pve2")).unwrap();
+    let names: Vec<String> = Registry::new(vec![], vec![]).with_nodes_dir(&nodes).nodes().unwrap().iter().map(|n| n.to_string()).collect();
+    assert_eq!(names, vec!["pve1"]);
 }

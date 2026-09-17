@@ -42,7 +42,7 @@ debug = false
 strip = true
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 # The oldest toolchain the crates claim to build with; rust-toolchain.toml pins
 # the one they are built with. Kept equal to that pin's minor.

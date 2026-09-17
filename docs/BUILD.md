@@ -3,7 +3,8 @@
 ## Toolchain
 
 Development and CI happen on a Debian 13 (trixie) host with a [rustup](https://rustup.rs/)
-toolchain installed under `~/.cargo/bin` (rustc 1.98 at the time of writing) — **not** the
+toolchain installed under `~/.cargo/bin` (the version `rust-toolchain.toml` pins, which
+rustup installs on first use) — **not** the
 `cargo`/`rustc` Debian packages. `pve-meta-perl` (the perlmod bindings) needs `libperl-dev`
 headers and only builds on Linux; `pve-meta-core` and `pve-meta-wasm` are pure Rust and
 also compile on macOS. Use the Linux build host for anything else:
@@ -71,10 +72,20 @@ make -C crates/pve-meta-perl check               # test/basic.pl over the built 
 
 The Rust suites take their paths from the environment — `PVE_META_ROOT` for the store,
 `PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` (colon-separated, lowest
-precedence first) for the two registry directories — and `test/basic.pl` sets all three
-to temp dirs, so nothing here touches `/etc/pve`.
+precedence first) for the two registry directories, `PVE_META_NODES_DIR` for the
+directory holding each node's prefix files — and `test/basic.pl` sets all four to temp
+dirs, so nothing here touches `/etc/pve`. A store rooted under `/etc/pve` refuses every
+operation unless `/etc/pve/local` is a symlink (pmxcfs is mounted);
+`PVE_META_CLUSTER_MARKER` names the symlink to check instead, for any root, and set to
+nothing checks none. `test/basic.pl` points it at a temp path to exercise the refusal;
+the Rust suites use `MetaStore::with_cluster_marker`.
 
 ## Debian package
+
+The second binary package, `libpve-meta-rs-perl`, keeps its own notes in
+`crates/pve-meta-perl/PACKAGING.md`: what it needs from `debian/control` and
+`debian/rules`, and how the two packages' files are kept apart. This section is how the
+packages are built and installed.
 
 The `.deb`s are built with `dpkg-buildpackage`, but **without** relying on Debian's own
 `cargo`/`rustc` packages — `debian/rules` calls `make`, and the `Makefile` resolves `cargo` as

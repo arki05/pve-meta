@@ -11,7 +11,7 @@ override_dh_auto_build:
 	$(MAKE) build ui
 
 # Cargo.toml's `[workspace.package] version` must agree with debian/changelog's
-# upstream version (see docs/design/PROXMOX-CONVENTIONS.md §7.4, mirroring
+# upstream version (see docs/reference/PROXMOX-CONVENTIONS.md §7.4, mirroring
 # upstream pve-rs's debian/rules): catches a bumped changelog with a forgotten
 # Cargo.toml bump (or vice versa) at build time instead of shipping a `.deb`
 # whose own crate disagrees with its own package version. Skipped for

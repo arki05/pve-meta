@@ -19,6 +19,9 @@
 //!   authorization, the lint, `touched` reporting) that
 //!   `PVE::RS::Meta`'s `api_*` functions export to
 //!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8).
+//! - [`backup`] — the notes block: a document rendered into, and read back
+//!   out of, a guest config's notes, which is how it rides through a vzdump
+//!   backup and restore (`docs/DESIGN.md` §9).
 //! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
 //!   most-specific first: what governs a path, what its schema says
 //!   (`docs/DESIGN.md` §3). Schemas shadow.
@@ -39,7 +42,9 @@
 //!   documents, snapshot copies, and content-hashed version polling.
 //! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
 //!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
-//!   operations (`docs/DESIGN.md` §2), plus [`view::render`]/[`view::parse`]/
+//!   operations (`docs/DESIGN.md` §2), [`view::strip_comments`]/
+//!   [`view::keep_comments`] for the notes a caller did not ask for, plus
+//!   [`view::render`]/[`view::parse`]/
 //!   [`view::parse_patch`] for a view's wire text.
 //! - [`metaschema`] — the two registry file formats, written as schemas in the
 //!   same dialect a prefix uses, so the editor can show a prefix or grant
@@ -174,6 +179,7 @@ macro_rules! warn_line {
 }
 
 pub mod api;
+pub mod backup;
 pub mod digest;
 pub mod edit;
 pub mod error;

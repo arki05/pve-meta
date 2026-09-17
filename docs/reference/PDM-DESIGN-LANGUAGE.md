@@ -13,7 +13,7 @@ checkouts, pinned at the revisions already in `ui/Cargo.toml`'s `[patch.crates-i
 | `PWT` | `.../scratchpad/upstream/proxmox-yew-widget-toolkit` (rev `3ce6f16`) |
 | `SCSS` | `/Users/arki/Documents/proxmox/pve-meta/ui/pwt-assets/scss` (vendored, byte-identical to upstream `pwt-assets/scss`) |
 
-Companion document: `docs/design/PROXMOX-CONVENTIONS.md` (how Proxmox *writes* code — Rust
+Companion document: `docs/reference/PROXMOX-CONVENTIONS.md` (how Proxmox *writes* code — Rust
 style, Perl API modules, ExtJS/JS, Makefile/debian).
 
 ---
@@ -1417,7 +1417,7 @@ wasm payload; toolbar/`Ext.Msg` behaviour is free. The tab would be a normal ent
 `PVE.lxc.Config`'s `items:` array
 (`/usr/share/pve-manager/js/pvemanagerlib.js:39669-39724`), and an options-style page would be
 a `Proxmox.grid.PendingObjectGrid` like `PVE.lxc.Options`
-(`pvemanagerlib.js:42408-42500`) — see `docs/design/PROXMOX-CONVENTIONS.md` §7 for the exact
+(`pvemanagerlib.js:42408-42500`) — see `docs/reference/PROXMOX-CONVENTIONS.md` §7 for the exact
 idioms.
 
 **Cons:** none of the existing Rust model/patch/schema/diff code (`ui/src/model.rs`,

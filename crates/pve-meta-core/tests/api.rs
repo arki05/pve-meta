@@ -2,12 +2,13 @@
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::api::{
-    access, delete_document, effective, get_document, list_guests,
+    self, access, delete_document, effective, get_document, list_guests,
     parse_id, permissions_list, prefixes_list, put_document, version, ApiError, ApiPutResult,
     ApiViewDocument, CallerAcl, GuestInput, PermissionEntry,
 };
 use pve_meta_core::path::Path as DocPath;
-use pve_meta_core::registry::{self, Origin, Permission, PrefixDef, RegistryFailure};
+use pve_meta_core::shape::Shape;
+use pve_meta_core::registry::{self, NodeName, Origin, Permission, PrefixDef, RegistryFailure};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind};
 use serde_json::json;
 
@@ -44,6 +45,7 @@ fn full() -> CallerAcl {
         read: true,
         write: true,
         tags: vec![],
+        node: None,
     }
 }
 
@@ -53,6 +55,7 @@ fn scoped(tags: &[&str]) -> CallerAcl {
         read: false,
         write: false,
         tags: tags.iter().map(|s| s.to_string()).collect(),
+        node: None,
     }
 }
 
@@ -73,6 +76,7 @@ fn auditor(tags: &[&str]) -> CallerAcl {
         read: true,
         write: false,
         tags: tags.iter().map(|s| s.to_string()).collect(),
+        node: None,
     }
 }
 
@@ -109,7 +113,8 @@ fn get(
     fmt: &str,
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, ApiError> {
-    get_document(store, &regs(), id, view, fmt, acl)
+    // `comments`: every rule below but the notes' own is about the stored content.
+    get_document(store, &regs(), id, view, fmt, true, acl)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -143,7 +148,8 @@ fn put_with(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     put_document(
-        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, acl,
+        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, true,
+        acl,
     )
 }
 
@@ -244,10 +250,10 @@ fn version_detail_names_the_documents_that_changed() {
     store.put_raw(&DocId::Guest(200), "b: 2\n", None).unwrap();
 
     // Without `detail` the shape is unchanged: no `documents` on the wire.
-    let plain = version(&store, false, None).unwrap();
+    let plain = version(&store, false, None, None).unwrap();
     assert!(plain.documents.is_none());
 
-    let detailed = version(&store, true, None).unwrap();
+    let detailed = version(&store, true, None, None).unwrap();
     let docs = detailed.documents.expect("detail asked for");
     let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
     assert_eq!(ids, vec!["100", "200"]);
@@ -261,13 +267,13 @@ fn a_scoped_version_ignores_other_documents_and_snapshots() {
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
 
-    let mine = || version(&store, false, Some("100")).unwrap().token;
+    let mine = || version(&store, false, Some("100"), None).unwrap().token;
     let before = mine();
 
     // Another guest's document: the unscoped token moves, mine does not.
-    let whole_before = version(&store, false, None).unwrap().token;
+    let whole_before = version(&store, false, None, None).unwrap().token;
     store.put_raw(&DocId::Guest(101), "b: 2\n", None).unwrap();
-    assert_ne!(version(&store, false, None).unwrap().token, whole_before);
+    assert_ne!(version(&store, false, None, None).unwrap().token, whole_before);
     assert_eq!(mine(), before, "another guest is not my document");
 
     // My own snapshot copy is not my document either -- it is exactly the
@@ -293,10 +299,10 @@ fn a_scoped_version_still_watches_the_registry() {
     std::fs::create_dir_all(&prefixes).unwrap();
 
     for (id, body) in [("100", "selector: {all: true}\n"), ("prefixes/homelab", "selector: {tag: web}\n")] {
-        let before = version(&store, false, Some(id)).unwrap().token;
+        let before = version(&store, false, Some(id), None).unwrap().token;
         std::fs::write(prefixes.join("homelab.yaml"), body).unwrap();
         assert_ne!(
-            version(&store, false, Some(id)).unwrap().token,
+            version(&store, false, Some(id), None).unwrap().token,
             before,
             "a prefix appearing must move the token for {id}"
         );
@@ -316,7 +322,7 @@ fn a_scoped_detail_lists_exactly_what_the_scoped_token_covers() {
     std::fs::create_dir_all(&prefixes).unwrap();
     std::fs::write(prefixes.join("homelab.yaml"), "selector: {all: true}\n").unwrap();
 
-    let docs = version(&store, true, Some("100")).unwrap().documents.unwrap();
+    let docs = version(&store, true, Some("100"), None).unwrap().documents.unwrap();
     let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
     assert_eq!(ids, vec!["100", "prefixes/homelab"]);
 }
@@ -326,7 +332,7 @@ fn a_scoped_version_refuses_a_garbage_id() {
     // The same parser every other endpoint uses: a 400, not a 500 and not
     // a silent fall back to the whole store.
     let (_dir, store) = store();
-    let err = version(&store, false, Some("nope")).unwrap_err().to_string();
+    let err = version(&store, false, Some("nope"), None).unwrap_err().to_string();
     assert!(err.starts_with("400: "), "{err}");
 }
 
@@ -577,7 +583,7 @@ fn a_scoped_write_outside_the_view_is_refused_by_the_touched_check() {
     // patch reaches out of the prefix cannot exist (the patch is applied
     // relative to the view), so the touched check is exercised through a
     // full-read/no-write caller instead.
-    let ro = CallerAcl { authid: "ro@pve".into(), read: true, write: false, tags: vec![] };
+    let ro = CallerAcl { authid: "ro@pve".into(), read: true, write: false, tags: vec![], node: None };
     let err = put(&store, "100", Some("traefik"), "json", "{\"a\":1}", "replace", None, false, &ro)
         .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
@@ -721,6 +727,279 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
         get(&store, "100", Some("alpha"), "yaml", &full()).unwrap().text.as_deref(),
         Some("2\n")
     );
+}
+
+// -- comment keys are notes (docs/DESIGN.md §2, §7) ---------------------
+
+/// A read that did not ask for the notes.
+fn get_bare(store: &MetaStore, id: &str, view: Option<&str>, fmt: &str, acl: &CallerAcl) -> Result<ApiViewDocument, ApiError> {
+    get_document(store, &regs(), id, view, fmt, false, acl)
+}
+
+/// A JSON write with `comments` as given, against `permission_files` and `prefixes`.
+#[allow(clippy::too_many_arguments)]
+fn put_notes(
+    store: &MetaStore,
+    permission_files: &[Permission],
+    prefixes: &[PrefixDef],
+    id: &str,
+    view: Option<&str>,
+    payload: &str,
+    mode: &str,
+    dry_run: bool,
+    comments: bool,
+    acl: &CallerAcl,
+) -> Result<ApiPutResult, ApiError> {
+    put_document(store, permission_files, prefixes, id, view, "json", payload, mode, None, dry_run, false, comments, acl)
+}
+
+fn touched_paths(r: &ApiPutResult) -> Vec<String> {
+    let mut v: Vec<String> = r.touched.iter().map(|t| format!("{} {}", t.op, t.path)).collect();
+    v.sort();
+    v
+}
+
+const NOTED: &str = "__: the whole document\n\
+backup:\n\
+\x20 __: the backup job's settings\n\
+\x20 retention: 7\n\
+\x20 retention__: days\n\
+\x20 targets:\n\
+\x20 - host: nas\n\
+\x20   host__: the only one\n\
+traefik__: about traefik\n\
+traefik:\n\
+\x20 host__: public name\n\
+\x20 host: web\n\
+netbird__: about netbird\n\
+netbird:\n\
+\x20 groups:\n\
+\x20 - lan\n";
+
+#[test]
+fn a_read_carries_no_comment_key_unless_it_asks() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let digest = store.digest_of(&DocId::Guest(100)).unwrap().unwrap();
+    let bare = json!({
+        "backup": {"retention": 7, "targets": [{"host": "nas"}]},
+        "traefik": {"host": "web"},
+        "netbird": {"groups": ["lan"]},
+    });
+
+    // At any depth, array members included, in both formats; YAML is the
+    // canonical dump of what is left, never the file's text. The digest is the file's.
+    let json_read = get_bare(&store, "100", None, "json", &full()).unwrap();
+    assert_eq!((json_read.data.unwrap(), json_read.digest), (bare.clone(), digest.clone()));
+    let yaml_read = get_bare(&store, "100", None, "yaml", &full()).unwrap();
+    assert_eq!(
+        yaml_read.text.as_deref(),
+        Some("backup:\n  retention: 7\n  targets:\n  - host: nas\ntraefik:\n  host: web\nnetbird:\n  groups:\n  - lan\n")
+    );
+    assert_eq!(yaml_read.digest, digest);
+    assert_eq!(
+        get_bare(&store, "100", Some("backup"), "yaml", &full()).unwrap().text.as_deref(),
+        Some("retention: 7\ntargets:\n- host: nas\n")
+    );
+    // A scoped reader's union is stripped the same way.
+    assert_eq!(
+        get_bare(&store, "100", None, "json", &scoped(&["traefik"])).unwrap().data.unwrap(),
+        json!({"traefik": {"host": "web"}, "netbird": {"groups": ["lan"]}})
+    );
+    // Naming a note is asking for it: without `comments` that is a 400.
+    for view in ["traefik__", "traefik.host__", "__"] {
+        let err = get_bare(&store, "100", Some(view), "json", &full()).unwrap_err();
+        assert_eq!(status(&err), 400, "{view}: {err}");
+        assert!(err.msg.contains("comments=1"), "{err}");
+    }
+
+    // With `comments`, the read is what it always was: the file's own text for a
+    // full reader's root view, the notes everywhere else.
+    assert_eq!(get(&store, "100", None, "yaml", &full()).unwrap().text.as_deref(), Some(NOTED));
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host__": "public name", "host": "web"})
+    );
+    assert_eq!(get(&store, "100", Some("traefik__"), "json", &full()).unwrap().data.unwrap(), json!("about traefik"));
+}
+
+#[test]
+fn a_registry_document_hides_its_notes_the_same_way() {
+    let (_dir, store) = store();
+    seed(&store, "prefixes/traefik", "selector__: every guest for now\nselector:\n  all: true\n");
+    assert_eq!(
+        get_bare(&store, "prefixes/traefik", None, "json", &full()).unwrap().data.unwrap(),
+        json!({"selector": {"all": true}})
+    );
+    assert_eq!(
+        get_bare(&store, "prefixes/traefik", None, "yaml", &full()).unwrap().text.as_deref(),
+        Some("selector:\n  all: true\n")
+    );
+    assert!(get(&store, "prefixes/traefik", None, "yaml", &full()).unwrap().text.unwrap().contains("selector__"));
+}
+
+#[test]
+fn an_unrecoverable_document_shows_its_text_only_to_a_read_that_asks_for_notes() {
+    let (dir, store) = store();
+    std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
+    assert!(get(&store, "100", None, "yaml", &full()).unwrap().parse_error.is_some());
+    assert_eq!(status(&get_bare(&store, "100", None, "yaml", &full()).unwrap_err()), 422);
+}
+
+#[test]
+fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+
+    // A stripped read written straight back changes nothing, touches nothing and
+    // rewrites nothing.
+    let bare = get_bare(&store, "100", None, "json", &full()).unwrap().data.unwrap().to_string();
+    let r = put_notes(&store, &regs(), &[], "100", None, &bare, "replace", false, false, &full()).unwrap();
+    assert!(r.touched.is_empty(), "{:?}", r.touched);
+    assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
+
+    // An edit keeps every note whose subject it keeps, where it was.
+    let edited = bare.replace("\"retention\":7", "\"retention\":14");
+    let r = put_notes(&store, &regs(), &[], "100", None, &edited, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set backup.retention"]);
+    assert_eq!(read_raw(&store, "100").unwrap(), NOTED.replace("retention: 7", "retention: 14"));
+
+    // A note whose subject the write drops goes with it -- and says so; a map's
+    // own `__` stays while the map does. A view's payload is judged the same way.
+    let dry = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
+    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__", "set backup.targets"]);
+    assert_eq!(touched_paths(&dry), touched_paths(&r), "a dry run plans the same write");
+    assert_eq!(
+        get(&store, "100", Some("backup"), "json", &full()).unwrap().data.unwrap(),
+        json!({"__": "the backup job's settings", "targets": [{"host": "nas", "host__": "the only one"}, {"host": "tape"}]})
+    );
+    // Replacing a scalar keeps the note beside it, which is outside the view anyway.
+    put_notes(&store, &regs(), &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host__": "public name", "host": "www"})
+    );
+}
+
+#[test]
+fn a_replace_without_comments_may_not_carry_or_name_a_note() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    for (view, payload, path) in [
+        (None, r#"{"traefik": {"host": "web", "host__": "new"}}"#, "traefik.host__"),
+        (Some("backup"), r#"{"targets": [{"host": "nas", "host__": "x"}]}"#, "backup.targets.0.host__"),
+        (Some("traefik.host__"), r#""new""#, "traefik.host__"),
+    ] {
+        let err = put_notes(&store, &regs(), &[], "100", view, payload, "replace", false, false, &full()).unwrap_err();
+        assert_eq!(status(&err), 400, "{view:?} {payload}: {err}");
+        assert!(err.msg.starts_with(path), "{err}");
+    }
+    assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
+}
+
+#[test]
+fn a_replace_with_comments_is_the_whole_subtree_notes_included() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host": "web", "port__": "later"}"#, "replace", false, true, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.host__", "set traefik.port__"]);
+    assert_eq!(
+        get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
+        json!({"host": "web", "port__": "later"})
+    );
+}
+
+#[test]
+fn a_merge_is_the_same_with_or_without_comments() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    // It names what it changes: a note it writes is written, a note it does not
+    // name is left, and a key it deletes takes its note along.
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host__": "renamed", "port": 80}"#, "merge", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host__", "set traefik.port"]);
+    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"retention": null}"#, "merge", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__"]);
+    // ... unless the same patch says what becomes of the note.
+    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"port": null, "port__": "was 80"}"#, "merge", false, true, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.port", "set traefik.port__"]);
+}
+
+#[test]
+fn a_note_is_named_only_by_a_caller_that_asks_and_a_broken_one_says_so() {
+    let (dir, store) = store();
+    seed(&store, "100", NOTED);
+    let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+    let err = list_guests(&store, &regs(), "root@pam", &rows, Some("traefik__")).unwrap_err();
+    assert_eq!(status(&err), 400, "{err}");
+
+    // A stored note that is not a string, from out of band: a replace that did
+    // not ask for notes kept it, and the lint says what it is.
+    std::fs::write(dir.path().join("100.yaml"), "a__: 5\na: 1\n").unwrap();
+    let err = put_notes(&store, &regs(), &[], "100", None, r#"{"a": 2}"#, "replace", false, false, &full()).unwrap_err();
+    assert_eq!(status(&err), 400);
+    assert!(err.msg.contains("a stored note; fix it with comments=1"), "{err}");
+
+    // An unrecoverable file tells a reader without notes how to see it.
+    std::fs::write(dir.path().join("100.yaml"), "a: [\n").unwrap();
+    let err = get_bare(&store, "100", None, "yaml", &full()).unwrap_err();
+    assert!(err.msg.contains("format=yaml&comments=1 (CLI: --comments)"), "{err}");
+}
+
+#[test]
+fn a_delete_takes_the_note_about_what_it_removes() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete traefik.host", "delete traefik.host__", "delete traefik__"]);
+    // The scope on `traefik` covers `traefik__`, so its holder may do the same.
+    seed(&store, "101", NOTED);
+    del(&store, "101", Some("traefik"), None, &scoped(&["traefik"])).unwrap();
+    assert!(!read_raw(&store, "101").unwrap().contains("traefik"));
+}
+
+#[test]
+fn a_replace_without_comments_drops_what_it_cannot_place_and_answers_for_it() {
+    let (_dir, store) = store();
+    seed(&store, "100", "__: the whole document\nlist:\n- k: 1\n  k__: one\n- k: 2\n  k__: two\nm:\n  __: about m\n  x: 1\n");
+    // The first member removed: the second is unchanged and keeps its note, the
+    // removed one's goes with it -- as a change.
+    let r = put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 2}]"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set list"]);
+    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 2, "k__": "two"}]));
+    // A member that changed keeps nothing.
+    put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 3}]"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 3}]));
+    // `{}` stores an empty map: its own `__` does not survive it.
+    let r = put_notes(&store, &regs(), &[], "100", Some("m"), "{}", "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete m.__", "delete m.x"]);
+    assert_eq!(get(&store, "100", Some("m"), "json", &full()).unwrap().data.unwrap(), json!({}));
+}
+
+#[test]
+fn a_kept_note_is_not_a_change_to_authorize_or_enforce() {
+    let (_dir, store) = store();
+    seed(&store, "100", NOTED);
+    // VM.Audit and `traefik` rw: it reads the whole document without the notes and
+    // writes it back with one value changed. `netbird__` and `__` are outside what
+    // it may write; kept, they are no touched path, so the write is its own.
+    let mut doc = get_bare(&store, "100", None, "json", &auditor(&["traefik"])).unwrap().data.unwrap();
+    doc["traefik"]["host"] = json!("www");
+    let r = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, false, &auditor(&["traefik"])).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
+    // The same body sent as the whole truth drops every note, which it may not.
+    let err = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, true, &auditor(&["traefik"])).unwrap_err();
+    assert_eq!(status(&err), 403, "{err}");
+
+    // An enforcing schema that says nothing about notes finds nothing in one kept.
+    let strict = vec![registry::parse_prefix(
+        "traefik",
+        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {host: {type: string}}}\n",
+    )
+    .unwrap()];
+    let r = put_notes(&store, &regs(), &strict, "100", Some("traefik"), r#"{"host": "web"}"#, "replace", false, false, &full()).unwrap();
+    assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
+    assert!(read_raw(&store, "100").unwrap().contains("host__: public name"));
 }
 
 #[test]
@@ -1089,6 +1368,7 @@ fn permissions_list_carries_failures_keyed_like_a_loaded_permission() {
     let failures = vec![RegistryFailure {
         name: "broken".to_string(),
         origin: Origin::Cluster,
+        node: None,
         error: "bad mode".to_string(),
     }];
     let gs = permissions_list(&regs(), &failures);
@@ -1111,6 +1391,7 @@ fn prefixes_list_carries_failures_keyed_like_a_loaded_prefix() {
     let failures = vec![RegistryFailure {
         name: "brokenns".to_string(),
         origin: Origin::Packaged,
+        node: None,
         error: "missing 'selector'".to_string(),
     }];
     let ns = prefixes_list(&prefixes, &failures);
@@ -1147,8 +1428,8 @@ fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
     assert_eq!(listed[0].digest, "");
 
     // The version poll skips it rather than failing.
-    assert!(version(&store, false, None).is_ok());
-    assert!(version(&store, true, None).is_ok());
+    assert!(version(&store, false, None, None).is_ok());
+    assert!(version(&store, true, None, None).is_ok());
 
     // A DELETE of a document another caller already removed is that
     // caller's request satisfied.
@@ -1350,6 +1631,7 @@ fn a_permission_never_reaches_the_registry_documents() {
         read: true,
         write: true,
         tags: vec![],
+        node: None,
     };
     let a = access(&regs(), &id, &admin);
     assert!(a.read && a.write && a.scopes.is_empty());
@@ -1370,4 +1652,269 @@ fn a_permission_never_reaches_the_registry_documents() {
     )
     .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
+}
+
+// -- node prefix files -------------------------------------------------------
+
+/// A store whose registry has a nodes directory as well, laid out the way
+/// `Registry::from_env` lays out `/etc/pve`: `registry/prefixes` is the cluster
+/// directory, `nodes/<node>/meta.d/prefixes` a node's.
+fn node_store() -> (tempfile::TempDir, MetaStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = registry::Registry::new(
+        vec![dir.path().join("registry/prefixes")],
+        vec![dir.path().join("registry/grants")],
+    )
+    .with_nodes_dir(dir.path().join("nodes"));
+    let store = MetaStore::with_registry(dir.path(), registry);
+    (dir, store)
+}
+
+fn on_node(node: &str) -> CallerAcl {
+    CallerAcl { node: Some(NodeName::new(node).unwrap()), ..full() }
+}
+
+/// `put_document` with the prefixes `api_put` hands it: the set for the
+/// caller's node.
+fn put_on(store: &MetaStore, id: &str, view: &str, payload: &str, acl: &CallerAcl) -> Result<ApiPutResult, ApiError> {
+    let doc_id = parse_id(id).unwrap();
+    let prefixes = api::effective_prefixes(store.registry().unwrap(), &doc_id, acl).unwrap();
+    put_with(store, &regs(), &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
+}
+
+fn put_node_prefix(store: &MetaStore, id: &str, text: &str) -> ApiPutResult {
+    put(store, id, None, "yaml", text, "replace", None, false, &full()).unwrap()
+}
+
+#[test]
+fn parse_id_reads_a_node_prefix_id_and_refuses_a_node_that_is_not_one() {
+    assert_eq!(
+        parse_id("nodes/pve1/prefixes/gpu.devices").unwrap(),
+        DocId::NodePrefix { node: NodeName::new("pve1").unwrap(), name: "gpu.devices".to_string() },
+    );
+    assert_eq!(parse_id("nodes/pve1/prefixes/gpu").unwrap().to_string(), "nodes/pve1/prefixes/gpu");
+    for bad in [
+        "nodes/../prefixes/gpu",
+        "nodes/./prefixes/gpu",
+        "nodes/pve.1/prefixes/gpu",
+        "nodes//prefixes/gpu",
+        "nodes/pve1/permissions/ops",
+        "nodes/pve1/prefixes/",
+        "nodes/pve1/prefixes/a/b",
+        "nodes/pve1/prefixes/../../x",
+        "nodes/pve1",
+        "nodes/-pve1/prefixes/gpu",
+    ] {
+        let err = parse_id(bad).unwrap_err();
+        assert_eq!(status(&err), 400, "{bad} was accepted: {err}");
+    }
+
+    let (_dir, store) = node_store();
+    for bad in ["..", "pve1/../x", "a.b", ""] {
+        assert_eq!(status(&api::prefixes(store.registry().unwrap(), Some(bad), false).unwrap_err()), 400, "{bad:?}");
+        assert_eq!(status(&version(&store, false, Some("100"), Some(bad)).unwrap_err()), 400, "{bad:?}");
+    }
+}
+
+#[test]
+fn a_node_prefix_is_a_document_in_its_nodes_directory_only() {
+    let (dir, store) = node_store();
+    put_node_prefix(&store, "prefixes/gpu", "description: cluster\nselector: {all: true}\n");
+    let written = put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "description: pve1\nselector: {all: true}\n");
+    assert_eq!(written.id, "nodes/pve1/prefixes/gpu");
+    assert!(dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml").is_file());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("registry/prefixes/gpu.yaml")).unwrap(),
+        "description: cluster\nselector:\n  all: true\n",
+        "the cluster file is untouched",
+    );
+
+    // Read back as itself, never as the cluster file it shadows -- and on
+    // another node the id names a file that is not there.
+    let got = get(&store, "nodes/pve1/prefixes/gpu", Some("description"), "json", &full()).unwrap();
+    assert_eq!(got.data.unwrap(), json!("pve1"));
+    assert_eq!(get(&store, "nodes/pve2/prefixes/gpu", None, "json", &full()).unwrap().digest, "");
+
+    // The loader's own parser gates the write, dry run included.
+    for dry_run in [false, true] {
+        let err = put(&store, "nodes/pve1/prefixes/gpu", None, "yaml", "description: no selector\n", "replace", None, dry_run, &full())
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{err}");
+        assert!(err.msg.contains("not be a valid prefix"), "{err}");
+    }
+    // No permission reaches it.
+    assert!(effective(&regs(), &parse_id("nodes/pve1/prefixes/gpu").unwrap(), &scoped(&["traefik"])).scopes.is_empty());
+
+    // DELETE removes the node's file; the cluster file is in effect on pve1 again.
+    del(&store, "nodes/pve1/prefixes/gpu", None, None, &full()).unwrap();
+    assert!(!dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml").exists());
+    let set = store.registry().unwrap().load_prefixes(Some(&NodeName::new("pve1").unwrap())).unwrap();
+    assert_eq!(set.len(), 1);
+    assert_eq!((set[0].description.as_deref(), set[0].origin), (Some("cluster"), Origin::Cluster));
+}
+
+/// Layers compose only through most-specific-wins: a cluster `gpu` and a node
+/// `gpu.devices` both apply on that node, each governing its own subtree.
+#[test]
+fn a_cluster_prefix_and_a_node_child_prefix_compose_by_most_specific_wins() {
+    let (_dir, store) = node_store();
+    put_node_prefix(
+        &store,
+        "prefixes/gpu",
+        "selector: {all: true}\nschema: {type: object, properties: {vendor: {type: string}, devices: {type: integer}}}\n",
+    );
+    put_node_prefix(
+        &store,
+        "nodes/pve1/prefixes/gpu.devices",
+        "selector: {all: true}\nschema: {type: object, properties: {count: {type: integer}}}\n",
+    );
+    let p = |s: &str| DocPath::parse(s).unwrap();
+    let governs = |node: &str, path: &str| {
+        let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node(node)).unwrap();
+        Shape::of_guest(&set, &[]).governing(&p(path)).map(|d| d.prefix.to_string())
+    };
+    assert_eq!(governs("pve1", "gpu.devices.count").as_deref(), Some("gpu.devices"));
+    assert_eq!(governs("pve1", "gpu.vendor").as_deref(), Some("gpu"), "the cluster prefix still governs its own keys");
+    assert_eq!(governs("pve2", "gpu.devices.count").as_deref(), Some("gpu"), "on another node the child does not exist");
+
+    let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node("pve1")).unwrap();
+    let shape = Shape::of_guest(&set, &[]);
+    assert_eq!(shape.schema_at(&p("gpu.devices.count")), Some(&json!({"type": "integer"})));
+    assert!(shape.findings(&json!({"gpu": {"devices": {"count": 2}}})).is_empty(), "the parent's `devices: integer` is shadowed");
+    // A registry document is given no prefixes to enforce.
+    assert!(api::effective_prefixes(store.registry().unwrap(), &parse_id("prefixes/gpu").unwrap(), &on_node("pve1")).unwrap().is_empty());
+}
+
+#[test]
+fn a_node_prefixs_enforce_applies_only_to_guests_on_that_node() {
+    let (_dir, store) = node_store();
+    put_node_prefix(
+        &store,
+        "nodes/pve1/prefixes/gpu",
+        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n",
+    );
+
+    let err = put_on(&store, "100", "gpu.count", r#""two""#, &on_node("pve1")).unwrap_err();
+    assert_eq!(status(&err), 422, "{err}");
+    assert!(err.msg.contains("gpu.count"), "{err}");
+
+    // The same write for a guest on pve2, or one whose node nobody said, is
+    // not answerable to pve1's schema.
+    put_on(&store, "100", "gpu.count", r#""two""#, &on_node("pve2")).unwrap();
+    put_on(&store, "101", "gpu.count", r#""two""#, &full()).unwrap();
+
+    // Migrated to pve1, the guest meets the schema for what it now changes;
+    // what the document already holds is left alone.
+    put_on(&store, "100", "gpu.note", r#""moved""#, &on_node("pve1")).unwrap();
+    assert_eq!(status(&put_on(&store, "100", "gpu.count", r#""three""#, &on_node("pve1")).unwrap_err()), 422);
+    put_on(&store, "100", "gpu.count", "3", &on_node("pve1")).unwrap();
+}
+
+#[test]
+fn the_prefixes_listing_is_cluster_wide_by_default_a_nodes_set_with_node_and_every_file_with_all() {
+    let (_dir, store) = node_store();
+    put_node_prefix(&store, "prefixes/gpu", "selector: {all: true}\n");
+    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {all: true}\n");
+    put_node_prefix(&store, "nodes/pve2/prefixes/local", "selector: {all: true}\n");
+
+    let rows_with = |node: Option<&str>, all: bool| -> Vec<serde_json::Value> {
+        api::prefixes(store.registry().unwrap(), node, all).unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect()
+    };
+    let rows = |node: Option<&str>| rows_with(node, node.is_none());
+
+    // Neither: what the listing meant before node files -- the cluster-wide set,
+    // one row per name, no node's files.
+    let default = rows_with(None, false);
+    assert_eq!(default.len(), 1, "{default:?}");
+    assert_eq!((&default[0]["prefix"], &default[0]["origin"]), (&json!("gpu"), &json!("cluster")));
+    let err = api::prefixes(store.registry().unwrap(), Some("pve1"), true).unwrap_err();
+    assert_eq!(status(&err), 400, "node and all together: {err}");
+
+    let pve1 = rows(Some("pve1"));
+    assert_eq!(pve1.len(), 1, "one row per name within a node's set: {pve1:?}");
+    assert_eq!((&pve1[0]["origin"], &pve1[0]["node"], &pve1[0]["overrides"]), (&json!("node"), &json!("pve1"), &json!(true)));
+
+    let every = rows(None);
+    let shown: Vec<(String, String, Option<String>)> = every
+        .iter()
+        .map(|r| (r["prefix"].as_str().unwrap().into(), r["origin"].as_str().unwrap().into(), r["node"].as_str().map(Into::into)))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("gpu".into(), "cluster".into(), None),
+            ("gpu".into(), "node".into(), Some("pve1".into())),
+            ("local".into(), "node".into(), Some("pve2".into())),
+        ]
+    );
+    assert!(every[0].get("node").is_none(), "a cluster row carries no node field");
+
+    // A failed node file is listed keyed like a loaded one, with its node.
+    let pve2 = NodeName::new("pve2").unwrap();
+    std::fs::write(store.registry().unwrap().node_prefix_dir(&pve2).unwrap().join("broken.yaml"), "selector: {x: 1}\n").unwrap();
+    let failed: Vec<serde_json::Value> = rows(None).into_iter().filter(|r| r.get("error").is_some()).collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!((&failed[0]["prefix"], &failed[0]["origin"], &failed[0]["node"]), (&json!("broken"), &json!("node"), &json!("pve2")));
+}
+
+#[test]
+fn a_node_prefix_moves_the_token_of_a_guest_on_that_node_and_migration_moves_it_too() {
+    let (dir, store) = node_store();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    std::fs::create_dir_all(dir.path().join("nodes/pve1/meta.d/prefixes")).unwrap();
+    std::fs::create_dir_all(dir.path().join("nodes/pve2/meta.d/prefixes")).unwrap();
+    let token = |node: &str| version(&store, false, Some("100"), Some(node)).unwrap().token;
+    let whole = || version(&store, false, None, None).unwrap().token;
+
+    let (on1, on2, all) = (token("pve1"), token("pve2"), whole());
+    assert_ne!(on1, on2, "the same files on another node are another token: the guest's set moved");
+
+    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {all: true}\n");
+    assert_ne!(token("pve1"), on1, "a file on the guest's node");
+    assert_eq!(token("pve2"), on2, "another node's file is not this guest's");
+    assert_ne!(whole(), all, "the unscoped token covers every node");
+
+    // The node prefix document's own poll watches its node's directory.
+    let own = version(&store, false, Some("nodes/pve1/prefixes/gpu"), None).unwrap().token;
+    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {tag: x}\n");
+    assert_ne!(version(&store, false, Some("nodes/pve1/prefixes/gpu"), None).unwrap().token, own);
+
+    // `detail` names it by its id.
+    let ids: Vec<String> = version(&store, true, None, None).unwrap().documents.unwrap().into_iter().map(|d| d.id).collect();
+    assert_eq!(ids, ["100", "nodes/pve1/prefixes/gpu"]);
+    let ids: Vec<String> = version(&store, true, Some("100"), Some("pve2")).unwrap().documents.unwrap().into_iter().map(|d| d.id).collect();
+    assert_eq!(ids, ["100"], "a guest on pve2 covers no pve1 file");
+}
+
+// -- a store that is not there (docs/DESIGN.md §7) ------------------------------
+
+#[test]
+fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
+    let (dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    let marker = dir.path().join("local");
+    let store = store.with_cluster_marker(&marker);
+    let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+    let unavailable = |status: u16, what: &str| assert_eq!(status, 503, "{what}");
+
+    unavailable(get(&store, "100", None, "json", &full()).unwrap_err().status, "get");
+    unavailable(get(&store, "prefixes/traefik", None, "yaml", &full()).unwrap_err().status, "get of a registry document");
+    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, true, &full()).unwrap_err().status, "dry run");
+    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, false, &full()).unwrap_err().status, "put");
+    unavailable(del(&store, "100", None, None, &full()).unwrap_err().status, "delete");
+    unavailable(version(&store, true, None, None).unwrap_err().status, "version");
+    unavailable(version(&store, false, Some("100"), None).unwrap_err().status, "scoped version");
+    unavailable(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap_err().status, "list");
+    let err = ApiError::from(store.registry().unwrap_err());
+    unavailable(err.status, "the registry, for the prefix and permission listings");
+    assert!(err.msg.starts_with("cluster filesystem not available"), "{err}");
+    assert_eq!(read_raw_unchecked(dir.path(), "100"), "traefik:\n  host: x\n");
+
+    std::os::unix::fs::symlink(dir.path(), &marker).unwrap();
+    assert_eq!(get(&store, "100", None, "json", &full()).unwrap().data.unwrap(), json!({"traefik": {"host": "x"}}));
+    assert_eq!(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap().len(), 1);
+}
+
+fn read_raw_unchecked(root: &std::path::Path, id: &str) -> String {
+    std::fs::read_to_string(root.join(format!("{id}.yaml"))).unwrap()
 }

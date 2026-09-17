@@ -30,8 +30,8 @@ pub struct Touched {
 /// Applies `patch` to `doc` in place, using merge-patch semantics (RFC 7386)
 /// with explicit delete: for each `(k, v)` in a patch object — if `v` is an
 /// object and the target already has an object at `k`, recurse; if `v` is
-/// `null`, delete `k`; otherwise set `k = v` (replacing whatever was there,
-/// including objects).
+/// `null`, delete `k` and its note `k__` (unless the patch names `k__` too);
+/// otherwise set `k = v` (replacing whatever was there, including objects).
 ///
 /// Returns the minimal set of paths that actually changed: recursing into an
 /// object yields leaf paths; replacing or deleting a whole subtree yields its
@@ -71,6 +71,15 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
                 if doc_map.shift_remove(k).is_some() {
                     touched.push(Touched {
                         path: child_path,
+                        op: Op::Delete,
+                    });
+                }
+                // A deleted key's note goes with it, unless the patch says
+                // what becomes of the note itself (`docs/DESIGN.md` §7).
+                let note = format!("{k}{}", crate::model::COMMENT_SUFFIX);
+                if !patch_map.contains_key(&note) && doc_map.shift_remove(&note).is_some() {
+                    touched.push(Touched {
+                        path: path.join(note),
                         op: Op::Delete,
                     });
                 }

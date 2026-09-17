@@ -1,20 +1,24 @@
-# pve-meta's own pve-ext managed-patch manifest: the one guest-lifecycle
-# hook that wires PVE::RS::Meta into stock libpve-guest-common-perl (see
-# docs/DESIGN.md section 9 and, for the design this diff implements,
-# docs/LIFECYCLE-PATCHES.md).
+# pve-meta's own pve-ext managed-patch manifest: the guest-lifecycle hooks that
+# wire PVE::RS::Meta into stock PVE (see docs/DESIGN.md section 9 and, for the
+# design these diffs implement, docs/LIFECYCLE.md).
 #
-# Installed to /usr/share/pve-ext/patches/pve-meta-lifecycle.toml; the diff
-# it references lives alongside it, under a "lifecycle/" subdirectory (both
-# here in the source tree and once installed), which is why the `diff`
-# value below is "lifecycle/<file>.diff" rather than a bare filename.
+# Installed to /usr/share/pve-ext/patches/pve-meta-lifecycle.toml; the diffs
+# it references live alongside it, under a "lifecycle/" subdirectory (both
+# here in the source tree and once installed), which is why each `diff` value
+# below is "lifecycle/<file>.diff" rather than a bare filename.
 #
-# The whole lifecycle is one patched file (docs/DESIGN.md section 9;
-# docs/decisions/008-lifecycle-is-one-patched-file.md): create, destroy,
-# snapshot, rollback and delete-snapshot all funnel through methods of
-# PVE::AbstractConfig, so the five hooks hang off that
-# one file, and clone/backup are not carried at all -- see
-# docs/LIFECYCLE-PATCHES.md for why. This manifest used to cover seven
-# files across pve-container, qemu-server and libpve-guest-common-perl.
+# Three patched files in three packages:
+#
+#   * PVE/AbstractConfig.pm (libpve-guest-common-perl): create, destroy,
+#     snapshot, rollback and delete-snapshot all funnel through methods of
+#     this one class, and so does the config write every restore ends in,
+#     where a backup's notes block is read back into the store. Five
+#     lifecycle hooks plus the restore side of backup, one file.
+#   * PVE/VZDump/QemuServer.pm (qemu-server) and PVE/VZDump/LXC.pm
+#     (pve-container): the backup side, one hook each in `assemble`, which
+#     appends the guest's document to the archive's copy of its notes.
+#
+# Clone is not carried; see docs/LIFECYCLE.md and decisions 008 and 019.
 #
 # `id` is this manifest's stable claim identity (see pve-ext/bin/pve-ext-patch's
 # header comment): the root Makefile installs this file under
@@ -28,5 +32,19 @@ id = "pve-meta-lifecycle"
 path = "/usr/share/perl5/PVE/AbstractConfig.pm"
 package = "libpve-guest-common-perl"
 diff = "lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/VZDump/QemuServer.pm"
+package = "qemu-server"
+diff = "lifecycle/qemu-server_VZDump-QemuServer.pm.diff"
+marker = "use PVE::RS::Meta;"
+check = "perl"
+
+[[file]]
+path = "/usr/share/perl5/PVE/VZDump/LXC.pm"
+package = "pve-container"
+diff = "lifecycle/pve-container_VZDump-LXC.pm.diff"
 marker = "use PVE::RS::Meta;"
 check = "perl"

@@ -12,7 +12,8 @@ configuration intent, not secrets.
 
 Scopes are a **blast-radius limiter**, not an adversarial boundary. In scope: a scoped
 principal does not read or write document content outside its granted prefixes; a
-concurrent write does not silently lose another's update. Out of scope: key-name
+concurrent write does not silently lose another's update; a cluster filesystem that is
+not mounted is never read as an empty store (§7). Out of scope: key-name
 disclosure through errors, digests or listings; any defence against a principal the
 administrator deliberately issued a token to. pve-meta gates nothing but access to
 metadata documents and never restricts a PVE permission the platform itself grants.
@@ -28,9 +29,13 @@ two rules on top:
   same keys and values in different orders are the same document, a reordering stages
   nothing in the editor, and no lookup, selector or permission depends on it. A
   reordering typed in Text mode is written only when applied from Text mode.
-* **Comment keys.** A key ending in `__` is a string note about its sibling (`host__`
-  documents `host`; a bare `__` documents the containing map). Comment keys are
-  ordinary data; the UI shows them as the row's description.
+* **Comment keys are notes.** A key ending in `__` is a string note about its sibling
+  (`host__` documents `host`; a bare `__` documents the containing map). They are
+  stored, permitted, linted and diffed like any key, and the UI shows them as the
+  row's description, but a read leaves them out unless it asks with `comments=1`,
+  and a write that did not ask keeps every one whose subject it keeps (§7). What carries the file rather
+  than a view of it — the backup block, `scan-notes`, the version detail's digests —
+  carries them as written.
 
 Object keys match `^[A-Za-z0-9_@!-]+$`. No key is reserved. There is no datacenter-level
 document; a `datacenter.yaml` an earlier release left behind is a stray file the store
@@ -46,9 +51,11 @@ and are never reachable through the API.
 ## 3. Prefixes — what a prefix is
 
 `/etc/pve/meta.d/prefixes/<prefix>.yaml`, with packaged defaults under
-`/usr/share/pve-meta/prefixes/<prefix>.yaml`; a cluster file overrides the packaged file
-of the same name. **The file name is the prefix**: `homelab.docker.yaml` declares
-`homelab.docker`. Names are dotted segments of the key charset, at most 128 bytes.
+`/usr/share/pve-meta/prefixes/<prefix>.yaml` and one node's files under
+`/etc/pve/nodes/<node>/meta.d/prefixes/<prefix>.yaml`. For a guest a node file
+overrides the cluster file of the same name, which overrides the packaged file.
+**The file name is the prefix**: `homelab.docker.yaml` declares `homelab.docker`. Names
+are dotted segments of the key charset, at most 128 bytes.
 
 ```yaml
 description: Traefik dynamic configuration   # optional
@@ -66,12 +73,20 @@ schema:                                      # optional, PVE::JSONSchema dialect
 ```
 
 * A prefix names **no principal**. Declaring one is useful on its own.
+* **A node file reaches only the guests on its node**: the node the vmlist names for the
+  guest when the request is made. A guest's prefixes are the packaged, cluster and that
+  node's files, one per name, and everything that consumes them — declared rows,
+  `hidden`, `enforce` — uses that set; selectors apply on top. Another node's files do
+  not exist for it. A guest that migrates gets the other node's set and its document is
+  untouched: a key declared only on the old node is an ordinary undeclared key.
 * The **selector** decides which guests the prefix reaches, and therefore where its
   declared-but-unset rows appear and where `enforce` applies. Tag membership is the
   guest's PVE tags from the cluster's cached guest properties.
 * **Most-specific wins; schemas never merge.** The governing prefix of a path is the
   longest declared prefix that contains it. A parent's schema for a key a child prefix
-  owns is shadowed, silently. A prefix with no `schema` still governs its subtree.
+  owns is shadowed, silently. A prefix with no `schema` still governs its subtree. This
+  is the only way the layers compose: a cluster `gpu` and a node `gpu.devices` both
+  apply on that node, each governing its own subtree.
 * The schema dialect the editor consumes: `type`, `properties`, `description`,
   `default`, `enum`, `minimum`, `maximum`, `format` (a PVE::JSONSchema format name,
   validated by proxmoxlib's own vtype in the editor), the editor hints `multiline` and
@@ -97,9 +112,9 @@ schema:                                      # optional, PVE::JSONSchema dialect
 
 ## 4. Permissions — who may touch a prefix
 
-`/etc/pve/meta.d/permissions/<name>.yaml`. **Cluster-only: there is no packaged
-permissions directory**, so an operator's package can declare a prefix but never grant
-itself access.
+`/etc/pve/meta.d/permissions/<name>.yaml`. **Cluster-only: there is no packaged or
+node-level permissions directory**, so an operator's package can declare a prefix but
+never grant itself access.
 
 ```yaml
 authid: svc@pve!traefik        # a PVE user or token id
@@ -114,14 +129,15 @@ rules:                         # optional; a file with none grants nothing
   `homelab.docker`. A rule on `p` also covers the sibling comment key `p__`; that is the
   only comment-key access rule.
 * Permissions apply to **guest documents only**.
-* Both directories are parsed strictly (`deny_unknown_fields`) and independently. A
+* Every directory is parsed strictly (`deny_unknown_fields`) and independently. A
   malformed file contributes nothing, is logged, and **is still listed** by `GET
-  /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, error }`, so it
-  can be found and repaired.
+  /meta/prefixes` and `GET /meta/permissions` as `{ name|prefix, origin, node?, error }`,
+  so it can be found and repaired.
 * **Precedence is by presence.** A cluster file is the file for its name whether or not
-  it parses: a malformed override is listed as a failure and the packaged file it
-  shadows stays out of effect until the override is repaired or deleted. The listing
-  has one row per name, and `GET prefixes/<name>` opens the file the loader judged.
+  it parses, and a node file likewise for its node's guests: a malformed override is
+  listed as a failure and the file it shadows stays out of effect until the override is
+  repaired or deleted. The cluster-wide listing and the listing for one node have one
+  row per name, and `GET prefixes/<name>` opens the file the loader judged.
 
 ## 5. Effective access for one request
 
@@ -140,16 +156,23 @@ rules:                         # optional; a file with none grants nothing
 * A document that **cannot be read back** (§7) is repaired only by a root `replace` or a
   root `DELETE`, and only with full write.
 * Registry documents (§6) get no scopes: read is open to every authenticated user,
-  write is `Sys.Modify` on `/`.
+  write is `Sys.Modify` on `/`, and on `/nodes/<node>` for a node's prefix file.
 
 ## 6. Registry files are documents
 
-A prefix or permission file is addressed as a document with id `prefixes/<name>` or
-`permissions/<name>`, through the same `view`, `format`, `mode`, `digest`, `dry_run`
-machinery as a guest document. Four things are specific to them:
+A prefix or permission file is addressed as a document with id `prefixes/<name>`,
+`nodes/<node>/prefixes/<name>` or `permissions/<name>`, through the same `view`,
+`format`, `mode`, `digest`, `dry_run` and `comments` machinery as a guest document.
+Four things are specific to them:
 
-* **Writes land in the cluster directory.** Editing a packaged prefix creates the
-  cluster override; deleting the override reverts to the packaged file.
+* **Writes land in the cluster directory**, or the node's for a node id. Editing a
+  packaged prefix creates the cluster override; deleting the override reverts to the
+  packaged file. A node id is that node's file and nothing else: it never reads through
+  to the cluster file, and deleting it reverts the node's guests to the cluster or
+  packaged file. The node must be of PVE's node-name format (400), and no path is built
+  from any other name. Creating a file needs the node in the cluster nodelist (404);
+  reading or removing one does not, so what a removed node left behind is an ordinary
+  file.
 * **The result must parse as its kind**, using the loader's own parser
   (`registry::parse_prefix` / `parse_permission`), on every write including `dry_run`
   and a narrow `DELETE ?view=`. A 200 must never make a file the loader would skip.
@@ -163,25 +186,40 @@ affordance, not the validator; a test keeps its required keys equal to the parse
 ## 7. Documents on the wire
 
 * Reads: `format=json` returns `data`, a native structure (unordered, booleans as
-  `1`/`0` per PVE convention); `format=yaml` returns `text`, the file's own text for a
-  full reader's root view and a canonical dump otherwise. The editor reads YAML.
+  `1`/`0` per PVE convention); `format=yaml` returns `text`, a canonical dump. Without
+  `comments=1` neither carries a comment key, at any depth, and a `view` naming one is
+  a 400; with it, a full reader's root view in YAML is the file's own text. `digest` is
+  the file's either way. The editor reads YAML with `comments=1`.
 * Writes: `data` (a JSON string) or `text` (YAML), with `mode=replace` (the view's
   subtree replaced; `{}` stores an empty map) or `mode=merge` (RFC 7386 merge patch,
   `null` deletes). `digest` is the compare-and-swap precondition (409 on mismatch;
   `""` matches a missing document). `dry_run=1` plans and validates without writing. A
   write that changes nothing rewrites nothing.
+* **Notes survive a caller that cannot see them.** A `replace` without `comments=1`
+  may carry no comment key and name none as its view (400); before it is planned, the
+  stored notes under the view whose subject survives are put back where they stood: a
+  `k__` whose `k` was in the stored map and is in the payload's (a note whose subject
+  was already gone is not revived), a bare `__` whose map is not empty (`{}` stores an
+  empty map), and in a list the notes of a member the payload has unchanged — at its
+  index, or else the first unused equal member. A kept note is no touched path, so it
+  needs no write permission and meets no enforced schema; every other note goes, and is
+  touched. With `comments=1` the payload is the subtree, notes included. A `merge` is
+  the same either way.
+* **A key's note goes with the key.** A `DELETE` of view `k`, and a `merge` setting
+  `k: null`, also remove `k__` beside it, unless that merge names `k__` itself.
 * **One lint** runs on the planned document: top level is a map, no nulls, keys match
   the charset, comment keys are strings. A failure is a 400 naming the path.
-* **Enforced schemas.** If a prefix that reaches the guest says `enforce: true` (for
-  itself, or on a schema node under it: §3), a write that would leave the enforced part
-  of its subtree not matching the schema — for the findings the write introduces or
-  touches, never for what was already wrong elsewhere — is a 422 naming the paths,
-  unless the request carries `force=1`. Anyone who may write may force. `type`, `enum`
-  and `minimum`/`maximum` are independent checks, every stated one applied, and `enum`
-  membership is by value (`"1"` is not `1`). `format:` checks are never enforced.
+* **Enforced schemas.** If a prefix that reaches the guest — in the set for its node,
+  §3 — says `enforce: true` (for itself, or on a schema node under it: §3), a write
+  that would leave the enforced part of its subtree not matching the schema — for the
+  findings the write introduces or touches, never for what was already wrong elsewhere
+  — is a 422 naming the paths, unless the request carries `force=1`. Anyone who may
+  write may force. `type`, `enum` and `minimum`/`maximum` are independent checks, every
+  stated one applied, and `enum` membership is by value (`"1"` is not `1`). `format:`
+  checks are never enforced.
 * **Unrecoverable file** — not valid YAML, above the 4 MiB read cap, or not a map:
-  `format=yaml` for a full reader returns the raw `text` plus `parse_error`; everything
-  else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
+  `format=yaml` with `comments=1` for a full reader returns the raw `text` plus
+  `parse_error`; everything else is a 422. A root `replace` or root `DELETE` repairs it; nothing narrower is
   accepted. Per document, never cluster-wide.
 * YAML is read strictly — no anchors, aliases, explicit tags or complex keys; the YAML
   1.1 words `yes`/`no`/`on`/`off` stay strings — and written canonically (block style,
@@ -192,6 +230,16 @@ affordance, not the validator; a test keeps its required keys equal to the parse
 * Writes run under `PVE::Cluster::cfs_lock_domain("pve-meta-<id>")` with the digest
   check inside the lock; files are written atomically. Reads are unlocked: a file that
   vanishes under one is a 404, never a 500.
+* **No cluster filesystem, no answer.** A store under `/etc/pve` checks before every
+  operation that pmxcfs is mounted — the `/etc/pve/local` symlink pmxcfs provides, the
+  test `PVE::Cluster::check_cfs_is_mounted` makes — and refuses with `cluster
+  filesystem not available` (503; the CLI exits 1) rather than reading an unmounted
+  `/etc/pve` as an empty store. Every `MetaStore` constructor decides the marker from
+  its root; `registry::Registry` and the free loaders check nothing. Likewise any I/O
+  error other than not found reading a document, or listing a directory, is an error
+  and never an absence; one registry entry that cannot be looked at or read is a listed
+  failure (§4), and a node directory entry that cannot be looked at is skipped with a
+  warning. A read still never fails on a document's content.
 * Every write that changes a file logs one syslog line at `info`, tagged
   `pve-meta audit:`, with the authid, document, view, mode, touched count and digest.
 
@@ -202,31 +250,40 @@ Native, `/api2/json/meta`, served by pveproxy (reads) and pvedaemon (writes,
 
 | Method | Path | Params | Returns |
 |---|---|---|---|
-| GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only. Tokens of different scope are not comparable |
-| GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of; `node`/`name`/`tags` only with `VM.Audit` |
-| GET | `/meta/guests/{vmid}` | `view`, `format` | `{ id, view, digest, data \| text, parse_error? }` |
-| PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force` | `{ id, view, digest, touched: [{ path, op }] }` |
+| GET | `/meta/version` | `detail`, `id` | `{ token, changed }`; with `detail`, `documents: [{ id, digest }]`. With `id`, the token covers that document plus the registry directories only (below). Tokens of different scope are not comparable |
+| GET | `/meta/guests` | `has` | `[{ vmid, node, type, name, tags, digest }]` for every guest the caller can read something of, and whose visible data has `has` (naming a comment key is a 400); `node`/`name`/`tags` only with `VM.Audit` |
+| GET | `/meta/guests/{vmid}` | `view`, `format`, `comments` | `{ id, view, digest, data \| text, parse_error? }` |
+| PUT | `/meta/guests/{vmid}` | `view`, `data`/`text`, `mode`, `digest`, `dry_run`, `force`, `comments` | `{ id, view, digest, touched: [{ path, op }] }` |
 | DELETE | `/meta/guests/{vmid}` | `view`, `digest` | same shape |
-| GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` only with `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
-| GET | `/meta/prefixes` | — | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, overrides }]`, most-specific first, plus `{ prefix, origin, error }` for a file that did not load |
+| GET | `/meta/access` | `id` | `{ read, write, scopes: [{ prefix, mode }], tags }` for that document; `tags` is empty without `VM.Audit`. Without `id`: the registry's answer (`read` always, `write` = `Sys.Modify`) |
+| GET | `/meta/prefixes` | `id`, `all` | `[{ prefix, description?, selector, enforce, hidden, schema?, origin, node?, overrides }]`, most-specific first, plus `{ prefix, origin, node?, error }` for a file that did not load. By default the cluster-wide set, one row per name; with `id` (a vmid), the set in effect for that guest on its current node; with `all`, the cluster-wide set plus every node's own files (below). `id` and `all` together are a 400 |
 | GET | `/meta/permissions` | — | `[{ name, authid, description?, rules, origin, overrides }]`, plus `{ name, origin, error }` rows |
-| GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>` |
+| GET/PUT/DELETE | `/meta/prefixes/{name}`, `/meta/nodes/{node}/prefixes/{name}`, `/meta/permissions/{name}` | as a document | the file as a document, id `prefixes/<name>`, `nodes/<node>/prefixes/<name>`, `permissions/<name>` |
 | GET | `/meta/schemas` | — | `{ prefix, permission }` |
 
-A vmid absent from the vmlist is 404 for GET, PUT and DELETE. Errors from Rust are
-`"NNN: message"`, re-raised by Perl as a `PVE::Exception`; there is no second error
-vocabulary. Everything crosses the Perl/Rust boundary as native structures except the
+The scoped version token of a guest also covers its current node's prefix directory and
+hashes the node's name, so a migration moves it; that of a node prefix id covers its
+node's directory. In the `all` listing a packaged file that a cluster file shadows is not
+a row of its own, as in the cluster-wide set: the cluster row says `overrides`. Node rows
+carry `origin: node` and `node`.
+
+A vmid absent from the vmlist is 404 for GET, PUT and DELETE (and for `GET
+/meta/prefixes?id=`); a PUT of a node prefix file whose node is absent from the nodelist
+is 404 too. Errors from Rust are `"NNN: message"`, re-raised by Perl as a
+`PVE::Exception`; there is no second error vocabulary. Everything crosses the Perl/Rust boundary as native structures except the
 client's `data` string.
 
-Implementation: `perl/PVE/API2/Ext/Meta.pm` does parameters, PVE ACL checks, the
-vmlist, guest tags and the per-document lock, and calls `PVE::RS::Meta::api_*`;
-`pve_meta_core::api` does everything else. The three get/put/delete families are
+Implementation: `perl/PVE/API2/Ext/Meta.pm` does parameters, PVE ACL checks, the vmlist
+and nodelist, guest tags and node, the per-document lock, and calls
+`PVE::RS::Meta::api_*`; `pve_meta_core::api` does everything else. The three get/put/delete families are
 generated from one spec.
 
 ## 9. Guest lifecycle
 
-One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), managed by
-`pve-ext-patch`:
+Three patched files, managed by `pve-ext-patch`: `PVE/AbstractConfig.pm`
+(`libpve-guest-common-perl`) for the lifecycle and the restore side of backup, and the
+vzdump plugins `PVE/VZDump/QemuServer.pm` (`qemu-server`) and `PVE/VZDump/LXC.pm`
+(`pve-container`) for the backup side.
 
 * `create_and_lock_config` calls `on_create` when PVE has just asserted the vmid was
   unused, clearing any document and snapshot copies left there.
@@ -235,10 +292,41 @@ One patched file, `PVE/AbstractConfig.pm` (`libpve-guest-common-perl`), managed 
 * `snapshot`, `rollback`, `delsnapshot` copy, restore and remove
   `<vmid>.<snapname>.yaml`. Rollback to a snapshot that had no document removes the
   live document.
+* **Backup.** `assemble` in both vzdump plugins appends the document to the archive's
+  copy of the guest's notes, as one marked block (`pve_meta_core::backup`):
 
-All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation.
-Migration needs nothing (the document is cluster-wide). Clone and backup are not
-carried; back up `/etc/pve`.
+  ```text
+  [pve-meta v1 vmid=105 time=2026-09-14T03:00:12Z sha256=<digest of the file text>]
+  ````yaml
+  <the document, verbatim>
+  ````
+  [/pve-meta]
+  ```
+
+  Only that copy: the live config never carries it. Every archive kind carries the
+  config, so this covers VMs with disks, containers, PBS, vma, tar and external
+  providers alike. Plain YAML, no encoding: PVE's notes encoder escapes what needs
+  escaping per line and its decoder restores it. A document above 16 KiB, or one that
+  does not parse, is not carried, and the backup log says so.
+* **Restore.** `write_config`, which every restore path ends in, finds the block,
+  writes the document and strips the block from the notes before the config lands.
+  Only while the marker `create_and_lock_config` left for the vmid under
+  `/run/pve-meta` is there. A create or restore keeps the config locked and writes it
+  more than once on the way, so the marker is taken by the first write that carries a
+  block, or by the first write of an unlocked config, and by nothing in between; only
+  the write that took it imports. A create ends with an unlocked write, so a block
+  pasted into a live guest's notes afterwards is never imported by an ordinary config
+  write. The block wins over whatever
+  document the vmid had: it is the backup being restored. Enforced schemas do not
+  apply; a restore is not an edit. A host without pve-meta restores the block as
+  notes text, readable and harmless. `pve-meta scan-notes`, run once by the package
+  install and by hand for a block a restore left behind, reads every such block in
+  the cluster's guest configs into the store and strips it; where a document is
+  already there it is kept and the block only stripped.
+
+All hooks are `eval`-wrapped and warn; metadata never breaks a guest operation, a
+backup or a restore. Migration needs nothing (the document is cluster-wide). Clone is
+not carried.
 
 There is no sweeper. A guest config removed out of band leaves an orphan; `pve-meta ls
 --orphans` lists them and `pve-meta rm <vmid>` removes one under the document's lock
@@ -251,15 +339,18 @@ hook script during boot.
 
 | Command | Does |
 |---|---|
-| `get <id> [<view>] [--format yaml\|json]` | a scalar prints bare, structure prints YAML; exit 2 when not there |
-| `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force]` | the API's `PUT mode=replace`, under the document's lock |
+| `get <id> [<view>] [--format yaml\|json] [--comments]` | a scalar prints bare, structure prints YAML; comment keys only with `--comments`; exit 2 when not there |
+| `set <id> [<view>] --data\|--text\|--file [--digest] [--dry-run] [--force] [--comments]` | the API's `PUT mode=replace`, under the document's lock; `--comments` is `comments=1` |
 | `merge ...` | the same with `mode=merge` |
 | `delete <id> [<view>] [--digest]` | the API's `DELETE`; exit 2 when nothing was there |
-| `ls [--orphans] [--format plain\|json]` | document ids; with `--orphans`, vmids with files but no guest |
+| `ls [--orphans] [--format plain\|json]` | document ids, every node's prefix files included; with `--orphans`, vmids with files but no guest |
 | `rm <vmid>` | remove an orphan's files; refuses a live guest |
+| `scan-notes` | read every backup notes block in the cluster's guest configs into the store and strip it; the package install runs it once |
 
-Writes go through the same Rust functions as the API — lint, digest, enforced schemas,
-audit line — and skip only permissions, because root can already write the file.
+`<id>` is a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
+`permissions/<name>`. Writes go through the same Rust functions as the API — lint,
+digest, enforced schemas for the guest's node, audit line — and skip only permissions,
+because root can already write the file.
 
 ## 11. Extension seams (`pve-ext`)
 
@@ -280,16 +371,17 @@ manifest (lifecycle).
 
 ## 12. The editor
 
-`ui-extjs/pve-meta-tree.js`: plain JavaScript, a native `Ext.tree.Panel`, no build
-step. The rules it needs — codec, key charset, coverage, governing prefix, schema
+`ui-extjs/src/*.js`, shipped as the one generated `pve-meta-tree.js`: plain JavaScript,
+a native `Ext.tree.Panel`, concatenated by `make js` with no bundler. The rules it needs — codec, key charset, coverage, governing prefix, schema
 findings, staged edits — are `pve-meta-core` compiled to wasm
 (`crates/pve-meta-wasm`, see `WASM-CORE.md`); the editor reimplements none of them.
 
 * **Guest tab**: one tree of the document the caller can see. Rows are the union of
-  keys present and keys the governing prefixes declare and do not hide (§3);
-  declared-but-unset rows are greyed with their default and a **Set to default** action.
+  keys present and keys the governing prefixes declare and do not hide (§3), from `GET
+  /meta/prefixes?id=<vmid>` — the set for the node the guest is on now, so a reload
+  after a migration gets the new node's; declared-but-unset rows are greyed with their default and a **Set to default** action.
   Columns: key, value, description (the row's comment key), access (every rule covering
-  the row).
+  the row). Every read and write of a document carries `comments=1`.
 * **Edits are staged** and one **Apply** writes them as a single `replace` at the
   narrowest view covering every staged path (a single delete is a `DELETE`). Staged
   rows render like a pending PVE config change. **Revert** drops them.
@@ -308,9 +400,13 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 * A document that does not parse opens in Text mode only.
 * A version poll (`GET /meta/version?id=`) refreshes the tree, never while anything
   is staged or an editor is open. Every write carries the digest; a 409 reloads.
-* **Datacenter tab**: two grids, Prefixes and Permissions, with origin, selector,
-  schema and enforced columns. Editing a row opens the file in the same document
-  editor. **New** creates the smallest file the loader accepts, or a service token
+* **Datacenter tab**: two grids, Prefixes (`GET /meta/prefixes?all=1`) and Permissions,
+  with origin, node, selector, schema and enforced columns. Editing a row opens the file
+  in the same document editor, a node row its node's file; any row opens, and Remove
+  follows `Sys.Modify` on `/` except on a node's file, where the server decides. **New**
+  (gated on `Sys.Modify` on `/`, since its default location is the cluster) creates the
+  smallest file the loader accepts — a prefix in the cluster directory or a chosen
+  node's — or a service token
   (a `pve` user with no password, one token with privilege separation off, and an
   empty permission file naming the token). **Declare Key** writes one
   `schema.properties.<key>`; **Add Rule** appends to `rules`.
@@ -319,18 +415,19 @@ findings, staged edits — are `pve-meta-core` compiled to wasm
 ## 13. Repository layout
 
 ```
-crates/pve-meta-core     model, paths, formats, patch, view, registry, scopes, shape, edit, store, api
-crates/pve-meta-perl     PVE::RS::Meta: lifecycle hooks, stored_vmids, the api_* exports
+crates/pve-meta-core     model, paths, formats, patch, view, registry, scopes, shape, edit, store, api, backup
+crates/pve-meta-perl     PVE::RS::Meta: lifecycle and backup hooks, stored_vmids, the api_* exports
 crates/pve-meta-wasm     the core for the browser, behind a JSON-string ABI
 perl/PVE/API2/Ext/Meta.pm  the REST module
 bin/pve-meta             the CLI
 pages/                   the two page manifests
 examples/                the hook script and the example prefix, installed as documentation
-patches/                 the lifecycle patch manifest and diff
+patches/                 the lifecycle patch manifest and its three diffs
 pve-ext/                 the extension layer (own package)
 ui-extjs/                the editor and its offline and headless tests
 scripts/perl-stubs/      stub PVE modules so perl -c runs anywhere
 testdata/                the canonical YAML fixture both suites pin
 debian/, Makefile        packaging
 docs/decisions/          why the rules above are what they are
+docs/reference/          notes on upstream Proxmox, taken as input and not maintained
 ```

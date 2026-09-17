@@ -1,6 +1,6 @@
 # 008 — The guest lifecycle is one patched file; clone and backup are not carried
 
-**Status:** accepted.
+**Status:** accepted; the backup half is superseded by [019](019-backup-carries-the-document-in-the-notes.md) (2026-09-14), which carries the document in the archive's copy of the guest's notes and patches one file each in `qemu-server` and `pve-container` for it.
 
 ## Context
 

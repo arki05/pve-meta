@@ -1,8 +1,8 @@
 # pve-ext: a generic extension layer for Proxmox VE
 
-pve-ext is the thing that started as one-off, per-project research into
-patching stock pve-manager (see `docs/LIFECYCLE-PATCHES.md`, superseded by
-this package) turned into a small, reusable, package-agnostic seam. Any package
+pve-ext is what pve-meta's one-off research into patching stock Proxmox
+turned into: a small, reusable, package-agnostic seam. (The guest lifecycle
+that research served is `docs/LIFECYCLE.md`; the machinery is here.) Any package
 that needs to add an API endpoint or a UI tab to stock Proxmox VE, or patch
 a stock PVE file some other way, depends on `pve-ext` and drops a
 declarative artifact into one of three places, instead of writing (and
@@ -251,7 +251,7 @@ manifest-id <manifest-file>`, just prints a manifest's declared `id` (see
   patch's default fuzz (2) will slide a hunk onto the wrong one of
   several near-identical anchors in the same file and report success —
   pve-meta's own lifecycle-patch target has exactly that shape (see
-  `docs/LIFECYCLE-PATCHES.md`) — and a hunk that silently lands
+  `docs/LIFECYCLE.md`) — and a hunk that silently lands
   in the wrong place is worse than one that fails loudly. On any failure
   after a diversion that already existed (i.e. a re-apply after an
   upstream package upgrade replaced the diverted pristine with a newer
@@ -348,8 +348,9 @@ by construction — they simply never name the same file.
 
 `pve-meta`'s own lifecycle patch (`patches/lifecycle.toml` in that
 project, installed as `/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`)
-is a worked example of all four steps, for the one guest-lifecycle file it
-patches (the whole guest lifecycle is one file; see `docs/LIFECYCLE-PATCHES.md`).
+is a worked example of all four steps, for the three files it patches (one each
+in `libpve-guest-common-perl`, `qemu-server` and `pve-container`; see
+`docs/LIFECYCLE.md`).
 
 ## Summary: what pve-ext ships
 
@@ -374,7 +375,7 @@ it in.
 `make deb` (from this directory, or via the root `Makefile`'s `deb` target,
 which builds this package first) runs `lintian` against the freshly built
 `.deb`(s) as part of the target itself, not as a separate manual step (see
-`docs/design/PROXMOX-CONVENTIONS.md` §7.6 and §8, and `docs/DESIGN.md` §13):
+`docs/reference/PROXMOX-CONVENTIONS.md` §7.6 and §8, and `docs/DESIGN.md` §13):
 fatal (a non-zero `make deb` exit) when `$CI` is set in the environment, and
 `|| true` (advisory only, output still printed) for a local/dev build where
 `$CI` is unset — CI is expected to catch anything a local build let through.
