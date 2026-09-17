@@ -1,3 +1,38 @@
+pve-meta (0.1.3-1) unstable; urgency=medium
+
+  * Prefix files per node: /etc/pve/nodes/<node>/meta.d/prefixes/<name>.yaml,
+    above the cluster's and the packaged one, reaching the guests that node
+    currently holds. A guest's set is asked for by vmid -- GET /meta/prefixes
+    ?id=<vmid> resolves its node on the server -- and all=1 lists every node's
+    files for the Datacenter grid. A node file is a document with the id
+    nodes/<node>/prefixes/<name>; writing one is Sys.Modify on /nodes/<node>,
+    and only creating one requires the node to still be in the cluster, so a
+    departed node's leftovers can be read and removed like any other file. The
+    guest tab follows its guest across a migration; the grid gains a Node
+    column and the New dialog a location.
+  * Comment keys are notes: a read leaves them out unless it asks for them
+    with comments=1 (pve-meta get --comments). A replace without them keeps
+    the notes of the keys it keeps, so a script that never saw a note cannot
+    drop it, and deleting a key takes its note along. The editor asks for
+    them and is unchanged. Operators and other consumers stop receiving
+    description keys they never wanted.
+  * No cluster filesystem, no answer: every store operation refuses with 503
+    while /etc/pve is not pmxcfs, instead of reporting an empty store, and an
+    I/O error is never read as "absent". An operator acting on a document
+    that briefly looked gone cannot delete what it manages.
+  * New package pve-meta-publish, optional and not pulled in by pve-meta: a
+    per-node daemon that writes views of an LXC guest's own document into
+    files inside it, one way, driven by a publish prefix. Relative paths land
+    under /etc/pve-meta, absolute paths where they point; yaml, json or raw;
+    mode and owner per entry; never a comment key. A hash manifest in the
+    guest keeps a file that was edited by hand (local_edits, sync --force)
+    and deletes only a file that still matches what it wrote. Write access to
+    publish is root inside that guest -- the README says so where the package
+    is introduced.
+  * sha2 0.11.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Thu, 17 Sep 2026 21:40:00 +0200
+
 pve-meta (0.1.2-1) unstable; urgency=medium
 
   * Backups carry the guest's metadata document, and restores bring it back.
@@ -19,7 +54,7 @@ pve-meta (0.1.2-1) unstable; urgency=medium
     (the vzdump assemble hooks), tracked by the ceiling watcher alongside
     libpve-guest-common-perl.
 
- -- Julius Arkenberg <julius@rkenberg.de>  Sun, 14 Sep 2026 15:00:00 +0200
+ -- Julius Arkenberg <julius@rkenberg.de>  Mon, 14 Sep 2026 15:00:00 +0200
 
 pve-meta (0.1.1-1) unstable; urgency=medium
 
