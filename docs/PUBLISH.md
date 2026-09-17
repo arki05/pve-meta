@@ -7,8 +7,8 @@ that runs; the store stays passive, and nothing of this is in pveproxy, pvedaemo
 write path. **Writing a guest's `publish` key is root inside that guest**: it chooses the
 content, mode and owner of a file at any path the rules below admit, and with
 `local_edits: overwrite` that includes a file the guest already had, `/etc/shadow` among
-them. A permission rule granting `rw` on `publish` grants that on every guest its selector
-matches.
+them. So `VM.Config.Options` on a container is root inside it, the trust `pct enter`
+already carries.
 
 ```yaml
 publish:
