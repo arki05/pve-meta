@@ -4,7 +4,7 @@ pve-meta carries guest metadata through five lifecycle events — create, destro
 snapshot, rollback and delete-snapshot — all hooked in one file, `PVE/AbstractConfig.pm`,
 and through backup and restore, hooked in that same file and in the two vzdump plugins.
 Clone is not carried, and nothing runs on a timer. This is deliberate (`docs/DESIGN.md`
-§9; decisions 008, 009 and 019) — a smaller, honestly documented guarantee beats a wide
+§7; decisions 008, 009 and 019) — a smaller, honestly documented guarantee beats a wide
 one with a silent gap.
 
 ## The snapshot trio
@@ -36,7 +36,7 @@ How the diff reaches the installed file is not this document's subject: the mani
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
 `pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst`, and
 `pve-ext/README.md` ("Managed patches") owns the tool, its diversions and its limits. What each hook does is
-`docs/DESIGN.md` §9; the exports themselves, with their arguments and return values,
+`docs/DESIGN.md` §7; the exports themselves, with their arguments and return values,
 are documented where they are defined, in `crates/pve-meta-perl/src/lib.rs`.
 
 One caveat worth knowing, not fixing: vzdump's own transient `'vzdump'` snapshot for LXC
@@ -78,7 +78,7 @@ and `pve-meta rm <vmid>` are the manual cleanup; no timer sweeps.
 ## Backup and restore: the notes block
 
 A vzdump backup of either guest type carries the guest config, and a config's notes
-carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §9; decision 019):
+carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decision 019):
 
 * **Backup.** `assemble` in `PVE/VZDump/QemuServer.pm` (`qemu-server`) and in
   `PVE/VZDump/LXC.pm` (`pve-container`) calls `PVE::RS::Meta::export_for_backup($vmid)`

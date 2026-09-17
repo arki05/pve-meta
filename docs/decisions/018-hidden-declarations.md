@@ -1,66 +1,25 @@
-# 018 — A declaration can say it is not a row
+# 018 — A declaration can say it is not a row; `hidden` and `enforce` inherit
 
-**Status:** accepted (2026-09-11).
+**Status:** accepted.
 
 ## Context
 
-A prefix's schema does two jobs at once. It types and validates what a document
-has, and it renders what the document lacks as a greyed row, so a key an operator
-declared is discoverable before anyone sets it. Both are worth having, and the
-second one scales badly: at five declared keys it is the feature, and at two
-hundred -- the size a real Traefik vocabulary reaches -- every unset key becomes a
-greyed row and what the guest actually says is buried in them.
-
-Nested prefixes already split a large vocabulary into governed subtrees, and they
-should be the first answer. They do not finish the job: a single subtree still has
-its own long tail of options nobody sets.
+A prefix's schema both types a document and renders what it lacks as a greyed row. That
+scales badly: a vocabulary of a few hundred keys turns every unset one into a greyed
+row, burying what the guest actually says. `enforce` has a matching problem: a schema
+often has a modelled part worth refusing bad writes into, and a passthrough subtree
+with no shape to check, and one flag cannot say both.
 
 ## Decision
 
-A schema node may say `hidden: true`. The editor then does not offer that path as
-a row before something is stored there. It is **inherited**, and an explicit
-setting wins at any depth, so a subtree is hidden at its root and the two keys
-worth showing are named inside it. The walk always descends, so that override
-needs no lookahead.
-
-Two things it deliberately does not do.
-
-It never hides data. A hidden key that *is* set has its row from the document, and
-still takes its type, enum, range, default and description from the schema --
-`hidden` decorates a row that exists and never creates one. A setting that could
-hide stored content would be worse than the problem it solves.
-
-It never reaches validation. Findings and `enforce` (014) ignore it entirely, the
-way `multiline` and `format` are ignored: a hidden declaration is still a
-declaration, and a value under it is refused exactly as a shown one would be.
-
-## `enforce` follows the same rule
-
-`enforce` was a prefix-level flag: the whole subtree was refused on, or none of
-it. The case that breaks is the one a real vocabulary has -- a modelled part
-worth refusing bad writes into, and a passthrough subtree that by definition has
-no shape to check. Those two cannot coexist under one flag, and a partial schema
-without an escape hatch is not honest.
-
-So a schema node may carry `enforce` too, inherited the same way, with the
-prefix's own flag as the root default. `enforce: true` on the prefix and
-`enforce: false` on the passthrough subtree says exactly what an operator means.
-The anti-lockout property is unchanged: `force=1` remains available to anyone who
-may write, so enforcement is still a deliberate act rather than an impossible one.
-
-Both flags also exist at the prefix level, which is just the root default of the
-inherited value -- `hidden: true` there is "this prefix offers no declared-but-unset
-rows below its own", which is what a vocabulary wants and what five keys do not. The
-prefix's own row stays: it is the declaration that something lives there, and one
-row is not the problem two hundred were.
+A schema node may say `hidden: true`: the editor offers that path as a row only once
+something is stored there. A node may also carry `enforce`, overriding the prefix's own
+value for its subtree. Both are **inherited**, with an explicit value at any depth
+winning. Neither decoration hides *stored* data — a set key keeps its row, type,
+default and description — nor is either seen by validation or `enforce`'s findings
+(014): a hidden declaration is still a declaration.
 
 ## Consequences
 
-The second extension to the PVE::JSONSchema dialect, after `multiline`. Both are
-editor hints the server neither reads nor validates against, which is the bar for
-adding one.
-
-Un-hiding is additive, so the rule can only ever reveal more than it did. If a
-richer version is ever wanted -- sections, groupings, ordering for a generated
-form -- it belongs with that feature and not here; this decision is about which
-rows exist, not how they are laid out.
+The prefix's own row always shows. Un-hiding a key is additive, so the rule can only
+ever reveal more than it did.

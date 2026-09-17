@@ -17,7 +17,7 @@ ssh pve-meta-build 'export PATH=$HOME/.cargo/bin:$PATH; cd /root/pve-meta && car
 ### The `wasm32-unknown-unknown` target
 
 The editor's rules are `pve-meta-core` compiled for the browser (`crates/pve-meta-wasm`,
-`docs/DESIGN.md` §12), and `make build` and `make check` both depend on `make wasm`, so
+`docs/WASM-CORE.md`), and `make build` and `make check` both depend on `make wasm`, so
 the toolchain needs the wasm32 standard library as well as the host's. rustup's
 `--profile minimal` (and a fresh `rustup-init`) installs the host target only, and building
 for a target that is not installed is a hard error, not a skip:
@@ -36,10 +36,9 @@ apt install libstd-rust-dev-wasm32                # a distro rustc instead, if y
 
 That is the whole requirement. The `.wasm` is a plain `cargo build --target
 wasm32-unknown-unknown --profile wasm` (the `[profile.wasm]` in the root `Cargo.toml`)
-behind a hand-written four-export ABI: no `wasm-bindgen`, no `wasm-pack`, no `wasm-opt`,
+behind a hand-written five-export ABI: no `wasm-bindgen`, no `wasm-pack`, no `wasm-opt`,
 no npm, nothing whose version has to match the crate's. `.github/workflows/build.yml`
-adds the target right after installing rustup; `docs/WASM-CORE.md` records why this
-shape was chosen.
+adds the target right after installing rustup; `docs/WASM-CORE.md` records the ABI.
 
 ## Plain (non-packaged) build
 
@@ -71,14 +70,13 @@ make -C crates/pve-meta-perl check               # test/basic.pl over the built 
 ```
 
 The Rust suites take their paths from the environment — `PVE_META_ROOT` for the store,
-`PVE_META_PREFIX_DIRS` and `PVE_META_PERMISSION_DIRS` (colon-separated, lowest
-precedence first) for the two registry directories, `PVE_META_NODES_DIR` for the
-directory holding each node's prefix files — and `test/basic.pl` sets all four to temp
-dirs, so nothing here touches `/etc/pve`. A store rooted under `/etc/pve` refuses every
-operation unless `/etc/pve/local` is a symlink (pmxcfs is mounted);
-`PVE_META_CLUSTER_MARKER` names the symlink to check instead, for any root, and set to
-nothing checks none. `test/basic.pl` points it at a temp path to exercise the refusal;
-the Rust suites use `MetaStore::with_cluster_marker`.
+`PVE_META_PREFIX_DIRS` (colon-separated, lowest precedence first) for the prefix
+registry directory — and `test/basic.pl` sets both to temp dirs, so nothing here
+touches `/etc/pve`. A store rooted under `/etc/pve` refuses every operation unless
+`/etc/pve/local` is a symlink (pmxcfs is mounted); `PVE_META_CLUSTER_MARKER` names the
+symlink to check instead, for any root, and set to nothing checks none. `test/basic.pl`
+points it at a temp path to exercise the refusal; the Rust suites use
+`MetaStore::with_cluster_marker`.
 
 ## Debian package
 
@@ -116,7 +114,7 @@ upgrade) it first — apt resolves the order for you either way:
 ```sh
 apt install ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb
 # or: dpkg -i ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb && apt-get -f install
-apt install ../pve-meta-publish_*.deb    # optional: the publish daemon (docs/DESIGN.md §13)
+apt install ../pve-meta-publish_*.deb    # optional: the publish daemon (docs/DESIGN.md §8)
 ```
 
 `libpve-meta-rs-perl` ships `activate-noawait pve-api-updates`

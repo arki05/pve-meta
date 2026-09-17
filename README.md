@@ -3,7 +3,7 @@
 Structured metadata for Proxmox VE guests. One YAML document per VM or container,
 stored in `/etc/pve` and replicated with the cluster, with a native API, an editor tab
 in the PVE UI, and a CLI for hook scripts. Optionally, a schema can describe part of a
-document and an API token can be scoped to part of it.
+document and drive the editor's rows.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-tree-dark.png">
@@ -19,9 +19,9 @@ labels for PVE guests, with structure.
 
 The store holds **intent**. Operators read it and act: a Traefik plugin that builds
 routes from `traefik.spec`, a DNS sync that reads `dns.records`, a backup policy that
-reads `backup.retention`. Several of them share one document safely, because each
-declares the prefix it owns, can attach a schema to it, and can be given a token that
-sees and writes nothing else. The document is removed when the guest is destroyed,
+reads `backup.retention`. Several of them share one document, because each declares the
+prefix it owns and can attach a schema to it; who may read and write is PVE's own ACLs
+(`docs/DESIGN.md` §4). The document is removed when the guest is destroyed,
 cleared when its vmid is reused, and snapshotted and rolled back with the guest;
 migration needs nothing, since the file is cluster-wide. A backup carries it in the
 archive's copy of the guest's notes and a restore reads it back; clone does not copy it.
@@ -38,7 +38,7 @@ backup:
 ```
 
 That is all a document is, and it works with nothing else in place: no prefix, no
-schema, no permission file. A comment key is for whoever edits the document: the tab
+schema. A comment key is for whoever edits the document: the tab
 shows it as the row's description, and a read leaves it out unless it asks for
 `comments`. Any key, any depth, edited in the tab or written by a
 script. Everything below is opt-in, layered on where you want a guarantee.
@@ -63,23 +63,12 @@ schema:                           # PVE::JSONSchema dialect; drives the editor's
         port: { type: integer, minimum: 1, maximum: 65535, default: 80 }
 ```
 
-A file of the same name in `/etc/pve/nodes/<node>/meta.d/prefixes/` overrides it for the
-guests on that node.
+A `nodes.<node>` key inside the same file replaces the top-level `schema`, `enforce`
+and `hidden` for guests on that node, wholesale (`docs/DESIGN.md` §3).
 
-A **permission** file gives a token a prefix, on the guests its selector matches, so
-one document can be shared by several tools that cannot step on each other. Cluster-only,
-so a package can declare a prefix but never grant itself access:
-
-```yaml
-# /etc/pve/meta.d/permissions/traefik.yaml
-authid: svc@pve!traefik
-rules:
-  - { prefix: traefik, mode: rw, selector: { tag: traefik } }
-```
-
-Full read of a guest's document is `VM.Audit`, full write is `VM.Config.Options`; a
-rule adds one prefix on the guests its selector matches. A write is authorized by what
-it changes, not by the view it names.
+Access follows PVE's own ACLs and nothing else: full read of a guest's document is
+`VM.Audit`, full write is `VM.Config.Options`; prefix files are readable by anyone
+authenticated, writable with `Sys.Modify` on `/` (`docs/DESIGN.md` §4).
 
 ## Install
 
@@ -102,9 +91,10 @@ the pristine files and leaves the documents alone.
 ## Use
 
 **In the UI.** Every LXC and QEMU guest gets a **Metadata** tab: one tree of the
-document, declared-but-unset keys greyed with their defaults, edits staged and applied
-together, a Text mode with Monaco, and a diff before you commit. The Datacenter panel's
-Metadata tab lists the prefixes and permissions and edits them in the same editor.
+document, declared-but-unset keys greyed with their defaults, and a Text mode with
+Monaco. An edit is one write with the digest, as everywhere in PVE; a conflict reloads
+(`docs/DESIGN.md` §8). The Datacenter panel's Metadata tab lists the prefixes and edits
+them in the same editor.
 
 | Text mode with the diff | Save anyway, when a schema objects |
 |---|---|
@@ -133,7 +123,7 @@ maintenance, in twenty lines.
 pvesh get /meta/guests --has traefik                     # every guest with that prefix
 pvesh get /meta/guests/105 --view traefik --format yaml  # one subtree, exact types
 pvesh set /meta/guests/105 --view traefik --data '{"spec":{"port":8081}}' --digest <d>
-pvesh get /meta/version --id 105                          # poll this; it moves when anything changes
+pvesh get /meta/version                                  # a token; moves when any document or prefix changes
 ```
 
 Every write leaves one syslog line tagged `pve-meta audit:`.
@@ -152,9 +142,8 @@ publish:
 > [!WARNING]
 > **With `pve-meta-publish` installed, write access to `publish` means root inside that
 > container.** It writes any file, with any owner and mode, as root. Gate it like root:
-> restrict `VM.Config.Options` on containers, and don't grant `publish` through permission
-> rules to anyone you wouldn't give root. It guards against accidents, not against users
-> inside the container.
+> grant `VM.Config.Options` on a container only to those you'd trust with root inside
+> it. It guards against accidents, not against users inside the container.
 
 ## Where things are
 

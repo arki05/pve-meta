@@ -1,7 +1,7 @@
-# Distribution: releases, the apt repository, and the ceiling watcher
+# Distribution: releases and the apt repository
 
-How packages get from a tag to a host running `apt update`, and how the "tested
-ceiling" for the patched upstream Proxmox packages stays current.
+How packages get from a tag to a host running `apt update`, and how an admin finds out
+if a patched upstream package no longer matches our patch.
 
 ## 1. Releases
 
@@ -67,62 +67,20 @@ apt update && apt install pve-meta
 `pve-meta` depends on `pve-ext` and `libpve-meta-rs-perl`, so apt installs all three.
 `pve-meta-publish` is not pulled in; `apt install pve-meta-publish` adds it.
 
-## 3. Ceiling watcher
+## 3. Upgrade safety
 
-The patched packages carry a *tested ceiling*, not a dependency pin, so
-`apt dist-upgrade` is never blocked (see "Upgrade gating" below).
-`ceilings.toml` at the repo root holds it:
+There is no scheduled check against upstream Proxmox releases; nothing pins or blocks
+`apt dist-upgrade` on `pve-manager`, `qemu-server`, `pve-container` or
+`libpve-guest-common-perl` (only a `Depends: pve-manager (>= 9.0)`-style floor, see
+`debian/control`, `pve-ext/debian/control`).
 
-```toml
-[tested]
-pve-manager = "9.2.11"
-libpve-guest-common-perl = "6.0.5"
-qemu-server = "9.2.7"
-pve-container = "6.1.14"
-```
-
-Every 6 hours (`.github/workflows/watch-pve.yml`, cron `17 */6 * * *`, plus manual
-`workflow_dispatch`) `scripts/watch-pve/check.sh`:
-
-1. fetches the Proxmox no-subscription `Packages` index for `trixie`;
-2. for each of the four tracked packages, compares its current version there (via
-   `dpkg --compare-versions`) against `ceilings.toml`'s ceiling;
-3. for every package strictly newer than its ceiling: downloads the `.deb`, extracts it
-   with `dpkg-deb -x`, and runs `pve-ext-patch --root <extracted> verify <manifest>`
-   (see `pve-ext/README.md` for what `verify` does: a dry-run of every entry's diff
-   against the pristine copy it can find under `--root`, never touching anything):
-   - **pve-manager**: verifies pve-ext's own manifest,
-     `pve-ext/patches/pve-manager.toml` (the `index.html.tpl`/`PVE/API2.pm` hooks);
-   - **libpve-guest-common-perl**, **qemu-server**, **pve-container**: verifies
-     `patches/lifecycle.toml` (pve-meta's guest-lifecycle manifest: one file in
-     each of the three, see `docs/LIFECYCLE.md`), filtered down first to that
-     package's own `[[file]]` entries;
-4. packages whose checks all pass get **one PR** bumping their `ceilings.toml` entries;
-   packages with any failure get **one GitHub issue** (label `pve-upgrade`) carrying the
-   full `pve-ext-patch verify` output, plus a `TODO(llm-fix)` block marking the hand-off
-   to a planned (not yet implemented) LLM-assisted fix flow that would hand the failing
-   diff to an LLM run to draft a fix PR for human review.
-   Both checks are best-effort deduplicated against already-open PRs/issues with the
-   same exact title, so a repeated 6-hourly run doesn't spam.
-
-### Escape hatch (Upgrade gating)
-
-The watcher is advisory, never a gate on anything:
-
-* A failed verify only opens an issue; it does not block `build.yml`, does not touch
-  `ceilings.toml`, and does not stop anyone from installing the newer upstream package
-  by hand -- there is no `Depends:` pin on any tracked package's version, only a
-  `Depends: pve-manager (>= 9.0)`-style floor (see `debian/control`,
-  `pve-ext/debian/control`).
-* If the automated verify has a false negative (e.g. it needs a check this script
-  can't perform), a human just edits the failing diff under `pve-ext/patches/` or
-  `patches/lifecycle/`, confirms locally, and hand-edits `ceilings.toml` in a normal PR
-  -- the watcher's own PRs are not special, just the same file anyone can bump.
-* Local dry run before trusting a real run:
-  ```sh
-  PVE_META_DRY_RUN=1 scripts/watch-pve/check.sh
-  ```
-  prints exactly what it would download/check/bump/file, and makes no GitHub API calls
-  (it also skips them automatically if `gh` isn't installed).
-* `workflow_dispatch` lets you trigger a check on demand instead of waiting up to 6h.
+Instead, the managed patches tell the admin at the moment it matters. `pve-meta`'s
+`debian/triggers` declares `interest-noawait` on the files its lifecycle patch touches,
+so upgrading any of the three packages above fires `pve-meta.postinst`'s `triggered`
+case in the same `apt` transaction, which re-runs `pve-ext-patch apply
+pve-meta-lifecycle`. If the patch no longer applies cleanly, `apply` restores the
+pristine file, never leaves one patched against stale content, and logs the failure to
+syslog and to `<root>/run/pve-ext-patch/failed` rather than only to a postinst's stderr.
+`pve-ext/README.md` ("Managed patches") owns the mechanism; `pve-ext-patch verify` runs
+the same check by hand, without writing anything, for a human confirming a fix.
 

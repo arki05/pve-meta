@@ -1,6 +1,6 @@
-# 016 — The CLI writes, for root on the node, skipping only permissions
+# 016 — The CLI writes, for root on the node, checking nothing
 
-**Status:** accepted (2026-09-11).
+**Status:** accepted.
 
 ## Context
 
@@ -10,11 +10,11 @@ an API token for something root on the node could already do with an editor.
 
 ## Decision
 
-`set`, `merge` and `delete` call the same `api_put`/`api_delete` the REST module calls,
-with a root ACL carrying the guest's tags, under the same per-document cluster lock
-with the guest's existence re-checked inside it. Lint, digest compare-and-swap,
-enforced schemas (`--force`) and the audit line all apply. Permissions are the one
-thing skipped, because root can already write the file. `--file -` reads stdin.
+`set`, `merge` and `delete` call the same functions the REST module calls, under the
+same per-document cluster lock with the guest's existence re-checked inside it. Lint,
+digest compare-and-swap, enforced schemas (`--force`) and the audit line all apply. No
+access check runs, because root can already write the file (§4). `--file -` reads
+stdin.
 
 ## Consequences
 
