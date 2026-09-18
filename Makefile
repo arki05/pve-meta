@@ -116,10 +116,6 @@ install: js
 	# prefix of its own. The packaged prefix directory (docs/DESIGN.md section 3)
 	# is for an operator's own .deb to drop into; it is created empty so that
 	# package has somewhere to land and dpkg knows who owns the directory.
-	#
-	# There is deliberately no packaged *permissions* directory: an operator's
-	# package may ship a prefix (a declaration) but must never ship its
-	# own permissions, and dpkg cannot write into pmxcfs (docs/DESIGN.md section 4).
 	install -D -m 0644 examples/prefixes/traefik.yaml \
 		$(DESTDIR)$(PREFIX)/share/doc/pve-meta/examples/prefixes/traefik.yaml
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-meta/prefixes

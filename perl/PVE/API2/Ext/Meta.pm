@@ -18,10 +18,9 @@ use base qw(PVE::RESTHandler);
 # `PVE::RS::Meta`'s `api_*` functions (`crates/pve-meta-perl`, implemented in
 # `pve_meta_core::api`). This module does parameters, PVE ACL checks, the
 # vmlist, the guests' tags and the per-document write lock; everything else --
-# resolving the caller's scopes against the permission files, view
-# extraction, prefix stripping, merge/replace, write authorization, the lint,
-# touched-path computation, YAML/JSON rendering and digesting -- happens in
-# Rust.
+# view extraction, prefix stripping, merge/replace, write authorization, the
+# lint, touched-path computation, YAML/JSON rendering and digesting -- happens
+# in Rust.
 #
 # Everything crosses the boundary as a **native structure** (`docs/DESIGN.md`
 # §8): the caller's ACL hash goes in, documents and results come back as Perl
@@ -42,15 +41,13 @@ sub ext_path { return 'meta' }
 
 # -- the caller's ACL ------------------------------------------------------
 #
-# `docs/DESIGN.md` §5: `full_read` = `VM.Audit` on `/vms/<vmid>`,
-# `full_write` = `VM.Config.Options`. Rust adds the scopes from the permission
-# files whose authid is the caller and whose selector matches the guest's tags
-# -- which is why the tags travel with the ACL -- and takes the guest's node from
-# it too, because that node's prefix files join the cluster's for this guest. A
-# registry document (a prefix or permission file) is readable by every
+# `docs/DESIGN.md` §4: PVE's ACLs and nothing else. `read` = `VM.Audit` on
+# `/vms/<vmid>`, `write` = `VM.Config.Options`; the tags travel with the ACL
+# because a prefix's selector matches against them, and the guest's node comes
+# along too, because that node's prefix files join the cluster's for this
+# guest. A registry document (a prefix file) is readable by every
 # authenticated user and written with `Sys.Modify` on `/` -- on `/nodes/<node>`
-# for a node's prefix file; scopes never apply to one, and Rust enforces that
-# rather than trusting an empty list here.
+# for a node's prefix file.
 
 # A guest's PVE tags, as an array ref. `get_guest_config_properties` is the
 # cluster-wide cached property fetch `list_guests` already used for the display
@@ -80,18 +77,13 @@ sub _guest_acl {
     };
 }
 
-# A registry document -- one prefix definition or permission file (docs/DESIGN.md §6) --
-# is an administrator's to edit and nobody else's.
+# A registry document -- one prefix definition (docs/DESIGN.md §3) -- is an
+# administrator's to edit and nobody else's.
 #
 # Read is open to every authenticated user, because it has to agree with the
-# two list endpoints below: they already return the same files' content to
+# list endpoint below: it already returns the same files' content to
 # everyone, and a document read that was stricter than the list of the same
 # thing would be a rule with two answers. Write is Sys.Modify on '/'.
-#
-# There is deliberately no scope path here at all: `api::effective` gives a
-# registry document no scopes, so an operator holding `rw` on some prefix
-# cannot edit the permission file that gave it that prefix, nor the prefix that
-# declares it. Self-registration is refused by there being no way to express it.
 #
 # A node's prefix file is the same, with write on that node rather than the whole
 # cluster: it reaches only that node's guests. `$node` has passed the `pve-node`
@@ -164,10 +156,10 @@ sub _vmlist_ids {
 
 # `docs/DESIGN.md` §8: "PUT and DELETE return 404 for a vmid that is not in
 # the vmlist; GET of such a vmid is 404 too." Without this, "every guest
-# document" is really "every u32": any caller with one rw scope could create
-# unbounded files under `/etc/pve/meta` (replicated cluster-wide by pmxcfs,
-# which has a hard size budget), and a guest later created at that vmid would
-# silently inherit the metadata.
+# document" is really "every u32": any caller with VM.Config.Options on some
+# vmid could create unbounded files under `/etc/pve/meta` (replicated
+# cluster-wide by pmxcfs, which has a hard size budget), and a guest later
+# created at that vmid would silently inherit the metadata.
 sub _assert_guest_exists {
     my ($vmid) = @_;
     return if _vmlist_ids()->{$vmid};
@@ -277,19 +269,6 @@ my $COMMENTS_SCHEMA = {
         . "included. 'merge' is the same either way.",
 };
 
-my $SCOPES_RETURNS = {
-    type => 'array',
-    description => "The caller's prefix scopes for this document, from the operator "
-        . "permission files (docs/DESIGN.md §4), with selectors already resolved.",
-    items => {
-        type => 'object',
-        properties => {
-            prefix => { type => 'string', description => "The key-path prefix the scope covers." },
-            mode => { type => 'string', enum => ['ro', 'rw'], description => "What it grants." },
-        },
-    },
-};
-
 my $VIEW_RETURNS = {
     type => 'object',
     properties => {
@@ -300,7 +279,7 @@ my $VIEW_RETURNS = {
         text => {
             type => 'string',
             optional => 1,
-            description => "Present when format=yaml: the file's own text for a full reader's "
+            description => "Present when format=yaml: the file's own text for the "
                 . "whole document with 'comments', a canonical dump otherwise.",
         },
         parse_error => {
@@ -336,8 +315,8 @@ my $PUT_RETURNS = {
     },
 };
 
-# `$id` is a vmid, `prefixes/<name>` or `permissions/<name>`; `$acl` is that
-# resource's ACL hash (see above).
+# `$id` is a vmid, `prefixes/<name>` or `nodes/<node>/prefixes/<name>`; `$acl`
+# is that resource's ACL hash (see above).
 my $get_view = sub {
     my ($id, $param, $acl) = @_;
     return _call(
@@ -385,11 +364,11 @@ __PACKAGE__->register_method({
         links => [{ rel => 'child', href => "{subdir}" }],
     },
     code => sub {
-        return [map { { subdir => $_ } } qw(version access guests prefixes permissions schemas)];
+        return [map { { subdir => $_ } } qw(version access guests prefixes schemas)];
     },
 });
 
-# -- version / access / prefixes / permissions -----------------------------
+# -- version / access / prefixes --------------------------------------------
 
 __PACKAGE__->register_method({
     name => 'version',
@@ -413,15 +392,14 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Watch just this document: a vmid, "
-                    . "'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or "
-                    . "'permissions/<name>'. The token then covers that document plus the "
-                    . "prefix and permission directories -- for a guest, its current node's "
-                    . "prefix directory and that node's name as well, so it moves when the "
-                    . "guest migrates -- and nothing else, which is what an open editor "
-                    . "watches, at a cost that does not grow with the number of guests. "
-                    . "Tokens from different 'id' are not comparable with each other or with "
-                    . "the unscoped one; poll with a fixed 'id' and compare against your own "
-                    . "previous answer.",
+                    . "'prefixes/<name>' or 'nodes/<node>/prefixes/<name>'. The token then "
+                    . "covers that document plus the prefix directory -- for a guest, its "
+                    . "current node's prefix directory and that node's name as well, so it "
+                    . "moves when the guest migrates -- and nothing else, which is what an "
+                    . "open editor watches, at a cost that does not grow with the number of "
+                    . "guests. Tokens from different 'id' are not comparable with each other "
+                    . "or with the unscoped one; poll with a fixed 'id' and compare against "
+                    . "your own previous answer.",
             },
         },
     },
@@ -442,8 +420,8 @@ __PACKAGE__->register_method({
                     properties => {
                         id => {
                             type => 'string',
-                            description => "A vmid, 'prefixes/<name>', "
-                                . "'nodes/<node>/prefixes/<name>' or 'permissions/<name>'.",
+                            description => "A vmid, 'prefixes/<name>' or "
+                                . "'nodes/<node>/prefixes/<name>'.",
                         },
                         digest => { type => 'string' },
                     },
@@ -470,15 +448,12 @@ __PACKAGE__->register_method({
     path => 'access',
     method => 'GET',
     permissions => { user => 'all' },
-    description => "The caller's effective access for one document (docs/DESIGN.md §5): "
-        . "'read'/'write' are the ACL answers for that document (VM.Audit / "
-        . "VM.Config.Options on a guest; for a prefix or permission file, read is open "
-        . "to every authenticated user and write is Sys.Modify on /), and 'scopes' "
-        . "lists the prefix scopes the permission files give the caller on it, with "
-        . "selectors already resolved against the guest's tags. Scopes apply to guest "
-        . "documents only. With no 'id', 'read'/'write' describe the registry as a "
-        . "whole -- what the prefix and permission lists ask before offering Add. "
-        . "Used by the editor UI to decide what to offer and whether to enable Apply.",
+    description => "The caller's access to one document (docs/DESIGN.md §4): PVE's ACLs "
+        . "and nothing else. 'read'/'write' are VM.Audit / VM.Config.Options on a guest; "
+        . "for a prefix file, read is open to every authenticated user and write is "
+        . "Sys.Modify on /. With no 'id', 'read'/'write' describe the registry as a "
+        . "whole -- what the prefix list asks before offering Add. Used by the editor "
+        . "UI to decide what to offer and whether to enable Apply.",
     parameters => {
         additionalProperties => 0,
         properties => {
@@ -486,8 +461,8 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "The document to ask about, as an id: a vmid, "
-                    . "'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or "
-                    . "'permissions/<name>'. Omit for the registry.",
+                    . "'prefixes/<name>' or 'nodes/<node>/prefixes/<name>'. Omit for "
+                    . "the registry.",
             },
         },
     },
@@ -496,17 +471,6 @@ __PACKAGE__->register_method({
         properties => {
             read => { type => 'boolean', description => "May read the whole document (ACL)." },
             write => { type => 'boolean', description => "May write the whole document (ACL)." },
-            scopes => $SCOPES_RETURNS,
-            tags => {
-                type => 'array',
-                description => "The guest's PVE tags, which is what a permission's or "
-                    . "prefix's 'selector: {tag: t}' matches against. Empty for any other "
-                    . "document, and for a caller without VM.Audit on the guest -- the "
-                    . "same filter GET /meta/guests applies to the same field. Here so "
-                    . "the editor does not have to read every document in the cluster "
-                    . "(GET /meta/guests) to learn one guest's tags.",
-                items => { type => 'string' },
-            },
         },
     },
     code => sub {
@@ -523,9 +487,9 @@ __PACKAGE__->register_method({
         my $id = $param->{id};
         if (!defined($id)) {
             my $acl = _registry_acl($rpcenv, $authuser);
-            return { read => $acl->{read}, write => $acl->{write}, scopes => [], tags => [] };
+            return { read => $acl->{read}, write => $acl->{write} };
         }
-        if ($id =~ m{^(prefixes|permissions)/}) {
+        if ($id =~ m{^prefixes/}) {
             return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
         }
         # The shape before the name reaches an ACL path; a name that is not one falls
@@ -626,54 +590,6 @@ __PACKAGE__->register_method({
 });
 
 __PACKAGE__->register_method({
-    name => 'permissions',
-    path => 'permissions',
-    method => 'GET',
-    permissions => {
-        description => "Readable by every authenticated user: a permission file says who may "
-            . "touch which prefix, which is exactly what the editor's Access column "
-            . "shows for every row, and listings are out of scope (docs/DESIGN.md §1).",
-        user => 'all',
-    },
-    description => "Every permission file (docs/DESIGN.md §4): the files in "
-        . "/etc/pve/meta.d/permissions. Cluster-only on purpose -- there is deliberately no "
-        . "packaged permissions directory, because an operator's own package may ship a "
-        . "prefix definition (what it expects) but must never ship its own. A file that did "
-        . "not load -- unreadable, or not valid as a permission -- still appears here: it is "
-        . "named ('name' is its file name) and carries 'error' instead of 'authid'/'rules'. "
-        . "It grants nothing (a malformed permission file must never grant anything), and it "
-        . "can be found and repaired at /meta/permissions/{name} rather than quietly not "
-        . "existing.",
-    parameters => {
-        additionalProperties => 0,
-        properties => {},
-    },
-    returns => {
-        type => 'array',
-        # `{ name, authid, description?, rules: [{ prefix, mode, selector }] }`
-        # for a loaded permission, or `{ name, origin, error }` for one that
-        # did not load.
-        items => {
-            type => 'object',
-            additionalProperties => 1,
-            properties => {
-                error => {
-                    type => 'string',
-                    optional => 1,
-                    description => "Present only on an entry for a file that did not load: "
-                        . "the parser's or the filesystem's own message. 'name' is still "
-                        . "the file name and 'origin' still says packaged or cluster, so the "
-                        . "row can be opened and repaired the same way a loaded one can.",
-                },
-            },
-        },
-    },
-    code => sub {
-        return _call(\&PVE::RS::Meta::api_permissions);
-    },
-});
-
-__PACKAGE__->register_method({
     name => 'schemas',
     path => 'schemas',
     method => 'GET',
@@ -682,12 +598,12 @@ __PACKAGE__->register_method({
             . "file format, the same one this package's own documentation carries.",
         user => 'all',
     },
-    description => "The two registry file formats as schemas (docs/DESIGN.md §6), "
-        . "keyed 'prefix' and 'permission', in the same PVE::JSONSchema dialect a "
-        . "prefix uses to describe a guest's subtree. The editor renders a "
-        . "prefix or permission document with these the way it renders a guest document "
-        . "with the prefixes that reach it. This is an affordance, not the "
-        . "validator: what is storable is decided by the parser on the way in.",
+    description => "The prefix file format as a schema (docs/DESIGN.md §6), keyed "
+        . "'prefix', in the same PVE::JSONSchema dialect a prefix uses to describe a "
+        . "guest's subtree. The editor renders a prefix document with this the way it "
+        . "renders a guest document with the prefixes that reach it. This is an "
+        . "affordance, not the validator: what is storable is decided by the parser "
+        . "on the way in.",
     parameters => {
         additionalProperties => 0,
         properties => {},
@@ -703,7 +619,7 @@ __PACKAGE__->register_method({
 
 # -- one document, three methods ---------------------------------------------
 #
-# Every kind of document -- a guest's, a prefix file, a permission file -- is
+# Every kind of document -- a guest's or a prefix file -- is
 # read, written and removed by the same three calls into
 # Rust ($get_view / $put_view / $delete_view). What differs is how the request
 # names the document, which ACL answers describe the caller on it, what lock a
@@ -835,48 +751,38 @@ my $REGISTRY_NAME_SCHEMA = {
         . "'homelab.docker.yaml' declares 'homelab.docker'.",
 };
 
-# A prefix and a permission file are the same document to everything but the
-# parser that validates what is written (`api::check_registry_shape`). A node's
-# prefix file, below, is a third registry document of the prefix kind.
-for my $kind (['prefixes', 'prefix'], ['permissions', 'permission']) {
-    my ($dir, $one) = @$kind;
-    my $where = $one eq 'prefix'
-        ? "/etc/pve/meta.d/prefixes, overriding the packaged file of the same name in "
-          . "/usr/share/pve-meta/prefixes if there is one"
-        : "/etc/pve/meta.d/permissions";
-
-    _register_document_methods({
-        name => $one,
-        path => "$dir/{name}",
-        params => { name => $REGISTRY_NAME_SCHEMA },
-        id => sub { "$dir/$_[0]->{name}" },
-        lock => sub { "$one-$_[0]->{name}" },
-        acl => sub { _registry_acl($_[0], $_[1]) },
-        perms => {
-            get => "Readable by every authenticated user, exactly as the "
-                . "GET /meta/$dir listing is (docs/DESIGN.md §1).",
-            put => "Requires Sys.Modify on / (docs/DESIGN.md §5).",
-            delete => "Requires Sys.Modify on / for the view and every touched "
-                . "path, same as PUT.",
-        },
-        describe => {
-            get => "Gets one $one file as a document (or a view/prefix of it). "
-                . "Unlike the GET /meta/$dir listing, which returns what the loader "
-                . "parsed, this returns the file itself -- including a file the loader "
-                . "would skip, so a malformed one can be seen and repaired.",
-            put => "Writes one $one file (or a view/prefix of it), in $where. "
-                . "The result must parse as a $one: a file the loader would skip is "
-                . "refused with a 400 rather than written, because a write that made the "
-                . "$one silently disappear would otherwise answer 200.",
-            delete => "Removes one $one file, or the subtree at 'view'. "
-                . ($one eq 'prefix'
-                    ? "A packaged prefix is never removed: deleting the cluster file "
-                      . "that overrode it reverts to the packaged one, which is then what "
-                      . "a following GET returns."
-                    : "Permission files are cluster-only, so this removes the file."),
-        },
-    });
-}
+# A node's prefix file, below, is a second registry document of the prefix kind.
+_register_document_methods({
+    name => 'prefix',
+    path => 'prefixes/{name}',
+    params => { name => $REGISTRY_NAME_SCHEMA },
+    id => sub { "prefixes/$_[0]->{name}" },
+    lock => sub { "prefix-$_[0]->{name}" },
+    acl => sub { _registry_acl($_[0], $_[1]) },
+    perms => {
+        get => "Readable by every authenticated user, exactly as the "
+            . "GET /meta/prefixes listing is (docs/DESIGN.md §1).",
+        put => "Requires Sys.Modify on / (docs/DESIGN.md §4).",
+        delete => "Requires Sys.Modify on / for the view and every touched "
+            . "path, same as PUT.",
+    },
+    describe => {
+        get => "Gets one prefix file as a document (or a view/prefix of it). "
+            . "Unlike the GET /meta/prefixes listing, which returns what the loader "
+            . "parsed, this returns the file itself -- including a file the loader "
+            . "would skip, so a malformed one can be seen and repaired.",
+        put => "Writes one prefix file (or a view/prefix of it), in "
+            . "/etc/pve/meta.d/prefixes, overriding the packaged file of the same name "
+            . "in /usr/share/pve-meta/prefixes if there is one. The result must parse "
+            . "as a prefix: a file the loader would skip is refused with a 400 rather "
+            . "than written, because a write that made the prefix silently disappear "
+            . "would otherwise answer 200.",
+        delete => "Removes one prefix file, or the subtree at 'view'. A packaged "
+            . "prefix is never removed: deleting the cluster file that overrode it "
+            . "reverts to the packaged one, which is then what a following GET "
+            . "returns.",
+    },
+});
 
 _register_document_methods({
     name => 'node_prefix',
@@ -917,27 +823,24 @@ __PACKAGE__->register_method({
     method => 'GET',
     permissions => {
         description => "Anybody may call this; the list is filtered to guests the "
-            . "caller can read anything of (VM.Audit, or a registered scope whose "
-            . "selector matches that guest). 'node', 'name' and 'tags' are returned "
-            . "only for guests the caller has VM.Audit on.",
+            . "caller has VM.Audit on (docs/DESIGN.md §4).",
         user => 'all',
     },
-    description => "Lists every guest in the vmlist the caller can read anything of.",
+    description => "Lists every guest in the vmlist the caller has VM.Audit on.",
     parameters => {
         additionalProperties => 0,
         properties => {
             has => {
                 type => 'string',
                 optional => 1,
-                description => "Only list guests whose *visible* data has something at this "
+                description => "Only list guests whose data has something at this "
                     . "dotted path. Naming a comment key is a 400: a note is not data.",
             },
         },
     },
     returns => {
         type => 'array',
-        # Open-shaped: `{ vmid, node, type, name, tags, digest }` per guest.
-        # Rust omits what the caller may not see.
+        # `{ vmid, node, type, name, tags, digest }` per guest.
         items => { type => 'object', additionalProperties => 1 },
     },
     code => sub {
@@ -952,7 +855,7 @@ __PACKAGE__->register_method({
         # opens `/etc/pve/.vmlist` or a guest config, so the two can no longer
         # disagree and guest-config parsing is not re-implemented in a second
         # language. `hostname` is the LXC name field, `name` the qemu one;
-        # `tags` resolves the permission files' and prefix definitions' selectors (docs/DESIGN.md §3, §4).
+        # `tags` resolves a prefix's selector (docs/DESIGN.md §3).
         my $props = eval { PVE::Cluster::get_guest_config_properties([qw(name hostname tags)]) } || {};
         warn "pve-meta: could not read guest properties: $@" if $@;
 
@@ -967,14 +870,10 @@ __PACKAGE__->register_method({
                 name => $p->{name} // $p->{hostname},
                 tags => _parse_tags($p->{tags}),
                 read => $rpcenv->check($authuser, "/vms/$vmid", ['VM.Audit'], 1) ? 1 : 0,
-                # Constant, not the real ACL answer: a listing never consults full_write
-                # (api.rs's `list_guests` gates only on read), so asking PVE for it would be
-                # one $rpcenv->check() per guest for a value nothing reads.
-                write => 0,
             };
         }
 
-        return _call(\&PVE::RS::Meta::api_list_guests, $authuser, $guests, $param->{has});
+        return _call(\&PVE::RS::Meta::api_list_guests, $guests, $param->{has});
     },
 });
 
@@ -987,22 +886,15 @@ _register_document_methods({
     acl => sub { _guest_acl($_[0], $_[1], $_[2]->{vmid}) },
     check => sub { _assert_guest_exists($_[0]->{vmid}) },
     perms => {
-        get => "The response is filtered to what the caller may read (VM.Audit, "
-            . "or a granted scope whose selector matches this guest). A caller with "
-            . "neither is refused with 403, as is a 'view' outside the caller's read "
-            . "access. A vmid that is not in the vmlist is 404 (docs/DESIGN.md §8).",
-        put => "Anybody may call this. What authorizes the write is what it "
-            . "*changes*: every path it touches -- values changed, keys added, keys "
-            . "removed -- must be covered by VM.Config.Options or by a granted rw "
-            . "scope, otherwise 403. The 'view' is where the write is aimed, not what "
-            . "it may do, so one write may span two granted prefixes even though the "
-            . "view covering both is the whole document. On top of that the caller "
-            . "must be able to read the named view and must hold some write permission "
-            . "on the document (docs/DESIGN.md §5). A document that cannot be read "
-            . "back is the exception: repairing it as a whole requires "
-            . "VM.Config.Options, since there is no stored content to check the change "
-            . "against. Unknown vmids are 404, not created.",
-        delete => "Anybody may call this; same write rules as PUT. Removes only "
+        get => "Requires VM.Audit on the guest; a caller without it is refused with "
+            . "403 for the whole document and any 'view' alike. A vmid that is not "
+            . "in the vmlist is 404 (docs/DESIGN.md §8).",
+        put => "Requires VM.Config.Options on the guest, and nothing else -- there is "
+            . "no per-path check and no requirement to also hold VM.Audit "
+            . "(docs/DESIGN.md §4). A document that cannot be read back is no "
+            . "exception: repairing it as a whole still only needs VM.Config.Options. "
+            . "Unknown vmids are 404, not created.",
+        delete => "Requires VM.Config.Options on the guest, same as PUT. Removes only "
             . "the current document -- snapshot copies belong to the guest lifecycle "
             . "and are never touched from here. Unknown vmids are 404.",
     },

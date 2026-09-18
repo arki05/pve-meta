@@ -24,10 +24,10 @@ version constraint if the two packages' versions can drift; they are built from 
 same source package here, so an exact match is simplest) alongside its existing
 `Depends:` line, so the two packages install together.
 
-## The prefix and grant drop-directories
+## The prefix drop-directories
 
-`docs/DESIGN.md` §3 and §4 put prefixes (what a prefix is) and permissions (who may touch
-one) outside the documents, in these directories:
+`docs/DESIGN.md` §3 puts prefixes (what a prefix is) outside the documents, in these
+directories:
 
 * `/usr/share/pve-meta/prefixes/` — packaged prefixes, one file per prefix; **the
   file name is the prefix** (`docs/DESIGN.md` §3). The root `Makefile`'s `install:`
@@ -43,11 +43,6 @@ one) outside the documents, in these directories:
 * `/etc/pve/nodes/<node>/meta.d/prefixes/` — one node's overrides, for the guests on that
   node. Nothing creates these ahead of time: the first write of a node's prefix file
   creates its directory, and a node without one simply has no files of its own.
-* `/etc/pve/meta.d/permissions/` — permissions, created by the same postinst. **Cluster-only: there
-  is deliberately no packaged permissions directory** (`docs/DESIGN.md` §4). An operator's
-  `.deb` may ship a prefix, which is a declaration, but must never ship its own grant,
-  which would be self-registration; dpkg cannot write into pmxcfs, so that rule is
-  enforced by where the files live rather than by a check.
 
 A cluster prefix file overrides the packaged file of the same name, and a node file the
 cluster file for that node's guests; all of these are read per request and none is

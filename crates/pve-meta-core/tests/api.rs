@@ -2,41 +2,23 @@
 
 use pretty_assertions::assert_eq;
 use pve_meta_core::api::{
-    self, access, delete_document, effective, get_document, list_guests,
-    parse_id, permissions_list, prefixes_list, put_document, version, ApiError, ApiPutResult,
-    ApiViewDocument, CallerAcl, GuestInput, PermissionEntry,
+    self, access, delete_document, get_document, list_guests, parse_id, prefixes_list,
+    put_document, version, ApiError, ApiPutResult, ApiViewDocument, CallerAcl, GuestInput,
 };
 use pve_meta_core::path::Path as DocPath;
 use pve_meta_core::shape::Shape;
-use pve_meta_core::registry::{self, NodeName, Origin, Permission, PrefixDef, RegistryFailure};
+use pve_meta_core::registry::{self, NodeName, Origin, PrefixDef, RegistryFailure};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind};
 use serde_json::json;
 
-/// A store over a fresh tempdir, with its registry directories inside it
-/// rather than the machine's real ones (see `tests/store.rs` for why). No
+/// A store over a fresh tempdir, with its registry directory inside it
+/// rather than the machine's real one (see `tests/store.rs` for why). No
 /// global state: every test owns its own root, so the suite runs in
 /// parallel like the rest of the crate's.
 fn store() -> (tempfile::TempDir, MetaStore) {
     let dir = tempfile::tempdir().unwrap();
-    let store = MetaStore::with_registry_dirs(
-        dir.path(),
-        vec![dir.path().join("registry/prefixes")],
-        vec![dir.path().join("registry/grants")],
-    );
+    let store = MetaStore::with_registry_dirs(dir.path(), vec![dir.path().join("registry/prefixes")]);
     (dir, store)
-}
-
-/// The grants used throughout: `scoped@pve!t1` holds `traefik` rw on
-/// guests tagged `traefik`, and `netbird` ro on every guest.
-fn regs() -> Vec<Permission> {
-    vec![registry::parse_permission(
-        "scoped",
-        "authid: scoped@pve!t1\n\
-         rules:\n\
-         \x20 - prefix: traefik\n    mode: rw\n    selector: {tag: traefik}\n\
-         \x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
-    )
-    .unwrap()]
 }
 
 fn full() -> CallerAcl {
@@ -49,12 +31,25 @@ fn full() -> CallerAcl {
     }
 }
 
-fn scoped(tags: &[&str]) -> CallerAcl {
+/// `VM.Audit` and no `VM.Config.Options`.
+fn read_only() -> CallerAcl {
     CallerAcl {
-        authid: "scoped@pve!t1".to_string(),
-        read: false,
+        authid: "auditor@pve".to_string(),
+        read: true,
         write: false,
-        tags: tags.iter().map(|s| s.to_string()).collect(),
+        tags: vec![],
+        node: None,
+    }
+}
+
+/// `VM.Config.Options` and no `VM.Audit` -- a PVE ACL can grant one without
+/// the other (`docs/DESIGN.md` §4).
+fn write_only() -> CallerAcl {
+    CallerAcl {
+        authid: "writer@pve".to_string(),
+        read: false,
+        write: true,
+        tags: vec![],
         node: None,
     }
 }
@@ -64,34 +59,6 @@ fn none() -> CallerAcl {
         authid: "nobody@pve".to_string(),
         ..Default::default()
     }
-}
-
-/// `VM.Audit` and no `VM.Config.Options`, plus whatever scopes the
-/// permission files give it: the principal every one of these rules is
-/// actually about. It can read the whole document, so it can compose a
-/// faithful whole-document write; what it may *change* is its scopes.
-fn auditor(tags: &[&str]) -> CallerAcl {
-    CallerAcl {
-        authid: "scoped@pve!t1".to_string(),
-        read: true,
-        write: false,
-        tags: tags.iter().map(|s| s.to_string()).collect(),
-        node: None,
-    }
-}
-
-/// A permission file with two `rw` rules, which is the ordinary shape the
-/// old view gate could not express a write for: the narrowest view
-/// covering one key in each is the document root.
-fn two_rw() -> Vec<Permission> {
-    vec![registry::parse_permission(
-        "two",
-        "authid: scoped@pve!t1\n\
-         rules:\n\
-         \x20 - prefix: traefik\n    mode: rw\n    selector: {all: true}\n\
-         \x20 - prefix: netbird\n    mode: rw\n    selector: {all: true}\n",
-    )
-    .unwrap()]
 }
 
 fn seed(store: &MetaStore, id: &str, text: &str) {
@@ -114,7 +81,7 @@ fn get(
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, ApiError> {
     // `comments`: every rule below but the notes' own is about the stored content.
-    get_document(store, &regs(), id, view, fmt, true, acl)
+    get_document(store, id, view, fmt, true, acl)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -129,13 +96,12 @@ fn put(
     dry_run: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    put_with(store, &regs(), &[], id, view, fmt, payload, mode, digest, dry_run, false, acl)
+    put_with(store, &[], id, view, fmt, payload, mode, digest, dry_run, false, acl)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn put_with(
     store: &MetaStore,
-    permission_files: &[Permission],
     prefixes: &[PrefixDef],
     id: &str,
     view: Option<&str>,
@@ -147,10 +113,7 @@ fn put_with(
     force: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    put_document(
-        store, permission_files, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, true,
-        acl,
-    )
+    put_document(store, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, true, acl)
 }
 
 /// The enforcing prefix the schema-gate tests use: `traefik`, reaching every
@@ -168,37 +131,36 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
     let strict = enforcing(true);
     let wrong = r#"{"port": "eighty"}"#;
 
-    // Refused, naming the path, for a full writer too: enforcement is about the
-    // write, not the writer.
-    let err = put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, false, &full())
+    // Refused, naming the path.
+    let err = put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, false, &full())
         .unwrap_err();
     assert_eq!(status(&err), 422, "{err}");
     assert!(err.msg.contains("traefik.port") && err.msg.contains("force=1"), "{err}");
     assert!(read_raw(&store, "100").is_none(), "nothing was written");
     // A dry run answers the same.
-    let err = put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, true, false, &full())
+    let err = put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, true, false, &full())
         .unwrap_err();
     assert_eq!(status(&err), 422);
 
     // `force` stores it anyway -- the deliberate act.
-    put_with(&store, &regs(), &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, true, &full()).unwrap();
+    put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, true, &full()).unwrap();
     assert_eq!(read_raw(&store, "100").as_deref(), Some("traefik:\n  port: eighty\n"));
 
     // The document is now wrong under `traefik`; a write elsewhere is not
     // answerable for that and goes through.
-    put_with(&store, &regs(), &strict, "100", Some("other"), "json", r#"{"k": 1}"#, "replace", None, false, false, &full()).unwrap();
+    put_with(&store, &strict, "100", Some("other"), "json", r#"{"k": 1}"#, "replace", None, false, false, &full()).unwrap();
     // ... but writing a differently-wrong value onto the wrong key still is.
-    let err = put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", r#""ninety""#, "replace", None, false, false, &full())
+    let err = put_with(&store, &strict, "100", Some("traefik.port"), "json", r#""ninety""#, "replace", None, false, false, &full())
         .unwrap_err();
     assert_eq!(status(&err), 422);
     // Fixing it is fine, of course.
-    put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", "80", "replace", None, false, false, &full()).unwrap();
+    put_with(&store, &strict, "100", Some("traefik.port"), "json", "80", "replace", None, false, false, &full()).unwrap();
 
     // A format check is never enforced: the server cannot judge a dns-name.
-    put_with(&store, &regs(), &strict, "100", Some("traefik.host"), "json", r#""not a host!!""#, "replace", None, false, false, &full()).unwrap();
+    put_with(&store, &strict, "100", Some("traefik.host"), "json", r#""not a host!!""#, "replace", None, false, false, &full()).unwrap();
 
     // Without `enforce`, the same schema is advisory and the same write goes through.
-    put_with(&store, &regs(), &enforcing(false), "100", Some("traefik.port"), "json", r#""eighty""#, "replace", None, false, false, &full()).unwrap();
+    put_with(&store, &enforcing(false), "100", Some("traefik.port"), "json", r#""eighty""#, "replace", None, false, false, &full()).unwrap();
 
     // A prefix that does not reach this guest enforces nothing on it.
     let tagged = vec![pve_meta_core::registry::parse_prefix(
@@ -206,18 +168,13 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
         "selector: {tag: web}\nenforce: true\nschema: {type: object, properties: {port: {type: integer}}}\n",
     )
     .unwrap()];
-    put_with(&store, &regs(), &tagged, "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
+    put_with(&store, &tagged, "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
     let mut web = full();
     web.tags = vec!["web".to_string()];
     assert_eq!(
-        status(&put_with(&store, &regs(), &tagged, "100", Some("traefik.port"), "json", r#""y""#, "replace", None, false, false, &web).unwrap_err()),
+        status(&put_with(&store, &tagged, "100", Some("traefik.port"), "json", r#""y""#, "replace", None, false, false, &web).unwrap_err()),
         422
     );
-
-    // A scoped principal writing inside its own prefix meets the same gate.
-    let err = put_with(&store, &regs(), &strict, "100", Some("traefik.port"), "json", r#""z""#, "replace", None, false, false, &scoped(&["traefik"]))
-        .unwrap_err();
-    assert_eq!(status(&err), 422);
 }
 
 fn del(
@@ -227,21 +184,10 @@ fn del(
     digest: Option<&str>,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    del_with(store, &regs(), id, view, digest, acl)
+    delete_document(store, id, view, digest, acl)
 }
 
-fn del_with(
-    store: &MetaStore,
-    permission_files: &[Permission],
-    id: &str,
-    view: Option<&str>,
-    digest: Option<&str>,
-    acl: &CallerAcl,
-) -> Result<ApiPutResult, ApiError> {
-    delete_document(store, permission_files, id, view, digest, acl)
-}
-
-// -- grants from registrations ----------------------------------------
+// -- version polling ----------------------------------------------------
 
 #[test]
 fn version_detail_names_the_documents_that_changed() {
@@ -290,9 +236,9 @@ fn a_scoped_version_ignores_other_documents_and_snapshots() {
 
 #[test]
 fn a_scoped_version_still_watches_the_registry() {
-    // The registry decides what the document *looks like* and who may
-    // write it, so a scoped poll that missed it would leave an open editor
-    // rendering against a schema that no longer exists.
+    // The registry decides what the document *looks like*, so a scoped poll
+    // that missed it would leave an open editor rendering against a schema
+    // that no longer exists.
     let (dir, store) = store();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     let prefixes = dir.path().join("registry/prefixes");
@@ -314,7 +260,7 @@ fn a_scoped_detail_lists_exactly_what_the_scoped_token_covers() {
     // `detail` answers "which of the things this token covers changed", so
     // it lists what the token is over and nothing else: this document, and
     // the registry documents -- which the scoped token watches too, because
-    // they decide how the document is rendered and who may write it.
+    // they decide how the document is rendered.
     let (dir, store) = store();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
     store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
@@ -336,130 +282,52 @@ fn a_scoped_version_refuses_a_garbage_id() {
     assert!(err.starts_with("400: "), "{err}");
 }
 
-#[test]
-    fn a_selector_resolves_against_the_guests_tags() {
-    // `docs/DESIGN.md` §4: adding the tag is the deliberate act of
-    // granting the operator that guest.
-    let permission_files = regs();
-    let untagged = effective(&permission_files, &DocId::Guest(100), &scoped(&[]));
-    assert_eq!(untagged.scopes.len(), 1);
-    assert_eq!(untagged.scopes[0].prefix.to_string(), "netbird");
-    assert!(!untagged.can_write(&DocPath::parse("traefik").unwrap()));
-
-    let tagged = effective(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
-    assert!(tagged.can_write(&DocPath::parse("traefik.spec").unwrap()));
-    assert!(tagged.can_read(&DocPath::parse("netbird").unwrap()));
-    assert!(!tagged.can_write(&DocPath::parse("netbird").unwrap()));
-}
+// -- write authorization is `acl.write` alone (`docs/DESIGN.md` §4) -----
 
 #[test]
-fn a_registration_for_another_authid_permissions_nothing() {
-    let g = effective(&regs(), &DocId::Guest(100), &none());
-    assert!(g.readable_prefixes().is_empty());
-}
-
-// -- write authorization ------------------------------------------------
-
-#[test]
-fn zero_permission_token_cannot_create_structure_through_an_empty_merge() {
-    // A `PUT ?view=zzz.deep&mode=merge` with `{}` must not write
-    // `zzz: {deep: {}}` while reporting `touched: []`: `check_write([])`
-    // is vacuously Ok, so the up-front view check is what stops it.
+fn a_caller_without_write_access_cannot_create_structure_through_a_write() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  spec:\n    host: ct100.example\n");
     let before = read_raw(&store, "100").unwrap();
 
-    for acl in [none(), scoped(&["traefik"])] {
-        for (view, mode, payload) in [
-            (Some("zzz_hacked.deep"), "merge", "{}"),
-            (Some("zzz_hacked"), "merge", "{}"),
-            (Some("zzz_hacked.deep"), "replace", "{}"),
-        ] {
-            let err = put(&store, "100", view, "json", payload, mode, None, false, &acl)
-                .expect_err("must be refused");
-            assert_eq!(status(&err), 403, "{view:?}/{mode}: {err}");
-            assert_eq!(read_raw(&store, "100").unwrap(), before, "{view:?}/{mode} mutated");
-        }
+    for (view, mode, payload) in [
+        (Some("zzz_hacked.deep"), "merge", "{}"),
+        (Some("zzz_hacked"), "merge", "{}"),
+        (Some("zzz_hacked.deep"), "replace", "{}"),
+        (None, "merge", "{}"),
+    ] {
+        let err = put(&store, "100", view, "json", payload, mode, None, false, &none())
+            .expect_err("must be refused");
+        assert_eq!(status(&err), 403, "{view:?}/{mode}: {err}");
+        assert_eq!(read_raw(&store, "100").unwrap(), before, "{view:?}/{mode} mutated");
     }
+    let err = del(&store, "100", None, None, &none()).expect_err("root delete");
+    assert_eq!(status(&err), 403, "{err}");
 }
 
-/// Still true after the gate moved to the content, but for two different
-/// reasons: a token with nothing has no write permission at all, and a
-/// scope-only one cannot read the whole document it would be replacing.
 #[test]
-fn a_token_without_full_read_cannot_write_the_root_view() {
+fn write_access_does_not_require_read_access() {
+    // `docs/DESIGN.md` §4: there is no "must read what you write" rule. A
+    // PVE ACL can grant `VM.Config.Options` without `VM.Audit`, and this is
+    // the one place that survives all the way to the root view.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
-    let before = read_raw(&store, "100").unwrap();
-    for acl in [none(), scoped(&["traefik"])] {
-        for (mode, payload) in [("merge", "{}"), ("replace", "{\"a\": 1}")] {
-            let err = put(&store, "100", None, "json", payload, mode, None, false, &acl)
-                .expect_err("neither principal can name the root view");
-            assert_eq!(status(&err), 403, "{mode}: {err}");
-        }
-        let err = del(&store, "100", None, None, &acl).expect_err("root delete");
-        assert_eq!(status(&err), 403, "{err}");
-    }
-    assert_eq!(read_raw(&store, "100").unwrap(), before);
-}
+    put(&store, "100", None, "json", r#"{"a": 1}"#, "replace", None, false, &write_only())
+        .expect("write access alone is enough to replace the whole document");
+    assert_eq!(read_raw(&store, "100").as_deref(), Some("a: 1\n"));
 
-// -- what authorizes a write is what it changes -----------------------
-//
-// `docs/DESIGN.md` §5: a write is authorized by what it changes, not by
-// the view it targets, so a write spanning two granted prefixes is not
-// refused just because no single view covers both.
-
-#[test]
-fn one_write_may_span_two_granted_prefixes() {
-    // A permission file has `rules`, plural. Editing one key in each of
-    // two `rw` prefixes is ordinary, and no view but the root covers both.
-    let (_dir, store) = store();
-    seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
-    let doc = r#"{"traefik":{"host":"b"},"netbird":{"groups":["wan"]}}"#;
-    let res = put_with(
-        &store, &two_rw(), &[], "100", None, "json", doc, "replace", None, false, false, &auditor(&[]))
-    .expect("every change is inside a granted prefix");
-    assert_eq!(
-        res.touched.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(),
-        vec!["traefik.host", "netbird.groups"]
-    );
+    del(&store, "101", None, None, &write_only()).expect("write access alone is enough to delete");
 }
 
 #[test]
-fn a_whole_document_write_still_answers_for_every_key_it_changes() {
-    // The permissiveness is exactly "every change is permitted" and not one
-    // step further: the same root replace that is allowed above is refused
-    // the moment it reaches outside the scopes -- by changing a key, and by
-    // quietly dropping one, which is the shape that would lose data.
-    let (_dir, store) = store();
-    let stored = "traefik:\n  host: a\nhomelab:\n  owner: arki\n";
-    for (label, doc) in [
-        ("changes an outside key", r#"{"traefik":{"host":"b"},"homelab":{"owner":"mallory"}}"#),
-        ("drops an outside key", r#"{"traefik":{"host":"b"}}"#),
-        ("adds an outside key", r#"{"traefik":{"host":"a"},"homelab":{"owner":"arki"},"new":1}"#),
-    ] {
-        seed(&store, "100", stored);
-        let err = put_with(
-            &store, &two_rw(), &[], "100", None, "json", doc, "replace", None, false, false, &auditor(&[]))
-        .unwrap_err();
-        assert_eq!(status(&err), 403, "{label}: {err}");
-        assert!(err.to_string().contains("homelab") || err.to_string().contains("new"), "{label}: {err}");
-        assert_eq!(read_raw(&store, "100").as_deref(), Some(stored), "{label} mutated");
-    }
-}
-
-#[test]
-fn reordering_keys_is_a_write_a_scoped_principal_may_make() {
-    // Key order is data -- the model preserves it -- but it is not a path,
-    // so a reordering changes nothing the permission rules are written
-    // about. It can only be expressed as a whole-document write.
+fn a_reordering_write_touches_nothing_but_is_still_a_write() {
+    // Key order is data -- the model preserves it -- but it is not a path a
+    // write reports as changed.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
-    let res = put_with(
-        &store, &two_rw(), &[], "100", None, "json", reordered, "replace", None, false, false,
-        &auditor(&[]))
-    .expect("a reordering changes no path");
+    let res = put(&store, "100", None, "json", reordered, "replace", None, false, &full())
+        .expect("a reordering changes no path");
     assert!(res.touched.is_empty(), "{:?}", res.touched);
     assert_eq!(
         read_raw(&store, "100").as_deref(),
@@ -469,124 +337,29 @@ fn reordering_keys_is_a_write_a_scoped_principal_may_make() {
 }
 
 #[test]
-fn a_reader_with_no_write_permission_cannot_cause_a_write() {
-    // The floor under the content check. A reordering touches no path, so
-    // the content check has nothing to refuse -- and without this, an
-    // auditor holding nothing but `VM.Audit` could rewrite the file.
+fn a_reader_with_no_write_access_cannot_cause_a_write() {
+    // The floor under every write: a reordering touches no path, so there is
+    // nothing for a content check to refuse -- and without a plain
+    // `acl.write` gate an auditor holding only `VM.Audit` could rewrite the
+    // file.
     let (_dir, store) = store();
     let stored = "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n";
     seed(&store, "100", stored);
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
-    let readonly = CallerAcl { authid: "auditor@pve".into(), read: true, ..Default::default() };
-    let err = put(&store, "100", None, "json", reordered, "replace", None, false, &readonly)
+    let err = put(&store, "100", None, "json", reordered, "replace", None, false, &read_only())
         .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
     assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
-
-    // A read-only *scope* is not write permission either.
-    let ro_only = vec![registry::parse_permission(
-        "ro",
-        "authid: auditor@pve\nrules:\n\x20 - prefix: netbird\n    mode: ro\n    selector: {all: true}\n",
-    )
-    .unwrap()];
-    let err = put_with(
-        &store, &ro_only, &[], "100", None, "json", reordered, "replace", None, false, false, &readonly)
-    .unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
-    assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
 }
 
 #[test]
-fn a_write_you_may_not_read_is_refused_before_it_can_answer_anything() {
-    // Without the read requirement the content check is a read oracle:
-    // replace a key you cannot read with a guess, and 200-versus-403 tells
-    // you whether the guess was right, one guess at a time.
-    let (_dir, store) = store();
-    seed(&store, "100", "traefik:\n  host: a\nsecret:\n  token: hunter2\n");
-    // `two_rw` grants traefik and netbird; `secret` is neither, and this
-    // principal has no full read.
-    for guess in ["\"hunter2\"", "\"wrong\""] {
-        let err = put_with(
-            &store, &two_rw(), &[], "100", Some("secret.token"), "json", guess, "replace", None,
-            false, false, &scoped(&[]))
-        .unwrap_err();
-        assert_eq!(status(&err), 403, "{guess}: {err}");
-        // The refusal must not depend on the guess, or it is the oracle again.
-        assert_eq!(err.to_string(), "403: not permitted: secret.token", "{guess}: {err}");
-    }
-}
-
-#[test]
-fn an_unreadable_document_is_repaired_only_by_full_write() {
-    // The one place the coarse rule survives, because the diff is blind
-    // here: the stored value is the empty document, so a scoped principal
-    // replacing the root with its own subtree produces a touched list
-    // entirely inside its own scope -- while destroying every other
-    // prefix's content in a file nobody can currently read.
-    // Written past the store, because a document this broken is exactly
-    // what `put_raw` refuses to create: it arrived by hand, or from an
-    // older writer, or from a half-finished replication.
-    let (dir, store) = store();
-    let broken = "traefik:\n  host: a\nhomelab: [unclosed\n";
-    std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
-    let before = std::fs::read_to_string(dir.path().join("100.yaml")).unwrap();
-    let err = put_with(
-        &store, &two_rw(), &[], "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace",
-        None, false, false, &auditor(&[]))
-    .unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
-    assert!(err.to_string().contains("cannot be read back"), "{err}");
-    assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), before);
-
-    // Full write access still repairs it, exactly as documented.
-    put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &full())
-        .expect("the documented repair path");
-}
-
-#[test]
-fn a_root_delete_still_answers_for_everything_it_removes() {
-    let (_dir, store) = store();
-    let stored = "traefik:\n  host: a\nhomelab:\n  owner: arki\n";
-    seed(&store, "100", stored);
-    let err = del_with(&store, &two_rw(), "100", None, None, &auditor(&[])).unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
-    assert!(err.to_string().contains("homelab"), "{err}");
-    assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
-}
-
-#[test]
-fn a_403_names_the_path_it_refused() {
+fn a_read_403_names_the_view_it_refused() {
     // `docs/DESIGN.md` §1: key-name disclosure is out of scope, and a
     // message that says nothing is a message nobody can act on.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\nnetbird:\n  groups:\n  - lan\n");
-    let err = put(
-        &store,
-        "100",
-        Some("netbird.groups"),
-        "json",
-        "[\"guess\"]",
-        "replace",
-        None,
-        false,
-        &scoped(&["traefik"]),
-    )
-    .unwrap_err();
+    let err = get(&store, "100", Some("netbird.groups"), "json", &none()).unwrap_err();
     assert_eq!(err.to_string(), "403: not permitted: netbird.groups", "{err}");
-}
-
-#[test]
-fn a_scoped_write_outside_the_view_is_refused_by_the_touched_check() {
-    let (_dir, store) = store();
-    seed(&store, "100", "traefik:\n  host: x\n");
-    // A root merge is refused by the view gate; a *scoped* merge whose
-    // patch reaches out of the prefix cannot exist (the patch is applied
-    // relative to the view), so the touched check is exercised through a
-    // full-read/no-write caller instead.
-    let ro = CallerAcl { authid: "ro@pve".into(), read: true, write: false, tags: vec![], node: None };
-    let err = put(&store, "100", Some("traefik"), "json", "{\"a\":1}", "replace", None, false, &ro)
-        .unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
 }
 
 // -- the one lint -------------------------------------------------------
@@ -599,7 +372,7 @@ fn one_lint_runs_on_the_planned_document_for_every_caller() {
     seed(&store, "100", "traefik:\n  host: x\n");
     let before = read_raw(&store, "100").unwrap();
 
-    for acl in [full(), scoped(&["traefik"])] {
+    for acl in [full(), write_only()] {
         for (view, mode, payload, expect) in [
             (Some("traefik__"), "replace", "5", "comment key value must be a string"),
             (Some("traefik"), "replace", "{\"bad key\": 1}", "invalid key"),
@@ -624,14 +397,14 @@ fn one_lint_runs_on_the_planned_document_for_every_caller() {
     }
 
     // ... and a legitimate comment-key write still goes through.
-    put(&store, "100", Some("traefik__"), "json", "\"the ingress config\"", "replace", None, false, &scoped(&["traefik"]))
+    put(&store, "100", Some("traefik__"), "json", "\"the ingress config\"", "replace", None, false, &full())
         .expect("a string comment value is fine");
 }
 
 #[test]
 fn the_lint_names_the_offending_path_whoever_asks() {
-    // No redaction (`docs/DESIGN.md` §1): an out-of-band bad key
-    // blocks the write and is spelled out, for a scoped caller too.
+    // No redaction (`docs/DESIGN.md` §1): an out-of-band bad key blocks the
+    // write and is spelled out.
     let (dir, store) = store();
     std::fs::write(
         dir.path().join("100.yaml"),
@@ -639,7 +412,7 @@ fn the_lint_names_the_offending_path_whoever_asks() {
     )
     .unwrap();
 
-    for acl in [full(), scoped(&["traefik"])] {
+    for acl in [full(), write_only()] {
         let err = put(&store, "100", Some("traefik"), "json", "{\"host\":\"y\"}", "replace", None, false, &acl)
             .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
@@ -676,44 +449,19 @@ fn dry_run_checks_the_digest_and_never_writes() {
 // -- reads --------------------------------------------------------------
 
 #[test]
-fn no_permission_read_is_forbidden_not_an_empty_document_with_a_real_digest() {
+fn a_read_without_access_is_forbidden_not_an_empty_document_with_a_real_digest() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
     let err = get(&store, "100", None, "json", &none()).unwrap_err();
     assert_eq!(status(&err), 403);
     assert_eq!(err.to_string(), "403: not permitted: the whole document");
 
-    // A partial grant still gets the whole-document digest (needed for
-    // compare-and-swap PUTs).
+    // Read access is a boolean: any caller who has it gets the same
+    // whole-document digest (needed for compare-and-swap PUTs).
     let real = get(&store, "100", None, "json", &full()).unwrap();
-    let partial = get(&store, "100", None, "json", &scoped(&["traefik"])).unwrap();
-    assert_eq!(partial.digest, real.digest);
-}
-
-#[test]
-fn a_scoped_read_sees_only_its_own_prefixes() {
-    let (_dir, store) = store();
-    seed(
-        &store,
-        "100",
-        "__: top level note\ntraefik__: about traefik\ntraefik:\n  host: x\nnetbird:\n  groups:\n  - lan\nother: 1\n",
-    );
-
-    let got = get(&store, "100", None, "json", &scoped(&["traefik"])).unwrap();
-    assert_eq!(
-        got.data.unwrap(),
-        json!({"traefik__": "about traefik", "traefik": {"host": "x"},
-               "netbird": {"groups": ["lan"]}})
-    );
-
-    // The bare `__` documents the whole document and is not disclosed;
-    // the explicit view of it agrees.
-    let err = get(&store, "100", Some("__"), "json", &scoped(&["traefik"])).unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
-
-    // Untag the guest and the traefik scope disappears from both.
-    let untagged = get(&store, "100", None, "json", &scoped(&[])).unwrap();
-    assert_eq!(untagged.data.unwrap(), json!({"netbird": {"groups": ["lan"]}}));
+    let read = get(&store, "100", None, "json", &read_only()).unwrap();
+    assert_eq!(read.digest, real.digest);
+    assert_eq!(read.data, real.data);
 }
 
 #[test]
@@ -733,14 +481,13 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
 
 /// A read that did not ask for the notes.
 fn get_bare(store: &MetaStore, id: &str, view: Option<&str>, fmt: &str, acl: &CallerAcl) -> Result<ApiViewDocument, ApiError> {
-    get_document(store, &regs(), id, view, fmt, false, acl)
+    get_document(store, id, view, fmt, false, acl)
 }
 
-/// A JSON write with `comments` as given, against `permission_files` and `prefixes`.
+/// A JSON write with `comments` as given, against `prefixes`.
 #[allow(clippy::too_many_arguments)]
 fn put_notes(
     store: &MetaStore,
-    permission_files: &[Permission],
     prefixes: &[PrefixDef],
     id: &str,
     view: Option<&str>,
@@ -750,7 +497,7 @@ fn put_notes(
     comments: bool,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
-    put_document(store, permission_files, prefixes, id, view, "json", payload, mode, None, dry_run, false, comments, acl)
+    put_document(store, prefixes, id, view, "json", payload, mode, None, dry_run, false, comments, acl)
 }
 
 fn touched_paths(r: &ApiPutResult) -> Vec<String> {
@@ -801,11 +548,6 @@ fn a_read_carries_no_comment_key_unless_it_asks() {
         get_bare(&store, "100", Some("backup"), "yaml", &full()).unwrap().text.as_deref(),
         Some("retention: 7\ntargets:\n- host: nas\n")
     );
-    // A scoped reader's union is stripped the same way.
-    assert_eq!(
-        get_bare(&store, "100", None, "json", &scoped(&["traefik"])).unwrap().data.unwrap(),
-        json!({"traefik": {"host": "web"}, "netbird": {"groups": ["lan"]}})
-    );
     // Naming a note is asking for it: without `comments` that is a 400.
     for view in ["traefik__", "traefik.host__", "__"] {
         let err = get_bare(&store, "100", Some(view), "json", &full()).unwrap_err();
@@ -813,8 +555,8 @@ fn a_read_carries_no_comment_key_unless_it_asks() {
         assert!(err.msg.contains("comments=1"), "{err}");
     }
 
-    // With `comments`, the read is what it always was: the file's own text for a
-    // full reader's root view, the notes everywhere else.
+    // With `comments`, the read is what it always was: the file's own text for the
+    // root view, the notes everywhere else.
     assert_eq!(get(&store, "100", None, "yaml", &full()).unwrap().text.as_deref(), Some(NOTED));
     assert_eq!(
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
@@ -854,20 +596,20 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
     // A stripped read written straight back changes nothing, touches nothing and
     // rewrites nothing.
     let bare = get_bare(&store, "100", None, "json", &full()).unwrap().data.unwrap().to_string();
-    let r = put_notes(&store, &regs(), &[], "100", None, &bare, "replace", false, false, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", None, &bare, "replace", false, false, &full()).unwrap();
     assert!(r.touched.is_empty(), "{:?}", r.touched);
     assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
 
     // An edit keeps every note whose subject it keeps, where it was.
     let edited = bare.replace("\"retention\":7", "\"retention\":14");
-    let r = put_notes(&store, &regs(), &[], "100", None, &edited, "replace", false, false, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", None, &edited, "replace", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["set backup.retention"]);
     assert_eq!(read_raw(&store, "100").unwrap(), NOTED.replace("retention: 7", "retention: 14"));
 
     // A note whose subject the write drops goes with it -- and says so; a map's
     // own `__` stays while the map does. A view's payload is judged the same way.
-    let dry = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
-    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
+    let dry = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__", "set backup.targets"]);
     assert_eq!(touched_paths(&dry), touched_paths(&r), "a dry run plans the same write");
     assert_eq!(
@@ -875,7 +617,7 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
         json!({"__": "the backup job's settings", "targets": [{"host": "nas", "host__": "the only one"}, {"host": "tape"}]})
     );
     // Replacing a scalar keeps the note beside it, which is outside the view anyway.
-    put_notes(&store, &regs(), &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
+    put_notes(&store, &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
     assert_eq!(
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
         json!({"host__": "public name", "host": "www"})
@@ -891,7 +633,7 @@ fn a_replace_without_comments_may_not_carry_or_name_a_note() {
         (Some("backup"), r#"{"targets": [{"host": "nas", "host__": "x"}]}"#, "backup.targets.0.host__"),
         (Some("traefik.host__"), r#""new""#, "traefik.host__"),
     ] {
-        let err = put_notes(&store, &regs(), &[], "100", view, payload, "replace", false, false, &full()).unwrap_err();
+        let err = put_notes(&store, &[], "100", view, payload, "replace", false, false, &full()).unwrap_err();
         assert_eq!(status(&err), 400, "{view:?} {payload}: {err}");
         assert!(err.msg.starts_with(path), "{err}");
     }
@@ -902,7 +644,7 @@ fn a_replace_without_comments_may_not_carry_or_name_a_note() {
 fn a_replace_with_comments_is_the_whole_subtree_notes_included() {
     let (_dir, store) = store();
     seed(&store, "100", NOTED);
-    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host": "web", "port__": "later"}"#, "replace", false, true, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"host": "web", "port__": "later"}"#, "replace", false, true, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.host__", "set traefik.port__"]);
     assert_eq!(
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
@@ -916,12 +658,12 @@ fn a_merge_is_the_same_with_or_without_comments() {
     seed(&store, "100", NOTED);
     // It names what it changes: a note it writes is written, a note it does not
     // name is left, and a key it deletes takes its note along.
-    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"host__": "renamed", "port": 80}"#, "merge", false, false, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"host__": "renamed", "port": 80}"#, "merge", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["set traefik.host__", "set traefik.port"]);
-    let r = put_notes(&store, &regs(), &[], "100", Some("backup"), r#"{"retention": null}"#, "merge", false, false, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", Some("backup"), r#"{"retention": null}"#, "merge", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__"]);
     // ... unless the same patch says what becomes of the note.
-    let r = put_notes(&store, &regs(), &[], "100", Some("traefik"), r#"{"port": null, "port__": "was 80"}"#, "merge", false, true, &full()).unwrap();
+    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"port": null, "port__": "was 80"}"#, "merge", false, true, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.port", "set traefik.port__"]);
 }
 
@@ -930,13 +672,13 @@ fn a_note_is_named_only_by_a_caller_that_asks_and_a_broken_one_says_so() {
     let (dir, store) = store();
     seed(&store, "100", NOTED);
     let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
-    let err = list_guests(&store, &regs(), "root@pam", &rows, Some("traefik__")).unwrap_err();
+    let err = list_guests(&store, &rows, Some("traefik__")).unwrap_err();
     assert_eq!(status(&err), 400, "{err}");
 
     // A stored note that is not a string, from out of band: a replace that did
     // not ask for notes kept it, and the lint says what it is.
     std::fs::write(dir.path().join("100.yaml"), "a__: 5\na: 1\n").unwrap();
-    let err = put_notes(&store, &regs(), &[], "100", None, r#"{"a": 2}"#, "replace", false, false, &full()).unwrap_err();
+    let err = put_notes(&store, &[], "100", None, r#"{"a": 2}"#, "replace", false, false, &full()).unwrap_err();
     assert_eq!(status(&err), 400);
     assert!(err.msg.contains("a stored note; fix it with comments=1"), "{err}");
 
@@ -952,44 +694,14 @@ fn a_delete_takes_the_note_about_what_it_removes() {
     seed(&store, "100", NOTED);
     let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.host", "delete traefik.host__", "delete traefik__"]);
-    // The scope on `traefik` covers `traefik__`, so its holder may do the same.
-    seed(&store, "101", NOTED);
-    del(&store, "101", Some("traefik"), None, &scoped(&["traefik"])).unwrap();
-    assert!(!read_raw(&store, "101").unwrap().contains("traefik"));
 }
 
 #[test]
-fn a_replace_without_comments_drops_what_it_cannot_place_and_answers_for_it() {
-    let (_dir, store) = store();
-    seed(&store, "100", "__: the whole document\nlist:\n- k: 1\n  k__: one\n- k: 2\n  k__: two\nm:\n  __: about m\n  x: 1\n");
-    // The first member removed: the second is unchanged and keeps its note, the
-    // removed one's goes with it -- as a change.
-    let r = put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 2}]"#, "replace", false, false, &full()).unwrap();
-    assert_eq!(touched_paths(&r), vec!["set list"]);
-    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 2, "k__": "two"}]));
-    // A member that changed keeps nothing.
-    put_notes(&store, &regs(), &[], "100", Some("list"), r#"[{"k": 3}]"#, "replace", false, false, &full()).unwrap();
-    assert_eq!(get(&store, "100", Some("list"), "json", &full()).unwrap().data.unwrap(), json!([{"k": 3}]));
-    // `{}` stores an empty map: its own `__` does not survive it.
-    let r = put_notes(&store, &regs(), &[], "100", Some("m"), "{}", "replace", false, false, &full()).unwrap();
-    assert_eq!(touched_paths(&r), vec!["delete m.__", "delete m.x"]);
-    assert_eq!(get(&store, "100", Some("m"), "json", &full()).unwrap().data.unwrap(), json!({}));
-}
-
-#[test]
-fn a_kept_note_is_not_a_change_to_authorize_or_enforce() {
+fn a_kept_note_is_not_a_finding_under_an_enforced_schema() {
     let (_dir, store) = store();
     seed(&store, "100", NOTED);
-    // VM.Audit and `traefik` rw: it reads the whole document without the notes and
-    // writes it back with one value changed. `netbird__` and `__` are outside what
-    // it may write; kept, they are no touched path, so the write is its own.
-    let mut doc = get_bare(&store, "100", None, "json", &auditor(&["traefik"])).unwrap().data.unwrap();
-    doc["traefik"]["host"] = json!("www");
-    let r = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, false, &auditor(&["traefik"])).unwrap();
-    assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
-    // The same body sent as the whole truth drops every note, which it may not.
-    let err = put_notes(&store, &regs(), &[], "100", None, &doc.to_string(), "replace", false, true, &auditor(&["traefik"])).unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
+    // Move the value away from "web" first, so writing it back is a real change.
+    put_notes(&store, &[], "100", Some("traefik.host"), "\"www\"", "replace", false, false, &full()).unwrap();
 
     // An enforcing schema that says nothing about notes finds nothing in one kept.
     let strict = vec![registry::parse_prefix(
@@ -997,7 +709,7 @@ fn a_kept_note_is_not_a_change_to_authorize_or_enforce() {
         "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {host: {type: string}}}\n",
     )
     .unwrap()];
-    let r = put_notes(&store, &regs(), &strict, "100", Some("traefik"), r#"{"host": "web"}"#, "replace", false, false, &full()).unwrap();
+    let r = put_notes(&store, &strict, "100", Some("traefik"), r#"{"host": "web"}"#, "replace", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
     assert!(read_raw(&store, "100").unwrap().contains("host__: public name"));
 }
@@ -1006,15 +718,14 @@ fn a_kept_note_is_not_a_change_to_authorize_or_enforce() {
 fn merge_with_null_deletes_end_to_end() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  spec:\n    host: a\n    port: 1\n");
-    let acl = scoped(&["traefik"]);
 
-    let r = put(&store, "100", Some("traefik.spec"), "json", "{\"host\": null}", "merge", None, false, &acl)
+    let r = put(&store, "100", Some("traefik.spec"), "json", "{\"host\": null}", "merge", None, false, &full())
         .unwrap();
     assert_eq!(r.touched.len(), 1);
     assert_eq!(r.touched[0].op, "delete");
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    port: 1\n");
 
-    put(&store, "100", Some("traefik"), "yaml", "spec: null\n", "merge", None, false, &acl).unwrap();
+    put(&store, "100", Some("traefik"), "yaml", "spec: null\n", "merge", None, false, &full()).unwrap();
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik: {}\n");
 }
 
@@ -1022,7 +733,7 @@ fn merge_with_null_deletes_end_to_end() {
 fn replace_with_an_empty_object_stores_an_empty_map() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik: {}\n");
-    let r = put(&store, "100", Some("traefik"), "json", "{}", "replace", None, false, &scoped(&["traefik"]))
+    let r = put(&store, "100", Some("traefik"), "json", "{}", "replace", None, false, &full())
         .unwrap();
     assert!(r.touched.is_empty());
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik: {}\n");
@@ -1049,7 +760,7 @@ fn get_then_put_with_the_empty_digest_creates_a_document() {
 fn delete_of_a_view_leaves_the_rest_and_reports_touched() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\nnetbird:\n  groups:\n  - lan\n");
-    let r = del(&store, "100", Some("traefik"), None, &scoped(&["traefik"])).unwrap();
+    let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
     assert_eq!(r.touched.len(), 1);
     assert_eq!(r.touched[0].op, "delete");
     assert_eq!(read_raw(&store, "100").unwrap(), "netbird:\n  groups:\n  - lan\n");
@@ -1073,9 +784,9 @@ fn an_unparseable_document_is_yaml_plus_parse_error_json_422_and_root_repairable
 
         let err = get(&store, "100", None, "json", &full()).unwrap_err();
         assert_eq!(status(&err), 422, "{broken:?}: {err}");
-        // A scoped reader gets 422 either way: there is no structure to
-        // filter, and the bytes are not theirs to repair.
-        let err = get(&store, "100", None, "yaml", &scoped(&["traefik"])).unwrap_err();
+        // Any reader gets the same 422 for `format=json`: read access is a
+        // boolean, so there is no narrower structure to filter to.
+        let err = get(&store, "100", None, "json", &read_only()).unwrap_err();
         assert_eq!(status(&err), 422, "{broken:?}: {err}");
 
         // A narrower write would plan against the empty document and drop
@@ -1124,7 +835,7 @@ fn a_document_above_the_read_cap_is_refused_on_read_and_repairable_on_write() {
         GuestInput { vmid: 100, read: true, ..Default::default() },
         GuestInput { vmid: 101, read: true, ..Default::default() },
     ];
-    let listed = list_guests(&store, &regs(), "root@pam", &rows, None).unwrap();
+    let listed = list_guests(&store, &rows, None).unwrap();
     assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
     assert!(!listed[0].digest.is_empty(), "it still reports its real digest");
 
@@ -1170,7 +881,7 @@ fn a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole() {
         assert!(!got.digest.is_empty(), "{text:?}");
 
         // Nobody else gets it rendered as an empty document ...
-        for acl in [full(), scoped(&["traefik"])] {
+        for acl in [full(), read_only()] {
             let err = get(&store, "100", None, "json", &acl).unwrap_err();
             assert_eq!(status(&err), 422, "{text:?}: {err}");
             // ... and no content of it leaks in the message.
@@ -1178,10 +889,8 @@ fn a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole() {
         }
 
         // `?has=` cannot be used as an oracle over it either.
-        let rows = vec![GuestInput { vmid: 100, ..Default::default() }];
-        assert!(list_guests(&store, &regs(), "scoped@pve!t1", &rows, Some("traefik"))
-            .unwrap()
-            .is_empty());
+        let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+        assert!(list_guests(&store, &rows, Some("traefik")).unwrap().is_empty());
 
         for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
             let err = put(&store, "100", view, "json", "{\"host\":\"y\"}", mode, None, false, &full())
@@ -1200,6 +909,27 @@ fn a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole() {
         del(&store, "100", None, None, &full()).unwrap();
         assert!(!dir.path().join("100.yaml").exists(), "{text:?}");
     }
+}
+
+#[test]
+fn an_unrecoverable_document_is_repaired_only_by_a_writer() {
+    // Written past the store, because a document this broken is exactly
+    // what `put_raw` refuses to create: it arrived by hand, or from an
+    // older writer, or from a half-finished replication.
+    let (dir, store) = store();
+    let broken = "traefik:\n  host: a\nhomelab: [unclosed\n";
+    std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
+    let before = std::fs::read_to_string(dir.path().join("100.yaml")).unwrap();
+
+    // No write access at all: refused before the content is even looked at.
+    let err = put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &read_only())
+        .unwrap_err();
+    assert_eq!(status(&err), 403, "{err}");
+    assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), before);
+
+    // Write access repairs it, exactly as documented.
+    put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &full())
+        .expect("the documented repair path");
 }
 
 #[test]
@@ -1255,7 +985,7 @@ fn a_document_that_is_not_a_map_can_never_be_written_back() {
 // -- listing, access, operators, gc -------------------------------------
 
 #[test]
-fn list_guests_uses_the_rows_perl_passes_and_gates_node_name_and_tags() {
+fn list_guests_uses_the_rows_perl_passes_and_gates_on_read_access() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
     seed(&store, "200", "other:\n  k: v\n");
@@ -1266,123 +996,48 @@ fn list_guests_uses_the_rows_perl_passes_and_gates_node_name_and_tags() {
             kind: Some("lxc".into()),
             name: Some("web".into()),
             tags: vec!["traefik".into()],
-            ..Default::default()
+            read: true,
         },
         GuestInput {
             vmid: 200,
             node: Some("node1".into()),
             kind: Some("lxc".into()),
             name: Some("db".into()),
+            read: false,
             ..Default::default()
         },
-        GuestInput { vmid: 300, node: Some("node1".into()), ..Default::default() },
+        GuestInput { vmid: 300, node: Some("node1".into()), read: true, ..Default::default() },
     ];
 
-    // The scoped caller: 100 and 200 both carry the `netbird` all-guests
-    // scope, so both are listed; 300 too (the scope applies to it as
-    // well, it just has no document).
-    let list = list_guests(&store, &regs(), "scoped@pve!t1", &rows, None).unwrap();
-    assert_eq!(list.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 200, 300]);
-    assert!(list[0].node.is_none() && list[0].name.is_none() && list[0].tags.is_none());
+    // Only the guests the caller has read access on are listed, with every
+    // field unconditional (`docs/DESIGN.md` §4, §8): no read, no row at all.
+    let list = list_guests(&store, &rows, None).unwrap();
+    assert_eq!(list.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 300]);
+    assert_eq!(list[0].node.as_deref(), Some("node1"));
+    assert_eq!(list[0].name.as_deref(), Some("web"));
+    assert_eq!(list[0].tags, vec!["traefik".to_string()]);
+    assert_eq!(list[1].digest, "", "a guest with no document reports an empty digest");
 
-    // A principal with no ACL and no registration sees nothing.
-    assert!(list_guests(&store, &regs(), "nobody@pve", &rows, None).unwrap().is_empty());
-
-    // With VM.Audit, node, name and tags come through.
-    let audited: Vec<GuestInput> =
-        rows.iter().cloned().map(|mut r| { r.read = true; r }).collect();
-    let list2 = list_guests(&store, &regs(), "root@pam", &audited, None).unwrap();
-    assert_eq!(list2[0].node.as_deref(), Some("node1"));
-    assert_eq!(list2[0].name.as_deref(), Some("web"));
-    assert_eq!(list2[0].tags.as_deref(), Some(&["traefik".to_string()][..]));
-    assert_eq!(list2[2].digest, "", "a guest with no document reports an empty digest");
-
-    // `has` filters on the *visible* data.
-    let filtered = list_guests(&store, &regs(), "root@pam", &audited, Some("traefik")).unwrap();
+    // `has` filters on the document's data.
+    let filtered = list_guests(&store, &rows, Some("traefik")).unwrap();
     assert_eq!(filtered.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100]);
-    // ... and cannot see through a caller's own missing scope.
-    assert!(list_guests(&store, &regs(), "scoped@pve!t1", &rows, Some("other"))
-        .unwrap()
-        .is_empty());
+
+    // No read access on anything: nothing is listed.
+    let none_readable: Vec<GuestInput> = rows.iter().cloned().map(|mut r| { r.read = false; r }).collect();
+    assert!(list_guests(&store, &none_readable, None).unwrap().is_empty());
 }
 
 #[test]
-fn access_reports_resolved_scopes() {
-    let permission_files = regs();
-    let tagged = access(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
-    assert!(!tagged.read && !tagged.write);
-    assert_eq!(
-        tagged.scopes.iter().map(|s| s.prefix.to_string()).collect::<Vec<_>>(),
-        vec!["traefik", "netbird"]
-    );
-    let untagged = access(&permission_files, &DocId::Guest(100), &scoped(&[]));
-    assert_eq!(untagged.scopes.len(), 1);
-    // A registry document gets the ACL answers through and never a scope.
-    let reg = access(&permission_files, &parse_id("prefixes/traefik").unwrap(), &full());
-    assert!(reg.read && reg.write && reg.scopes.is_empty());
-}
-
-#[test]
-fn access_returns_the_tags_only_to_a_caller_who_may_read_the_guest() {
-    // This field exists so the editor stops calling `GET /meta/guests`
-    // just to learn one guest's tags. It must therefore be filtered the
-    // way that endpoint filters the same field, or moving it would have
-    // widened who can see a guest's tags.
-    let permission_files = regs();
-
-    let mut auditor = full();
-    auditor.tags = vec!["traefik".to_string()];
-    let seen = access(&permission_files, &DocId::Guest(100), &auditor);
-    assert_eq!(seen.tags, vec!["traefik".to_string()]);
-
-    // A scope-only principal has no VM.Audit: it gets the scopes its
-    // permission file grants -- resolved against those very tags -- but
-    // not the tags themselves.
-    let hidden = access(&permission_files, &DocId::Guest(100), &scoped(&["traefik"]));
-    assert!(hidden.tags.is_empty(), "no VM.Audit, no tags");
-    assert_eq!(hidden.scopes.len(), 2, "the selector still resolved server-side");
-
-    assert!(access(&permission_files, &parse_id("prefixes/traefik").unwrap(), &full()).tags.is_empty());
-}
-
-#[test]
-fn permissions_list_returns_every_permission() {
-    let gs = permissions_list(&regs(), &[]);
-    assert_eq!(gs.len(), 1);
-    match &gs[0] {
-        PermissionEntry::Loaded(g) => {
-            assert_eq!(g.authid, "scoped@pve!t1");
-            assert_eq!(g.rules.len(), 2);
-        }
-        PermissionEntry::Failed(_) => panic!("regs() has no failures"),
-    }
-}
-
-/// The one place a file that did not load is visible at all (`docs/DESIGN.md`
-/// §4 and the module docs on `registry::RegistryFailure`): the listing has to
-/// carry both a loaded entry and a failed one, and the failed one has to be
-/// keyed the same way a loaded row is, or a consumer reading both arrays has
-/// no field to find either by.
-#[test]
-fn permissions_list_carries_failures_keyed_like_a_loaded_permission() {
-    let failures = vec![RegistryFailure {
-        name: "broken".to_string(),
-        origin: Origin::Cluster,
-        node: None,
-        error: "bad mode".to_string(),
-    }];
-    let gs = permissions_list(&regs(), &failures);
-    assert_eq!(gs.len(), 2);
-
-    let rows: Vec<serde_json::Value> =
-        gs.iter().map(|g| serde_json::to_value(g).unwrap()).collect();
-    assert_eq!(rows[0]["name"], json!("scoped"));
-    assert!(rows[0].get("error").is_none(), "a loaded row has no error");
-    assert_eq!(rows[1]["name"], json!("broken"), "keyed like a loaded permission -- 'name'");
-    assert_eq!(rows[1]["origin"], json!("cluster"));
-    assert_eq!(rows[1]["error"], json!("bad mode"));
-    assert!(rows[1].get("path").is_none(), "no filesystem path on the wire");
-    assert!(rows[1].get("authid").is_none(), "a failed row has nothing a loaded one promises");
+fn access_reflects_the_acl_it_is_given() {
+    let (_dir, store) = store();
+    let a = access(&store, &full()).unwrap();
+    assert!(a.read && a.write);
+    let n = access(&store, &none()).unwrap();
+    assert!(!n.read && !n.write);
+    let r = access(&store, &read_only()).unwrap();
+    assert!(r.read && !r.write);
+    let w = access(&store, &write_only()).unwrap();
+    assert!(!w.read && w.write);
 }
 
 #[test]
@@ -1423,7 +1078,7 @@ fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
 
     // A listing does not 500 for the whole cluster because of one of them.
     let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
-    let listed = list_guests(&store, &regs(), "root@pam", &rows, None).unwrap();
+    let listed = list_guests(&store, &rows, None).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].digest, "");
 
@@ -1452,10 +1107,6 @@ fn parse_id_reads_a_registry_id_and_refuses_anything_that_could_leave_the_direct
         parse_id("prefixes/traefik").unwrap(),
         DocId::Registry(RegistryKind::PrefixDef, "traefik".to_string()),
     );
-    assert_eq!(
-        parse_id("permissions/scoped").unwrap(),
-        DocId::Registry(RegistryKind::Permission, "scoped".to_string()),
-    );
     // The file name *is* the prefix, so a nested prefix is a dotted file
     // name and has to be addressable: `homelab.docker.yaml` declares
     // `homelab.docker`, and refusing that id would put every nested
@@ -1472,6 +1123,9 @@ fn parse_id_reads_a_registry_id_and_refuses_anything_that_could_leave_the_direct
         "prefixes/a..b",
         "prefixes/a b",
         "operators/traefik",
+        // Permission files are gone (`docs/DESIGN.md` §4): access is PVE's
+        // ACLs alone, so `permissions/<name>` is no longer a registry kind.
+        "permissions/ops",
     ] {
         let err = parse_id(bad).unwrap_err();
         assert_eq!(status(&err), 400, "{bad} was accepted: {err}");
@@ -1521,6 +1175,17 @@ fn a_prefix_is_read_and_written_like_any_other_document() {
 }
 
 #[test]
+fn a_registry_document_uses_only_the_acl_it_is_given() {
+    let (_dir, store) = store();
+    seed(&store, "prefixes/traefik", "selector: {all: true}\n");
+    let err = get(&store, "prefixes/traefik", None, "yaml", &none()).unwrap_err();
+    assert_eq!(status(&err), 403, "{err}");
+    let err = put(&store, "prefixes/traefik", Some("description"), "json", "\"x\"", "replace", None, false, &none())
+        .unwrap_err();
+    assert_eq!(status(&err), 403, "{err}");
+}
+
+#[test]
 fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
     let (_dir, store) = store();
     // No selector: `parse_prefix` refuses it, so the loader would skip
@@ -1555,103 +1220,6 @@ fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
     )
     .unwrap_err();
     assert_eq!(status(&err), 400, "{err}");
-
-    // An authid that is not an authid is refused on the permission side.
-    let err = put(
-        &store,
-        "permissions/ops",
-        None,
-        "yaml",
-        "authid: not-an-authid\nrules: []\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
-    .unwrap_err();
-    assert_eq!(status(&err), 400, "{err}");
-    assert!(format!("{err}").contains("not be a valid permission file"), "{err}");
-}
-
-#[test]
-fn a_partial_delete_that_would_break_a_permission_file_is_refused() {
-    let (_dir, store) = store();
-    put(
-        &store,
-        "permissions/ops",
-        None,
-        "yaml",
-        "authid: ops@pve!t1\nrules:\n  - prefix: homelab\n    mode: rw\n    selector: {all: true}\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
-    .unwrap();
-
-    let err = del(&store, "permissions/ops", Some("authid"), None, &full()).unwrap_err();
-    assert_eq!(status(&err), 400, "{err}");
-    let raw = read_raw(&store, "permissions/ops").unwrap();
-    assert!(registry::parse_permission("ops", &raw).is_ok(), "the file still loads");
-
-    // Removing the file whole is fine: that is an administrator revoking a
-    // grant, not a half-written one.
-    del(&store, "permissions/ops", None, None, &full()).unwrap();
-    assert_eq!(read_raw(&store, "permissions/ops"), None);
-}
-
-#[test]
-fn a_permission_never_reaches_the_registry_documents() {
-    let (_dir, store) = store();
-    put(
-        &store,
-        "prefixes/traefik",
-        None,
-        "yaml",
-        "selector: {all: true}\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
-    .unwrap();
-
-    // `scoped@pve!t1` holds `traefik` rw -- on *guests*. A registry
-    // document gets no scopes at all.
-    let acl = scoped(&["traefik"]);
-    let id = parse_id("prefixes/traefik").unwrap();
-    assert!(effective(&regs(), &id, &acl).scopes.is_empty());
-
-    // `access` passes the ACL answers through untouched for these documents --
-    // a registry file is readable by every authenticated user, while writing
-    // one is Sys.Modify -- so the caller has to say which document it is asking
-    // about, and `GET /meta/access?id=` is that question.
-    let admin = CallerAcl {
-        authid: "writer@pve".to_string(),
-        read: true,
-        write: true,
-        tags: vec![],
-        node: None,
-    };
-    let a = access(&regs(), &id, &admin);
-    assert!(a.read && a.write && a.scopes.is_empty());
-    let nobody = access(&regs(), &id, &none());
-    assert!(!nobody.read && !nobody.write);
-    let err = get(&store, "prefixes/traefik", None, "yaml", &acl).unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
-    let err = put(
-        &store,
-        "prefixes/traefik",
-        Some("traefik"),
-        "json",
-        "1",
-        "replace",
-        None,
-        false,
-        &acl,
-    )
-    .unwrap_err();
-    assert_eq!(status(&err), 403, "{err}");
 }
 
 // -- node prefix files -------------------------------------------------------
@@ -1661,11 +1229,8 @@ fn a_permission_never_reaches_the_registry_documents() {
 /// directory, `nodes/<node>/meta.d/prefixes` a node's.
 fn node_store() -> (tempfile::TempDir, MetaStore) {
     let dir = tempfile::tempdir().unwrap();
-    let registry = registry::Registry::new(
-        vec![dir.path().join("registry/prefixes")],
-        vec![dir.path().join("registry/grants")],
-    )
-    .with_nodes_dir(dir.path().join("nodes"));
+    let registry = registry::Registry::new(vec![dir.path().join("registry/prefixes")])
+        .with_nodes_dir(dir.path().join("nodes"));
     let store = MetaStore::with_registry(dir.path(), registry);
     (dir, store)
 }
@@ -1679,7 +1244,7 @@ fn on_node(node: &str) -> CallerAcl {
 fn put_on(store: &MetaStore, id: &str, view: &str, payload: &str, acl: &CallerAcl) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id).unwrap();
     let prefixes = api::effective_prefixes(store.registry().unwrap(), &doc_id, acl).unwrap();
-    put_with(store, &regs(), &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
+    put_with(store, &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
 }
 
 fn put_node_prefix(store: &MetaStore, id: &str, text: &str) -> ApiPutResult {
@@ -1742,8 +1307,6 @@ fn a_node_prefix_is_a_document_in_its_nodes_directory_only() {
         assert_eq!(status(&err), 400, "{err}");
         assert!(err.msg.contains("not be a valid prefix"), "{err}");
     }
-    // No permission reaches it.
-    assert!(effective(&regs(), &parse_id("nodes/pve1/prefixes/gpu").unwrap(), &scoped(&["traefik"])).scopes.is_empty());
 
     // DELETE removes the node's file; the cluster file is in effect on pve1 again.
     del(&store, "nodes/pve1/prefixes/gpu", None, None, &full()).unwrap();
@@ -1904,15 +1467,16 @@ fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
     unavailable(del(&store, "100", None, None, &full()).unwrap_err().status, "delete");
     unavailable(version(&store, true, None, None).unwrap_err().status, "version");
     unavailable(version(&store, false, Some("100"), None).unwrap_err().status, "scoped version");
-    unavailable(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap_err().status, "list");
+    unavailable(list_guests(&store, &rows, None).unwrap_err().status, "list");
+    unavailable(access(&store, &full()).unwrap_err().status, "access");
     let err = ApiError::from(store.registry().unwrap_err());
-    unavailable(err.status, "the registry, for the prefix and permission listings");
+    unavailable(err.status, "the registry, for the prefix listing");
     assert!(err.msg.starts_with("cluster filesystem not available"), "{err}");
     assert_eq!(read_raw_unchecked(dir.path(), "100"), "traefik:\n  host: x\n");
 
     std::os::unix::fs::symlink(dir.path(), &marker).unwrap();
     assert_eq!(get(&store, "100", None, "json", &full()).unwrap().data.unwrap(), json!({"traefik": {"host": "x"}}));
-    assert_eq!(list_guests(&store, &regs(), "root@pam", &rows, None).unwrap().len(), 1);
+    assert_eq!(list_guests(&store, &rows, None).unwrap().len(), 1);
 }
 
 fn read_raw_unchecked(root: &std::path::Path, id: &str) -> String {

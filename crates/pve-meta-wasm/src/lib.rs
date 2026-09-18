@@ -26,12 +26,11 @@
 //! # What crosses
 //!
 //! The concepts, one group each ([`call`]): the **codec** (`format::parse`,
-//! `format::dump`), the **path** rules, **`Effective`** (may this caller
-//! read or write a path), **`Shape`** (which prefixes reach a document, what
-//! governs a path, what a schema says), **`EditSet`** (staged edits), and
-//! the permission rules that reach a guest. Nothing here decides anything:
-//! it deserializes the wire shape the API hands the browser -- where Perl
-//! has rendered `true` as `1` -- into the core's own types, and calls.
+//! `format::dump`), the **path** rules, **`Shape`** (which prefixes reach a
+//! document, what governs a path, what a schema says) and **`EditSet`**
+//! (staged edits). Nothing here decides anything: it deserializes the wire
+//! shape the API hands the browser -- where Perl has rendered `true` as `1`
+//! -- into the core's own types, and calls.
 //!
 //! # Not a security boundary
 //!
@@ -46,15 +45,14 @@ use pve_meta_core::edit::EditSet;
 use pve_meta_core::error::Error;
 use pve_meta_core::format::{self, Format};
 use pve_meta_core::path::{self, Path};
-use pve_meta_core::registry::{self, Permission, Rule, Selector};
-use pve_meta_core::scopes::{self, Effective, Mode, Scope};
+use pve_meta_core::registry::{self, Selector};
 use pve_meta_core::shape::{self, Declared, Finding, Shape};
 use pve_meta_core::{view, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The ABI version; bump when the request or response shape changes.
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 
 thread_local! {
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -223,34 +221,13 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             }
         }
         "file_name_valid" => json!(registry::is_valid_file_name(a.str()?)),
-        // -- access: scopes::Effective -----------------------------------
-        //
-        // `covers` is the coverage rule on its own (a rule on `p` covers `p`,
-        // its comment key `p__`, and `p.*`), for "which rules reach this
-        // row"; the three `access_*` are the caller's own answers from a
-        // `GET /meta/access` result.
-        "covers" => {
-            let prefix = a.path()?;
-            let p = a.path()?;
-            json!(scopes::covers(&prefix, &p))
-        }
-        "access_can_read" => {
-            let access = a.access()?;
-            json!(access.can_read(&a.path()?))
-        }
-        "access_can_write" => {
-            let access = a.access()?;
-            json!(access.can_write(&a.path()?))
-        }
-        "access_has_any_write" => json!(a.access()?.has_any_write()),
 
         // -- shape: shape::Shape -----------------------------------------
         //
-        // Each takes the `GET /meta/prefixes` listing and the guest's tags
-        // (from `GET /meta/access`), and builds the Shape afresh: a listed
-        // file that did not load, or whose selector this cannot read, reaches
-        // nothing. A registry document passes its meta-schema as one entry
-        // with the empty prefix, which is a prefix of everything.
+        // Each takes the `GET /meta/prefixes` listing and the guest's tags,
+        // and builds the Shape afresh: a listed file that did not load
+        // reaches nothing. A registry document passes its meta-schema as one
+        // entry with the empty prefix, which is a prefix of everything.
         "shape_prefixes" => {
             let shape = a.shape()?;
             json!(shape.prefixes().iter().map(|d| d.prefix.to_string()).collect::<Vec<_>>())
@@ -287,25 +264,6 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             let after: Vec<Finding> = a.parsed()?;
             let changed: Vec<Path> = a.parsed()?;
             serde_json::to_value(shape::introduced(&before, &after, &changed))?
-        }
-
-        // -- permissions: registry::rules_reaching ------------------------
-        //
-        // The `GET /meta/permissions` listing and the guest's tags; every
-        // rule that reaches the guest, with the file it came from. A file
-        // that did not load grants nothing.
-        "rules_reaching" => {
-            let files = a.permissions()?;
-            let tags = a.tags()?;
-            let rules: Vec<Value> = registry::rules_reaching(&files, &tags)
-                .map(|(file, rule)| {
-                    json!({
-                        "name": file.name, "authid": file.authid,
-                        "prefix": rule.prefix, "mode": rule.mode, "selector": rule.selector,
-                    })
-                })
-                .collect();
-            json!(rules)
         }
 
         // -- edits: edit::EditSet ----------------------------------------
@@ -401,32 +359,11 @@ impl<'a> Args<'a> {
         self.parsed()
     }
 
-    /// A `GET /meta/access` result.
-    fn access(&mut self) -> Result<Effective, CallError> {
-        let v = self.next()?;
-        let scopes: Vec<Scope> = match v.get("scopes") {
-            None | Some(Value::Null) => Vec::new(),
-            Some(s) => serde_json::from_value(s.clone())
-                .map_err(|e| bad(format!("{}: scopes: {e}", self.name)))?,
-        };
-        Ok(Effective {
-            full_read: v.get("read").is_some_and(truthy),
-            full_write: v.get("write").is_some_and(truthy),
-            scopes,
-        })
-    }
-
     /// A `GET /meta/prefixes` listing plus the guest's tags, as a Shape.
     fn shape(&mut self) -> Result<Shape, CallError> {
         let entries: Vec<WirePrefix> = self.parsed()?;
         let tags = self.tags()?;
         Ok(Shape::new(entries.into_iter().filter_map(WirePrefix::declared), &tags))
-    }
-
-    /// A `GET /meta/permissions` listing.
-    fn permissions(&mut self) -> Result<Vec<Permission>, CallError> {
-        let entries: Vec<WirePermission> = self.parsed()?;
-        Ok(entries.into_iter().filter_map(WirePermission::permission).collect())
     }
 }
 
@@ -470,54 +407,9 @@ impl WirePrefix {
             selector: Selector::from_wire(self.selector.as_ref()?).ok()?,
             description: self.description,
             schema: self.schema,
-            // Perl's `1`/`0` on the wire, like `read`/`write` in an access answer.
+            // Perl's `1`/`0` on the wire.
             enforce: self.enforce.as_ref().is_some_and(truthy),
             hidden: self.hidden.as_ref().is_some_and(truthy),
-        })
-    }
-}
-
-/// One row of `GET /meta/permissions`, likewise.
-#[derive(Deserialize)]
-struct WirePermission {
-    name: String,
-    #[serde(default)]
-    authid: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    rules: Vec<WireRule>,
-    #[serde(default)]
-    error: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct WireRule {
-    prefix: String,
-    mode: Mode,
-    selector: Value,
-}
-
-impl WirePermission {
-    fn permission(self) -> Option<Permission> {
-        if self.error.is_some() {
-            return None;
-        }
-        let mut rules = Vec::with_capacity(self.rules.len());
-        for r in self.rules {
-            rules.push(Rule {
-                prefix: Path::parse(&r.prefix).ok()?,
-                mode: r.mode,
-                selector: Selector::from_wire(&r.selector).ok()?,
-            });
-        }
-        Some(Permission {
-            name: self.name,
-            authid: self.authid?,
-            description: self.description,
-            rules,
-            origin: registry::Origin::Cluster,
-            overrides: false,
         })
     }
 }
@@ -577,7 +469,7 @@ mod tests {
         assert!(err("parse", json!([1, "a: 1"])).message.contains("must be a string"));
         assert!(err("parse", json!(["toml", "a = 1"])).message.contains("unknown format"));
         assert!(err("nope", json!([])).message.contains("unknown function"));
-        assert!(err("covers", json!(["a", "a b"])).message.contains("invalid path"));
+        assert!(err("shape_governing", json!([[], [], "a b"])).message.contains("invalid path"));
     }
 
     #[test]
@@ -597,24 +489,6 @@ mod tests {
         // the API's `maxLength => 128` refuses.
         assert_eq!(ok("file_name_valid", json!(["a".repeat(128)])), json!(true));
         assert_eq!(ok("file_name_valid", json!(["a".repeat(129)])), json!(false));
-    }
-
-    #[test]
-    fn access_reads_perls_booleans() {
-        let auditor = json!({"read": 1, "write": 0, "scopes": [], "tags": ["t"]});
-        assert_eq!(ok("access_can_read", json!([auditor, "anything"])), json!(true));
-        assert_eq!(ok("access_can_write", json!([auditor, "anything"])), json!(false));
-        assert_eq!(ok("access_has_any_write", json!([auditor])), json!(false));
-
-        let scoped = json!({"read": 0, "write": 0, "scopes": [{"prefix": "traefik", "mode": "rw"}, {"prefix": "netbird", "mode": "ro"}]});
-        assert_eq!(ok("access_can_write", json!([scoped, "traefik.spec.host"])), json!(true));
-        assert_eq!(ok("access_can_write", json!([scoped, "traefik__"])), json!(true));
-        assert_eq!(ok("access_can_write", json!([scoped, "netbird.groups"])), json!(false));
-        assert_eq!(ok("access_can_read", json!([scoped, "netbird.groups"])), json!(true));
-        assert_eq!(ok("access_can_read", json!([scoped, ""])), json!(false), "a scope never covers the root");
-        assert_eq!(ok("access_has_any_write", json!([scoped])), json!(true));
-        assert_eq!(ok("access_has_any_write", json!([{}])), json!(false));
-        assert_eq!(ok("access_has_any_write", json!([{"write": true}])), json!(true));
     }
 
     #[test]
@@ -663,24 +537,6 @@ mod tests {
             ok("shape_findings", json!([fmt, [], {"t": {"host": "h", "z": "no"}}])),
             json!([{"path": "t.host", "format": "dns-name", "value": "h"}, {"path": "t.z", "msg": "expected integer"}])
         );
-    }
-
-    #[test]
-    fn rules_reaching_the_guest_carry_their_file() {
-        let listing = json!([
-            {"name": "traefik", "authid": "svc@pve!traefik", "rules": [
-                {"prefix": "traefik", "mode": "rw", "selector": {"tag": "traefik"}},
-                {"prefix": "netbird", "mode": "ro", "selector": {"all": 1}},
-            ]},
-            {"name": "broken", "error": "authid: nope"},
-        ]);
-        let got = ok("rules_reaching", json!([listing, []]));
-        assert_eq!(got.as_array().unwrap().len(), 1);
-        assert_eq!(got[0]["prefix"], "netbird");
-        assert_eq!(got[0]["name"], "traefik");
-        assert_eq!(got[0]["selector"], json!({"all": true}));
-        let got = ok("rules_reaching", json!([listing, ["traefik"]]));
-        assert_eq!(got.as_array().unwrap().len(), 2);
     }
 
     #[test]

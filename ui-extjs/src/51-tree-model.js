@@ -20,8 +20,6 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'valueText', type: 'string' },
         { name: 'description', type: 'string' }, // the comment key `k__`, if present
         { name: 'grammarDescription', type: 'string' }, // the grammar's, shown as tooltip
-        { name: 'accessText', type: 'string' }, // plain-text summary of accessList
-        { name: 'accessList' }, // [{ name, mode, selector, prefix }]
         { name: 'kind', type: 'string' }, // map | array | string | number | boolean
         { name: 'present', type: 'boolean' },
         { name: 'editable', type: 'boolean' },

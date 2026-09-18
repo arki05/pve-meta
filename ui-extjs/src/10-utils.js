@@ -205,21 +205,11 @@ PVE.meta.Utils = {
 
     // One element of a list, on one line. Presentation only -- like `format`, it
     // describes nothing and constrains nothing; it is there so a list of maps reads
-    // as something other than JSON in a grid cell.
-    //
-    // A permission rule gets its own shape because that is the list people actually
-    // look at, and `{"prefix":"traefik","mode":"rw","selector":{"tag":"traefik"}}`
-    // is not a thing anyone reads twice.
+    // as something other than JSON in a grid cell. There is no shape this recognises
+    // beyond a scalar, so a map member falls back to its JSON.
     itemSummary: function (v) {
         if (!v || typeof v !== 'object' || Array.isArray(v)) {
             return PVE.meta.Utils.scalarText(v);
-        }
-        let has = (k) => Object.prototype.hasOwnProperty.call(v, k);
-        if (has('prefix') && has('mode')) {
-            return (
-                v.prefix + ' (' + v.mode +
-                (has('selector') ? ', ' + PVE.meta.Utils.selectorText(v.selector) : '') + ')'
-            );
         }
         return Ext.encode(v);
     },
@@ -343,7 +333,7 @@ PVE.meta.Utils = {
         return vtypes[vtype + 'Text'] || gettext('invalid value');
     },
 
-    // Human-readable form of a scope's selector, for the Access tooltip.
+    // Human-readable form of a prefix's selector, for the "Applies to" column.
     selectorText: function (selector) {
         let sel = selector || {};
         if (sel.tag) {

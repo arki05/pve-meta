@@ -3,11 +3,11 @@
 // loaded from the same `.wasm` the package ships. A minimal Ext/PVE shim is enough;
 // none of this touches the DOM.
 //
-// The rules themselves (the YAML codec, key names, coverage, shadowing, the edit
-// set, the schema findings) are tested where they live, in Rust. What this suite
-// shows is that the wasm build loads and answers, that the JavaScript objects over it
-// (Codec, Access, Shape, EditSet) hand the right things in and out, and that the
-// editor's own logic on top of them still does what it did.
+// The rules themselves (the YAML codec, key names, shadowing, the edit set, the
+// schema findings) are tested where they live, in Rust. What this suite shows is
+// that the wasm build loads and answers, that the JavaScript objects over it
+// (Codec, Shape, EditSet) hand the right things in and out, and that the editor's
+// own logic on top of them still does what it did.
 //
 // Build the core first: `make wasm` (or `cargo build -p pve-meta-wasm --target
 // wasm32-unknown-unknown --profile wasm`). PVE_META_WASM overrides the path.
@@ -121,28 +121,12 @@ const throws = (name, fn, contains) => {
 
 console.log('--- before the core has loaded: everything that asks it fails closed ---');
 // The core is lazy, and `syncButtons` runs on render ahead of the first document
-// read; the registry grids' dialogs can open before it too. This editor has
-// shipped two lazy-load ordering bugs already (js-yaml's). Nothing below may throw,
-// and nothing may claim an edit is possible before the rule that decides it is here.
+// read; the registry grid's dialogs can open before it too. This editor has
+// shipped two lazy-load ordering bugs already (js-yaml's). Nothing below may throw.
 {
     const Core = ctx.PVE.meta.Core;
-    const P0 = ctx.PVE.meta.TreePanel;
     eq('the core reports itself unloaded', Core.loaded(), false);
     throws('a direct call says so instead of trapping', () => Core.call('abi'), 'not loaded');
-    // Full write access on paper, but nothing is editable until the core can judge
-    // it: the guard fails CLOSED, never open.
-    const early = { access: { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] } };
-    early.editableFor = P0.editableFor;
-    eq('nothing is editable before the core arrives', early.editableFor('traefik.spec.host'), false);
-    eq('... not even with full write access', early.editableFor(''), false);
-    // The whole access face fails closed, not just the one caller that remembered
-    // to check: the panel syncs its buttons on render, before the core is there,
-    // and an answer that threw aborted the render hook before the first load.
-    const Access0 = ctx.PVE.meta.Access;
-    eq('hasAnyWrite fails closed', Access0.hasAnyWrite({ write: 1, scopes: [] }), false);
-    eq('canWrite fails closed', Access0.canWrite({ write: 1 }, 'a'), false);
-    eq('covers fails closed', Access0.covers('a', 'a.b'), false);
-    eq('no rule reaches yet', Access0.rulesReaching([{ name: 'x', authid: 'a@pve', rules: [{ prefix: 'a', mode: 'rw', selector: { all: 1 } }] }], []), []);
     // The two name validators fail OPEN, deliberately: they only refuse early and in
     // words, and the server refuses the same names on its own. An unloaded core
     // means no early answer, not a field that cannot be typed into.
@@ -165,11 +149,8 @@ eq('the ABI version is the one the glue expects', Core.call('abi'), Core.ABI);
 eq('and now the core reports itself loaded', Core.loaded(), true);
 {
     // The same guards, the other way round, once the core is here.
-    const late = { access: { read: 1, write: 1, scopes: [] } };
-    late.editableFor = ctx.PVE.meta.TreePanel.editableFor;
-    eq('editable once the core can judge it', late.editableFor('traefik.spec.host'), true);
-    eq('and a bad key name is refused now', typeof ctx.PVE.meta.Utils.keyPathError('bad key'), 'string');
-    eq('and a bad file name too', typeof ctx.PVE.meta.Utils.fileNameError('my file'), 'string');
+    eq('a bad key name is refused now', typeof ctx.PVE.meta.Utils.keyPathError('bad key'), 'string');
+    eq('a bad file name too', typeof ctx.PVE.meta.Utils.fileNameError('my file'), 'string');
     eq('... including one the API would refuse for its length', typeof ctx.PVE.meta.Utils.fileNameError('a'.repeat(129)), 'string');
     eq('... while 128 is fine', ctx.PVE.meta.Utils.fileNameError('a'.repeat(128)), null);
 }
@@ -185,7 +166,7 @@ eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde �
     const text = Core.call('dump', 'yaml', big);
     eq('a megabyte round trips through the buffer', text.length > 1000000 && JSON.stringify(Core.call('parse', 'yaml', text)) === JSON.stringify(big), true);
     // And a call after the growth still works (the output pointer moved).
-    eq('the instance is fine afterwards', Core.call('covers', 'a', 'a.b'), true);
+    eq('the instance is fine afterwards', Core.call('same', 1, 1), true);
 }
 {
     const err = throws('a parse error is a CoreError, not a trap', () => Core.call('parse', 'yaml', 'a: 1\nb: [\n'), 'failed to parse');
@@ -193,7 +174,7 @@ eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde �
     // (`instanceof Error` would be the vm context's own Error, not this realm's.)
     eq('... and it is a CoreError with a message', err instanceof ctx.PVE.meta.CoreError && typeof err.message === 'string', true);
     throws('an unknown function is an error', () => Core.call('no_such_function'), 'unknown function');
-    throws('a bad argument is an error', () => Core.call('covers', 'a', 'a b'), 'invalid path');
+    throws('a bad argument is an error', () => Core.call('shape_governing', [], [], 'a b'), 'invalid path');
     eq('the instance is fine after errors', Core.call('parse', 'yaml', 'ok: 1\n'), { ok: 1 });
 }
 
@@ -202,21 +183,18 @@ eq('defined', ctx.__defined, [
     'PVE.meta.Footer',
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
-    'PVE.meta.AddRuleWindow',
     'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
     'PVE.meta.DocumentWindow',
     'PVE.meta.NewRegistryWindow',
-    'PVE.meta.ServiceToken',
     'PVE.meta.RegistryGrid',
     'PVE.meta.DatacenterPanel',
 ]);
 
 const U = ctx.PVE.meta.Utils;
 const Codec = ctx.PVE.meta.Codec;
-const Access = ctx.PVE.meta.Access;
 const Shape = ctx.PVE.meta.Shape;
 const EditSet = ctx.PVE.meta.EditSet;
 const Markers = ctx.PVE.meta.Markers;
@@ -250,21 +228,13 @@ try {
 }
 eq('throws on a duplicate member instead of picking a winner', composeThrew, true);
 
-console.log('\n--- Access: the coverage rule is the core\'s, read from a /meta/access answer ---');
-// The rule itself (a scope on `p` covers `p`, `p__` and `p.*`, and nothing else)
-// is tested in Rust; these show the face hands the right shapes across, Perl's
-// `1`/`0` booleans included.
-eq('a scope covers its subtree', Access.covers('traefik', 'traefik.spec.host'), true);
-eq('and the sibling comment key -- the one comment-key rule', Access.covers('traefik', 'traefik__'), true);
-eq('a longer name is not a child', Access.covers('traefik', 'traefikx'), false);
-eq('never the root', Access.covers('traefik', ''), false);
-eq('full write access', Access.hasAnyWrite({ write: 1, scopes: [] }), true);
-eq('one rw scope', Access.hasAnyWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }), true);
-eq('read-only scopes are not write access', Access.hasAnyWrite({ write: 0, scopes: [{ prefix: 'netbird', mode: 'ro' }] }), false);
-eq('an auditor holds nothing', Access.hasAnyWrite({ read: 1, write: 0, scopes: [] }), false);
-eq('a missing access object is not write access', Access.hasAnyWrite(undefined), false);
-eq('canWrite inside an rw scope', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'traefik.spec'), true);
-eq('canWrite outside it', Access.canWrite({ write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }, 'netbird'), false);
+console.log('\n--- rows are editable iff the document is (DESIGN §4) ---');
+// Nothing is computed per path: PVE's ACLs decide read/write for the whole
+// document, and the editor just reflects that.
+const editableForP = ctx.PVE.meta.TreePanel.editableFor;
+eq('writable document', editableForP.call({ access: { read: 1, write: 1 } }), true);
+eq('read-only document', editableForP.call({ access: { read: 1, write: 0 } }), false);
+eq('no access object yet', editableForP.call({}), false);
 
 eq('join root', U.joinPath('', 'a'), 'a');
 eq('join nested', U.joinPath('a.b', 'c'), 'a.b.c');
@@ -305,7 +275,7 @@ eq('no format, no vtype', U.editorFor({ kind: 'string' }).vtype, undefined);
 eq('enum wins over format', U.editorFor({ kind: 'string', format: 'ipv4', enumValues: ['a'] }).xtype,
     'combobox');
 
-console.log('\n--- selector text (the Access tooltip) ---');
+console.log('\n--- selector text (the "Applies to" column) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
 eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');
 
@@ -736,24 +706,10 @@ const panel = {
     registryDoc: false,
     docId: '200',
     tags: ['traefik'],
-    access: { read: 1, write: 1, scopes: [] },
-    // Two lists now, two rules (DESIGN sections 3-4): prefixes decide shape,
-    // permissions decide access.
+    access: { read: 1, write: 1 },
     prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
-    ],
-    permissions: [
-        {
-            name: 'traefik',
-            authid: 'svc@pve!traefik',
-            rules: [{ prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } }],
-        },
-        {
-            name: 'netbird',
-            authid: 'svc@pve!netbird',
-            rules: [{ prefix: 'netbird', mode: 'ro', selector: { all: true } }],
-        },
     ],
 };
 [
@@ -763,9 +719,6 @@ const panel = {
     'schemaKind',
     'shapeFor', 'shapeInputs', 'buildShape',
     'docKind',
-    'applicablePermissions',
-    'accessFor',
-    'accessSummary',
     'editableFor',
 ].forEach((m) => (panel[m] = P[m]));
 
@@ -773,9 +726,6 @@ const shape = panel.shapeFor('200');
 // Most-specific first, then by name: the order the server lists in, and the one
 // the Shape resolves in, whatever order the listing arrived in.
 eq('the prefixes that reach this guest', shape.declared().map((n) => n.prefix), ['netbird', 'traefik']);
-const scopes = panel.applicablePermissions.call(panel);
-eq('the rules that reach it', scopes.map((s) => s.prefix), ['traefik', 'netbird']);
-eq('... each carrying its file', scopes.map((s) => s.name + '/' + s.authid), ['traefik/svc@pve!traefik', 'netbird/svc@pve!netbird']);
 
 const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
 panel.addData.call(panel, root, storeDoc);
@@ -887,7 +837,7 @@ console.log('\n--- a registry file that did not load is still a row ---');
     // A prefix that stops parsing must still be listed, with its error --
     // silently ceasing to exist is the one failure mode with no symptom
     // (docs/decisions/003-registry-files-are-documents.md).
-    const pfx = G.rowsFrom('prefixes', [
+    const pfx = G.rowsFrom([
         { prefix: 'good', selector: { all: true }, origin: 'cluster' },
         { prefix: 'broken', origin: 'packaged', error: 'mapping values are not allowed here' },
     ]);
@@ -896,7 +846,7 @@ console.log('\n--- a registry file that did not load is still a row ---');
     eq('... and says so where it would say what it does', pfx[1].description, pfx[1].error);
     eq('... and is still addressable, which is how it gets repaired', pfx[1].id, 'prefixes/broken');
     // The two flags as the grid shows them, in Perl's spelling and in JSON's.
-    const flagged = G.rowsFrom('prefixes', [
+    const flagged = G.rowsFrom([
         { prefix: 'p', selector: { all: true }, enforce: 1, hidden: true },
         { prefix: 'q', selector: { all: true }, enforce: '0', hidden: 0 },
     ]);
@@ -905,28 +855,15 @@ console.log('\n--- a registry file that did not load is still a row ---');
     eq('... and keeps the origin, which is where to look for it', pfx[1].origin, 'packaged');
     eq('a file that loaded carries no error', pfx[0].error, undefined);
 
-    const perm = G.rowsFrom('permissions', [
-        { name: 'ops', authid: 'a@pve!t', rules: [], origin: 'cluster' },
-        { name: 'bad', origin: 'cluster', error: 'missing field `authid`' },
-    ]);
-    eq('permissions the same way', perm.map((r) => r.name), ['ops', 'bad']);
-    eq('a failed permission claims no authid', perm[1].authid, '');
-    eq('... and no rules', perm[1].summary, '');
-
-    // The safety half: a file that did not load must never describe anything, and
-    // never grant anything. The listing carries it; the Shape and the rules drop it.
+    // The safety half: a file that did not load must never describe anything. The
+    // listing carries it; the Shape drops it.
     const p2 = Object.assign({}, panel, {
         prefixes: [
             { prefix: 'netbird', selector: { all: true } },
             { prefix: 'broken', selector: { all: true }, error: 'nope' },
         ],
-        permissions: [
-            { name: 'ok', authid: 'a@pve', rules: [{ prefix: 'netbird', mode: 'rw', selector: { all: true } }] },
-            { name: 'bad', authid: 'b@pve', error: 'nope', rules: [{ prefix: 'netbird', mode: 'rw', selector: { all: true } }] },
-        ],
     });
     eq('a failed prefix reaches no guest, even carrying a selector', p2.shapeFor('200').declared().map((n) => n.prefix), ['netbird']);
-    eq('a failed permission file grants nothing, even carrying rules', p2.applicablePermissions().map((r) => r.name), ['ok']);
 }
 
 console.log('\n--- a hidden declaration decorates a row, it never creates one ---');
@@ -988,8 +925,8 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
 console.log('\n--- a prefix is a declaration, with or without a schema ---');
 {
     // A prefix is itself a statement about the document: something of mine
-    // lives at this key. That is the statement permissions are written in terms of,
-    // so it earns a row; it just has less to say than a schema'd one.
+    // lives at this key. It earns a row on that alone; it just has less to say than
+    // a schema'd one.
     const doc = (data) => {
         const d = Object.assign({}, panel, {
             docId: '100',
@@ -1023,45 +960,13 @@ console.log('\n--- a prefix is a declaration, with or without a schema ---');
     eq('... and editable as the scalar it is', U.editorKind(scalar.children.netbird), 'inline');
 }
 
-console.log('\n--- Access: every rule whose prefix covers the row ---');
-eq('access of a grammar row', panel.accessFor.call(panel, 'traefik.spec.port', scopes), [
-    { name: 'traefik', mode: 'rw', selector: 'tag: traefik', prefix: 'traefik' },
-]);
-eq('access ro marked', panel.accessSummary(panel.accessFor.call(panel, 'netbird.groups', scopes)), 'netbird (ro)');
-eq('access of an unclaimed row', panel.accessFor.call(panel, 'mine.key', scopes), []);
-// Several principals may cover the same subtree; rw sorts before ro.
-const overlapping = scopes.concat([
-    { name: 'audit', authid: 'svc@pve!audit', prefix: 'traefik', mode: 'ro', selector: { all: true } },
-]);
-eq(
-    'rw first, then ro',
-    panel.accessSummary(panel.accessFor.call(panel, 'traefik.spec.host', overlapping)),
-    'traefik, audit (ro)',
-);
-
-panel.access = { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-eq('scoped write inside', panel.editableFor.call(panel, 'traefik.spec.host'), true);
-eq('scoped write outside', panel.editableFor.call(panel, 'netbird.groups'), false);
-eq('scoped write on the comment key of the prefix', panel.editableFor.call(panel, 'traefik__'), true);
-
 console.log('\n--- S6: a guest that does not carry the tag ---');
-// A tag selector resolves against this guest's tags and nothing else. Holding a
-// `traefik` rw scope of our own must not drag another principal's tag-selected
-// rule onto a guest that is not tagged `traefik` -- the Access column would
-// then name a writer who cannot in fact write here.
+// A tag selector resolves against this guest's tags and nothing else.
 const untagged = Object.assign({}, panel);
 untagged.tags = [];
-untagged.access = { read: 1, write: 1, scopes: [{ prefix: 'traefik', mode: 'rw' }] };
-const untaggedScopes = panel.applicablePermissions.call(untagged);
-eq('a tag rule needs the tag', untaggedScopes.map((s) => s.prefix), ['netbird']);
-eq(
-    'no Access row for the prefix whose selector missed',
-    panel.accessFor.call(untagged, 'traefik.spec.host', untaggedScopes),
-    [],
-);
 // Same rule on the shape side: no tag, no declared rows from that prefix.
 eq(
-    'prefix applicability follows the same tags',
+    'prefix applicability follows the guest\'s tags',
     untagged.shapeFor('200').declared().map((n) => n.prefix),
     ['netbird'],
 );
@@ -1282,12 +1187,9 @@ eq('booleans still parse', Codec.parse('v: true\n', 'yaml'), { v: true });
 eq('YAML 1.1 words stay strings', Codec.parse('a: yes\nb: on\n', 'yaml'), { a: 'yes', b: 'on' });
 eq('an empty document is the empty map, not null', Codec.parse('', 'yaml'), {});
 
-console.log('\n--- governing uses containment, not the permission predicate ---');
-// `covers` aliases the sibling comment key `p__` -- that is a PERMISSION rule. Using
-// it to pick a governing prefix would make `a` govern the whole `a__` prefix; the
-// Shape uses plain containment and says `a__`. Two predicates, two jobs, and the
-// core keeps them apart (docs: shape.rs vs scopes.rs).
-eq('covers aliases the comment key (permission rule)', Access.covers('a', 'a__'), true);
+console.log('\n--- governing uses plain containment ---');
+// A prefix `a` does not govern the sibling comment key `a__`'s own declared
+// prefix: plain containment, no alias for a comment key.
 {
     const two = Shape.of([{ prefix: 'a', selector: { all: true } }, { prefix: 'a__', selector: { all: true } }], []);
     eq('a comment-key prefix governs itself, not its subject', two.governing('a__').prefix, 'a__');
@@ -1371,10 +1273,8 @@ D.FORM_KEYS = D.statics.FORM_KEYS; // the shim does not hoist statics; Ext does
 // An id is an address: the path it is served at, for every kind of document.
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
-eq('a permission id', P.urlFor.call(P, 'permissions/scoped'), '/meta/permissions/scoped');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
-eq('kind of a permission file', P.docKind.call(P, 'permissions/scoped'), 'permission');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
 // A node's prefix file is its own document at its own path, and a prefix to
 // everything that renders one.
@@ -1392,7 +1292,7 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
         return opts.params;
     };
     eq('a guest tab lists its own prefix set by id', asked({ registryDoc: false, docId: '201' }), { id: '201' });
-    eq('a registry document lists every file', asked({ registryDoc: true, docId: 'permissions/ops' }), { all: 1 });
+    eq('a registry document lists every file', asked({ registryDoc: true, docId: 'prefixes/ops' }), { all: 1 });
     eq('a node id is shaped like the others', P.registryId('prefixes', 'gpu', 'pve1'), 'nodes/pve1/prefixes/gpu');
     eq('... and a cluster-wide one has no node', P.registryId('prefixes', 'gpu'), 'prefixes/gpu');
 }
@@ -1401,21 +1301,21 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 // write to another document, which is a 409 at best and the wrong document at worst.
 {
     const panelM = Object.assign({}, panel, {
-        docState: { 'permissions/y': { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
+        docState: { 'prefixes/y': { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
     });
     ['digestOf', 'dataOf', 'docOf'].forEach((m) => (panelM[m] = P[m]));
-    panelM.docId = 'permissions/y';
+    panelM.docId = 'prefixes/y';
     eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
-    eq('and its own data', panelM.dataOf('permissions/y'), { a: 1 });
-    eq('an unknown document has no digest', panelM.digestOf('permissions/nope'), '');
+    eq('and its own data', panelM.dataOf('prefixes/y'), { a: 1 });
+    eq('an unknown document has no digest', panelM.digestOf('prefixes/nope'), '');
     eq('a row names its document', panelM.docOf({ data: { docId: 'prefixes/x' } }), 'prefixes/x');
-    eq('no row means the default one', panelM.docOf(null), 'permissions/y');
+    eq('no row means the default one', panelM.docOf(null), 'prefixes/y');
 }
 
 // What describes a registry document: its meta-schema, rooted at the document.
 {
     const META = { type: 'object', properties: { selector: { type: 'object' } } };
-    const panelG = Object.assign({}, panel, { registryDoc: true, schemas: { prefix: META, permission: {} } });
+    const panelG = Object.assign({}, panel, { registryDoc: true, schemas: { prefix: META } });
     ['shapeFor', 'shapeInputs', 'buildShape', 'docKind'].forEach((m) => (panelG[m] = P[m]));
     eq('a prefix document is described by the meta-schema, rooted at the document',
         panelG.shapeFor('prefixes/x').declared().map((g) => g.prefix), ['']);
@@ -1555,11 +1455,11 @@ console.log('\n--- staged edits: the change that had no legal single step ---');
     eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
 }
 
-console.log('\n--- the registry lists ---');
+console.log('\n--- the registry list ---');
 {
     // `statics:` in the shim is a plain object; Ext hoists it onto the class.
     const G = ctx.PVE.meta.RegistryGrid.statics;
-    const rows = G.rowsFrom('prefixes', [
+    const rows = G.rowsFrom([
         {
             prefix: 'traefik',
             description: 'Traefik dynamic configuration',
@@ -1590,29 +1490,12 @@ console.log('\n--- the registry lists ---');
     eq('an administrator\'s own', G.originText(rows[1]), 'cluster');
     eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
 
-    const permRows = G.rowsFrom('permissions', [
-        {
-            name: 'scoped',
-            authid: 'svc@pve!t1',
-            rules: [
-                { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
-                { prefix: 'netbird', mode: 'ro', selector: { all: true } },
-            ],
-            origin: 'cluster',
-        },
-    ]);
-    eq('a permission row is addressed the same way', permRows[0].id, 'permissions/scoped');
-    eq(
-        'and says what it actually permits',
-        permRows[0].summary,
-        'traefik (rw, tag: traefik), netbird (ro, all guests)',
-    );
     // An older API returns neither field; the list must still render.
-    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom('permissions', [{ name: 'x' }])[0]), 'cluster');
+    eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom([{ prefix: 'x' }])[0]), 'cluster');
 
     // Node rows: the same prefix may be listed once per file, and each row opens
     // its own file.
-    const nodeRows = G.rowsFrom('prefixes', [
+    const nodeRows = G.rowsFrom([
         { prefix: 'gpu', selector: { all: true }, origin: 'cluster', overrides: false },
         { prefix: 'gpu', selector: { all: true }, origin: 'node', node: 'pve1', overrides: true },
         { prefix: 'gpu.devices', selector: { all: true }, origin: 'node', node: 'pve2', overrides: false },
@@ -1872,9 +1755,8 @@ console.log('\n--- text is just another way to edit rows ---');
 console.log('\n--- a single delete has to stay a DELETE ---');
 {
     // `writeView` steps up a level for a delete -- you cannot remove a key by replacing
-    // it -- but for a top-level key that step lands on the document root, and a root
-    // write needs full write access. A scoped writer removing its own prefix would get
-    // a 403 for something the server would have taken as `DELETE ?view=traefik`.
+    // it -- but for a top-level key that step lands on the document root. Apply
+    // prefers the narrower `DELETE ?view=traefik` instead, which is the smaller write.
     eq('a top-level delete would write the document', new EditSet([{ path: 'traefik', op: 'delete' }]).writeView(), '');
     // ... so Apply sends the narrow DELETE instead, which is what this shape is for.
     eq('a nested delete writes its parent', new EditSet([{ path: 'a.b', op: 'delete' }]).writeView(), 'a');
@@ -2047,9 +1929,9 @@ console.log('\n--- a list is a container, like a map ---');
     const root = { key: '', path: '', children: {}, present: true, kind: 'map' };
     panel.addData.call(panel, root, {
         netbird: { groups: ['lan', 'wan'] },
-        rules: [
-            { prefix: 'traefik', mode: 'rw', selector: { tag: 'traefik' } },
-            { prefix: 'netbird', mode: 'ro', selector: { all: true } },
+        peers: [
+            { host: 'a.example', port: 51820 },
+            { host: 'b.example', port: 51821 },
         ],
         empty: [],
     });
@@ -2063,114 +1945,63 @@ console.log('\n--- a list is a container, like a map ---');
     eq('a member is not addressable', groups.children['0'].addressable, false);
     eq('the list itself still is', groups.addressable, undefined);
 
-    const rules = root.children.rules;
-    eq('a list of maps too', Object.keys(rules.children).sort(), ['0', '1']);
-    // A member with structure shows one readable line, and carries its real value.
-    eq('a rule reads as a rule', rules.children['0'].value, 'traefik (rw, tag: traefik)');
-    eq('and the real thing rides along', rules.children['0'].rawItem.selector, { tag: 'traefik' });
+    const peers = root.children.peers;
+    eq('a list of maps too', Object.keys(peers.children).sort(), ['0', '1']);
+    // A member with structure has no shape `itemSummary` recognises, so it falls
+    // back to its JSON -- and carries its real value regardless.
+    eq('an unrecognised shape falls back to JSON', peers.children['0'].value, '{"host":"a.example","port":51820}');
+    eq('and the real thing rides along', peers.children['0'].rawItem.port, 51820);
     eq('an empty list has no members', Object.keys(root.children.empty.children), []);
 
-    // The summary is presentation only, and falls back to JSON for a shape it does
-    // not recognise -- it describes nothing and constrains nothing.
+    // The summary is presentation only, and describes nothing and constrains nothing.
     eq('an unknown shape is still legible', U.itemSummary({ a: 1 }), '{"a":1}');
     eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
 }
 
-console.log('\n--- adding one rule to a permission file ---');
-{
-    const R = ctx.PVE.meta.AddRuleWindow.statics;
-    eq('a rule with an all selector', R.rulesWith([], { prefix: 'traefik', mode: 'rw', selector: 'all' }), [
-        { prefix: 'traefik', mode: 'rw', selector: { all: true } },
-    ]);
-    eq('a rule with a tag selector', R.rulesWith([], { prefix: 'homelab', mode: 'ro', selector: 'tag', tag: 'web' }), [
-        { prefix: 'homelab', mode: 'ro', selector: { tag: 'web' } },
-    ]);
-    // Appending, not replacing: `rules` is written whole because a view addresses
-    // through maps only, so the existing entries have to come along.
-    eq(
-        'the ones already there come with it',
-        R.rulesWith([{ prefix: 'netbird', mode: 'ro', selector: { all: true } }], {
-            prefix: 'traefik', mode: 'rw', selector: 'all',
-        }).map((r) => r.prefix),
-        ['netbird', 'traefik'],
-    );
-    eq('a missing mode is the safe one', R.rulesWith([], { prefix: 'x', selector: 'all' })[0].mode, 'ro');
-    eq('nothing there yet is still an array', Array.isArray(R.rulesWith(undefined, { prefix: 'x', selector: 'all' })), true);
-}
-
 console.log('\n--- creating a registry file: the least that parses ---');
 {
-    const plan = (kind, v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(kind, v);
-    eq('a prefix with an "all" selector', plan('prefixes', { name: 'x', selector: 'all' }).content, { selector: { all: true } });
+    const plan = (v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(v);
+    eq('a prefix with an "all" selector', plan({ name: 'x', selector: 'all' }).content, { selector: { all: true } });
 
     // Where it lands: the cluster by default, or one node's directory.
     const CLUSTER = ctx.PVE.meta.NewRegistryWindow.statics.CLUSTER_LOCATION;
-    const cluster = plan('prefixes', { name: 'gpu', location: CLUSTER, selector: 'all' });
+    const cluster = plan({ name: 'gpu', location: CLUSTER, selector: 'all' });
     eq('the cluster is the default location', [cluster.id, cluster.node], ['prefixes/gpu', undefined]);
-    eq('... also when no location was asked', plan('prefixes', { name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
-    const onNode = plan('prefixes', { name: 'gpu.devices', location: 'pve1', selector: 'all' });
+    eq('... also when no location was asked', plan({ name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
+    const onNode = plan({ name: 'gpu.devices', location: 'pve1', selector: 'all' });
     eq('a node location writes that node\'s file', [onNode.id, ctx.PVE.meta.Doc.urlFor(onNode.id), onNode.node], [
         'nodes/pve1/prefixes/gpu.devices',
         '/meta/nodes/pve1/prefixes/gpu.devices',
         'pve1',
     ]);
     eq('the file itself does not change with where it lands', onNode.content, { selector: { all: true } });
-    eq('a permission file has no location', plan('permissions', { name: 'ops', principal: 'existing', authid: 'a@pve', location: 'pve1' }).id, 'permissions/ops');
     eq(
         'the locations are the cluster, then every node by name',
         ctx.PVE.meta.NewRegistryWindow.statics.locationItems([{ node: 'pve2' }, { node: 'pve1' }]).map((i) => i[0]),
         [CLUSTER, 'pve1', 'pve2'],
     );
-    eq('a prefix with a tag selector', plan('prefixes', { name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
+    eq('a prefix with a tag selector', plan({ name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
-        plan('prefixes', { name: 'x', selector: 'all', description: 'Home' }).content,
+        plan({ name: 'x', selector: 'all', description: 'Home' }).content,
         { description: 'Home', selector: { all: true } },
     );
-    // A permission file is created permitting nothing: it names a principal, and an
-    // administrator says what it may touch afterwards.
-    const existing = plan('permissions', { name: 'ops', principal: 'existing', authid: 'a@pve!t1' });
-    eq('a permission file starts empty', existing.content, { authid: 'a@pve!t1', rules: [] });
-    eq('an existing principal makes nothing', existing.user, undefined);
-    eq('the file is named separately from the principal', existing.file, 'ops');
-
-    // The other half of the same dialog: the principal does not exist yet. The file
-    // must name the TOKEN, not the user -- naming the user produces a file that
-    // parses, loads, and grants the token nothing.
-    const fresh = plan('permissions', {
-        name: 'traefik', principal: 'new', user: 'traefik@pve', tokenid: 'meta', role: 'none',
-    });
-    eq('the file names the token', fresh.content.authid, 'traefik@pve!meta');
-    eq('and the user is created too', fresh.user, 'traefik@pve');
-    eq('the none sentinel grants nothing', fresh.acl, undefined);
-    const withRole = plan('permissions', {
-        name: 'a', principal: 'new', user: 'a@pve', tokenid: 't', role: 'PVEAuditor', description: 'x',
-    });
-    // /vms, not per-guest (a guest created tomorrow would miss it) and not `/`
-    // (PVEAuditor there also grants Sys.Audit, the datacenter document's read).
-    eq('a role goes on /vms, propagating', withRole.acl, { path: '/vms', role: 'PVEAuditor', propagate: 1 });
-    eq('a description reaches the file', withRole.content.description, 'x');
-
-    // The generated token id is a name, not a secret: PVE generates the secret.
-    const T = ctx.PVE.meta.ServiceToken;
-    eq('a generated id is a legal token id', /^[A-Za-z0-9_-]+$/.test(T.randomTokenId()), true);
-    eq('and two of them differ', T.randomTokenId() === T.randomTokenId(), false);
 }
 
 console.log('\n--- reloading must not fold the tree up ---');
 {
     // The key that survives a reload. A document row and a group row both live at the
-    // empty path, and the two group rows have no document at all, so keying on
-    // (docId, path) collided: collapsing `Prefixes` came back expanded on the next
-    // reload because `Grants` had won the shared key.
+    // empty path, and two group rows have no document at all, so keying on
+    // (docId, path) collided: collapsing one group came back expanded on the next
+    // reload because the other had won the shared key.
     const key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
-    const prefixes = { data: { docId: null, path: '', key: 'Prefixes' } };
-    const permissions = { data: { docId: null, path: '', key: 'Permissions' } };
-    const dcRoot = { data: { docId: 'permissions/scoped', path: '', key: 'permissions/scoped' } };
-    const nsRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
+    const groupA = { data: { docId: null, path: '', key: 'A' } };
+    const groupB = { data: { docId: null, path: '', key: 'B' } };
+    const dcRoot = { data: { docId: 'prefixes/homelab', path: '', key: 'prefixes/homelab' } };
+    const nsRoot = { data: { docId: 'prefixes/gpu', path: '', key: 'prefixes/gpu' } };
     const same = { data: { docId: 'prefixes/homelab', path: 'selector', key: 'selector' } };
-    const other = { data: { docId: 'permissions/scoped', path: 'selector', key: 'selector' } };
-    const keys = [prefixes, permissions, dcRoot, nsRoot, same, other].map(key);
+    const other = { data: { docId: 'prefixes/gpu', path: 'selector', key: 'selector' } };
+    const keys = [groupA, groupB, dcRoot, nsRoot, same, other].map(key);
     eq('every row has a key of its own', new Set(keys).size, keys.length);
 }
 

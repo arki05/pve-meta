@@ -121,11 +121,8 @@ impl EditSet {
     /// them all, moved one level up when a delete sits exactly there, since a
     /// key cannot be removed by replacing it. `None` with nothing staged.
     ///
-    /// Narrow on purpose: a write that names less can collide with less, and
-    /// a scope-only principal cannot name the root view at all
-    /// (`docs/DESIGN.md` §5). Not narrow for *permission* reasons -- this
-    /// consults no scopes; what a write may do is decided by what it changes,
-    /// and a plan whose narrowest view is the root is an ordinary write.
+    /// Narrow on purpose: a write that names less can collide with less. A
+    /// plan whose narrowest view is the root is an ordinary write.
     pub fn write_view(&self) -> Option<Path> {
         let first = self.0.first()?;
         let mut common: Vec<String> = first.path.segments().to_vec();

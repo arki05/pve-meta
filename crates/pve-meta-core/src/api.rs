@@ -10,24 +10,19 @@
 //!
 //! Perl does parameters, PVE ACL checks, the vmlist, the guests' tags and the
 //! per-document write lock, and hands this module a [`CallerAcl`]. This
-//! module does everything else: resolving the caller's scopes against the
-//! registrations, view extraction/replace/merge/remove, touched-path
-//! computation, the lint, YAML/JSON rendering, and digesting.
+//! module does everything else: view extraction/replace/merge/remove,
+//! touched-path computation, the lint, YAML/JSON rendering, and digesting.
 //!
 //! ## Authorization
 //!
-//! A write is authorized **by what it changes, not by what it is addressed
-//! to** (`docs/DESIGN.md` §5):
-//!
-//! 1. [`authorize_view_write`] refuses the two request shapes that must not
-//!    reach the content check at all: the caller must be able to *read* the
-//!    view it names, and must hold some write permission on the document
-//!    ([`Effective::has_any_write`]); `full_write` short-circuits both;
-//! 2. the mutation is planned against a **clone** of the stored document and
-//!    every path the plan touches is checked with [`Effective::check_write`];
-//! 3. the planned document is linted — once, the same way for every caller
-//!    (`docs/DESIGN.md` §7);
-//! 4. only then is the planned value written.
+//! PVE's ACLs and nothing else (`docs/DESIGN.md` §4): a caller's read/write
+//! access to a document is the two booleans on [`CallerAcl`], computed by
+//! Perl. Read without `read` is a 403; write without `write` is a 403. There
+//! is no partial access, no per-path authorization and no other check on
+//! *what* a write changes -- only whether the caller may write the document
+//! at all. The mutation is still planned against a **clone** of the stored
+//! document, and the planned document is linted once, the same way for every
+//! caller (`docs/DESIGN.md` §7), before it is written.
 //!
 //! ## Wire contract
 //!
@@ -57,8 +52,7 @@ use crate::format::{self, Format};
 use crate::model;
 use crate::patch::{Op, Touched};
 use crate::path::Path as DocPath;
-use crate::registry::{self, NodeName, Permission, PrefixDef, PrefixSet, Registry, RegistryFailure, RegistryKind};
-use crate::scopes::Effective;
+use crate::registry::{self, NodeName, PrefixDef, PrefixSet, Registry, RegistryFailure, RegistryKind};
 use crate::shape::{self, Shape};
 use crate::store::{DocId, MetaStore, DISK_FORMAT};
 use crate::view;
@@ -143,25 +137,8 @@ fn forbidden(path: &DocPath) -> ApiError {
     ApiError { status: 403, msg: format!("not permitted: {path}") }
 }
 
-/// The caller's effective [`Effective`] on `doc_id`.
-///
-/// Scopes apply to **guest documents only** (`docs/DESIGN.md` §5).
-pub fn effective(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> Effective {
-    let scopes = match doc_id {
-        DocId::Guest(_) => registry::scopes_for(permission_files, &acl.authid, &acl.tags),
-        // A registry document is governed by ACLs alone: a permission that
-        // could reach the permission files would be able to widen itself.
-        DocId::Registry(..) | DocId::NodePrefix { .. } => Vec::new(),
-    };
-    Effective {
-        full_read: acl.read,
-        full_write: acl.write,
-        scopes,
-    }
-}
-
 /// Parses an API `id` into a [`DocId`]: a vmid, or a registry document as
-/// `prefixes/<name>` / `permissions/<name>` / `nodes/<node>/prefixes/<name>`.
+/// `prefixes/<name>` / `nodes/<node>/prefixes/<name>`.
 ///
 /// The registry form is the API path it is reached at, so the id a caller sends
 /// back is the one it read. `<name>` is the file's name, checked with
@@ -188,11 +165,9 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
     if let Some((kind, name)) = id.split_once('/') {
         let kind = match kind {
             "prefixes" => RegistryKind::PrefixDef,
-            "permissions" => RegistryKind::Permission,
             other => {
                 return Err(bad_request(format!(
-                    "invalid id '{id}': unknown registry kind '{other}' \
-                     (expected 'prefixes' or 'permissions')"
+                    "invalid id '{id}': unknown registry kind '{other}' (expected 'prefixes')"
                 )))
             }
         };
@@ -205,8 +180,7 @@ pub fn parse_id(id: &str) -> Result<DocId, ApiError> {
     }
     id.parse::<u32>().map(DocId::Guest).map_err(|_| {
         bad_request(format!(
-            "invalid id '{id}': must be a vmid, 'prefixes/<name>', \
-             'nodes/<node>/prefixes/<name>' or 'permissions/<name>'"
+            "invalid id '{id}': must be a vmid, 'prefixes/<name>' or 'nodes/<node>/prefixes/<name>'"
         ))
     })
 }
@@ -383,46 +357,23 @@ pub fn version(
     })
 }
 
-/// `GET /meta/schemas`: the two registry file formats as schemas
-/// (`crate::metaschema`), so the editor can show a prefix or permission file as a
-/// typed tree the way a prefix's own schema does for a guest document.
+/// `GET /meta/schemas`: the prefix file format as a schema (`crate::metaschema`),
+/// so the editor can show a prefix file as a typed tree the way a prefix's own
+/// schema does for a guest document.
 pub fn schemas() -> Value {
     crate::metaschema::schemas()
 }
 
-/// `GET /meta/access`: `{ read, write, scopes, tags }` for one document.
-pub fn access(permission_files: &[Permission], doc_id: &DocId, acl: &CallerAcl) -> ApiAccess {
-    let g = effective(permission_files, doc_id, acl);
-    ApiAccess {
-        read: g.full_read,
-        write: g.full_write,
-        scopes: g.scopes,
-        tags: if acl.read { acl.tags.clone() } else { Vec::new() },
-    }
-}
-
-/// `GET /meta/permissions`: every permission, readable by every authenticated user.
+/// `GET /meta/access`: `{ read, write }` for one document -- exactly `acl`'s
+/// own two ACL answers (`docs/DESIGN.md` §4). With no `id` this is the
+/// registry as a whole, which the caller computes the same `acl` for.
 ///
-/// Not filtered per caller: a permission says who may touch which prefix, which is
-/// exactly what the UI's Access column shows for every row, and the threat
-/// model puts listings out of scope (`docs/DESIGN.md` §1).
-///
-/// `failures` rides along in the same array (see [`PermissionEntry`]): this is
-/// the one place a file that did not load is still visible at all, because it
-/// is the one endpoint feeding the grid an administrator would otherwise have
-/// no reason to suspect is short a row. Nothing that *decides* anything --
-/// [`effective`], [`access`], the write pipeline -- ever sees `failures`;
-/// only this listing does.
-pub fn permissions_list(
-    permission_files: &[Permission],
-    failures: &[RegistryFailure],
-) -> Vec<PermissionEntry> {
-    permission_files
-        .iter()
-        .cloned()
-        .map(PermissionEntry::Loaded)
-        .chain(failures.iter().cloned().map(|f| PermissionEntry::Failed(f.into())))
-        .collect()
+/// # Errors
+/// `503:` the cluster filesystem is not available (`docs/DESIGN.md` §1: no
+/// pmxcfs, no answer, not even this one).
+pub fn access(store: &MetaStore, acl: &CallerAcl) -> Result<ApiAccess, ApiError> {
+    store.check_available()?;
+    Ok(ApiAccess { read: acl.read, write: acl.write })
 }
 
 /// `GET /meta/prefixes`: the cluster-wide set, packaged and cluster files
@@ -463,8 +414,7 @@ pub fn effective_prefixes(registry: &Registry, doc_id: &DocId, acl: &CallerAcl) 
 
 /// `GET /meta/prefixes`' rows: every prefix given, in the order given
 /// (most-specific first, as the registry loads them), readable by every
-/// authenticated user, plus every file that did not load (see
-/// [`permissions_list`], the same reasoning applies here).
+/// authenticated user, plus every file that did not load.
 pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Vec<PrefixEntry> {
     prefixes
         .iter()
@@ -474,12 +424,10 @@ pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Ve
         .collect()
 }
 
-/// `GET /meta/guests`: for every guest Perl passed in, the metadata the
-/// caller may see.
+/// `GET /meta/guests`: for every guest Perl passed in that the caller has
+/// read access to, its metadata (`docs/DESIGN.md` §4, §8).
 ///
-/// A guest the caller can read *nothing* of is omitted entirely, and
-/// `node`/`name`/`tags` are returned only to a caller with `VM.Audit` on that
-/// guest (`docs/DESIGN.md` §8).
+/// A guest the caller cannot read is omitted entirely.
 ///
 /// A `has` that names a comment key is a `400`, as a view naming one is without
 /// `comments`: a note is not something a guest has.
@@ -488,8 +436,6 @@ pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Ve
 /// `400:` if `has` is not a valid path, or names a comment key.
 pub fn list_guests(
     store: &MetaStore,
-    permission_files: &[Permission],
-    authid: &str,
     guests: &[GuestInput],
     has: Option<&str>,
 ) -> Result<Vec<GuestListEntry>, ApiError> {
@@ -502,35 +448,24 @@ pub fn list_guests(
 
     let mut out = Vec::with_capacity(guests.len());
     for guest in guests {
-        let acl = CallerAcl {
-            authid: authid.to_string(),
-            read: guest.read,
-            write: guest.write,
-            tags: guest.tags.clone(),
-            // A listing decides no prefix set.
-            node: None,
-        };
-        let g = effective(permission_files, &DocId::Guest(guest.vmid), &acl);
-        let readable = g.readable_prefixes();
-        if readable.is_empty() {
+        if !guest.read {
             continue;
         }
 
         let stored = read_stored(store, &DocId::Guest(guest.vmid))?;
-        let visible = view::filter(&stored.value, &readable);
 
         if let Some(path) = &has_path {
-            if model::get_path(&visible, path).is_none() {
+            if model::get_path(&stored.value, path).is_none() {
                 continue;
             }
         }
 
         out.push(GuestListEntry {
             vmid: guest.vmid,
-            node: g.full_read.then(|| guest.node.clone()).flatten(),
+            node: guest.node.clone(),
             kind: guest.kind.clone(),
-            name: g.full_read.then(|| guest.name.clone()).flatten(),
-            tags: g.full_read.then(|| guest.tags.clone()),
+            name: guest.name.clone(),
+            tags: guest.tags.clone(),
             digest: stored.digest,
         });
     }
@@ -539,37 +474,33 @@ pub fn list_guests(
 
 /// `GET /meta/guests/{vmid}`, and the registry documents' `GET`.
 ///
-/// With a `view`, requires read access to it ([`Effective::can_read`]); without
-/// one, returns the union of the caller's readable subtrees
-/// ([`Effective::readable_prefixes`] + [`view::filter`]) — the whole document
-/// for a full-read grant. A caller with **no** read grant at all gets a 403,
+/// Access is `acl.read` alone (`docs/DESIGN.md` §4): a caller with it sees the
+/// whole document (or the named `view` into it); one without it gets a 403,
 /// not an empty document with the real digest (which would be a
-/// change-detection oracle over content they may not see).
+/// change-detection oracle over content they may not see). There is no
+/// partial access, so `view` only narrows what is returned, never what may be.
 ///
 /// **A document whose content could not be recovered** (`docs/DESIGN.md` §7
 /// and [`Stored::unrecoverable`] — it does not parse, it is above the read
-/// cap, or it is not a mapping): `format=yaml` with `comments` for a full
-/// reader answers `200` with the file's raw text plus `parse_error`, so an
-/// administrator can see what to repair. Everyone else — `format=json`, a read
-/// without `comments`, any caller without full read, and anyone at all when
-/// the bytes were never read — gets `422`
-/// naming the condition. It is reported, never rendered as an empty document:
-/// the file is there, and the caller has to know that before writing over it.
+/// cap, or it is not a mapping): `format=yaml` with `comments` answers `200`
+/// with the file's raw text plus `parse_error`, so an administrator can see
+/// what to repair. Every other read — `format=json`, or without `comments` —
+/// gets `422` naming the condition. It is reported, never rendered as an
+/// empty document: the file is there, and the caller has to know that before
+/// writing over it.
 ///
 /// **Comment keys are notes** (`docs/DESIGN.md` §2): without `comments` the
 /// answer carries none, at any depth, and `format=yaml` is the canonical dump of
 /// what is left; a `view` naming one is a `400`. With `comments` the answer is
-/// the stored content, and a full reader's root view in YAML the file's own
-/// text. `digest` is the file's either way.
+/// the stored content, and the root view in YAML the file's own text. `digest`
+/// is the file's either way.
 ///
 /// # Errors
 /// `400:` invalid id/view/format, or a view naming a comment key without
-/// `comments`. `403:` no read grant, or a `view` that is not readable. `422:`
-/// the stored document's content could not be recovered.
-#[allow(clippy::too_many_arguments)] // matches the GET endpoint's parameter set 1:1 (docs/DESIGN.md §8)
+/// `comments`. `403:` no read access. `422:` the stored document's content
+/// could not be recovered.
 pub fn get_document(
     store: &MetaStore,
-    permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     format_name: &str,
@@ -577,25 +508,20 @@ pub fn get_document(
     acl: &CallerAcl,
 ) -> Result<ApiViewDocument, ApiError> {
     let doc_id = parse_id(id)?;
-    let access = effective(permission_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
     if !comments {
         refuse_comment(&Value::Null, &view_path)?;
     }
 
-    let readable = access.readable_prefixes();
-    if readable.is_empty() {
-        return Err(forbidden(&view_path));
-    }
-    if view.is_some() && !access.can_read(&view_path) {
+    if !acl.read {
         return Err(forbidden(&view_path));
     }
 
     let stored = read_stored(store, &doc_id)?;
 
     if let Some(err) = &stored.unrecoverable {
-        if fmt == Format::Yaml && access.full_read && comments {
+        if fmt == Format::Yaml && comments {
             if let Some(raw) = &stored.raw {
                 return Ok(ApiViewDocument {
                     id: doc_id.to_string(),
@@ -620,17 +546,17 @@ pub fn get_document(
     let result_value = if view.is_some() {
         view::extract(&stored.value, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
     } else {
-        view::filter(&stored.value, &readable)
+        stored.value.clone()
     };
     let result_value = if comments { result_value } else { view::strip_comments(&result_value) };
 
     let (data, text) = match fmt {
         Format::Json => (Some(result_value), None),
-        // The root view of a full reader who asked for the notes renders the
-        // file's own text; every other read is a canonical dump of what it sees.
+        // The root view with the notes renders the file's own text; every
+        // other read is a canonical dump of what it sees.
         Format::Yaml => {
             let own_text = stored.raw.as_deref().filter(|raw| !raw.is_empty() && comments);
-            let text = if let (None, true, Some(raw)) = (view, access.full_read, own_text) {
+            let text = if let (None, Some(raw)) = (view, own_text) {
                 raw.to_string()
             } else {
                 view::render(&result_value, Format::Yaml)
@@ -672,36 +598,14 @@ fn refuse_comment(value: &Value, view_path: &DocPath) -> Result<(), ApiError> {
 ///
 /// One condition, one gate: whatever makes a document unrecoverable, the
 /// repair is the same two shapes and nothing narrower — a root `merge` very
-/// much included, since it is planned against the empty document too.
-///
-/// **And it takes `full_write`, which is the one place that rule survives.**
-/// Everywhere else a write is authorized by what it changes, because the diff
-/// against the stored document can see what that is. Here it cannot: the
-/// stored value *is* the empty document, so a scoped principal replacing the
-/// root with nothing but its own subtree would produce a touched list entirely
-/// inside its own scope — and destroy every other prefix's content in a file
-/// nobody can currently read. Content-based authorization needs content to
-/// authorize against; when there is none, the coarse rule is the only honest
-/// one.
-fn check_repairable(
-    stored: &Stored,
-    access: &Effective,
-    view_path: &DocPath,
-    is_merge: bool,
-) -> Result<(), ApiError> {
+/// much included, since it is planned against the empty document too. The
+/// caller has already been required to hold write access to reach here
+/// ([`authorize_write`]), so a root replace/delete needs nothing further.
+fn check_repairable(stored: &Stored, view_path: &DocPath, is_merge: bool) -> Result<(), ApiError> {
     let Some(err) = &stored.unrecoverable else {
         return Ok(());
     };
     if view_path.is_root() && !is_merge {
-        if !access.full_write {
-            return Err(ApiError {
-                status: 403,
-                msg: "not permitted: this document cannot be read back, so repairing it \
-                      replaces content that cannot be checked against your permissions; \
-                      repairing it as a whole requires full write access"
-                    .to_string(),
-            });
-        }
         return Ok(());
     }
     Err(bad_request(format!(
@@ -710,63 +614,21 @@ fn check_repairable(
     )))
 }
 
-/// Every write's up-front, request-shaped authorization gate.
-///
-/// **What authorizes a write is what it changes, not what it is addressed
-/// to.** The real gate is `Effective::check_write` in [`plan_write`], which
-/// runs over the paths the write actually touches — computed by `patch::diff`
-/// against the stored document, so it sees every value that changed, every key
-/// that appeared and every key that vanished, wherever the write was aimed.
-/// This function only refuses the requests that must not reach that check at
-/// all.
-///
-/// Two things still have to be refused here, and neither is about the content:
-///
-/// * **You must be able to read the view you name.** Otherwise the content
-///   check becomes a read oracle: replace a key you cannot read with a guess,
-///   and `200` versus `403` tells you whether the guess was right. Requiring
-///   read access makes the oracle answer a question you could have asked
-///   outright. This also keeps a scope-only principal out of the root view —
-///   `covers` never covers the root — which is what stops it from replacing a
-///   document it can only see part of.
-/// * **You must have some write permission on this document.** The content
-///   check measures changed *paths*, and key order is not one: a pure
-///   reordering touches nothing and would sail through, letting a read-only
-///   auditor rewrite a file. `has_any_write` is the floor that keeps the
-///   people who may not write here from causing a write at all.
-///
-/// `full_write` short-circuits both: it is the "may write the whole document"
-/// answer, and it does not depend on being able to read it (a PVE ACL can
-/// grant `VM.Config.Options` without `VM.Audit`).
-fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), ApiError> {
-    if access.full_write {
+/// Every write's authorization gate: `acl.write` alone (`docs/DESIGN.md` §4).
+/// There is no per-path check -- what a write changes is irrelevant to
+/// whether it is allowed.
+fn authorize_write(acl: &CallerAcl) -> Result<(), ApiError> {
+    if acl.write {
         return Ok(());
     }
-    if !access.has_any_write() {
-        return Err(ApiError {
-            status: 403,
-            msg: "not permitted: no write access to this document".to_string(),
-        });
-    }
-    if !access.can_read(view_path) {
-        // The root gets its own sentence: `forbidden` names the path it
-        // refused, and the root's name is the empty string.
-        if view_path.is_root() {
-            return Err(ApiError {
-                status: 403,
-                msg: "not permitted: writing the whole document requires being able to \
-                      read the whole document; name a view inside a prefix you hold"
-                    .to_string(),
-            });
-        }
-        return Err(forbidden(view_path));
-    }
-    Ok(())
+    Err(ApiError {
+        status: 403,
+        msg: "not permitted: no write access to this document".to_string(),
+    })
 }
 
 /// Runs the planned mutation against `planned` (already a clone of the
-/// stored document), checks every touched path against the caller's permissions,
-/// and runs **the** lint on the result.
+/// stored document) and runs **the** lint on the result.
 ///
 /// The lint lives here, before the `dry_run` branch, so a dry run validates
 /// exactly what the write validates — and it is the same lint for every
@@ -776,15 +638,10 @@ fn authorize_view_write(access: &Effective, view_path: &DocPath) -> Result<(), A
 /// a stored note, and says how to reach it.
 fn plan_write(
     planned: &mut Value,
-    access: &Effective,
     kept_notes: bool,
     mutate: impl FnOnce(&mut Value) -> Result<Vec<Touched>, ApiError>,
 ) -> Result<Vec<Touched>, ApiError> {
     let touched = mutate(planned)?;
-
-    if let Err(denied) = access.check_write(&touched) {
-        return Err(forbidden(&denied));
-    }
 
     let lints = model::lint(planned);
     if !lints.is_empty() {
@@ -804,9 +661,8 @@ fn plan_write(
     Ok(touched)
 }
 
-/// The extra gate a registry document passes and the other two do not: the
-/// text about to be written must parse as the kind it is
-/// (`registry::parse_prefix` / `registry::parse_permission`).
+/// The extra gate a registry document passes and a guest document does not:
+/// the text about to be written must parse as a prefix (`registry::parse_prefix`).
 ///
 /// The loader **skips** a malformed file with a warning and carries on, so
 /// without this check the editor's most likely mistake (a typo in `selector:`)
@@ -826,12 +682,10 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
     };
     let parsed = match kind {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
-        RegistryKind::Permission => registry::parse_permission(name, text).map(|_| ()),
     };
     parsed.map_err(|e| {
         let kind = match kind {
             RegistryKind::PrefixDef => "prefix",
-            RegistryKind::Permission => "permission file",
         };
         bad_request(format!(
             "the result would not be a valid {kind}: {e} \
@@ -866,14 +720,11 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// # Errors
 /// `400:` invalid id/view/format/mode/payload, a comment key in a `replace`
 /// without `comments`, or the planned document fails the lint. `409:` digest
-/// mismatch. `403:` the view is not writable, or a planned touched path is
-/// outside the caller's write permissions. `422:`
-/// the write introduces a finding under an enforcing prefix and `force` is
-/// not set.
+/// mismatch. `403:` no write access. `422:` the write introduces a finding
+/// under an enforcing prefix and `force` is not set.
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
 pub fn put_document(
     store: &MetaStore,
-    permission_files: &[Permission],
     prefixes: &[PrefixDef],
     id: &str,
     view: Option<&str>,
@@ -887,12 +738,11 @@ pub fn put_document(
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id)?;
-    let access = effective(permission_files, &doc_id, acl);
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
 
     // (1) Authorize the *request* before computing anything.
-    authorize_view_write(&access, &view_path)?;
+    authorize_write(acl)?;
 
     // A merge payload is a patch (`null` deletes); a replace payload is
     // document content.
@@ -917,12 +767,12 @@ pub fn put_document(
 
     store.check_precondition(&doc_id, digest)?;
     let stored = read_stored(store, &doc_id)?;
-    check_repairable(&stored, &access, &view_path, is_merge)?;
+    check_repairable(&stored, &view_path, is_merge)?;
 
     // (2) Plan the mutation against a *copy*; the stored document is only
     //     touched once the plan has passed every check.
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &access, keep_notes, |v| {
+    let touched = plan_write(&mut planned, keep_notes, |v| {
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(ApiError::from)
         } else {
@@ -979,9 +829,7 @@ pub fn put_document(
 /// `enforce: true` refuse a write that *introduces* a finding under them
 /// ([`shape::introduced`]: new since the stored document, or on a path the
 /// write changed). A guest whose document was already wrong elsewhere is
-/// still editable elsewhere; a scoped principal cannot be locked out of its
-/// own prefix by another prefix's schema, because it can only ever change
-/// paths inside its own. Format checks are never enforced
+/// still editable elsewhere. Format checks are never enforced
 /// ([`Shape::enforced_findings`]). Registry documents have their own gate
 /// ([`check_registry_shape`]).
 fn check_enforced(
@@ -1027,30 +875,27 @@ fn check_enforced(
 /// (`docs/DESIGN.md` §9).
 ///
 /// # Errors
-/// `400:` invalid id/view. `409:` digest mismatch. `403:` the view is not
-/// writable, or a planned touched path is outside the caller's write permissions.
+/// `400:` invalid id/view. `409:` digest mismatch. `403:` no write access.
 pub fn delete_document(
     store: &MetaStore,
-    permission_files: &[Permission],
     id: &str,
     view: Option<&str>,
     digest: Option<&str>,
     acl: &CallerAcl,
 ) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id)?;
-    let access = effective(permission_files, &doc_id, acl);
     let view_path = parse_view(view)?;
 
-    authorize_view_write(&access, &view_path)?;
+    authorize_write(acl)?;
 
     store.check_precondition(&doc_id, digest)?;
     let stored = read_stored(store, &doc_id)?;
     // A root DELETE removes the file whole, so it repairs an unrecoverable
     // document exactly like a root replace does.
-    check_repairable(&stored, &access, &view_path, false)?;
+    check_repairable(&stored, &view_path, false)?;
 
     let mut planned = stored.value.clone();
-    let touched = plan_write(&mut planned, &access, false, |v| {
+    let touched = plan_write(&mut planned, false, |v| {
         view::remove(v, &view_path).map_err(ApiError::from)
     })?;
 
@@ -1069,9 +914,8 @@ pub fn delete_document(
     } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
         // A partial delete is a write, and a write of a registry document must
-        // still leave a file its own loader will read: dropping `authid` from a
-        // grant is a `DELETE ?view=authid`, and the same rule has to hold on
-        // this path as on `put_document`'s.
+        // still leave a file its own loader will read: the same rule has to
+        // hold on this path as on `put_document`'s.
         check_registry_shape(&doc_id, &text)?;
         let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
         crate::audit(&format!(

@@ -19,7 +19,7 @@
 // operator fills it in, or there is a reason it is not there -- and a `default` is an
 // offer the row makes ("Set to default"), never something written behind your back.
 // (`optional` survives in the meta-schema, DESIGN §6, because *those* files really do
-// have required fields: a permission file without an `authid` is refused on the way in.)
+// have required fields: a prefix file without a `selector` is refused on the way in.)
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DeclareKeyWindow', {

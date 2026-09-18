@@ -82,7 +82,7 @@ usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
        $SELF rm <vmid>
        $SELF scan-notes
 
-  <id>    a vmid, 'prefixes/<name>', 'nodes/<node>/prefixes/<name>' or 'permissions/<name>'
+  <id>    a vmid, 'prefixes/<name>' or 'nodes/<node>/prefixes/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
   get     print the view; comment keys (key__, a note about key) only with --comments
@@ -130,9 +130,8 @@ sub lock_id_for {
     my ($id) = @_;
     return $id if $id =~ /^\d+$/;
     return "node-$1.prefix-$2" if $id =~ m{^nodes/([^/]*)/prefixes/(.*)$};
-    my ($dir, $name) = split(m{/}, $id, 2);
-    my $one = $dir eq 'prefixes' ? 'prefix' : 'permission';
-    return "$one-$name";
+    my (undef, $name) = split(m{/}, $id, 2);
+    return "prefix-$name";
 }
 
 # Runs $code under the document's cluster lock, with the same things the API

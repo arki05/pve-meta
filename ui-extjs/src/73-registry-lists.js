@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// The two registry lists.
+// The registry list: prefix definitions.
 //
 // A grid rather than a tree, because the interesting facts about these files are
 // *columns*: which guests a prefix reaches, whether it carries a schema, and
@@ -13,14 +13,13 @@ Ext.define('PVE.meta.RegistryGrid', {
     extend: 'Ext.grid.Panel',
     xtype: 'pveMetaRegistryGrid',
 
-    kind: 'prefixes', // or 'permissions'
     border: false,
     emptyText: gettext('No entries'),
 
     // The row a list entry becomes. Kept out of initComponent so the offline suite
     // can check the mapping without a DOM.
     statics: {
-        rowsFrom: function (kind, list) {
+        rowsFrom: function (list) {
             let U = PVE.meta.Utils;
             return (list || []).map(function (e) {
                 // A file in the directory that did not load. It is named -- the
@@ -31,15 +30,12 @@ Ext.define('PVE.meta.RegistryGrid', {
                 // otherwise say what it does, and Edit still opens it, which is
                 // where it gets repaired.
                 if (e.error) {
-                    let name = kind === 'permissions' ? e.name : e.prefix;
                     return {
-                        name: name,
-                        id: PVE.meta.Doc.registryId(kind, name, e.node),
+                        name: e.prefix,
+                        id: PVE.meta.Doc.registryId('prefixes', e.prefix, e.node),
                         node: e.node || '',
                         error: e.error,
                         description: e.error,
-                        authid: '',
-                        summary: '',
                         selector: '',
                         schema: '',
                         enforce: '',
@@ -48,24 +44,9 @@ Ext.define('PVE.meta.RegistryGrid', {
                         overrides: false,
                     };
                 }
-                if (kind === 'permissions') {
-                    return {
-                        name: e.name,
-                        id: 'permissions/' + e.name,
-                        authid: e.authid || '',
-                        description: e.description || '',
-                        // What it actually permits, in one line: prefix, mode and the
-                        // selector that decides which guests it reaches.
-                        summary: (e.rules || [])
-                            .map((g) => g.prefix + ' (' + g.mode + ', ' + U.selectorText(g.selector) + ')')
-                            .join(', '),
-                        origin: e.origin || 'cluster',
-                        overrides: !!e.overrides,
-                    };
-                }
                 return {
                     name: e.prefix,
-                    id: PVE.meta.Doc.registryId(kind, e.prefix, e.node),
+                    id: PVE.meta.Doc.registryId('prefixes', e.prefix, e.node),
                     node: e.node || '',
                     description: e.description || '',
                     selector: U.selectorText(e.selector),
@@ -95,31 +76,28 @@ Ext.define('PVE.meta.RegistryGrid', {
 
     initComponent: function () {
         let me = this;
-        let isPrefix = me.kind === 'prefixes';
         me.store = Ext.create('Ext.data.Store', {
-            fields: ['name', 'id', 'node', 'authid', 'description', 'selector', 'schema', 'enforce', 'hidden', 'summary', 'origin', 'overrides'],
+            fields: ['name', 'id', 'node', 'description', 'selector', 'schema', 'enforce', 'hidden', 'origin', 'overrides'],
             data: [],
             sorters: [{ property: 'name' }, { property: 'node' }],
         });
         me.access = { write: 0 };
 
-        let columns = [
-            {
-                text: isPrefix ? gettext('Prefix') : gettext('Name'),
-                dataIndex: 'name',
-                flex: 2,
-                // The same marker the tree puts on a row whose value does not match
-                // its schema, one step further out: this whole file does not match
-                // the format it is in. The Description column carries the parser's
-                // own words, so the icon does not have to say anything.
-                renderer: (v, meta, rec) =>
-                    rec.data.error
-                        ? Ext.htmlEncode(v) + ' <i class="fa fa-exclamation-triangle warning"></i>'
-                        : Ext.htmlEncode(v),
-            },
-        ];
-        if (isPrefix) {
-            columns.push(
+        Ext.apply(me, {
+            columns: [
+                {
+                    text: gettext('Prefix'),
+                    dataIndex: 'name',
+                    flex: 2,
+                    // The same marker the tree puts on a row whose value does not match
+                    // its schema, one step further out: this whole file does not match
+                    // the format it is in. The Description column carries the parser's
+                    // own words, so the icon does not have to say anything.
+                    renderer: (v, meta, rec) =>
+                        rec.data.error
+                            ? Ext.htmlEncode(v) + ' <i class="fa fa-exclamation-triangle warning"></i>'
+                            : Ext.htmlEncode(v),
+                },
                 {
                     text: gettext('Node'),
                     dataIndex: 'node',
@@ -143,26 +121,15 @@ Ext.define('PVE.meta.RegistryGrid', {
                     renderer: Ext.htmlEncode,
                     tooltip: gettext('Declared keys are not offered as rows until something is stored there'),
                 },
-            );
-        } else {
-            columns.push(
-                { text: gettext('Auth ID'), dataIndex: 'authid', flex: 2, renderer: Ext.htmlEncode },
-                { text: gettext('Rules'), dataIndex: 'summary', flex: 3, renderer: Ext.htmlEncode },
-            );
-        }
-        columns.push(
-            { text: gettext('Description'), dataIndex: 'description', flex: 2, renderer: Ext.htmlEncode },
-            {
-                text: gettext('Origin'),
-                dataIndex: 'origin',
-                width: 200,
-                renderer: (v, meta, rec) =>
-                    Ext.htmlEncode(PVE.meta.RegistryGrid.originText(rec.data)),
-            },
-        );
-
-        Ext.apply(me, {
-            columns: columns,
+                { text: gettext('Description'), dataIndex: 'description', flex: 2, renderer: Ext.htmlEncode },
+                {
+                    text: gettext('Origin'),
+                    dataIndex: 'origin',
+                    width: 200,
+                    renderer: (v, meta, rec) =>
+                        Ext.htmlEncode(PVE.meta.RegistryGrid.originText(rec.data)),
+                },
+            ],
             tbar: [
                 {
                     text: gettext('Add'),
@@ -240,11 +207,11 @@ Ext.define('PVE.meta.RegistryGrid', {
             failure: Ext.emptyFn,
         });
         me.request({
-            url: '/meta/' + me.kind,
+            url: '/meta/prefixes',
             // Every file, a node's beside the cluster's, rather than a resolved set.
-            params: me.kind === 'prefixes' ? { all: 1 } : {},
+            params: { all: 1 },
             success: function (response) {
-                me.store.setData(PVE.meta.RegistryGrid.rowsFrom(me.kind, response.result.data || []));
+                me.store.setData(PVE.meta.RegistryGrid.rowsFrom(response.result.data || []));
                 me.syncButtons();
             },
             failure: (response) =>
@@ -262,113 +229,30 @@ Ext.define('PVE.meta.RegistryGrid', {
         win.show();
     },
 
-    // "New" for both lists, and for a permission file both of the things that used
-    // to be two buttons: name an existing principal, or make one.
-    //
-    // When it makes one, the order is chosen so a failure leaves the least behind: a
-    // user with no token is inert, a token with no permission file grants nothing at
-    // all, and only the last step makes anything true. Each failure says which step
-    // it was and what already exists, because "create failed" with three PVE objects
-    // half-made is not a message anyone can act on.
+    // "New Prefix": writes the file with `digest: ''`, so two administrators
+    // creating the same name is a 409 rather than one silently overwriting the
+    // other.
     createOne: function () {
         let me = this;
-        let win = Ext.create('PVE.meta.NewRegistryWindow', { kind: me.kind });
+        let win = Ext.create('PVE.meta.NewRegistryWindow', {});
         win.on('create', function (plan) {
-            let made = [];
-            let fail = (step) => (response) =>
-                Ext.Msg.alert(
-                    gettext('Error'),
-                    Ext.htmlEncode(step) + ': ' +
-                        (response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response)) +
-                        (made.length
-                            ? '<br><br>' +
-                              Ext.htmlEncode(
-                                  Ext.String.format(
-                                      gettext('Already created: {0}. Remove it from Datacenter → Permissions, or run this again to reuse it.'),
-                                      made.join(', '),
-                                  ),
-                              )
-                            : ''),
-                );
-            let req = (opts) => Proxmox.Utils.API2Request(Ext.apply({ waitMsgTarget: me }, opts));
-
-            let writeFile = function (secret) {
-                req({
-                    url: PVE.meta.Doc.urlFor(plan.id),
-                    method: 'PUT',
-                    // `digest: ''` is "this file must not exist yet", so two
-                    // administrators creating the same name is a 409 rather than one
-                    // silently overwriting the other.
-                    params: PVE.meta.Doc.docParams({
-                        data: Ext.encode(plan.content),
-                        mode: 'replace',
-                        digest: '',
-                    }),
-                    failure: fail(gettext('writing the file')),
-                    success: function () {
-                        me.reload();
-                        if (secret) {
-                            PVE.meta.ServiceToken.showSecret(plan, secret);
-                            return;
-                        }
-                        me.editOne({ data: { id: plan.id } });
-                    },
-                });
-            };
-            if (!plan.user) {
-                writeFile(null);
-                return;
-            }
-            let addAcl = function (secret) {
-                if (!plan.acl) {
-                    writeFile(secret);
-                    return;
-                }
-                req({
-                    url: '/access/acl',
-                    method: 'PUT',
-                    params: {
-                        path: plan.acl.path,
-                        roles: plan.acl.role,
-                        propagate: plan.acl.propagate,
-                        users: plan.user,
-                    },
-                    failure: fail(gettext('granting guest access')),
-                    success: () => writeFile(secret),
-                });
-            };
-            let addToken = function () {
-                req({
-                    url: '/access/users/' + encodeURIComponent(plan.user) + '/token/' +
-                        encodeURIComponent(plan.tokenid),
-                    method: 'POST',
-                    // privsep off: this user exists only to carry this token, and with
-                    // it on, a role added to the user later would silently not apply.
-                    params: { privsep: 0 },
-                    failure: fail(gettext('creating the token')),
-                    success: function (response) {
-                        made.push(plan.authid);
-                        addAcl((response.result.data || {}).value);
-                    },
-                });
-            };
-            req({
-                url: '/access/users',
-                method: 'POST',
-                // No password: this user cannot log in, only its token can act.
-                params: { userid: plan.user, comment: 'pve-meta service principal' },
-                failure: function (response) {
-                    // An existing user is the normal case for a second token on the
-                    // same principal, not an error to stop on.
-                    if (String(response.htmlStatus || '').indexOf('already exists') !== -1) {
-                        addToken();
-                        return;
-                    }
-                    fail(gettext('creating the user'))(response);
-                },
+            Proxmox.Utils.API2Request({
+                url: PVE.meta.Doc.urlFor(plan.id),
+                method: 'PUT',
+                waitMsgTarget: me,
+                params: PVE.meta.Doc.docParams({
+                    data: Ext.encode(plan.content),
+                    mode: 'replace',
+                    digest: '',
+                }),
+                failure: (response) =>
+                    Ext.Msg.alert(
+                        gettext('Error'),
+                        response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
+                    ),
                 success: function () {
-                    made.push(plan.user);
-                    addToken();
+                    me.reload();
+                    me.editOne({ data: { id: plan.id } });
                 },
             });
         });
@@ -417,4 +301,3 @@ Ext.define('PVE.meta.RegistryGrid', {
         });
     },
 });
-

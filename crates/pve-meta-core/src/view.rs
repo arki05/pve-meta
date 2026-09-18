@@ -5,8 +5,6 @@
 //! the subtree at a prefix (with the prefix itself stripped); [`replace`]
 //! and [`merge`] write it back (whole-subtree replace vs. RFC 7386-style
 //! merge-patch, both scoped to the prefix); [`remove`] deletes it.
-//! [`filter`] builds the "no view" read: the union of several readable
-//! prefixes, unstripped and in the document's own order.
 //! [`strip_comments`] and [`keep_comments`] are what a read and a `replace`
 //! that did not ask for comment keys do with them (`docs/DESIGN.md` §7).
 //! [`render`]/[`parse`]/[`parse_patch`] convert a view's value to and from
@@ -24,12 +22,9 @@
 //! [`patch::diff`]/[`patch::apply_patch`]): unlike [`patch::apply_patch`]'s
 //! "replacing/deleting a whole subtree yields its root path" convention
 //! (which exists to keep a merge-patch's own change summary concise), this
-//! module's touched list feeds [`crate::scopes::Effective::check_write`], which
-//! must be able to reject a write that reaches outside the caller's scope
-//! inside a replaced or removed subtree. Where a whole subtree disappears at
-//! once the report names that subtree's own path, not each leaf under it —
-//! which only makes the write check *stricter*, since every reported path is
-//! an ancestor of everything it stands for.
+//! module's touched list feeds [`crate::api`]'s enforced-schema check and the
+//! API's own `touched` response, both of which want every leaf a replaced or
+//! removed subtree carried, not just the subtree's own path.
 //!
 //! **The touched list is complete**: every
 //! one of these operations reports at least one touched path whenever it
@@ -47,7 +42,6 @@ use crate::format::{self, Format};
 use crate::model::{self, Value};
 use crate::patch::{self, Op, Touched};
 use crate::path::Path;
-use crate::scopes;
 
 fn blocked(prefix: &Path) -> Error {
     Error::InvalidPath(format!(
@@ -150,8 +144,8 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
         None => {
             patch::diff_at(&Value::Object(Map::new()), &subtree, prefix, &mut touched);
             // Creating a key whose value is an empty map is a real change
-            // even though the content diff is empty: report it, so it can
-            // never slip past `Effective::check_write`.
+            // even though the content diff is empty: report it, so `touched`
+            // is never vacuous for a write that changed the document.
             if touched.is_empty() {
                 touched.push(Touched {
                     path: prefix.clone(),
@@ -255,9 +249,8 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
     }
     let own = match map.shift_remove(&key) {
         Some(Value::Object(old_map)) => {
-            // Report *below* `prefix`, so a write-scope check can catch
-            // removed content outside the caller's scope even when it is
-            // nested under `prefix`.
+            // Report *below* `prefix`, matching every other operation's
+            // touched-path convention (see the module docs).
             let mut below = Vec::new();
             patch::diff_at(
                 &Value::Object(old_map),
@@ -282,58 +275,6 @@ pub fn remove(doc: &mut Value, prefix: &Path) -> Result<Vec<Touched>> {
     };
     touched.extend(own);
     Ok(touched)
-}
-
-/// Builds the "no view" read: the union of `readable_prefixes`, unstripped
-/// (comment keys travel with whatever they document) and in the document's
-/// own key order. A prefix list containing the root returns the whole
-/// document, unchanged. Unlike [`extract`]/[`replace`]/[`merge`]/[`remove`],
-/// this never errors: a prefix that runs through an array or a scalar simply
-/// never matches anything below that point (this is a read-only,
-/// best-effort union over whatever prefixes a caller happens to have).
-///
-/// Inclusion is decided with [`crate::scopes::covers`] — the same predicate
-/// [`crate::scopes::Effective::can_read`] answers with — so a key is emitted
-/// exactly when an explicit view of it would be allowed. That single rule is
-/// all comment keys need: `p__` travels with a readable `p` (the one
-/// sibling rule, `docs/DESIGN.md` §4), while a map's bare `__` documents the
-/// whole map and so travels only where the map itself is readable.
-///
-/// **A document that is not a map at the top level is the empty document
-/// here.** A prefix addresses only through maps, so no non-root prefix can
-/// cover any part of a list- or scalar-rooted document; the honest union of
-/// those prefixes is nothing. A full-read caller holds the root prefix and
-/// still gets it verbatim, from the early return above.
-pub fn filter(doc: &Value, readable_prefixes: &[Path]) -> Value {
-    if readable_prefixes.iter().any(|p| p.is_root()) {
-        return doc.clone();
-    }
-    match doc {
-        Value::Object(map) => Value::Object(filter_map(map, &Path::root(), readable_prefixes)),
-        _ => Value::Object(Map::new()),
-    }
-}
-
-fn filter_map(map: &Map<String, Value>, path: &Path, readable: &[Path]) -> Map<String, Value> {
-    // One pass, in the map's own order: covered keys (comment keys included)
-    // come through whole, partially covered maps recurse, everything else is
-    // dropped -- including a non-object node an otherwise-readable prefix
-    // would have to run through.
-    let mut out = Map::new();
-    for (k, v) in map.iter() {
-        let child_path = path.join(k.clone());
-        if readable.iter().any(|p| scopes::covers(p, &child_path)) {
-            out.insert(k.clone(), v.clone());
-        } else if let Value::Object(sub) = v {
-            if readable.iter().any(|p| child_path.is_prefix_of(p)) {
-                let filtered = filter_map(sub, &child_path, readable);
-                if !filtered.is_empty() {
-                    out.insert(k.clone(), Value::Object(filtered));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// `value` without its comment keys, at any depth, array members included: what
@@ -711,8 +652,8 @@ mod tests {
     #[test]
     fn merge_with_empty_patch_never_mutates_the_document() {
         // An empty merge at an arbitrary
-        // deep prefix must create nothing and touch nothing, so that a
-        // vacuous `check_write([])` cannot be used to write structure.
+        // deep prefix must create nothing and touch nothing: a vacuous
+        // `touched: []` must never be produced by a write that built structure.
         for prefix in ["zzz_hacked", "zzz_hacked.deep", "traefik.spec.deeper"] {
             let mut doc = json!({"traefik": {"spec": {"host": "x"}}});
             let before = doc.clone();
@@ -827,183 +768,6 @@ mod tests {
     fn remove_through_array_is_invalid_path() {
         let mut doc = json!({"a": [1, 2, 3]});
         assert!(matches!(remove(&mut doc, &p("a.0")), Err(Error::InvalidPath(_))));
-    }
-
-    // -- filter -----------------------------------------------------------
-
-    #[test]
-    fn filter_no_readable_prefixes_is_empty() {
-        let doc = json!({"a": 1, "b": {"c": 2}});
-        assert_eq!(filter(&doc, &[]), json!({}));
-    }
-
-    #[test]
-    fn filter_root_prefix_returns_whole_doc_unchanged() {
-        let doc = json!({"__": "top", "a": 1, "b": {"c": 2}});
-        assert_eq!(filter(&doc, &[Path::root()]), doc);
-    }
-
-    #[test]
-    fn filter_keeps_only_readable_top_level_subtrees() {
-        let doc = json!({"a": 1, "b": {"c": 2}, "d": 3});
-        assert_eq!(filter(&doc, &[p("a"), p("d")]), json!({"a": 1, "d": 3}));
-    }
-
-    #[test]
-    fn filter_partial_prefix_recurses() {
-        let doc = json!({"a": {"b": {"c": 1}, "d": 2}});
-        assert_eq!(filter(&doc, &[p("a.b")]), json!({"a": {"b": {"c": 1}}}));
-    }
-
-    #[test]
-    fn filter_comment_keys_travel_with_included_sibling() {
-        let doc = json!({"a__": "doc a", "a": {"x": 1}, "b": 2});
-        assert_eq!(filter(&doc, &[p("a")]), json!({"a__": "doc a", "a": {"x": 1}}));
-    }
-
-    #[test]
-    fn filter_keeps_comment_key_that_follows_its_own_key() {
-        // The natural authoring order (`a` then `a__`) must still surface
-        // the comment.
-        let doc = json!({"a": 1, "a__": "about a", "b": 2});
-        assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1, "a__": "about a"}));
-    }
-
-    #[test]
-    fn filter_keeps_comment_keys_in_both_orders_for_nested_maps() {
-        let doc = json!({"ns": {"x": 1, "x__": "about x", "y__": "about y", "y": 2}});
-        assert_eq!(
-            filter(&doc, &[p("ns")]),
-            json!({"ns": {"x": 1, "x__": "about x", "y__": "about y", "y": 2}})
-        );
-    }
-
-    #[test]
-    fn filter_drops_comment_keys_for_excluded_sibling() {
-        let doc = json!({"a__": "doc a", "a": {"x": 1}, "b": 2});
-        assert_eq!(filter(&doc, &[p("b")]), json!({"b": 2}));
-    }
-
-    #[test]
-    fn filter_never_emits_a_bare_map_comment_the_permission_cannot_read() {
-        // The document-root `__` documents the *whole* document, so a scope
-        // on one key must not disclose it -- `?view=__` is a 403, and the
-        // view-less read must agree.
-        let doc = json!({"__": "top level note - secret-ish", "a": 1, "b": 2});
-        assert_eq!(filter(&doc, &[p("a")]), json!({"a": 1}));
-        assert_eq!(filter(&doc, &[]), json!({}));
-        // A full reader (root prefix) still sees it.
-        assert_eq!(filter(&doc, &[Path::root()]), doc);
-
-        // The bare `__` *inside* a map travels exactly when that map does.
-        let nested = json!({"ns": {"__": "about ns", "x": 1, "y": 2}});
-        assert_eq!(filter(&nested, &[p("ns")]), nested);
-        assert_eq!(filter(&nested, &[p("ns.x")]), json!({"ns": {"x": 1}}));
-    }
-
-    #[test]
-    fn filter_emits_only_comment_keys_the_same_permission_can_read() {
-        // The paired invariant, checked over a document
-        // that has a comment key at every interesting position: whatever
-        // `filter` emits, `Effective::can_read` must also allow as a view.
-        use crate::scopes::{Effective, Mode, Scope};
-
-        let doc = json!({
-            "__": "the whole document",
-            "a__": "about a (partially readable)",
-            "a": {"__": "about a's map", "b__": "about b", "b": {"deep": 1}, "c": 2},
-            "t__": "about t",
-            "t": {"__": "about t's map", "x": 1},
-            "u__": "about u",
-            "u": 3,
-        });
-
-        for prefixes in [
-            vec![p("t")],
-            vec![p("a.b")],
-            vec![p("a.b"), p("t")],
-            vec![p("u")],
-            vec![],
-        ] {
-            let access = Effective {
-                scopes: prefixes
-                    .iter()
-                    .map(|prefix| Scope { prefix: prefix.clone(), mode: Mode::Ro })
-                    .collect(),
-                ..Default::default()
-            };
-            let filtered = filter(&doc, &prefixes);
-            let mut offenders = Vec::new();
-            collect_comment_paths(&filtered, &Path::root(), &mut offenders);
-            for path in offenders {
-                assert!(
-                    access.can_read(&path),
-                    "filter({prefixes:?}) emitted {path}, which can_read refuses"
-                );
-            }
-        }
-    }
-
-    fn collect_comment_paths(value: &Value, path: &Path, out: &mut Vec<Path>) {
-        if let Value::Object(map) = value {
-            for (k, v) in map.iter() {
-                let child = path.join(k.clone());
-                if model::is_comment_key(k) {
-                    out.push(child);
-                } else {
-                    collect_comment_paths(v, &child, out);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn filter_drops_a_comment_key_whose_subject_is_only_partially_readable() {
-        // `a__` documents all of `a`; a scope on `a.b` alone must not see it
-        // (`covers` says no, so `?view=a__` is a 403 -- the two must agree).
-        let doc = json!({"a__": "about a", "a": {"b": 1, "secret": 2}});
-        assert_eq!(filter(&doc, &[p("a.b")]), json!({"a": {"b": 1}}));
-        assert_eq!(filter(&doc, &[p("a")]), doc);
-    }
-
-    #[test]
-    fn filter_preserves_document_order() {
-        let doc = json!({"z": 1, "a__": "about a", "a": 2, "m": 3});
-        let out = filter(&doc, &[p("z"), p("a"), p("m")]);
-        let keys: Vec<&str> = out.as_object().unwrap().keys().map(String::as_str).collect();
-        assert_eq!(keys, vec!["z", "a__", "a", "m"]);
-    }
-
-    #[test]
-    fn filter_through_array_never_matches() {
-        let doc = json!({"a": [1, 2, 3]});
-        assert_eq!(filter(&doc, &[p("a.0")]), json!({}));
-    }
-
-    #[test]
-    fn filter_of_a_document_that_is_not_a_map_is_empty_for_a_scoped_reader() {
-        // A lenient read makes this arm reachable: a document rewritten out
-        // of band as a list or a scalar must never leak to a scope-only
-        // caller.
-        for doc in [
-            json!([1, 2, 3]),
-            json!(["a"]),
-            json!("just a string"),
-            json!(42),
-            json!(true),
-        ] {
-            assert_eq!(filter(&doc, &[p("a")]), json!({}), "{doc} leaked to a scope on `a`");
-            assert_eq!(filter(&doc, &[p("a.b"), p("traefik")]), json!({}), "{doc} leaked");
-            assert_eq!(filter(&doc, &[]), json!({}), "{doc} leaked to a zero grant");
-            // A full reader holds the root prefix and still gets it verbatim.
-            assert_eq!(filter(&doc, &[Path::root()]), doc);
-        }
-    }
-
-    #[test]
-    fn filter_empty_maps_stay() {
-        let doc = json!({"a": {}});
-        assert_eq!(filter(&doc, &[p("a")]), json!({"a": {}}));
     }
 
     // -- comment keys -------------------------------------------------------

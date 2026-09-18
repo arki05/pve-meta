@@ -39,9 +39,6 @@ PVE.meta.Doc = {
         if (id.indexOf('prefixes/') === 0 || /^nodes\/[^/]+\/prefixes\//.test(id)) {
             return 'prefix';
         }
-        if (id.indexOf('permissions/') === 0) {
-            return 'permission';
-        }
         return 'guest';
     },
 
@@ -114,18 +111,14 @@ PVE.meta.Doc = {
         // this load is about to read, not the one the panel used to hold.
         me.docParseError = '';
         me.loadPrefixes(() =>
-            me.loadPermissions(() =>
-                me.loadAccess(() =>
-                    me.loadSchemas(() =>
-                        me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false)),
-                    ),
-                ),
+            me.loadAccess(() =>
+                me.loadSchemas(() => me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false))),
             ),
         );
     },
 
-    // A failure here doesn't break the page: the Access column and the
-    // schema-declared rows stay empty, rather than the page.
+    // A failure here doesn't break the page: the schema-declared rows stay empty,
+    // rather than the page.
     loadPrefixes: function (next) {
         let me = this;
         me.request({
@@ -154,28 +147,6 @@ PVE.meta.Doc = {
         return this.registryDoc ? { all: 1 } : { id: this.docId };
     },
 
-    loadPermissions: function (next) {
-        let me = this;
-        me.request({
-            url: '/meta/permissions',
-            success: function (response) {
-                me.permissions = response.result.data || [];
-                next();
-            },
-            failure: function () {
-                me.permissions = [];
-                next();
-            },
-        });
-    },
-
-    // There is no separate tag request: `GET /meta/access` returns the guest's
-    // tags with the access answer (see `loadAccess`), instead of a `GET
-    // /meta/guests` that would read, parse and digest every document in the
-    // cluster just to learn one guest's tags, on every open of every guest tab
-    // that has a `tag:` selector anywhere in the registry, which the shipped
-    // traefik prefix has.
-
     loadAccess: function (next) {
         let me = this;
         me.request({
@@ -185,12 +156,7 @@ PVE.meta.Doc = {
             // asking about the wrong kind gives the wrong access answer (DESIGN §6).
             params: { id: me.docId },
             success: function (response) {
-                me.access = response.result.data || { read: 0, write: 0, scopes: [], tags: [] };
-                // The server resolved the selectors it enforces; these tags are
-                // for the *rendering* decisions the client makes on top -- which
-                // prefixes apply to this guest. Same tags, same authority, one
-                // request instead of two.
-                me.tags = me.access.tags || [];
+                me.access = response.result.data || { read: 0, write: 0 };
                 me.syncAccessLabel();
                 next();
             },
@@ -302,12 +268,12 @@ PVE.meta.Doc = {
         Proxmox.Utils.API2Request({
             url: '/meta/version',
             method: 'GET',
-            // Scoped to the document this panel shows. Unscoped, every tick of
+            // Narrowed to the document this panel shows. Unnarrowed, every tick of
             // every open tab read and hashed every document *and every snapshot
             // copy* in the cluster to answer a question about one guest, and any
-            // guest changing anywhere reloaded every open editor. The scoped
-            // token still covers the prefix and permission directories, so a
-            // registry change reloads this panel the way it always did.
+            // guest changing anywhere reloaded every open editor. The token still
+            // covers the prefix directory, so a registry change reloads this panel
+            // the way it always did.
             params: { id: me.docId },
             failure: Ext.emptyFn, // transient; the next tick tries again
             success: function (response) {

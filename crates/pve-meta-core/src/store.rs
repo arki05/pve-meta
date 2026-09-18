@@ -105,19 +105,17 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 /// diff. The alternative was a second write path beside the first, which is
 /// the shape of every wrong-result bug this project has had.
 ///
-/// Two things are *not* uniform, and both live outside this type: a registry
-/// document is governed by ACLs alone (`api::effective` gives it no scopes -- a
-/// permission file that could widen its own grants would be self-registration), and
-/// its content must additionally parse as the kind it claims to be, which
-/// `api::put_document` checks before writing. A node's prefix file is a registry
-/// document in both respects.
+/// One thing is *not* uniform, and lives outside this type: a registry
+/// document's content must additionally parse as the kind it claims to be,
+/// which `api::put_document` checks before writing. A node's prefix file is a
+/// registry document in that respect too.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
     Guest(u32),
-    /// A prefix or permission file, named `<name>.yaml` in its kind's directory.
-    /// The name is dotted segments (`crate::registry::is_valid_file_name`), so
-    /// it can never contain a slash or escape that directory.
+    /// A prefix file, named `<name>.yaml` in its kind's directory. The name
+    /// is dotted segments (`crate::registry::is_valid_file_name`), so it can
+    /// never contain a slash or escape that directory.
     Registry(RegistryKind, String),
     /// One node's prefix file, `<name>.yaml` in that node's prefix directory
     /// (`crate::registry::Registry::node_prefix_dir`) and nowhere else. With
@@ -135,8 +133,8 @@ impl DocId {
 }
 
 /// The id as the API spells it and as `parse_id` reads it back: `105`,
-/// `prefixes/<name>`, `permissions/<name>`, `nodes/<node>/prefixes/<name>`. The
-/// one string form of a document id, used on the wire and in error messages alike.
+/// `prefixes/<name>`, `nodes/<node>/prefixes/<name>`. The one string form of
+/// a document id, used on the wire and in error messages alike.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -159,8 +157,7 @@ pub struct Document {
     /// The parsed value, or the **empty document** when [`Document::parse_error`]
     /// is set. Comment keys (`foo__`) stay in it: the store holds the file, and
     /// what a caller sees of one is decided further up, by
-    /// [`crate::view::filter`], where [`crate::scopes::covers`] makes a scope on
-    /// `foo` cover `foo__` as well, and by [`crate::view::strip_comments`].
+    /// [`crate::view::strip_comments`].
     pub value: Value,
     /// `Some(message)` when the file's text is not valid YAML at all, in
     /// which case [`Document::value`] is the empty document
@@ -305,10 +302,10 @@ static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// The on-disk metadata store.
 ///
 /// Two things, not one: `root` holds the guest documents and
-/// the snapshot copies, and `registry` holds the prefix and permission
-/// drop-directory lists ([`DocId::Registry`]). Those lists are ordered lowest
-/// precedence first, exactly as [`Registry`] loads them, so the **last**
-/// entry of each is the one a write goes to -- the cluster directory, with
+/// the snapshot copies, and `registry` holds the prefix drop-directory list
+/// ([`DocId::Registry`]). That list is ordered lowest precedence first,
+/// exactly as [`Registry`] loads it, so the **last**
+/// entry is the one a write goes to -- the cluster directory, with
 /// the packaged one below it staying read-only. Writing a prefix whose name a
 /// packaged file already uses therefore creates the cluster override rather
 /// than editing the package's file, and deleting it falls back to the
@@ -335,11 +332,11 @@ impl MetaStore {
     /// Opens a store rooted at `root` (created on first write; does not need
     /// to exist yet), with the registry directories [`Registry::from_env`]
     /// would load -- the packaged and cluster defaults, or whatever
-    /// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS` say.
+    /// `PVE_META_PREFIX_DIRS` says.
     ///
-    /// Reading those two variables here, once, is deliberate: the alternative
-    /// is reading them again deeper in the call path, where a test (or a
-    /// caller that changed them between constructing a store and using it)
+    /// Reading that variable here, once, is deliberate: the alternative
+    /// is reading it again deeper in the call path, where a test (or a
+    /// caller that changed it between constructing a store and using it)
     /// would get a store whose reads and writes disagree about where a file
     /// lives. Tests that want their own directories pass them explicitly with
     /// [`MetaStore::with_registry_dirs`].
@@ -354,12 +351,8 @@ impl MetaStore {
     /// [`MetaStore::new`] with the registry directories given explicitly,
     /// lowest precedence first. For tests, and for any caller that already
     /// knows its directories and does not want the environment consulted.
-    pub fn with_registry_dirs(
-        root: impl Into<PathBuf>,
-        prefix_dirs: Vec<PathBuf>,
-        permission_dirs: Vec<PathBuf>,
-    ) -> Self {
-        MetaStore::with_registry(root, Registry::new(prefix_dirs, permission_dirs))
+    pub fn with_registry_dirs(root: impl Into<PathBuf>, prefix_dirs: Vec<PathBuf>) -> Self {
+        MetaStore::with_registry(root, Registry::new(prefix_dirs))
     }
 
     /// [`MetaStore::new`] with a [`Registry`] given directly, for a caller
@@ -412,10 +405,10 @@ impl MetaStore {
     }
 
     /// The [`Registry`] this store reads and writes registry documents
-    /// through, for a caller that needs the same directory lists (loading the
-    /// prefixes or permissions themselves, say) rather than a second,
-    /// independently-read copy. Behind [`MetaStore::check_available`], like every
-    /// other way into the store's files.
+    /// through, for a caller that needs the same directory list (loading the
+    /// prefixes themselves, say) rather than a second, independently-read
+    /// copy. Behind [`MetaStore::check_available`], like every other way into
+    /// the store's files.
     ///
     /// # Errors
     /// [`Error::Unavailable`].
@@ -945,10 +938,10 @@ impl MetaStore {
     /// [`MetaStore::version`], restricted to the one document a caller is
     /// actually watching.
     ///
-    /// `None` is the whole store. `Some(id)` covers `id`'s own file plus both
-    /// registry directories and nothing else, which is exactly what an open
-    /// editor needs: its document's content, and the prefixes and permissions
-    /// that decide how that content is rendered and who may write it.
+    /// `None` is the whole store. `Some(id)` covers `id`'s own file plus the
+    /// registry directory and nothing else, which is exactly what an open
+    /// editor needs: its document's content, and the prefixes that decide how
+    /// that content is rendered.
     ///
     /// The registry directories are still walked whole, because they are the
     /// unit of *shadowing*: a prefix appearing in the cluster directory
@@ -1028,7 +1021,7 @@ impl MetaStore {
                 node_dirs = self.registry.nodes()?;
             }
         }
-        for kind in [RegistryKind::PrefixDef, RegistryKind::Permission] {
+        for kind in [RegistryKind::PrefixDef] {
             for dir in self.registry.dirs(kind) {
                 // The full directory path, not just the kind: two directories
                 // of the same kind hold same-named files on purpose, and the

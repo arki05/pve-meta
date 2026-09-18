@@ -30,10 +30,10 @@
 //!
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
-//! `test/basic.pl`); the prefix and permission directories likewise with
-//! `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`, and the nodes directory
-//! holding each node's prefix files with `PVE_META_NODES_DIR`. A store under
-//! `/etc/pve` refuses every call while pmxcfs is not mounted (a `503:`), and
+//! `test/basic.pl`); the prefix directory likewise with
+//! `PVE_META_PREFIX_DIRS`, and the nodes directory holding each node's
+//! prefix files with `PVE_META_NODES_DIR`. A store under `/etc/pve` refuses
+//! every call while pmxcfs is not mounted (a `503:`), and
 //! `PVE_META_CLUSTER_MARKER` names the marker it checks instead
 //! (`MetaStore::new`).
 
@@ -130,29 +130,13 @@ mod pve_rs_meta {
 
     use pve_meta_core::api::{self, CallerAcl, GuestInput};
     use pve_meta_core::backup;
-    use pve_meta_core::registry::Permission;
-    use pve_meta_core::store::MetaStore;
 
     use super::{now_unix, open_store, run_dir, RollbackOutcome, Vmid};
 
-    /// Every grant (`docs/DESIGN.md` §4). Cluster-only on purpose: an
-    /// operator's `.deb` may ship a prefix but must never ship its own
-    /// grant. Read per request — the directory is tiny, pmxcfs caches it, and
-    /// a stale grant is a wrong answer about who may write.
-    ///
-    /// Goes through `store`'s own registry rather than reading
-    /// `PVE_META_PERMISSION_DIRS` again: `store` already read it once
-    /// (`MetaStore::new`), and a second, independent read of the same
-    /// variable is exactly the kind of state that only agreed with the
-    /// store's by coincidence.
-    fn open_permissions(store: &MetaStore) -> Result<Vec<Permission>, api::ApiError> {
-        Ok(store.registry()?.load_permissions()?)
-    }
-
-    // No `open_prefixes` counterpart: a prefix names no principal, so it never
-    // gates a read or write, and the two exports that read prefixes want
-    // different sets -- `api_prefixes` the listing with its failures,
-    // `api_put` the set for the guest's node (`api::effective_prefixes`).
+    // No `open_prefixes`: a prefix names no principal, so it never gates a
+    // read or write, and the two exports that read prefixes want different
+    // sets -- `api_prefixes` the listing with its failures, `api_put` the set
+    // for the guest's node (`api::effective_prefixes`).
 
     // -- snapshot hooks (`docs/DESIGN.md` §9) -----------------------------
     //
@@ -336,10 +320,10 @@ mod pve_rs_meta {
     //
     // `$acl` is a native hash: `{ authid, read, write, tags => [...], node }`,
     // where `read`/`write` are the PVE ACL answers for the document being
-    // addressed, `tags` are the guest's PVE tags, which resolve the
-    // registrations' selectors, and `node` is the guest's current node, whose
-    // prefix files join the packaged and cluster ones. Rust computes the
-    // caller's scopes from it.
+    // addressed and are the whole of access (`docs/DESIGN.md` §4), `tags` are
+    // the guest's PVE tags, which resolve a prefix's selector, and `node` is
+    // the guest's current node, whose prefix files join the packaged and
+    // cluster ones.
 
     /// `GET /meta/version` -> `{ token, changed }`, plus `documents`
     /// (`[{ id, digest }]`, sorted) when `$detail` is true.
@@ -358,27 +342,14 @@ mod pve_rs_meta {
         api::version(&open_store(), detail, id, node)
     }
 
-    /// `GET /meta/permissions` -> every permission, as native hashes, plus a
-    /// row for any file in the directory that failed to load -- named, with
-    /// `error` set, and nothing else -- so a hand-edit or a bad package
-    /// upgrade that broke a file is visible here instead of just in the log
-    /// (`docs/DESIGN.md` §1). This is the one export that reads
-    /// `Registry::list_permissions` rather than `open_permissions`: every
-    /// other export needs the parsed grants alone, because a file that did
-    /// not load must never grant anything.
-    #[export]
-    pub fn api_permissions() -> Result<Vec<api::PermissionEntry>, api::ApiError> {
-        let store = open_store();
-        let (permissions, failures) = store.registry()?.list_permissions()?;
-        Ok(api::permissions_list(&permissions, &failures))
-    }
-
     /// `GET /meta/prefixes` -> the cluster-wide prefixes, most-specific first;
     /// with `$node`, the prefixes in effect for a guest on that node; with `$all`
     /// (optional, trailing), every prefix file there is, each with its `origin`
-    /// (and `node`). Each plus a row for any file that failed to load. See
-    /// [`api_permissions`] -- the same reasoning. The caller has checked that
-    /// `$node` is in the cluster; Rust checks its shape, and refuses both at once.
+    /// (and `node`). Each plus a row for any file that failed to load -- named,
+    /// with `error` set, and nothing else -- so a hand-edit or a bad package
+    /// upgrade that broke a file is visible here instead of just in the log
+    /// (`docs/DESIGN.md` §1). The caller has checked that `$node` is in the
+    /// cluster; Rust checks its shape, and refuses both at once.
     #[export]
     pub fn api_prefixes(
         node: Option<&str>,
@@ -387,41 +358,40 @@ mod pve_rs_meta {
         api::prefixes(open_store().registry()?, node, all.unwrap_or(false))
     }
 
-    /// `GET /meta/schemas` -> `{ prefix, permission }`, the two registry file
-    /// formats described in the same dialect a prefix uses, so the editor
-    /// can show one as a typed tree.
+    /// `GET /meta/schemas` -> `{ prefix }`, the prefix file format described
+    /// in the same dialect a prefix uses, so the editor can show one as a
+    /// typed tree.
     #[export]
     pub fn api_schemas() -> Result<pve_meta_core::model::Value, Error> {
         Ok(api::schemas())
     }
 
-    /// `GET /meta/access` -> `{ read, write, scopes }` for one document,
-    /// with the permissions' selectors already resolved against `$acl`'s
-    /// tags. `$id` is a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>`
-    /// or `permissions/<name>`.
+    /// `GET /meta/access` -> `{ read, write }` for one document -- exactly
+    /// `$acl`'s own ACL answers (`docs/DESIGN.md` §4). `$id` is a vmid,
+    /// `prefixes/<name>` or `nodes/<node>/prefixes/<name>`; it is only parsed,
+    /// to give a 400 for a garbage id rather than an answer for a document
+    /// that could not exist.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, api::ApiError> {
-        let doc_id = api::parse_id(id)?;
-        Ok(api::access(&open_permissions(&open_store())?, &doc_id, &acl))
+        api::parse_id(id)?;
+        api::access(&open_store(), &acl)
     }
 
     /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already
-    /// has — `[{vmid, node, type, name, tags, read, write}]` — as a native
+    /// has — `[{vmid, node, type, name, tags, read}]` — as a native
     /// array of hashes. Rust never reads `.vmlist` or a guest config itself.
     #[export]
     pub fn api_list_guests(
-        authid: &str,
         guests: Vec<GuestInput>,
         has: Option<&str>,
     ) -> Result<Vec<api::GuestListEntry>, api::ApiError> {
-        let store = open_store();
-        api::list_guests(&store, &open_permissions(&store)?, authid, &guests, has)
+        api::list_guests(&open_store(), &guests, has)
     }
 
     /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
-    /// a vmid, `prefixes/<name>`, `nodes/<node>/prefixes/<name>` or
-    /// `permissions/<name>`). `$comments` (optional, trailing) keeps the comment
-    /// keys, which a read otherwise leaves out.
+    /// a vmid, `prefixes/<name>` or `nodes/<node>/prefixes/<name>`).
+    /// `$comments` (optional, trailing) keeps the comment keys, which a read
+    /// otherwise leaves out.
     #[export]
     pub fn api_get(
         id: &str,
@@ -430,9 +400,7 @@ mod pve_rs_meta {
         acl: CallerAcl,
         comments: Option<bool>,
     ) -> Result<api::ApiViewDocument, api::ApiError> {
-        let store = open_store();
-        let comments = comments.unwrap_or(false);
-        api::get_document(&store, &open_permissions(&store)?, id, view, format, comments, &acl)
+        api::get_document(&open_store(), id, view, format, comments.unwrap_or(false), &acl)
     }
 
     /// `PUT /meta/guests/{vmid}` and the registry documents' `PUT`.
@@ -467,7 +435,6 @@ mod pve_rs_meta {
         let prefixes = api::effective_prefixes(store.registry()?, &api::parse_id(id)?, &acl)?;
         api::put_document(
             &store,
-            &open_permissions(&store)?,
             &prefixes,
             id,
             view,
@@ -491,7 +458,6 @@ mod pve_rs_meta {
         digest: Option<&str>,
         acl: CallerAcl,
     ) -> Result<api::ApiPutResult, api::ApiError> {
-        let store = open_store();
-        api::delete_document(&store, &open_permissions(&store)?, id, view, digest, &acl)
+        api::delete_document(&open_store(), id, view, digest, &acl)
     }
 }

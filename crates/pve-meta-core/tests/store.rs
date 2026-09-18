@@ -22,7 +22,6 @@ fn store() -> (tempfile::TempDir, MetaStore) {
     let store = MetaStore::with_registry_dirs(
         dir.path(),
         vec![packaged_prefix_dir(dir.path()), cluster_prefix_dir(dir.path())],
-        vec![cluster_grant_dir(dir.path())],
     );
     (dir, store)
 }
@@ -33,10 +32,6 @@ fn packaged_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
 
 fn cluster_prefix_dir(root: &std::path::Path) -> std::path::PathBuf {
     root.join("registry/prefixes-cluster")
-}
-
-fn cluster_grant_dir(root: &std::path::Path) -> std::path::PathBuf {
-    root.join("registry/grants")
 }
 
 fn prefix(name: &str) -> DocId {
@@ -827,7 +822,7 @@ fn a_node_prefix_document_lives_where_the_loader_reads_or_nowhere() {
     assert!(!dir.path().join("nodes").exists(), "nothing was written inside the root");
 
     // With one, the store writes where the loader reads.
-    let registry = Registry::new(vec![cluster_prefix_dir(dir.path())], vec![])
+    let registry = Registry::new(vec![cluster_prefix_dir(dir.path())])
         .with_nodes_dir(dir.path().join("nodes"));
     let store = MetaStore::with_registry(dir.path(), registry);
     let written = store.put_raw(&good, "selector: {all: true}\n", None).unwrap();
@@ -887,24 +882,22 @@ fn a_directory_that_cannot_be_read_is_an_error_not_an_empty_one() {
     let dir = tempdir().unwrap();
     let not_a_dir = dir.path().join("file");
     std::fs::write(&not_a_dir, "").unwrap();
-    let store = MetaStore::with_registry_dirs(&not_a_dir, vec![], vec![]);
+    let store = MetaStore::with_registry_dirs(&not_a_dir, vec![]);
     assert!(matches!(store.stored_vmids(), Err(Error::Io(_))));
     assert!(matches!(store.list_snapshots(100), Err(Error::Io(_))));
     assert!(matches!(store.version(), Err(Error::Io(_))));
 
-    let store = MetaStore::with_registry_dirs(dir.path(), vec![not_a_dir.clone()], vec![not_a_dir.clone()]);
+    let store = MetaStore::with_registry_dirs(dir.path(), vec![not_a_dir.clone()]);
     let registry = store.registry().unwrap();
     assert!(matches!(registry.list_prefixes(PrefixSet::Cluster), Err(Error::Io(_))));
-    assert!(matches!(registry.load_permissions(), Err(Error::Io(_))));
     assert!(matches!(store.version(), Err(Error::Io(_))));
-    let nodes = Registry::new(vec![], vec![]).with_nodes_dir(&not_a_dir);
+    let nodes = Registry::new(vec![]).with_nodes_dir(&not_a_dir);
     assert!(matches!(nodes.nodes(), Err(Error::Io(_))));
 
     // And a missing one is still nothing at all.
     let gone = dir.path().join("gone");
-    let store = MetaStore::with_registry_dirs(&gone, vec![gone.clone()], vec![gone.clone()]);
+    let store = MetaStore::with_registry_dirs(&gone, vec![gone.clone()]);
     assert_eq!(store.stored_vmids().unwrap(), Vec::<u32>::new());
-    assert!(store.registry().unwrap().load_permissions().unwrap().is_empty());
     assert!(store.version().unwrap().documents.is_empty());
 }
 
@@ -923,6 +916,6 @@ fn one_entry_that_cannot_be_looked_at_costs_that_entry_not_the_answer() {
     let nodes = dir.path().join("nodes");
     std::fs::create_dir_all(nodes.join("pve1")).unwrap();
     std::os::unix::fs::symlink("pve2", nodes.join("pve2")).unwrap();
-    let names: Vec<String> = Registry::new(vec![], vec![]).with_nodes_dir(&nodes).nodes().unwrap().iter().map(|n| n.to_string()).collect();
+    let names: Vec<String> = Registry::new(vec![]).with_nodes_dir(&nodes).nodes().unwrap().iter().map(|n| n.to_string()).collect();
     assert_eq!(names, vec!["pve1"]);
 }

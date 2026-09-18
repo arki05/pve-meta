@@ -12,20 +12,15 @@
 //! **Schemas shadow; they never merge.** The most specific prefix covering a
 //! path governs it and no other contributes, so with `homelab` and
 //! `homelab.docker` both declared, `homelab`'s own `properties.docker` is
-//! never consulted for anything under `homelab.docker`. That is the opposite
-//! of how permissions nest ([`crate::scopes::Effective`] accumulates by
-//! containment) and the difference is the point: shape has one owner,
-//! access is a union. It is also why [`Shape::governing`] uses plain
-//! containment ([`Path::is_prefix_of`]) and deliberately not
-//! [`crate::scopes::covers`], which aliases the sibling comment key `p__`:
-//! that alias is a *permission* rule (whoever may write `p` may write the
-//! note about `p`), and with prefixes `a` and `a__` both declared, `covers`
-//! would have handed `a__`'s subtree to `a`.
+//! never consulted for anything under `homelab.docker`. That is why
+//! [`Shape::governing`] uses plain containment ([`Path::is_prefix_of`]): a
+//! comment key `a__` is its own prefix here, not `a`'s sibling note, so with
+//! prefixes `a` and `a__` both declared each governs only its own subtree.
 //!
-//! A registry document (a prefix or permission file) is shaped by its
-//! meta-schema instead, rooted at the document itself ([`Shape::rooted`]):
-//! the root prefix is a prefix of every path and the least specific of all,
-//! so it governs everything without a special case anywhere below.
+//! A registry document (a prefix file) is shaped by its meta-schema instead,
+//! rooted at the document itself ([`Shape::rooted`]): the root prefix is a
+//! prefix of every path and the least specific of all, so it governs
+//! everything without a special case anywhere below.
 
 use serde::{Deserialize, Serialize};
 
@@ -517,7 +512,7 @@ mod tests {
             (vec![all("homelab"), all("homelab.docker")], vec![], "homelab.docker", Some("homelab.docker"),
              "the child's own key is the child's, not the parent's"),
             (vec![all("a"), all("a__")], vec![], "a__.note", Some("a__"),
-             "plain containment: `a__` is its own prefix here, not `a`'s comment key -- that alias belongs to permissions"),
+             "plain containment: `a__` is its own prefix here, not `a`'s comment key"),
             (vec![all("a")], vec![], "a__", None,
              "... and without `a__` declared, `a` does not reach the comment key either"),
             (vec![tagged("traefik", "traefik"), all("homelab")], vec![], "traefik.spec", None,

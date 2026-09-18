@@ -27,17 +27,17 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
         me.vmid = me.vmid || sel.vmid;
         // This panel is ONE document's editor, named by `docId`: a guest's, or a
-        // prefix/permission file's -- they are all documents (DESIGN §6), so the
-        // same tree, markers, text editor and diff serve both, and the registry
-        // grids open one of these in a window rather than reimplementing any of it.
+        // prefix file's -- they are all documents (DESIGN §6), so the same tree,
+        // markers, text editor and diff serve both, and the registry grid opens one
+        // of these in a window rather than reimplementing any of it.
         //
         // Rows still carry their document's id even though there is only ever one:
         // it is what every write threads through, and a panel that had to remember
         // which document it was on top of which row was selected is how the digest of
         // one document ends up on a write to another.
         me.docId = me.docId || String(me.vmid);
-        // A registry document: no tags to resolve, no permissions to apply, and the
-        // meta-schema describes it instead of the prefixes.
+        // A registry document: no tags to resolve, and the meta-schema describes it
+        // instead of the prefixes.
         me.registryDoc = me.docKind(me.docId) !== 'guest';
         // Start fetching the core now rather than at the first document read: the
         // registry grids open their dialogs before that read lands, and a validator
@@ -50,9 +50,12 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // derives it whenever the shown document changes; a write clears it.
         me.pending = PVE.meta.EditSet.empty();
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
-        me.access = { read: 1, write: 0, scopes: [] };
+        me.access = { read: 1, write: 0 };
         me.prefixes = [];
-        me.permissions = [];
+        // Not sourced from anywhere any more: `GET /meta/access` carried the
+        // guest's tags alongside the access answer, and that answer is now just
+        // `{ read, write }` (DESIGN §4). A tag-selected prefix therefore cannot be
+        // resolved here until something else supplies the guest's tags.
         me.tags = [];
         me.token = null;
         me.editing = false; // a row editor is open
@@ -146,15 +149,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let me = this;
         return [
             {
-                // The permission-document twin of Declare Key, and hidden by the same
-                // rule: a missing concept elsewhere, not a missing permission.
-                text: gettext('Add Rule'),
-                itemId: 'ruleBtn',
-                iconCls: 'fa fa-key',
-                hidden: true,
-                handler: () => me.addRule(),
-            },
-            {
                 text: gettext('Add'),
                 itemId: 'addBtn',
                 iconCls: 'fa fa-plus',
@@ -190,7 +184,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             {
                 // Only ever shown on a prefix document, where declaring a key is a
                 // thing you can do; hidden everywhere else rather than disabled, since
-                // on a guest tab it is not a missing permission but a missing concept.
+                // on a guest tab it is not disallowed but a missing concept.
                 text: gettext('Declare Key'),
                 itemId: 'declareBtn',
                 iconCls: 'fa fa-tag',
@@ -427,38 +421,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     return fade(rec, Ext.htmlEncode(value || ''));
                 },
             },
-            {
-                // Permissions reach guest documents only (DESIGN §4), so on anything
-                // else this column can only ever be blank.
-                hidden: me.docKind(me.docId) !== 'guest',
-                text: gettext('Access'),
-                dataIndex: 'accessText',
-                flex: 2,
-                renderer: function (value, meta, rec) {
-                    let list = rec.data.accessList || [];
-                    if (!list.length) {
-                        return '';
-                    }
-                    tip(
-                        meta,
-                        list
-                            .map((a) =>
-                                Ext.htmlEncode(a.name + ' (' + a.mode + ', ' + a.selector + ')'),
-                            )
-                            .join('<br>'),
-                    );
-                    return fade(
-                        rec,
-                        list
-                            .map((a) =>
-                                a.mode === 'ro'
-                                    ? '<span class="faded">' + Ext.htmlEncode(a.name) + ' (ro)</span>'
-                                    : Ext.htmlEncode(a.name),
-                            )
-                            .join(', '),
-                    );
-                },
-            },
         ];
     },
 
@@ -652,8 +614,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // What describes this document's shape (`PVE.meta.Shape`). A guest document is
     // described by the prefixes that reach it, most-specific first (they shadow); a
-    // prefix or permission file by the one meta-schema for its kind, rooted at the
-    // document itself. One function, every caller that needs it -- the row builder, the row
+    // prefix file by the one meta-schema for its kind, rooted at the document itself.
+    // One function, every caller that needs it -- the row builder, the row
     // markers, the text editor's squiggles and hovers, and the warning banner Apply
     // shows -- so they cannot disagree about what describes the document.
     //
@@ -676,17 +638,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // What a document's Shape is built from. A guest's: the prefix listing and the
-    // guest's tags (the server resolved the selectors it enforces; these tags are for
-    // the rendering decisions the client makes on top, and the client only ever
-    // matches tags it was given, DESIGN §12). A registry file's: the meta-schema for
-    // its kind.
+    // guest's tags (see `me.tags` above -- always empty for now). A registry file's:
+    // the meta-schema for its kind.
     shapeInputs: function (id) {
         let me = this;
         let kind = me.docKind(id);
         if (kind === 'guest') {
             return [me.prefixes, me.tags];
         }
-        if (kind === 'prefix' || kind === 'permission') {
+        if (kind === 'prefix') {
             return [(me.schemas || {})[kind]];
         }
         return [];
@@ -697,7 +657,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (kind === 'guest') {
             return PVE.meta.Shape.of(inputs[0], inputs[1]);
         }
-        if (kind === 'prefix' || kind === 'permission') {
+        if (kind === 'prefix') {
             return PVE.meta.Shape.rooted(inputs[0]);
         }
         return PVE.meta.Shape.empty();
@@ -756,19 +716,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             }
         };
         let target = me.addTarget();
-        // A permission file has three keys and the parser refuses a fourth
-        // (`deny_unknown_fields`), so an arbitrary Add can only ever produce a file
-        // the loader would skip: the one thing you add to one is a rule, and Add Rule
-        // is that. On a prefix definition Add stays, because `schema` holds whatever
-        // you declare -- but its *root* keys are fixed the same way, so Add there is
-        // disabled until you are somewhere it means something.
+        // On a prefix definition Add is disabled at its root: `schema` holds
+        // whatever you declare, but the document's own top-level keys are fixed.
         let kind = me.docKind(me.docId);
-        let addBtn = me.down('#addBtn');
-        if (addBtn) {
-            addBtn.setHidden(kind === 'permission');
-        }
         let fixedRoot = kind === 'prefix' && target && target.path === '';
-        set('addBtn', text || !target || fixedRoot || !me.editableFor(target.path));
+        set('addBtn', text || !target || fixedRoot || !me.editableFor());
         let row = d;
         set('editBtn', text || !row || !row.editable);
         set('removeBtn', text || !row || !row.present || !row.editable);
@@ -779,12 +731,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let dflt = me.down('#defaultBtn');
         if (dflt) {
             // Disabled, not hidden. What varies per *document* may hide (Declare Key
-            // is a missing concept on a guest, not a missing permission); what varies
-            // per *row* must not, or the buttons beside it shift under the pointer
-            // every time the selection changes -- which is how you click Remove and
-            // hit something else.
-            // Hidden entirely when nothing in this document declares a default --
-            // a permission file never can, so the button was pure furniture there.
+            // is a missing concept on a guest); what varies per *row* must not, or the
+            // buttons beside it shift under the pointer every time the selection
+            // changes -- which is how you click Remove and hit something else.
+            // Hidden entirely when nothing in this document declares a default.
             // Disabled, not hidden, when the document has defaults but this row is
             // not one of them: that varies per row, and a button that moves under
             // the pointer is how you aim for one thing and hit another.
@@ -806,11 +756,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // The Text toggle's enabled state depends on staged edits too, and this is
         // the function that runs whenever those change.
         me.syncAccessLabel();
-        let rule = me.down('#ruleBtn');
-        if (rule) {
-            rule.setHidden(me.docKind(me.docId) !== 'permission');
-            rule.setDisabled(text || !me.editableFor(''));
-        }
         let declare = me.down('#declareBtn');
         if (declare) {
             // Hidden by the *document*, disabled by the *row* -- the rule above. Hidden
@@ -834,15 +779,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
         PVE.meta.Footer.sync(me, {
             // In text mode the buffer is the edit, and Apply is offered whenever the
-            // caller may write at all -- the diff is what decides if it is worth it.
-            //
-            // "At all" means any rw scope, not full write access. A whole-document
-            // write is authorized by what it changes (DESIGN §5), so a principal
-            // holding `rw` on one prefix can perfectly well apply a buffer whose only
-            // changes are inside it -- and the server refuses the rest, naming the path
-            // it refused. Requiring full write here disabled the button for exactly the
-            // callers this view is most useful to.
-            canApply: textMode ? PVE.meta.Access.hasAnyWrite(me.access) : me.isDirty(),
+            // document is writable (DESIGN §4) -- the diff is what decides if it is
+            // worth it.
+            canApply: textMode ? !!me.access.write : me.isDirty(),
             // The same count in both views: the buffer is rendered from the planned
             // document, so those staged edits are in it. Showing it only in the tree
             // made switching to Text look like it had dropped them.
@@ -854,8 +793,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // The label is a restriction notice, so it says nothing at all for a caller with
-    // full write access (DESIGN §12).
+    // The label is a read-only notice, so it says nothing at all for a caller who
+    // may write (DESIGN §4).
     syncAccessLabel: function () {
         let me = this;
         let modeBtn = me.down('#modeBtn');
@@ -876,17 +815,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             );
         }
         if (modeBtn && modeBtn.items.getAt(1)) {
-            // The Text card is the whole document at the root view, and a scope-only
-            // principal may not read that at all (DESIGN §5): do not offer it. Staged
-            // edits are no longer a reason to refuse -- the buffer is rendered from the
-            // planned document, so they are *in* it, and switching back turns whatever
-            // was typed into staged edits again.
             modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
-        // A Text-mode Apply is a root replace, which needs full write and nothing else
-        // (DESIGN §5, `authorize_view_write`). Without this a read-only caller could
-        // compose a whole document, open the diff, tick through the schema warning and
-        // collect a 403 at the very end -- the server was right, the button was a lie.
         me.syncFooter();
         let label = me.down('#accessText');
         if (!label) {
@@ -896,73 +826,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             label.setVisible(false);
             return;
         }
-        // The core's rule, the same one the footer's Apply asks for. Deciding it
-        // again here is how a label and a button come to disagree.
-        let scoped = PVE.meta.Access.hasAnyWrite(me.access);
-        label.setText(scoped ? gettext('Scoped write access') : gettext('Read-only'));
+        label.setText(gettext('Read-only'));
         label.setVisible(true);
     },
 
     // --- rows ---------------------------------------------------------------
 
-    // `shapeFor` (the prefixes that reach this guest) and `applicablePermissions`
-    // (the rules that do) both resolve `selector: { tag: t }` against `me.tags`,
-    // which `GET /meta/access` fills in only for a caller with VM.Audit (DESIGN §8).
-    // That is not a gap here: this is a guest tab, and a caller without VM.Audit
-    // on `/vms/<vmid>` never sees the guest in the resource tree at all
-    // (`PVE::API2::Cluster::resources` skips it), so no reachable caller of this
-    // panel has tags we cannot read. A scope-only principal is still bound by
-    // its permissions -- they are enforced server-side, on the API it actually uses.
-
-    // The permission rules that reach this guest, with the file each came from.
-    // Permissions decide *access*, and unlike prefixes they accumulate by
-    // containment: a rule on `homelab` covers `homelab.docker` (DESIGN section 4).
-    // The core answers from the listing and this guest's tags, the same way the
-    // server computes a caller's scopes, and a file that did not load grants nothing.
-    applicablePermissions: function () {
-        let me = this;
-        if (me.registryDoc) {
-            return []; // permissions apply to guest documents only
-        }
-        return PVE.meta.Access.rulesReaching(me.permissions, me.tags);
-    },
-
-    // Every rule whose prefix covers this row, `rw` first. Several principals
-    // may read a subtree; this is about who writes and who subscribes, not ownership.
-    accessFor: function (path, scopes) {
-        let U = PVE.meta.Utils;
-        let out = [];
-        // Registration names are operator-chosen strings, so no plain `{}` here.
-        let seen = Object.create(null);
-        scopes.forEach(function (s) {
-            if (!PVE.meta.Access.covers(s.prefix, path)) {
-                return;
-            }
-            let name = s.name || s.authid || '';
-            let mode = s.mode === 'ro' ? 'ro' : 'rw';
-            let key = name + '\u0000' + mode;
-            if (seen[key]) {
-                return;
-            }
-            seen[key] = true;
-            out.push({
-                name: name,
-                mode: mode,
-                selector: U.selectorText(s.selector),
-                prefix: s.prefix,
-            });
-        });
-        out.sort((a, b) => (a.mode === b.mode ? 0 : a.mode === 'rw' ? -1 : 1));
-        return out;
-    },
-
-    accessSummary: (list) => list.map((a) => a.name + (a.mode === 'ro' ? ' (ro)' : '')).join(', '),
-
-    // Nothing is editable before the core has arrived: `syncButtons` runs on
-    // render, ahead of the first load, and a row that cannot be judged yet is a
-    // row that cannot be edited yet.
-    editableFor: function (path) {
-        return PVE.meta.Core.loaded() && PVE.meta.Access.canWrite(this.access, path);
+    // Rows are editable iff the document is: PVE's ACLs are the whole access model
+    // now (DESIGN §4), so nothing is computed per path.
+    editableFor: function () {
+        return !!(this.access && this.access.write);
     },
 
     // The document and the grammars are two sources for the same rows, so merge them
@@ -1040,8 +913,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     //
     // Two things, from the one Shape. Every prefix that reaches the document gets a
     // row: declaring a prefix *is* a statement about the document -- "something of
-    // mine lives at this key" -- and it is the statement the whole permission model
-    // is written in terms of. Hiding the row until someone had already put content
+    // mine lives at this key". Hiding the row until someone had already put content
     // there meant a prefix that applied to every guest was invisible on every guest
     // that had not used it yet, which reads as "netbird is missing" rather than
     // "netbird is empty". Then every path a schema declares gets its declared type,
@@ -1227,10 +1099,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     buildTree: function () {
         let me = this;
         let I = PVE.meta.Icons;
-        // Permissions reach guest documents only, so the Access
-        // column is empty on the datacenter tab by construction (DESIGN §4).
-        let scopes = me.applicablePermissions();
-
         let findings = me.findingsFor();
         // What is staged, by path, so a changed row can show `stored -> pending`.
         let staged = Object.create(null);
@@ -1276,7 +1144,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     if (c.defaultValue !== undefined) {
                         me.hasDefaults = true;
                     }
-                    let access = me.accessFor(c.path, scopes);
                     let node = {
                         key: key,
                         text: key,
@@ -1298,8 +1165,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         addressable: c.addressable !== false,
                         rawItem: c.rawItem,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
-                        accessList: access,
-                        accessText: me.accessSummary(access),
                         finding: findings[c.path] || '',
                         pending: (function () {
                             if (c.pendingDelete) {
@@ -1335,7 +1200,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                             let v = PVE.meta.Utils.valueAt(storedDoc, c.path);
                             return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
                         })(),
-                        editable: me.editableFor(c.path),
+                        editable: me.editableFor(),
                         leaf: kind !== 'map' && !Object.keys(c.children).length,
                     };
                     if (kind === 'map' || Object.keys(c.children).length) {
@@ -1351,7 +1216,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         };
 
         // Does anything in this document declare a default? If not, "Set to default"
-        // is furniture -- a permission file can never have one.
+        // is furniture.
         me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
@@ -1481,11 +1346,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         //
         // `writeView` steps up a level for a delete, because you cannot remove a key by
         // replacing it -- and for a *top-level* key that step lands on the document
-        // root. A root replace is not required for permission reasons -- the server
-        // authorizes a write by what it changes -- but the narrower `DELETE
-        // ?view=traefik` stays anyway, because it is the smaller write: it names one
-        // subtree instead of the whole document, so it collides with less, and it does
-        // not require the caller to be able to send back every key it did not touch.
+        // root. The narrower `DELETE ?view=traefik` is preferred anyway, because it is
+        // the smaller write: it names one subtree instead of the whole document, so it
+        // collides with less, and it does not require the caller to be able to send
+        // back every key it did not touch.
         let onlyDelete =
             me.pending.length === 1 && me.pending.edits[0].op === 'delete' && me.pending.edits[0].path;
         // `force` is what the warned dialog's Apply sends: the "Save anyway" tick.
@@ -1594,16 +1458,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.stage(rec.data.path, 'set', rec.data.defaultValue);
     },
 
-    // Appending to a list. A rule list gets the rule form, because that is the list
-    // worth having a form for; anything else asks for a value, since a member of a
-    // list has no name to give it.
+    // Appending to a list. A member of a list has no name to give it, so this asks
+    // for a value.
     addListMember: function (path) {
         let me = this;
         let list = me.listAt(path);
-        if (path === 'rules' && me.docKind(me.docId) === 'permission') {
-            me.addRule();
-            return;
-        }
         me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
             _path,
             value,
@@ -1612,56 +1471,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // Editing one member of a list. Three cases, in the order they are worth having:
-    // a permission rule gets its own form (it is the list anyone actually edits), a
-    // scalar gets the ordinary value editor, and anything else with structure gets
-    // the text editor on the list it is in -- which is where it was before lists had
-    // rows at all, so nothing is lost.
+    // Editing one member of a list: a scalar gets the ordinary value editor, and
+    // anything else with structure gets the text editor on the list it is in --
+    // which is where it was before lists had rows at all, so nothing is lost.
     editListMember: function (rec) {
         let me = this;
         let d = rec.data;
         let item = d.rawItem;
-        let isRule =
-            item &&
-            typeof item === 'object' &&
-            Object.prototype.hasOwnProperty.call(item, 'prefix') &&
-            Object.prototype.hasOwnProperty.call(item, 'mode');
-        if (isRule) {
-            me.openEditor(
-                'PVE.meta.AddRuleWindow',
-                { title: gettext('Edit Rule'), prefixes: me.prefixes, rule: item },
-                'addrule',
-                function (rules) {
-                    // The form appends to what it was given; for an edit it was given
-                    // nothing, so the one rule it produced replaces this member.
-                    me.stageListMember(d.path, d.arrayIndex, rules[rules.length - 1]);
-                },
-            );
-            return;
-        }
         if (item !== null && typeof item === 'object') {
             me.editAsText(rec);
             return;
         }
         me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
             me.stageListMember(d.path, d.arrayIndex, value),
-        );
-    },
-
-    // Append one rule to this permission file. The prefix combobox is filled from
-    // the declared prefixes, which is the list an administrator is choosing from
-    // nine times in ten -- but it stays editable, because a rule and a prefix
-    // definition are independent files and neither waits for the other.
-    addRule: function () {
-        let me = this;
-        if (me.docKind(me.docId) !== 'permission') {
-            return;
-        }
-        me.openEditor(
-            'PVE.meta.AddRuleWindow',
-            { prefixes: me.prefixes, existing: me.plannedData().rules },
-            'addrule',
-            (rules) => me.stage('rules', 'set', rules),
         );
     },
 

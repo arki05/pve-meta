@@ -1,9 +1,9 @@
 // ---------------------------------------------------------------------------
-// One document in a window — what a registry grid opens.
+// One document in a window — what the registry grid opens.
 //
 // It is the ordinary editor panel, unchanged: tree, row editors, markers, the
-// Tree | Text toggle, the diff. A prefix definition or a permission file is a document
-// (DESIGN §6), so "edit one" was never a thing that needed its own editor.
+// Tree | Text toggle, the diff. A prefix definition is a document (DESIGN §6), so
+// "edit one" was never a thing that needed its own editor.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DocumentWindow', {
@@ -14,7 +14,7 @@ Ext.define('PVE.meta.DocumentWindow', {
     width: 860,
     height: 560,
     layout: 'fit',
-    // configs: docId ('prefixes/<name>', 'nodes/<node>/prefixes/<name>' or 'permissions/<name>')
+    // configs: docId ('prefixes/<name>' or 'nodes/<node>/prefixes/<name>')
 
     initComponent: function () {
         let me = this;

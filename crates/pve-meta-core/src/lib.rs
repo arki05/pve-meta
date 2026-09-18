@@ -6,8 +6,8 @@
 //! hooks, `stored_vmids` and the `api_*` functions backing
 //! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8); and
 //! `crates/pve-meta-wasm`, the browser build the editor asks for the codec,
-//! the path rules, [`scopes::Effective`], [`shape::Shape`] and
-//! [`edit::EditSet`]. There is no daemon and no CLI.
+//! the path rules, [`shape::Shape`] and [`edit::EditSet`]. There is no daemon
+//! and no CLI.
 //!
 //! No networking, no async, no PVE-specific crates. Builds and passes tests
 //! on macOS and Linux, and builds for `wasm32-unknown-unknown` (the
@@ -49,16 +49,10 @@
 //! - [`metaschema`] — the two registry file formats, written as schemas in the
 //!   same dialect a prefix uses, so the editor can show a prefix or grant
 //!   file as a typed tree (`docs/DESIGN.md` §6).
-//! - [`registry`] — the two drop-directories: **prefixes**
-//!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which
-//!   say what a prefix is and carry its schema, and **grants**
-//!   (`/etc/pve/meta.d/permissions`, cluster-only), which say who may touch one
-//!   (`docs/DESIGN.md` §4). They nest by opposite rules: prefixes shadow
-//!   most-specific-first ([`shape::Shape::governing`]), grants accumulate by
-//!   containment ([`registry::scopes_for`]).
-//! - [`scopes`] — [`scopes::Effective`], a principal's effective access to one
-//!   document: the PVE ACL answers plus the grant scopes whose selector
-//!   matches the guest.
+//! - [`registry`] — the prefix drop-directories
+//!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which say
+//!   what a prefix is and carry its schema, shadowing most-specific-first
+//!   ([`shape::Shape::governing`]) (`docs/DESIGN.md` §3).
 //! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
 //!   alias) returned throughout this crate.
 //!
@@ -189,7 +183,6 @@ pub mod model;
 pub mod patch;
 pub mod path;
 pub mod registry;
-pub mod scopes;
 pub mod shape;
 pub mod store;
 pub mod view;

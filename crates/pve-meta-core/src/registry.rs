@@ -1,10 +1,9 @@
-//! The two drop directories: **prefixes** (what a prefix is) and **grants**
-//! (who may touch one) — `docs/DESIGN.md` §3, §4.
+//! The prefix drop directory: what a prefix is and which guests it reaches
+//! (`docs/DESIGN.md` §3).
 //!
-//! Both live outside the documents, one file each, parsed strictly and
-//! independently: a malformed file is skipped with a warning and contributes
-//! nothing, and never affects another file. That isolation is the whole
-//! reason this data left `datacenter.yaml`.
+//! Each file is parsed strictly and independently: a malformed file is
+//! skipped with a warning and contributes nothing, and never affects another
+//! file. That isolation is the whole reason this data left `datacenter.yaml`.
 //!
 //! # Prefixes
 //!
@@ -33,8 +32,8 @@
 //! cluster file of its name whole, like a cluster file shadows a packaged one;
 //! between different names the one composition there is stays the
 //! most-specific-prefix rule, so a cluster `gpu` and a node `gpu.devices` both
-//! apply. Another node's files do not exist for that guest at all. There is no
-//! node-level permissions directory: access is the cluster's alone.
+//! apply. Another node's files do not exist for that guest at all. Access is
+//! PVE's ACLs alone (`docs/DESIGN.md` §4): a prefix names no principal.
 //!
 //! **The file name is the prefix.** `homelab.docker.yaml` declares the prefix
 //! `homelab.docker`, so a definition and its prefix are one thing and there is
@@ -57,38 +56,9 @@
 //! definition is only the "give this one a bit more structure" piece, for the
 //! operators and hook scripts that want it.
 //!
-//! # Effective
-//!
-//! * `/etc/pve/meta.d/permissions/<name>.yaml` — cluster only. **There is
-//!   deliberately no packaged permissions directory**: an operator's `.deb` may ship
-//!   a prefix definition (what it expects) but must never ship its own grant,
-//!   which would be self-registration. dpkg cannot write into pmxcfs, so "an operator
-//!   declares what it expects; only an administrator grants it" is enforced by
-//!   where files live rather than by a rule.
-//!
-//! ```yaml
-//! # permissions/traefik.yaml
-//! authid: svc@pve!traefik
-//! rules:
-//!   - prefix: traefik
-//!     mode: rw
-//!     selector: { tag: traefik }
-//! ```
-//!
-//! # The two nesting rules are opposites, deliberately
-//!
-//! [`crate::shape::Shape::governing`]: **most-specific wins, schemas never
-//! merge.** The longest declared prefix covering a path governs it; no other
-//! contributes.
-//!
-//! [`scopes_for`]: **permissions accumulate by containment.** A grant on `homelab`
-//! covers `homelab.docker`, because "you may write `homelab`" not implying its
-//! subtree would be surprising.
-//!
-//! Shape has one owner, so it shadows; permission is a union, so it adds. Those
-//! two rules cannot live on one object, which is why a prefix and a permission
-//! are two concepts, not one (see
-//! `docs/decisions/001-prefix-and-permission-are-two-concepts.md`).
+//! [`crate::shape::Shape::governing`] is the one nesting rule: **most-specific
+//! wins, schemas never merge.** The longest declared prefix covering a path
+//! governs it; no other contributes.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -100,7 +70,6 @@ use crate::error::{Error, Result};
 use crate::format::{self, Format};
 use crate::model::Value;
 use crate::path::Path;
-use crate::scopes::{Mode, Scope};
 use crate::store::gone_is_none;
 
 /// The packaged prefix directory.
@@ -108,14 +77,10 @@ pub const PREFIX_PACKAGED_DIR: &str = "/usr/share/pve-meta/prefixes";
 /// The cluster-wide prefix directory (pmxcfs); overrides
 /// [`PREFIX_PACKAGED_DIR`] by file name.
 pub const PREFIX_CLUSTER_DIR: &str = "/etc/pve/meta.d/prefixes";
-/// The permissions directory. Cluster only, on purpose — see the module docs.
-pub const PERMISSION_CLUSTER_DIR: &str = "/etc/pve/meta.d/permissions";
 
 /// Environment variable overriding the prefix directories with a
 /// colon-separated list, lowest precedence first. Tests and `test/basic.pl`.
 pub const PREFIX_DIRS_ENV: &str = "PVE_META_PREFIX_DIRS";
-/// Environment variable overriding the permissions directories, likewise.
-pub const PERMISSION_DIRS_ENV: &str = "PVE_META_PERMISSION_DIRS";
 /// The cluster's per-node directories (pmxcfs). A node's prefix files are
 /// `<this>/<node>/meta.d/prefixes/<prefix>.yaml`, next to the node's guest
 /// configs, and pmxcfs replicates them like everything else in `/etc/pve`.
@@ -124,23 +89,21 @@ pub const NODES_DIR: &str = "/etc/pve/nodes";
 /// directory is read or written at all. Tests and `test/basic.pl`.
 pub const NODES_DIR_ENV: &str = "PVE_META_NODES_DIR";
 
-/// Which of the two drop directories a [`crate::store::DocId::Registry`] document lives in
-/// .
+/// Which drop directory a [`crate::store::DocId::Registry`] document lives in.
+/// One kind today; the type stays so a document id keeps its `<kind>/<name>`
+/// shape if a second registry kind is ever added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RegistryKind {
     /// A prefix: what a prefix is ([`PrefixDef`]).
     PrefixDef,
-    /// A permission file: who may touch one ([`Permission`]).
-    Permission,
 }
 
 impl RegistryKind {
     /// The kind's wire name, and the first segment of a registry document's
-    /// API id: `prefixes` / `permissions`.
+    /// API id: `prefixes`.
     pub fn as_str(&self) -> &'static str {
         match self {
             RegistryKind::PrefixDef => "prefixes",
-            RegistryKind::Permission => "permissions",
         }
     }
 }
@@ -185,8 +148,8 @@ impl Selector {
         }
     }
 
-    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`,
-    /// `GET /meta/permissions`), which is [`Selector`]'s own serialization
+    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`),
+    /// which is [`Selector`]'s own serialization
     /// after a trip through Perl -- where `true` becomes `1`. That is the one
     /// tolerance here; the rule ("exactly one of `all: true` or `tag: <name>`")
     /// is [`parse_selector`]'s, applied unchanged, so a file and a listing
@@ -291,37 +254,6 @@ pub enum Origin {
     Node,
 }
 
-/// One `rules:` entry.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Rule {
-    /// The key-path prefix, any depth. Non-empty.
-    pub prefix: Path,
-    /// What it grants.
-    pub mode: Mode,
-    /// Which guests it applies to.
-    pub selector: Selector,
-}
-
-/// One grants file: what a principal may touch.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Permission {
-    /// The file's base name without the extension — the override key.
-    pub name: String,
-    /// The PVE user or token id this grant is for.
-    pub authid: String,
-    /// A human description, for the UI.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// What it grants.
-    pub rules: Vec<Rule>,
-    /// Which directory this one was read from. Always `Cluster` today: there is
-    /// no packaged permissions directory, deliberately (see the module docs).
-    pub origin: Origin,
-    /// `true` when it displaced a same-named file from a lower-precedence
-    /// directory. Always `false` while there is only one permissions directory.
-    pub overrides: bool,
-}
-
 /// A file in a registry directory that did not load: unreadable, or not
 /// valid as the kind it lives in (a bad `selector`, an unknown field, text
 /// that is not YAML at all). Silently dropping this -- what `load_dirs`
@@ -335,8 +267,8 @@ pub struct Permission {
 ///
 /// `yaml_files` has already filtered to names [`is_valid_file_name`] accepts
 /// before `load_dirs` calls the parser at all, so `name` here is always
-/// something `GET /meta/prefixes/{name}` or `GET /meta/permissions/{name}`
-/// can open -- never a name a hand-edit made unaddressable in the first place.
+/// something `GET /meta/prefixes/{name}` can open -- never a name a hand-edit
+/// made unaddressable in the first place.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegistryFailure {
     /// The file name without `.yaml`, which for a prefix IS the prefix.
@@ -382,25 +314,6 @@ fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option
             )))
         }
     })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawPermission {
-    authid: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    rules: Vec<RawRule>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawRule {
-    prefix: String,
-    mode: String,
-    #[serde(default)]
-    selector: Option<RawSelector>,
 }
 
 #[derive(Deserialize)]
@@ -526,48 +439,6 @@ fn check_schema_dialect(name: &str, at: &str, node: &Value) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// `true` if `s` is a PVE realm (or token sub-id):
-/// `[A-Za-z][A-Za-z0-9.\-_]+` — `PVE::Auth::Plugin`'s `$realm_regex`, which
-/// also backs `PVE::AccessControl`'s `$token_subid_regex`.
-fn is_realm(s: &str) -> bool {
-    let mut chars = s.chars();
-    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
-        return false;
-    }
-    let rest = chars.as_str();
-    !rest.is_empty()
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-}
-
-/// `true` if `s` is a PVE authid: `user@realm`, optionally `!tokenid`.
-///
-/// `PVE::AccessControl`'s `$userid_or_token_regex` transliterated. The user
-/// part may itself contain `@`, so the split is tried from the right — the
-/// same answer Perl's greedy match gives.
-pub fn is_authid(s: &str) -> bool {
-    for (at, _) in s.rmatch_indices('@') {
-        let (user, tail) = (&s[..at], &s[at + 1..]);
-        if user.is_empty()
-            || user
-                .chars()
-                .any(|c| c.is_whitespace() || c == ':' || c == '/')
-        {
-            continue;
-        }
-        // A realm cannot contain `!`, so the first one starts the token id.
-        let ok = match tail.split_once('!') {
-            Some((realm, subid)) => is_realm(realm) && is_realm(subid),
-            None => is_realm(tail),
-        };
-        if ok {
-            return true;
-        }
-    }
-    false
 }
 
 /// The selector an entry declares. Absent is an error: which guests something
@@ -712,55 +583,6 @@ pub fn parse_prefix(name: &str, text: &str) -> Result<PrefixDef> {
     })
 }
 
-/// Parses one grants file. `name` is the file's base name (the override key).
-///
-/// # Errors
-/// As [`parse_prefix`].
-pub fn parse_permission(name: &str, text: &str) -> Result<Permission> {
-    let value = format::parse_raw(Format::Yaml, text)?;
-    let raw: RawPermission = serde_json::from_value(value).map_err(|e| bad(format!("{name}: {e}")))?;
-
-    if !is_authid(&raw.authid) {
-        return Err(bad(format!(
-            "{name}: 'authid' ({}) is not a PVE user or token id (user@realm, optionally !tokenid)",
-            raw.authid
-        )));
-    }
-
-    let mut rules = Vec::with_capacity(raw.rules.len());
-    for (i, g) in raw.rules.into_iter().enumerate() {
-        let where_ = format!("{name}: rules.{i}");
-        let prefix = Path::parse(&g.prefix)
-            .map_err(|_| bad(format!("{where_}: invalid prefix '{}'", g.prefix)))?;
-        if prefix.is_root() {
-            return Err(bad(format!(
-                "{where_}: 'prefix' must not be empty (whole-document access comes \
-                 from PVE ACLs, never from a permission)"
-            )));
-        }
-        let mode = match g.mode.as_str() {
-            "ro" => Mode::Ro,
-            "rw" => Mode::Rw,
-            other => {
-                return Err(bad(format!(
-                    "{where_}: invalid mode '{other}' (expected 'ro' or 'rw')"
-                )))
-            }
-        };
-        let selector = parse_selector(&where_, g.selector)?;
-        rules.push(Rule { prefix, mode, selector });
-    }
-
-    Ok(Permission {
-        origin: Origin::Cluster,
-        overrides: false,
-        name: name.to_string(),
-        authid: raw.authid,
-        description: raw.description,
-        rules,
-    })
-}
-
 fn dirs_from(env: &str, defaults: &[&str]) -> Vec<PathBuf> {
     match std::env::var_os(env) {
         Some(v) => std::env::split_paths(&v)
@@ -775,11 +597,6 @@ pub fn prefix_dirs() -> Vec<PathBuf> {
     dirs_from(PREFIX_DIRS_ENV, &[PREFIX_PACKAGED_DIR, PREFIX_CLUSTER_DIR])
 }
 
-/// The permissions directories. One, and cluster-only — see the module docs.
-pub fn permission_dirs() -> Vec<PathBuf> {
-    dirs_from(PERMISSION_DIRS_ENV, &[PERMISSION_CLUSTER_DIR])
-}
-
 /// The nodes directory, from [`NODES_DIR_ENV`] or [`NODES_DIR`]. `None` when
 /// the variable is set to nothing: no node directory is read.
 pub fn nodes_dir() -> Option<PathBuf> {
@@ -791,24 +608,23 @@ pub fn nodes_dir() -> Option<PathBuf> {
 }
 
 /// Owns the drop-directory lists. Everything that needs to know where a
-/// prefix or permission file lives -- `MetaStore`, the perlmod bindings, a
-/// test -- is handed one of these rather than reading
-/// `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`/`PVE_META_NODES_DIR` (or
-/// the environment at all) on its own: two callers reading the same variable
-/// independently agree only because nothing changes it mid-process, and that
-/// was never a guarantee, just an accident of everything running in one process.
+/// prefix file lives -- `MetaStore`, the perlmod bindings, a test -- is
+/// handed one of these rather than reading
+/// `PVE_META_PREFIX_DIRS`/`PVE_META_NODES_DIR` (or the environment at all) on
+/// its own: two callers reading the same variable independently agree only
+/// because nothing changes it mid-process, and that was never a guarantee,
+/// just an accident of everything running in one process.
 #[derive(Debug, Clone)]
 pub struct Registry {
     prefix_dirs: Vec<PathBuf>,
-    permission_dirs: Vec<PathBuf>,
     nodes_dir: Option<PathBuf>,
 }
 
 impl Registry {
-    /// Reads `PVE_META_PREFIX_DIRS`/`PVE_META_PERMISSION_DIRS`/`PVE_META_NODES_DIR`
-    /// (or the compiled-in defaults) once. See [`crate::store::MetaStore::new`]'s
-    /// doc comment for why that has to happen exactly once per store rather than
-    /// wherever a directory list happens to be needed next.
+    /// Reads `PVE_META_PREFIX_DIRS`/`PVE_META_NODES_DIR` (or the compiled-in
+    /// defaults) once. See [`crate::store::MetaStore::new`]'s doc comment for
+    /// why that has to happen exactly once per store rather than wherever a
+    /// directory list happens to be needed next.
     ///
     /// A `Registry` is a building block: it checks nothing about whether its
     /// directories are there to be read, and neither do the free loaders below.
@@ -817,15 +633,14 @@ impl Registry {
     pub fn from_env() -> Self {
         Registry {
             prefix_dirs: prefix_dirs(),
-            permission_dirs: permission_dirs(),
             nodes_dir: nodes_dir(),
         }
     }
 
     /// Explicit directories, lowest precedence first, and no nodes directory --
     /// for tests and sandboxes that must not consult the environment.
-    pub fn new(prefix_dirs: Vec<PathBuf>, permission_dirs: Vec<PathBuf>) -> Self {
-        Registry { prefix_dirs, permission_dirs, nodes_dir: None }
+    pub fn new(prefix_dirs: Vec<PathBuf>) -> Self {
+        Registry { prefix_dirs, nodes_dir: None }
     }
 
     /// This registry with `dir` as its nodes directory ([`NODES_DIR`]'s place).
@@ -839,7 +654,6 @@ impl Registry {
     pub fn dirs(&self, kind: RegistryKind) -> &[PathBuf] {
         match kind {
             RegistryKind::PrefixDef => &self.prefix_dirs,
-            RegistryKind::Permission => &self.permission_dirs,
         }
     }
 
@@ -910,11 +724,6 @@ impl Registry {
         Ok(self.list_prefixes(node.map_or(PrefixSet::Cluster, PrefixSet::Node))?.0)
     }
 
-    /// [`load_permissions`] over this registry's own permission directories.
-    pub fn load_permissions(&self) -> Result<Vec<Permission>> {
-        Ok(self.list_permissions()?.0)
-    }
-
     /// The prefixes of `set`, plus every file in it that did not load: `GET
     /// /meta/prefixes`' source. In a resolved set `overrides` is decided within
     /// that set, so a node file says whether it displaced a cluster or packaged
@@ -955,12 +764,6 @@ impl Registry {
         }
         loaded.sort_by(|a, b| by_specificity(&a.prefix, &b.prefix).then_with(|| a.node.cmp(&b.node)));
         Ok((loaded, failures))
-    }
-
-    /// Every permission, plus every file that did not load, likewise --
-    /// `GET /meta/permissions`'s source.
-    pub fn list_permissions(&self) -> Result<(Vec<Permission>, Vec<RegistryFailure>)> {
-        permissions_with_failures(self.dirs(RegistryKind::Permission))
     }
 }
 
@@ -1054,8 +857,8 @@ type Loaded<T> = (Vec<(String, T)>, Vec<RegistryFailure>);
 ///
 /// Returns the failures alongside the parsed items -- an unreadable file and
 /// an unparseable one both count -- so a caller that needs to show them (`GET
-/// /meta/prefixes`, `GET /meta/permissions`) can have both from one walk of
-/// the directories, instead of two.
+/// /meta/prefixes`) can have both from one walk of the directories, instead
+/// of two.
 fn load_dirs<T>(
     layers: &[(PathBuf, Source)],
     kind: &str,
@@ -1131,27 +934,6 @@ pub fn load_prefixes(dirs: &[PathBuf]) -> Result<Vec<PrefixDef>> {
     Ok(prefixes_with_failures(&cluster_layers(dirs))?.0)
 }
 
-/// [`load_dirs`] for permissions, split out for the same reason as
-/// [`prefixes_with_failures`].
-fn permissions_with_failures(dirs: &[PathBuf]) -> Result<(Vec<Permission>, Vec<RegistryFailure>)> {
-    let (parsed, failures) =
-        load_dirs(&cluster_layers(dirs), "permission", parse_permission, |g, source, over| {
-            g.origin = source.origin();
-            g.overrides = over;
-        })?;
-    Ok((parsed.into_iter().map(|(_, g)| g).collect(), failures))
-}
-
-/// Every grant in `dirs`, sorted by file name.
-pub fn load_permissions(dirs: &[PathBuf]) -> Result<Vec<Permission>> {
-    // Same drop, the other direction, and just as deliberate: a file that did
-    // not parse is not a permission, and it must never reach `scopes_for` --
-    // a malformed permission file must grant nothing, not "grant nothing
-    // until someone reads the log". `Registry::list_permissions` is where the
-    // failure survives instead.
-    Ok(permissions_with_failures(dirs)?.0)
-}
-
 fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
     let Some(entries) = gone_is_none(std::fs::read_dir(dir))? else {
         return Ok(Vec::new());
@@ -1167,11 +949,10 @@ fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
             continue;
         };
         // The same rule `api::parse_id` and `store::registry_document_id` apply. It
-        // was missing here, which meant a hand-created `my file.yaml` *loaded* -- it
-        // granted scopes and appeared in the listing -- while `GET
-        // /meta/permissions/my file` was a 400, so nothing could open or repair it.
-        // `is_valid_file_name`'s own doc says three places need it and must agree;
-        // this was the third.
+        // was missing here, which meant a hand-created `my file.yaml` *loaded* and
+        // appeared in the listing while `GET /meta/prefixes/my file` was a 400, so
+        // nothing could open or repair it. `is_valid_file_name`'s own doc says
+        // three places need it and must agree; this was the third.
         // An entry that cannot be looked at is listed: reading it fails, and that
         // is a failure row for its name, not a silently shorter set.
         if !is_valid_file_name(stem) || !is_file_or_unreadable(&entry.path()) {
@@ -1181,37 +962,6 @@ fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
     }
     out.sort();
     Ok(out)
-}
-
-/// The scopes `authid` holds on a guest carrying `tags`: the union of every
-/// rule for that authid whose selector matches (`docs/DESIGN.md` §5).
-///
-/// Effective **accumulate**: a rule on `homelab` covers `homelab.docker`, because
-/// [`crate::scopes::covers`] is prefix containment. That is the opposite of how
-/// prefixes nest, and deliberately so — permission is a union, shape is not.
-///
-/// Permissions apply to **guest documents only**; a registry document is
-/// governed by ACLs alone, so this is never called for one.
-pub fn scopes_for(files: &[Permission], authid: &str, tags: &[String]) -> Vec<Scope> {
-    rules_reaching(files, tags)
-        .filter(|(file, _)| file.authid == authid)
-        .map(|(_, rule)| Scope { prefix: rule.prefix.clone(), mode: rule.mode })
-        .collect()
-}
-
-/// Every rule, from every permission file, whose selector matches a guest
-/// carrying `tags` -- with the file it came from. [`scopes_for`] is this
-/// narrowed to one principal; the editor's Access column is this for all of
-/// them ("who may touch this row"), and the two must not decide reach
-/// differently.
-pub fn rules_reaching<'a>(
-    files: &'a [Permission],
-    tags: &'a [String],
-) -> impl Iterator<Item = (&'a Permission, &'a Rule)> + 'a {
-    files
-        .iter()
-        .flat_map(|file| file.rules.iter().map(move |rule| (file, rule)))
-        .filter(move |(_, rule)| rule.selector.matches(tags))
 }
 
 #[cfg(test)]
@@ -1230,17 +980,6 @@ schema:
       properties:
         host: { type: string, description: Public host name }
         port: { type: integer, minimum: 1, maximum: 65535, optional: 1, default: 80 }
-";
-
-    const PERMISSION_FILE: &str = "\
-authid: svc@pve!traefik
-rules:
-  - prefix: traefik
-    mode: rw
-    selector: { tag: traefik }
-  - prefix: netbird
-    mode: ro
-    selector: { all: true }
 ";
 
     fn write(dir: &std::path::Path, name: &str, text: &str) {
@@ -1368,15 +1107,11 @@ rules:
     }
 
     #[test]
-    fn parsing_is_strict_on_both_kinds() {
-        // Unknown fields, a missing selector, a bad authid, an empty prefix.
+    fn parsing_is_strict() {
+        // Unknown fields, a missing selector, both selector alternatives at once.
         assert!(parse_prefix("x", "selector: {all: true}\nnope: 1\n").is_err());
         assert!(parse_prefix("x", "description: no selector\n").is_err());
         assert!(parse_prefix("x", "selector: {all: true, tag: t}\n").is_err());
-        assert!(parse_permission("g", "authid: not-an-authid\nrules: []\n").is_err());
-        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: '', mode: rw, selector: {all: true}}]\n").is_err());
-        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: sideways, selector: {all: true}}]\n").is_err());
-        assert!(parse_permission("g", "authid: a@pve\nrules: [{prefix: p, mode: rw}]\n").is_err());
     }
 
     /// One line per rule of the dialect check: what it refuses, and the
@@ -1441,17 +1176,6 @@ rules:
     }
 
     #[test]
-    fn a_permission_has_no_schema_and_a_prefix_has_no_authid() {
-        // The split, asserted: neither file can express the other's job.
-        assert!(parse_permission(
-            "g",
-            "authid: a@pve\nrules: [{prefix: p, mode: rw, selector: {all: true}, schema: {}}]\n"
-        )
-        .is_err());
-        assert!(parse_prefix("x", "selector: {all: true}\nauthid: a@pve\n").is_err());
-    }
-
-    #[test]
     fn a_cluster_file_overrides_the_packaged_one_of_the_same_name() {
         let packaged = tempfile::tempdir().unwrap();
         let cluster = tempfile::tempdir().unwrap();
@@ -1502,7 +1226,7 @@ rules:
         for sub in ["packaged", "cluster", "nodes/pve1/meta.d/prefixes", "nodes/pve2/meta.d/prefixes"] {
             std::fs::create_dir_all(dir.path().join(sub)).unwrap();
         }
-        let reg = Registry::new(vec![dir.path().join("packaged"), dir.path().join("cluster")], vec![])
+        let reg = Registry::new(vec![dir.path().join("packaged"), dir.path().join("cluster")])
             .with_nodes_dir(dir.path().join("nodes"));
         (dir, reg)
     }
@@ -1604,9 +1328,9 @@ rules:
             assert!(serde_json::from_value::<NodeName>(json!(bad)).is_err(), "{bad:?} deserialized");
         }
         let pve1 = NodeName::new("pve1").unwrap();
-        let reg = Registry::new(vec![], vec![]).with_nodes_dir("/nodes");
+        let reg = Registry::new(vec![]).with_nodes_dir("/nodes");
         assert_eq!(reg.node_prefix_dir(&pve1), Some(PathBuf::from("/nodes/pve1/meta.d/prefixes")));
-        assert_eq!(Registry::new(vec![], vec![]).node_prefix_dir(&pve1), None, "no nodes directory, no node files");
+        assert_eq!(Registry::new(vec![]).node_prefix_dir(&pve1), None, "no nodes directory, no node files");
     }
 
     #[test]
@@ -1642,25 +1366,6 @@ rules:
     }
 
     #[test]
-    fn permissions_accumulate_by_containment_which_is_the_opposite_of_prefixes() {
-        let g = parse_permission("traefik", PERMISSION_FILE).unwrap();
-        let scopes = scopes_for(std::slice::from_ref(&g), "svc@pve!traefik", &["traefik".to_string()]);
-        assert_eq!(scopes.len(), 2, "both entries, the tag one having matched");
-
-        // A rule on `traefik` covers everything under it -- containment, not
-        // most-specific-wins (`docs/DESIGN.md` §4).
-        let access = crate::scopes::Effective { full_read: false, full_write: false, scopes };
-        assert!(access.can_write(&Path::parse("traefik.spec.host").unwrap()));
-        assert!(access.can_read(&Path::parse("netbird.groups").unwrap()));
-        assert!(!access.can_write(&Path::parse("netbird.groups").unwrap()), "ro stays ro");
-
-        // The selector still gates: no tag, no traefik scope.
-        let untagged = scopes_for(&[g], "svc@pve!traefik", &[]);
-        assert_eq!(untagged.len(), 1);
-        assert_eq!(untagged[0].prefix.to_string(), "netbird");
-    }
-
-    #[test]
     fn a_selector_serializes_as_it_is_written() {
         assert_eq!(serde_json::to_value(Selector::All).unwrap(), json!({"all": true}));
         assert_eq!(
@@ -1672,7 +1377,6 @@ rules:
     #[test]
     fn a_missing_directory_is_not_an_error() {
         assert!(load_prefixes(&[PathBuf::from("/nonexistent/pve-meta")]).unwrap().is_empty());
-        assert!(load_permissions(&[PathBuf::from("/nonexistent/pve-meta")]).unwrap().is_empty());
     }
 
     #[test]
@@ -1680,7 +1384,7 @@ rules:
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "traefik.yaml", NS);
         write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
-        let reg = Registry::new(vec![dir.path().to_path_buf()], vec![]);
+        let reg = Registry::new(vec![dir.path().to_path_buf()]);
 
         let (parsed, failures) = reg.list_prefixes(PrefixSet::Cluster).unwrap();
         assert_eq!(
@@ -1698,43 +1402,4 @@ rules:
         assert_eq!(reg.load_prefixes(None).unwrap(), parsed);
     }
 
-    #[test]
-    fn a_malformed_permission_file_is_listed_named_and_grants_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "good.yaml", PERMISSION_FILE);
-        // Well-formed enough to name a real authid -- the point is that a
-        // parse failure refuses it regardless of who it claims to be for.
-        write(
-            dir.path(),
-            "broken.yaml",
-            "authid: svc@pve!traefik\nrules:\n  - prefix: x\n    mode: sideways\n    selector: {all: true}\n",
-        );
-        let reg = Registry::new(vec![], vec![dir.path().to_path_buf()]);
-
-        let (parsed, failures) = reg.list_permissions().unwrap();
-        assert_eq!(parsed.len(), 1, "only the good file becomes a permission");
-        assert_eq!(parsed[0].name, "good");
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].name, "broken");
-        assert!(!failures[0].error.is_empty());
-        assert_eq!(failures[0].origin, Origin::Cluster);
-
-        // What `access`/`effective` actually consult must never see it.
-        assert_eq!(reg.load_permissions().unwrap(), parsed);
-
-        // The important check: even though the malformed file's own `authid`
-        // matches exactly, a file that did not parse grants nothing.
-        let scopes = scopes_for(&parsed, "svc@pve!traefik", &["traefik".to_string()]);
-        assert_eq!(scopes.len(), 2, "only the good file's two rules -- nothing from `broken`");
-    }
-
-    #[test]
-    fn is_authid_matches_pve_accesscontrols_shape() {
-        for good in ["root@pam", "svc@pve!traefik", "john.doe@pve", "svc@ldap.corp"] {
-            assert!(is_authid(good), "{good}");
-        }
-        for bad in ["root", "root@", "@pve", "root@1pve", "root@pve!", "ro ot@pve", ""] {
-            assert!(!is_authid(bad), "{bad}");
-        }
-    }
 }

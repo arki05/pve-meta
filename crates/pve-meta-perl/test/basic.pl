@@ -7,7 +7,7 @@
 # directly -- see `-I.` above and `Makefile`'s `all` target).
 #
 # The point of this file, beyond the contract itself, is the **boundary**
-# (`docs/DESIGN.md` §8): permissions, guest lists and results cross as native Perl
+# (`docs/DESIGN.md` §8): ACLs, guest lists and results cross as native Perl
 # hashes and arrays, and only the client's `data` parameter is a JSON string.
 # So everything below passes real hash refs and inspects real hash refs; the
 # only `encode_json` here is for that one parameter.
@@ -23,10 +23,8 @@ use PVE::RS::Meta;
 
 my $root = tempdir(CLEANUP => 1);
 my $nsdir = tempdir(CLEANUP => 1);
-my $grantdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
-$ENV{PVE_META_PERMISSION_DIRS} = $grantdir;
 my $nodesdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_NODES_DIR} = $nodesdir;
 my $rundir = tempdir(CLEANUP => 1);
@@ -52,13 +50,6 @@ sub read_file {
 sub write_prefix {
     my ($name, $content) = @_;
     open(my $fh, '>', "$nsdir/$name.yaml") or die "failed to write $nsdir/$name.yaml: $!\n";
-    print {$fh} $content;
-    close($fh);
-}
-
-sub write_permission {
-    my ($name, $content) = @_;
-    open(my $fh, '>', "$grantdir/$name.yaml") or die "failed to write $grantdir/$name.yaml: $!\n";
     print {$fh} $content;
     close($fh);
 }
@@ -150,11 +141,12 @@ $res = eval { PVE::RS::Meta::on_snapshot(9001, 'not a valid name') };
 ok(!defined($res), 'on_snapshot dies on an invalid snapshot name');
 like($@, qr/invalid name/i, 'invalid-name error is readable');
 
-# These lifecycle exports are gone. `on_destroy`, `api_permissions` and
-# `export_for_backup` are not in this list: those names exist again, as the
-# create/destroy hook, the grant-file listing behind GET /meta/permissions, and
-# the backup side of the notes block, respectively.
-for my $gone (qw(on_clone import_from_backup list_snapshots has_document)) {
+# These exports are gone. `on_destroy` and `export_for_backup` are not in
+# this list: those names exist again, as the create/destroy hook and the
+# backup side of the notes block, respectively. `api_permissions` is gone
+# along with the permission files it listed (docs/DESIGN.md §4): access is
+# PVE's ACLs alone.
+for my $gone (qw(on_clone import_from_backup list_snapshots has_document api_permissions)) {
     ok(!defined(&{"PVE::RS::Meta::$gone"}), "PVE::RS::Meta::$gone is not exported any more");
 }
 
@@ -417,13 +409,13 @@ isnt(PVE::RS::Meta::api_put('9300', 'traefik', 'json', '{"host":"new"}', 'replac
     '', 'PUT with the empty digest creates the document instead of 409-ing forever');
 PVE::RS::Meta::api_delete('9300', undef, undef, $FULL);
 
-# reads require a permission
+# reads require VM.Audit
 $res = eval { PVE::RS::Meta::api_get('9101', undef, 'json', $NONE) };
-ok(!defined($res), 'a caller with no permission at all cannot read a document');
+ok(!defined($res), 'a caller with no read access at all cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
 # =========================================================================
-# Prefixes, permissions, selectors and tags (docs/DESIGN.md §3, §4).
+# Prefixes, selectors and tags (docs/DESIGN.md §3).
 # =========================================================================
 
 # The file name is the prefix; there is no `prefix:` field to disagree with it.
@@ -456,33 +448,12 @@ is_deeply($traefik_ns->{selector}, { tag => 'traefik' }, 'and the selector, as a
 ok($traefik_ns->{schema}, 'and the schema, passed through verbatim');
 ok(!exists $traefik_ns->{authid}, 'a prefix names no principal');
 
-write_permission('scoped', <<'YAML');
-authid: scoped@pve!t1
-description: The scoped test principal
-rules:
-  - prefix: traefik
-    mode: rw
-    selector: { tag: traefik }
-  - prefix: netbird
-    mode: ro
-    selector: { all: true }
-YAML
+sub read_only {
+    return { authid => 'auditor@pve', read => 1, write => 0, tags => [] };
+}
 
-my $gs = PVE::RS::Meta::api_permissions();
-is(scalar(@$gs), 1, 'api_permissions lists the permission');
-is($gs->[0]->{name}, 'scoped', 'with the file name as its name');
-is($gs->[0]->{authid}, 'scoped@pve!t1', 'and the authid');
-is($gs->[0]->{description}, 'The scoped test principal', 'and the description');
-is_deeply($gs->[0]->{rules}->[0]->{selector}, { tag => 'traefik' },
-    'and the selector, as a native hash');
-ok($gs->[0]->{rules}->[1]->{selector}->{all},
-    '... and { all: true } is a hash spelled the way the file spells it, not a bare string');
-is($gs->[0]->{rules}->[1]->{prefix}, 'netbird', 'and every rule');
-ok(!exists $gs->[0]->{rules}->[0]->{schema}, 'a permission carries no schema');
-
-sub scoped_acl {
-    my (@tags) = @_;
-    return { authid => 'scoped@pve!t1', read => 0, write => 0, tags => [@tags] };
+sub write_only {
+    return { authid => 'writer@pve', read => 0, write => 1, tags => [] };
 }
 
 PVE::RS::Meta::api_put('9400', undef, 'json',
@@ -493,156 +464,61 @@ PVE::RS::Meta::api_put('9400', undef, 'json',
     }),
     'replace', undef, 0, $FULL);
 
-# Tag off: only the all-guests netbird scope applies.
-my $untagged = PVE::RS::Meta::api_access('9400', scoped_acl());
-is(scalar(@{ $untagged->{scopes} }), 1, 'without the tag only the all: true scope applies');
-is($untagged->{scopes}->[0]->{prefix}, 'netbird', '... the netbird one');
-is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', scoped_acl())->{data},
-    { netbird => { groups => ['lan'] } }, 'and the read sees only that subtree');
-$res = eval { PVE::RS::Meta::api_put('9400', 'traefik.spec', 'json', '{"host":"x"}',
-        'replace', undef, 0, scoped_acl()) };
-ok(!defined($res), 'a write into the tag-gated prefix is refused while the tag is off');
-like($@, api_error_status(403), 'that write is refused with 403:');
+# Access is PVE's ACLs alone (docs/DESIGN.md §4): read/write are exactly the
+# ACL's own booleans, with no partial view and no scopes.
+is_deeply(PVE::RS::Meta::api_access('9400', $FULL), { read => 1, write => 1 },
+    'api_access reflects a full ACL');
+is_deeply(PVE::RS::Meta::api_access('9400', $NONE), { read => 0, write => 0 },
+    '... and an empty one');
+is_deeply(PVE::RS::Meta::api_access('9400', read_only()), { read => 1, write => 0 },
+    '... and read-only');
+is_deeply(PVE::RS::Meta::api_access('9400', write_only()), { read => 0, write => 1 },
+    '... and write-only');
 
-# Tag on: the traefik rw scope appears.
-my $tagged = PVE::RS::Meta::api_access('9400', scoped_acl('traefik'));
-is_deeply([map { $_->{prefix} } @{ $tagged->{scopes} }], ['traefik', 'netbird'],
-    'with the tag, both scopes apply');
-is_deeply([map { $_->{mode} } @{ $tagged->{scopes} }], ['rw', 'ro'], '... with their modes');
-
-# The tags come back with the access answer, so an editor never has to read
-# every document in the cluster (GET /meta/guests) to learn one guest's. They
-# are filtered exactly as that endpoint filters them: no VM.Audit, no tags.
-is_deeply($tagged->{tags}, [], 'a caller without VM.Audit is told its scopes but not the tags');
-is_deeply(
-    PVE::RS::Meta::api_access('9400',
-        { authid => 'root@pam', read => 1, write => 1, tags => ['traefik', 'web'] })->{tags},
-    ['traefik', 'web'],
-    'a caller with VM.Audit gets the guest tags back',
-);
-is_deeply(PVE::RS::Meta::api_access('prefixes/traefik', $FULL)->{tags}, [],
-    'a registry document has no tags');
-is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', scoped_acl('traefik'))->{data},
-    { traefik => { spec => { host => 'ct.example' } }, netbird => { groups => ['lan'] } },
-    'and the read now carries both subtrees, but never `other`');
-ok(defined(eval { PVE::RS::Meta::api_put('9400', 'traefik.spec', 'json', '{"host":"y"}',
-            'replace', undef, 0, scoped_acl('traefik')) }),
-    'a write into the tag-gated rw prefix now succeeds');
-
-# A read-only scope is still read-only, and an unscoped view is refused.
-$res = eval { PVE::RS::Meta::api_put('9400', 'netbird', 'json', '{"groups":["wan"]}',
-        'replace', undef, 0, scoped_acl('traefik')) };
-ok(!defined($res), 'a write into a read-only scope is refused');
-like($@, api_error_status(403), 'that write is refused with 403:');
-
-$res = eval { PVE::RS::Meta::api_get('9400', 'other', 'json', scoped_acl('traefik')) };
-ok(!defined($res), 'a scoped principal cannot read a view outside its scopes');
+# Read access is a boolean: any reader sees the whole document, the same as a
+# full ACL -- there is no narrower structure to filter to.
+is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', read_only())->{data},
+    PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data},
+    'a read-only caller sees exactly what a full one does');
+$res = eval { PVE::RS::Meta::api_get('9400', undef, 'json', $NONE) };
+ok(!defined($res), 'a caller with no read access cannot read a document');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# A scope-only principal still cannot write the root view -- not because the root
-# needs full write, but because it cannot *read* the whole document, and
-# authorizing a write by what it changes needs the caller to be able to say what
-# the document is (docs/DESIGN.md 5).
-$res = eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"other":2}', 'merge', undef, 0,
-        scoped_acl('traefik')) };
-ok(!defined($res), 'a scope-only principal cannot write the root view');
-like($@, qr/read the whole document/, 'the 403 explains that it cannot read the whole document');
+# Write access does not require read access (docs/DESIGN.md §4): there is no
+# "must read what you write" rule any more, not even for the root view.
+ok(defined(eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"other":2}', 'merge',
+        undef, 0, write_only()) }),
+    'write access alone is enough to merge into the root view');
+is(PVE::RS::Meta::api_get('9400', 'other', 'json', $FULL)->{data}, 2, '... and it landed');
 
-# A caller with no write permission at all cannot write anything, even a change
+# A caller with no write access at all cannot write anything, even a change
 # that touches no path: key order is not a path, so nothing else would stop it.
-my $auditor = { authid => 'auditor@pve', read => 1, write => 0, tags => [] };
-$res = eval { PVE::RS::Meta::api_put('9400', undef, 'json', '{"traefik":{"spec":{}}}',
-        'replace', undef, 0, $auditor) };
-ok(!defined($res), 'a read-only auditor cannot write at all');
+$res = eval { PVE::RS::Meta::api_put('9400', undef, 'json',
+        encode_json({ traefik => { spec => { host => 'ct.example' } },
+            netbird => { groups => ['lan'] }, other => 2 }),
+        'replace', undef, 0, read_only()) };
+ok(!defined($res), 'a read-only caller cannot write at all');
 like($@, qr/no write access/, '... and the 403 says it has no write access at all');
 
-# -------------------------------------------------------------------------
-# A write is authorized by what it *changes*, not by the view it names.
-# -------------------------------------------------------------------------
-#
-# This principal has VM.Audit (so it can read and therefore compose a whole
-# document) and no VM.Config.Options; what it may change is its rw scopes.
-sub audit_scoped_acl {
-    my (@tags) = @_;
-    return { authid => 'scoped@pve!t1', read => 1, write => 0, tags => [@tags] };
-}
-
-write_permission('tworw', <<'YAML');
-authid: scoped@pve!t1
-rules:
-  - prefix: traefik
-    mode: rw
-    selector: { all: true }
-  - prefix: netbird
-    mode: rw
-    selector: { all: true }
-YAML
-
-# Literal JSON throughout this block, not `encode_json`: a Perl hash has no key
-# order, and both the touched list and the stored key order are the assertions.
-my $DOC_A = '{"traefik":{"host":"a"},"netbird":{"groups":["lan"]},"homelab":{"owner":"arki"}}';
-PVE::RS::Meta::api_put('9401', undef, 'json', $DOC_A, 'replace', undef, 0, $FULL);
-
-# One write spanning two granted prefixes. The narrowest view covering both is
-# the document root.
-$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
-    '{"traefik":{"host":"b"},"netbird":{"groups":["wan"]},"homelab":{"owner":"arki"}}',
-    'replace', undef, 0, audit_scoped_acl()) };
-ok(defined($res), 'one root write may span two granted prefixes');
-is_deeply([map { $_->{path} } @{ $res->{touched} }], ['traefik.host', 'netbird.groups'],
-    '... and it answers for exactly the two paths it changed');
-
-# The same write, reaching one key further, is refused -- and changes nothing.
-$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
-    '{"traefik":{"host":"c"},"netbird":{"groups":["wan"]},"homelab":{"owner":"mallory"}}',
-    'replace', undef, 0, audit_scoped_acl()) };
-ok(!defined($res), 'a root write that changes an ungranted key is refused');
-like($@, api_error_status(403), '... with 403:');
-is(PVE::RS::Meta::api_get('9401', 'homelab.owner', 'json', $FULL)->{data}, 'arki',
-    '... and wrote nothing');
-
-# Dropping an ungranted key is a change too -- this is the shape that loses data.
-$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
-    '{"traefik":{"host":"b"},"netbird":{"groups":["wan"]}}',
-    'replace', undef, 0, audit_scoped_acl()) };
-ok(!defined($res), 'a root write that drops an ungranted key is refused');
-is_deeply(PVE::RS::Meta::api_get('9401', 'homelab', 'json', $FULL)->{data}, { owner => 'arki' },
-    '... and the key is still there');
-
 # Reordering the keys changes no path, so it is allowed -- and it is a real
-# change to the file, so it is stored.
-$res = eval { PVE::RS::Meta::api_put('9401', undef, 'json',
-    '{"homelab":{"owner":"arki"},"netbird":{"groups":["wan"]},"traefik":{"host":"b"}}',
-    'replace', undef, 0, audit_scoped_acl()) };
-ok(defined($res), 'reordering keys is a write a scoped principal may make');
-is_deeply($res->{touched}, [], '... and it touches no path');
-like(read_file('9401.yaml'), qr/\Ahomelab:/, '... and the new order is what is on disk');
+# change to the file, so it is stored. Literal JSON, not `encode_json`: a
+# Perl hash has no key order, and the stored order is the assertion.
+$res = PVE::RS::Meta::api_put('9400', undef, 'json',
+    '{"other":2,"netbird":{"groups":["lan"]},"traefik":{"spec":{"host":"ct.example"}}}',
+    'replace', undef, 0, $FULL);
+is_deeply($res->{touched}, [], 'a reordering write touches no path');
+like(read_file('9400.yaml'), qr/\Aother:/, '... and the new order is what is on disk');
 
-unlink("$grantdir/tworw.yaml");
-PVE::RS::Meta::api_delete('9401', undef, undef, $FULL);
-
-# An empty merge at an arbitrary prefix creates nothing.
+# An empty merge at an arbitrary prefix creates nothing, for a caller with no
+# write access to reach it with.
 my $before_hack = PVE::RS::Meta::api_get('9400', undef, 'json', $FULL);
 for my $hack_view ('zzz_hacked', 'zzz_hacked.deep') {
-    $res = eval { PVE::RS::Meta::api_put('9400', $hack_view, 'json', '{}', 'merge', undef, 0,
-            scoped_acl('traefik')) };
+    $res = eval { PVE::RS::Meta::api_put('9400', $hack_view, 'json', '{}', 'merge', undef, 0, $NONE) };
     ok(!defined($res), "an empty merge at $hack_view is refused");
     like($@, api_error_status(403), "the empty merge at $hack_view is refused with 403:");
 }
 is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data}, $before_hack->{data},
     'no empty merge created any structure');
-
-# A scope on `traefik` covers the sibling comment key `traefik__` -- the one
-# comment-key rule left (docs/DESIGN.md §4).
-PVE::RS::Meta::api_put('9400', 'traefik__', 'json', '"the ingress config"', 'replace', undef, 0,
-    scoped_acl('traefik'), 0, 1);
-is(PVE::RS::Meta::api_get('9400', 'traefik__', 'json', scoped_acl('traefik'), 1)->{data},
-    'the ingress config', 'a scoped principal can write its own comment key');
-$res = eval { PVE::RS::Meta::api_put('9400', 'netbird__', 'json', '"nope"', 'replace', undef, 0,
-        scoped_acl('traefik'), 0, 1) };
-ok(!defined($res), '... but not another key\'s comment (netbird is ro)');
-like($@, api_error_status(403), '... with 403:');
-PVE::RS::Meta::api_delete('9400', 'traefik__', undef, scoped_acl('traefik'));
 
 # Comment keys are notes (docs/DESIGN.md §2, §7): a read leaves them out unless
 # `$comments`, and a replace without it carries none and keeps the stored ones.
@@ -670,43 +546,24 @@ is(read_file('9403.yaml'), "__: the guest\nweb:\n  host: c\n",
 write_file('9403.yaml', "web__: the site\nweb:\n  host: c\n");
 PVE::RS::Meta::api_delete('9403', 'web', undef, $FULL);
 is(read_file('9403.yaml'), "{}\n", 'a DELETE of a view takes its note along');
-$res = eval { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9403, read => 1 }], 'web__') };
+$res = eval { PVE::RS::Meta::api_list_guests([{ vmid => 9403, read => 1 }], 'web__') };
 like($@, api_error_status(400), 'has= naming a comment key is 400:');
 unlink("$root/9403.yaml");
 
-# Scopes never apply to a registry document.
-my $reg_scoped = PVE::RS::Meta::api_access('prefixes/traefik', scoped_acl('traefik'));
-is_deeply($reg_scoped->{scopes}, [], 'no permission ever reaches a registry document');
-$res = eval { PVE::RS::Meta::api_get('prefixes/traefik', 'traefik', 'json', scoped_acl('traefik')) };
+# A registry document uses only the ACL it is given, same as a guest.
+is_deeply(PVE::RS::Meta::api_access('prefixes/traefik', $NONE), { read => 0, write => 0 },
+    'a registry document is not readable by an empty ACL');
+$res = eval { PVE::RS::Meta::api_get('prefixes/traefik', 'traefik', 'json', $NONE) };
 ok(!defined($res), 'and a read of one with no read bit is refused');
 like($@, api_error_status(403), 'that read is refused with 403:');
 
-# A malformed file is skipped with a warning and grants/defines nothing; it
-# never takes another file's grants away, but it is not invisible: the
-# listing carries a row for it too, named, with 'error' set and nothing else
-# -- the one place an administrator can find out a file stopped loading at
-# all, instead of only a log line nobody reads (docs/DESIGN.md §1). Both
-# directories, independently.
-#
-# `alsobroken` names the very authid under test, deliberately: a malformed
-# permission file has to grant nothing even when it claims to be for the
-# principal whose access this test is about to re-check.
-write_permission('broken', "authid: nope-not-an-authid\n");
-write_permission('alsobroken', "authid: scoped\@pve!t1\nrules:\n  - prefix: x\n    mode: sideways\n");
+# A malformed file is skipped with a warning and defines nothing; it is not
+# invisible: the listing carries a row for it too, named, with 'error' set
+# and nothing else -- the one place an administrator can find out a file
+# stopped loading at all, instead of only a log line nobody reads
+# (docs/DESIGN.md §1).
 write_prefix('brokenns', "selector: { nonsense: true }\n");
 write_prefix('a b', "selector: { all: true }\n"); # not a valid file name, so not addressable at all
-
-my $perms_all = PVE::RS::Meta::api_permissions();
-is(scalar(@$perms_all), 3, 'api_permissions lists the good file plus both malformed ones');
-my @perms_failed = sort { $a->{name} cmp $b->{name} } grep { exists $_->{error} } @$perms_all;
-is(scalar(@perms_failed), 2, '... two of the three carry an error');
-is_deeply([map { $_->{name} } @perms_failed], ['alsobroken', 'broken'],
-    '... named by file name, the same key a loaded permission uses');
-is($perms_failed[0]->{origin}, 'cluster', '... and where it would have to be repaired');
-ok(!exists $perms_failed[0]->{authid} && !exists $perms_failed[0]->{rules},
-    '... nothing a loaded permission promises');
-ok((grep { $_->{name} eq 'scoped' && !exists $_->{error} } @$perms_all),
-    '... and the one good file is still there, unmarked');
 
 my $prefixes_all = PVE::RS::Meta::api_prefixes();
 is(scalar(@$prefixes_all), 4, 'api_prefixes lists the three good ones plus the malformed one');
@@ -719,11 +576,7 @@ ok(!exists $ns_failed[0]->{selector} && !exists $ns_failed[0]->{schema},
 ok(!(grep { defined($_->{prefix}) && $_->{prefix} eq 'a b' } @$prefixes_all),
     "'a b' cannot be addressed at all, so it is not even a failure row");
 
-is(scalar(@{ PVE::RS::Meta::api_access('9400', scoped_acl('traefik'))->{scopes} }), 2,
-    '... and the valid ones still grant exactly what they did -- the malformed '
-    . 'file for the same authid grants nothing at all');
-unlink("$grantdir/broken.yaml", "$grantdir/alsobroken.yaml",
-    "$nsdir/brokenns.yaml", "$nsdir/a b.yaml");
+unlink("$nsdir/brokenns.yaml", "$nsdir/a b.yaml");
 
 # =========================================================================
 # api_list_guests: native rows in, native rows out.
@@ -738,40 +591,33 @@ sub guest_row {
         name => "guest-$vmid",
         tags => $opts{tags} // [],
         read => $opts{read} // 0,
-        write => $opts{write} // 0,
     };
 }
 
 my $rows = [guest_row(9400, read => 1, tags => ['traefik']), guest_row(9401, read => 1)];
-my $listed = PVE::RS::Meta::api_list_guests('root@pam', $rows, undef);
-is(scalar(@$listed), 2, 'api_list_guests lists every guest the caller fully reads');
+my $listed = PVE::RS::Meta::api_list_guests($rows, undef);
+is(scalar(@$listed), 2, 'api_list_guests lists every guest the caller has VM.Audit on');
 my ($g9400) = grep { $_->{vmid} == 9400 } @$listed;
 my ($g9401) = grep { $_->{vmid} == 9401 } @$listed;
 is($g9400->{node}, 'n1', 'api_list_guests reports the node Perl passed in');
 is($g9400->{type}, 'lxc', 'and the type');
 is($g9400->{name}, 'guest-9400', 'and the display name');
-is_deeply($g9400->{tags}, ['traefik'], 'and the tags (docs/DESIGN.md §5)');
+is_deeply($g9400->{tags}, ['traefik'], 'and the tags (docs/DESIGN.md §4)');
 is($g9401->{digest}, '', 'digest is "" for a guest with no document');
 
-# A caller with no ACL and no matching registration never sees a guest.
-is(scalar(@{ PVE::RS::Meta::api_list_guests('nobody@pve', [guest_row(9400)], undef) }), 0,
-    'api_list_guests omits a guest the caller can read nothing of');
+# A guest without VM.Audit is omitted entirely -- never included with its
+# fields hidden, since there is no partial visibility any more.
+is(scalar(@{ PVE::RS::Meta::api_list_guests([guest_row(9400)], undef) }), 0,
+    'api_list_guests omits a guest the caller cannot read');
 
-# A scoped caller sees the guests its selectors match, without node/name/tags.
-my $scoped_rows = [guest_row(9400, tags => ['traefik']), guest_row(9401)];
-my $scoped_list = PVE::RS::Meta::api_list_guests('scoped@pve!t1', $scoped_rows, undef);
-is(scalar(@$scoped_list), 2, 'the all: true netbird scope makes every guest listed');
-is($scoped_list->[0]->{node}, undef, 'api_list_guests hides the node without VM.Audit');
-is($scoped_list->[0]->{name}, undef, '... the name');
-is($scoped_list->[0]->{tags}, undef, '... and the tags');
-
-# `has` filters against the caller's own visible data.
-is(scalar(@{ PVE::RS::Meta::api_list_guests('root@pam', $rows, 'traefik.spec') }), 1,
+# `has` filters against the guest's document, and only among guests already
+# included by `read`.
+is(scalar(@{ PVE::RS::Meta::api_list_guests($rows, 'traefik.spec') }), 1,
     'has=traefik.spec matches the guest that has it');
-is(scalar(@{ PVE::RS::Meta::api_list_guests('root@pam', $rows, 'traefik.spec.port') }), 0,
+is(scalar(@{ PVE::RS::Meta::api_list_guests($rows, 'traefik.spec.port') }), 0,
     'has=traefik.spec.port does not match');
-is(scalar(@{ PVE::RS::Meta::api_list_guests('scoped@pve!t1', $scoped_rows, 'other') }), 0,
-    'has cannot see through a caller\'s own missing scope');
+is(scalar(@{ PVE::RS::Meta::api_list_guests([guest_row(9400, tags => ['traefik'])], 'traefik.spec') }), 0,
+    'has cannot see through a caller\'s own missing read access');
 
 # =========================================================================
 # The one lint (docs/DESIGN.md §7), and parse failures.
@@ -789,7 +635,7 @@ for my $case (
     ['traefik.q__.r', 'replace', '1', qr/comment key value must be a string/],
 ) {
     my ($view, $mode, $payload, $re) = @$case;
-    for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
+    for my $who (['FULL', $FULL], ['WRITE-ONLY', write_only()]) {
         my ($label, $a) = @$who;
         $res = eval { PVE::RS::Meta::api_put('9400', $view, 'json', $payload, $mode, undef, 0, $a, 0, 1) };
         ok(!defined($res), "[$label] a $mode of $payload at $view is refused");
@@ -800,7 +646,7 @@ for my $case (
 
 # There is no redaction: the 400 names the offending path, whoever asks.
 write_file('9502.yaml', "traefik:\n  host: x\nsecret_area:\n  customer name: acme\n");
-for my $who (['FULL', $FULL], ['SCOPED', scoped_acl('traefik')]) {
+for my $who (['FULL', $FULL], ['WRITE-ONLY', write_only()]) {
     my ($label, $a) = @$who;
     $res = eval { PVE::RS::Meta::api_put('9502', 'traefik', 'json', '{"host":"y"}', 'replace',
             undef, 0, $a) };
@@ -826,8 +672,8 @@ for my $broken ("a: 1\n\tb: 2\n", "a: &anc 1\nb: *anc\n", "a: 1\n  b: 2\n", "a: 
     $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', $FULL) };
     like($@, api_error_status(422), "[$label] ... and so is yaml without comments");
 
-    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'yaml', scoped_acl('traefik'), 1) };
-    ok(!defined($res), "[$label] and a scoped reader never gets the bytes");
+    $res = eval { PVE::RS::Meta::api_get('9500', undef, 'json', read_only()) };
+    ok(!defined($res), "[$label] any reader gets the same 422 for format=json");
     like($@, api_error_status(422), "[$label] ... 422 there too");
 
     # A narrower write would plan against the empty document: refused.
@@ -889,7 +735,7 @@ for my $fmt (qw(json yaml)) {
     like($@, qr/too large/, "... and says why ($fmt)");
 }
 my ($listed_big) = grep { $_->{vmid} == 9504 }
-    @{ PVE::RS::Meta::api_list_guests('root@pam', [guest_row(9504, read => 1)], undef) };
+    @{ PVE::RS::Meta::api_list_guests([guest_row(9504, read => 1)], undef) };
 ok(defined($listed_big), 'one oversized document does not take the listing down');
 isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
 ok(defined(PVE::RS::Meta::api_version(0, undef)->{token}), '... nor the version poll');
@@ -949,7 +795,7 @@ ok(!file_exists('9400.yaml'), 'api_delete without a view actually removes the fi
 
 my $schemas = PVE::RS::Meta::api_schemas();
 is(ref($schemas), 'HASH', 'api_schemas returns a native hash');
-is_deeply([sort keys %$schemas], ['permission', 'prefix'], '... one schema per registry kind');
+is_deeply([sort keys %$schemas], ['prefix'], '... one schema, for the one registry kind');
 is($schemas->{prefix}->{properties}->{selector}->{type}, 'object',
     'the prefix schema describes its selector');
 ok(!defined($schemas->{prefix}->{properties}->{selector}->{optional}),
@@ -968,11 +814,11 @@ $res = eval { PVE::RS::Meta::api_put('prefixes/bothsel', undef, 'yaml',
 ok(!defined($res), 'a selector with both alternatives is refused');
 like($@, api_error_status(400), '... with a 400');
 
-# -- registry documents: prefixes and permissions are documents too --------------
+# -- registry documents: a prefix is a document too ------------------------
 #
-# Same three functions, a third kind of id (`prefixes/<name>`), and one rule
-# they do not share with the other two: what is written has to parse as the kind
-# it claims to be, because the loader *skips* a file it cannot parse. A 200 on a
+# Same three functions, a second kind of id (`prefixes/<name>`), and one rule
+# it does not share with a guest document: what is written has to parse as a
+# prefix, because the loader *skips* a file it cannot parse. A 200 on a
 # write that made the prefix disappear from api_prefixes() would be the
 # worst possible answer, so it is a 400 instead.
 
@@ -1013,26 +859,6 @@ ok(!defined($res), 'api_put refuses a prefix the loader could not read back');
 like($@, api_error_status(400), '... with a 400');
 ok(!-e "$nsdir/broken.yaml", '... and wrote nothing');
 
-my $g_put = PVE::RS::Meta::api_put(
-    'permissions/ops', undef, 'yaml',
-    "authid: ops\@pve!t1\nrules:\n  - prefix: labtest\n    mode: rw\n    selector: {all: true}\n",
-    'replace', '', 0, $ADMIN,
-);
-is($g_put->{id}, 'permissions/ops', 'api_put creates a permission document');
-my ($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_permissions() };
-is($ops->{authid}, 'ops@pve!t1', 'the permission loader picks it up too');
-
-# A partial delete is a write, and the same rule holds on that path.
-$res = eval { PVE::RS::Meta::api_delete('permissions/ops', 'authid', undef, $ADMIN) };
-ok(!defined($res), 'api_delete refuses to strip a permission of its authid');
-like($@, api_error_status(400), '... with a 400');
-($ops) = grep { $_->{name} eq 'ops' } @{ PVE::RS::Meta::api_permissions() };
-ok($ops, 'the permission still loads');
-
-is(PVE::RS::Meta::api_delete('permissions/ops', undef, undef, $ADMIN)->{digest}, '',
-    'removing the whole file is an ordinary delete');
-ok(!-e "$grantdir/ops.yaml", '... and the file is gone');
-
 # A nested prefix is a dotted file name, and has to be addressable: the
 # file name *is* the prefix, and `homelab.docker` was declared above.
 my $nested = PVE::RS::Meta::api_get('prefixes/homelab.docker', undef, 'json', $ADMIN);
@@ -1040,8 +866,10 @@ is($nested->{id}, 'prefixes/homelab.docker', 'a nested prefix is addressable by 
 is_deeply($nested->{data}->{schema}, { type => 'object' },
     '... and reads back the file the loader reads');
 
-# An id that could address a file outside the directory is not an id.
-for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'operators/traefik') {
+# An id that could address a file outside the directory is not an id, and
+# neither is a registry kind that no longer exists.
+for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'operators/traefik',
+    'permissions/ops') {
     $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
     ok(!defined($res), "api_get refuses the id '$bad'");
     like($@, api_error_status(400), "... with a 400");
@@ -1134,10 +962,9 @@ write_file('9700.yaml', "a: 1\n");
         ['api_put', sub { PVE::RS::Meta::api_put('9700', 'b', 'json', '1', 'replace', undef, 0, $FULL) }],
         ['api_delete', sub { PVE::RS::Meta::api_delete('9700', undef, undef, $FULL) }],
         ['api_version', sub { PVE::RS::Meta::api_version(1, undef) }],
-        ['api_list_guests', sub { PVE::RS::Meta::api_list_guests('root@pam', [{ vmid => 9700, read => 1 }], undef) }],
+        ['api_list_guests', sub { PVE::RS::Meta::api_list_guests([{ vmid => 9700, read => 1 }], undef) }],
         ['api_access', sub { PVE::RS::Meta::api_access('9700', $FULL) }],
         ['api_prefixes', sub { PVE::RS::Meta::api_prefixes(undef) }],
-        ['api_permissions', sub { PVE::RS::Meta::api_permissions() }],
     ) {
         my ($name, $call) = @$case;
         $res = eval { $call->() };

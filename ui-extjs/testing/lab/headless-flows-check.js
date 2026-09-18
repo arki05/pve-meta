@@ -317,12 +317,12 @@ async function main() {
         await api(`/api2/json/meta/guests/${vmid}?view=protokeys`, 'DELETE', tk, csrf, '');
         await sleep(500);
 
-        // --- 6. The datacenter tab: the two registry lists, and no document ------
+        // --- 6. The datacenter tab: the prefix registry list, and no document -----
         await openTab(page, 'dc');
         result.checks.datacenter = await page.evaluate(() => {
             const grids = Ext.ComponentQuery.query('pveMetaRegistryGrid');
             return {
-                grids: grids.map((g) => g.kind),
+                grids: grids.length,
                 treePanels: Ext.ComponentQuery.query('pveMetaTreePanel').length,
                 rows: grids.map((g) => g.getStore().getCount()),
             };

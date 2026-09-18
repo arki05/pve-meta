@@ -3,17 +3,16 @@
  *
  * One panel, one edited document, two views of it (DESIGN.md §11, §12):
  *
- *   Tree — an Ext.tree.Panel with columns Key | Value | Description | Access over the
- *     document the caller can see. Rows are the union of the keys present in the
- *     document and the keys the governing prefixes declare (`GET /meta/prefixes`,
- *     matched by prefix and selector against this guest, most-specific first -- schemas
- *     shadow, they never merge); a declared-but-unset key
- *     renders faded with its default, and "setting" it is just editing it. Map rows
- *     carry a folder icon (open when expanded), value rows a document icon, both at the
- *     size and colour of the PVE resource tree. Comment keys (`k__`, and the bare `__`
- *     for the map itself) are not rows — `k__` is the Description of row `k`. A list is
- *     a container like a map, one row per member. Access lists every permission whose
- *     prefix covers the row.
+ *   Tree — an Ext.tree.Panel with columns Key | Value | Description over the document
+ *     the caller can see. Rows are the union of the keys present in the document and
+ *     the keys the governing prefixes declare (`GET /meta/prefixes`, matched by prefix
+ *     and selector against this guest, most-specific first -- schemas shadow, they
+ *     never merge); a declared-but-unset key renders faded with its default, and
+ *     "setting" it is just editing it. Map rows carry a folder icon (open when
+ *     expanded), value rows a document icon, both at the size and colour of the PVE
+ *     resource tree. Comment keys (`k__`, and the bare `__` for the map itself) are not
+ *     rows — `k__` is the Description of row `k`. A list is a container like a map, one
+ *     row per member.
  *
  *   Text — a full-document Monaco editor (YAML, with a presentation-only YAML/JSON view
  *     toggle) over the same planned document.
@@ -34,8 +33,9 @@
  * method happened to live in.
  *
  * Editing is a modal row editor (Edit, double-click, or Enter), the field chosen from
- * the grammar type and falling back to the value's own type; editability is per row from
- * `GET /meta/access`. Edits are staged (`PVE.meta.EditSet`) and one Apply writes them:
+ * the grammar type and falling back to the value's own type; a row is editable iff
+ * `GET /meta/access` says the document is writable (DESIGN §4) -- nothing is decided
+ * per path. Edits are staged (`PVE.meta.EditSet`) and one Apply writes them:
  *   PUT /meta/guests/{vmid}?view=<narrowest covering path>&mode=replace&data=<json>&digest=<d>&comments=1
  * Every read and write of a document carries `comments=1`: the comment keys are the
  * description column, and without it the server would leave them out.
@@ -50,16 +50,15 @@
  * (Monaco is vendored into the package by `make ui`, never fetched from a CDN); every
  * editor is disposed when its owner goes away.
  *
- * The rules -- YAML in and out, key names, who may touch a path, which prefix governs
- * one, what a schema makes of a value, what staged edits do to a document -- are not
- * implemented here. They are pve-meta-core, the server's own crate, built for the
- * browser (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`). Two of them are
- * objects the panel holds -- a `PVE.meta.Shape` per document, which owns the prefix
- * listing and the tags and caches what the core derives from them, and the
- * `PVE.meta.EditSet` that is the staged edits -- and the rest are stateless faces:
- * `Codec`, `Access`, and the key-name checks on `Utils`. The server stays the
- * authority: an Apply sends the buffer or the planned subtree to the API, which runs
- * the same code again on the real write.
+ * The rules -- YAML in and out, key names, which prefix governs a path, what a schema
+ * makes of a value, what staged edits do to a document -- are not implemented here.
+ * They are pve-meta-core, the server's own crate, built for the browser
+ * (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`). Two of them are objects the
+ * panel holds -- a `PVE.meta.Shape` per document, which owns the prefix listing and the
+ * tags and caches what the core derives from them, and the `PVE.meta.EditSet` that is
+ * the staged edits -- and the rest are stateless faces: `Codec`, and the key-name checks
+ * on `Utils`. The server stays the authority: an Apply sends the buffer or the planned
+ * subtree to the API, which runs the same code again on the real write.
  *
  * pve-ext's page loader loads this file and instantiates `pveMetaTreePanel` as the
  * tab (see README.md), so session, CSRF, dark theme and i18n all come from the PVE

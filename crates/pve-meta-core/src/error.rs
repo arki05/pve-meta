@@ -70,8 +70,8 @@ pub enum Error {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
-    /// A prefix definition or permission file (`docs/DESIGN.md` §6) is malformed; see
-    /// [`crate::registry::parse_prefix`] / [`crate::registry::parse_permission`].
+    /// A prefix definition (`docs/DESIGN.md` §6) is malformed; see
+    /// [`crate::registry::parse_prefix`].
     #[error("invalid registry file: {0}")]
     Registry(String),
 

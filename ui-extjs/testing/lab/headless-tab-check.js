@@ -2,14 +2,13 @@
 // pve-manager SPA on node1, in both themes.
 //
 // Usage: node headless-tab-check.js <host> <vmid> <theme: light|dark>
-//            [--stub-registry] [--readonly] [--scoped]
-// --stub-registry stubs GET /meta/prefixes and GET /meta/permissions, for a lab
-//   whose real files do not exercise every schema shape.
+//            [--stub-registry] [--readonly] [--ro]
+// --stub-registry stubs GET /meta/prefixes, for a lab whose real files do not
+//   exercise every schema shape.
 // --readonly skips everything that writes.
-// --scoped / --ro stub GET /meta/access with a restricted answer (an rw scope on
-//   `traefik` only, or full read and no write) so the "Scoped write access" and
-//   "Read-only" toolbar labels and the per-row editability can be seen without
-//   depending on a second lab principal's credentials. Both imply --readonly.
+// --ro stubs GET /meta/access with full read and no write, so the "Read-only"
+//   toolbar label and the per-row editability can be seen without depending on a
+//   second lab principal's credentials. Implies --readonly.
 const puppeteer = require('puppeteer-core');
 const https = require('https');
 
@@ -17,12 +16,9 @@ const host = process.argv[2] || '10.10.10.154';
 const vmid = process.argv[3] || '200';
 const theme = process.argv[4] || 'light';
 const stubRegistry = process.argv.includes('--stub-registry');
-const scoped = process.argv.includes('--scoped');
 const roOnly = process.argv.includes('--ro');
-const readOnly = scoped || roOnly || process.argv.includes('--readonly');
-const ACCESS_STUB = scoped
-    ? { read: 1, write: 0, scopes: [{ prefix: 'traefik', mode: 'rw' }] }
-    : { read: 1, write: 0, scopes: [] };
+const readOnly = roOnly || process.argv.includes('--readonly');
+const ACCESS_STUB = { read: 1, write: 0 };
 const out = '/root/headless/shots';
 
 const PREFIXES = [
@@ -46,27 +42,6 @@ const PREFIXES = [
         },
     },
     { prefix: 'netbird', description: 'NetBird peer groups', selector: { tag: 'netbird' } },
-];
-
-const PERMISSIONS = [
-    {
-        name: 'traefik',
-        authid: 'svc@pve!traefik',
-        description: 'Traefik dynamic-configuration provider',
-        rules: [{ prefix: 'traefik', mode: 'rw', selector: { all: true } }],
-    },
-    {
-        name: 'netbird',
-        authid: 'svc@pve!netbird',
-        description: 'NetBird peer group assignment',
-        rules: [{ prefix: 'netbird', mode: 'ro', selector: { tag: 'netbird' } }],
-    },
-    {
-        name: 'audit',
-        authid: 'svc@pve!audit',
-        description: 'Read-only observer of every guest',
-        rules: [{ prefix: 'traefik', mode: 'ro', selector: { all: true } }],
-    },
 ];
 
 const ticket = () =>
@@ -100,7 +75,7 @@ const ticket = () =>
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// The DOM cell of one row, by column index (0 Key, 1 Value, 2 Description, 3 Access).
+// The DOM cell of one row, by column index (0 Key, 1 Value, 2 Description).
 const cellHandle = (page, path, col) =>
     page.evaluateHandle(
         (pth, c) => {
@@ -156,7 +131,7 @@ async function main() {
                 } catch (_e) {}
             }, t.CSRFPreventionToken);
 
-            if (stubRegistry || scoped || roOnly) {
+            if (stubRegistry || roOnly) {
                 await page.setRequestInterception(true);
                 page.on('request', (req) => {
                     const reply = (data) =>
@@ -169,11 +144,7 @@ async function main() {
                         reply(PREFIXES);
                         return;
                     }
-                    if (stubRegistry && /\/api2\/(extjs|json)\/meta\/permissions/.test(req.url())) {
-                        reply(PERMISSIONS);
-                        return;
-                    }
-                    if ((scoped || roOnly) && /\/api2\/(extjs|json)\/meta\/access/.test(req.url())) {
+                    if (roOnly && /\/api2\/(extjs|json)\/meta\/access/.test(req.url())) {
                         reply(ACCESS_STUB);
                         return;
                     }
@@ -271,8 +242,6 @@ async function main() {
                         value: n.data.valueText,
                         desc: n.data.description,
                         grammarDesc: n.data.grammarDescription,
-                        access: n.data.accessText,
-                        accessList: n.data.accessList,
                         icon: n.data.iconCls,
                         expandedCls: n.data.expandedCls,
                         present: n.data.present,
@@ -289,7 +258,6 @@ async function main() {
                 digest: p.digest,
                 access: p.access,
                 prefixes: (p.prefixes || []).length,
-                permissions: (p.permissions || []).length,
                 columns: p.tree.getColumns().map((c) => c.text),
                 rows,
                 toolbar: tb ? tb.items.items.map((i) => i.text || i.xtype) : [],
@@ -305,40 +273,10 @@ async function main() {
             };
         });
 
-        const shotName = scoped ? 'scoped' : roOnly ? 'readonly' : 'tree';
+        const shotName = roOnly ? 'readonly' : 'tree';
         await page.screenshot({
             path: `${out}/extjs-${shotName}-${theme}${stubRegistry ? '-registry' : ''}.png`,
         });
-
-        // The Access tooltip: hover the Access cell of a covered row.
-        {
-            // The row with the most entries, so the tooltip shows a real list.
-            const target = await page.evaluate(() => {
-                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-                let t = null;
-                p.getRootNode().cascadeBy((n) => {
-                    const len = (n.data.accessList || []).length;
-                    if (len && (!t || len > t.data.accessList.length)) t = n;
-                });
-                return t ? t.data.path : null;
-            });
-            result.checks.accessTipRow = target;
-            if (target) {
-                const h = await cellHandle(page, target, 3);
-                if (h.asElement()) {
-                    const box = await h.asElement().boundingBox();
-                    await page.mouse.move(box.x + box.width / 3, box.y + box.height / 2);
-                    await sleep(1600);
-                    result.checks.accessTip = await page.evaluate(() => {
-                        const el = document.querySelector('.x-tip:not([style*="display: none"])');
-                        return el ? el.innerText.replace(/\s+/g, ' ').trim() : null;
-                    });
-                    await page.screenshot({ path: `${out}/extjs-access-tip-${theme}.png` });
-                    await page.mouse.move(5, 5);
-                    await sleep(500);
-                }
-            }
-        }
 
         // The row editor, opened the way a user opens it: a double-click on the row.
         {
