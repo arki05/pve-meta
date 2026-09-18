@@ -38,7 +38,7 @@ pve-meta (0.2.0-1) UNRELEASED; urgency=medium
     non-goals; the code, its comments and its tests are about half their
     size, with every rule tested once.
 
- -- Julius Arkenberg <julius@rkenberg.de>  Thu, 18 Sep 2026 12:00:00 +0200
+ -- Julius Arkenberg <julius@rkenberg.de>  Fri, 18 Sep 2026 12:00:00 +0200
 
 pve-meta (0.1.3-1) unstable; urgency=medium
 
