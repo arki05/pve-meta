@@ -1,3 +1,14 @@
+pve-ext (0.2.0-1) UNRELEASED; urgency=medium
+
+  * The manifest id, the .claimed-by marker, the manifest-id subcommand and
+    the no-stacking refusal are gone; a file another package has diverted is
+    still refused. A leftover marker is ignored. Tabs are no longer gated on
+    capabilities, and the iframe page form is gone: every page is a script
+    with an xtype. A page manifest is checked for the fields the loader needs
+    and skipped with a warning otherwise.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Thu, 18 Sep 2026 12:00:00 +0200
+
 pve-ext (0.1.0-1) unstable; urgency=medium
 
   * Initial release: PVE::API2::Ext (API-module discovery), pve-ext-loader.js
