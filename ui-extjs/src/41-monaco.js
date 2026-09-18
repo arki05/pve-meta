@@ -6,6 +6,18 @@ PVE.meta.Monaco = {
     VS: '/pve2/js/pve-meta-extjs/vs',
     promise: null,
 
+    // ExtJS marks every function with an *enumerable* `Function.prototype.$isFunction`,
+    // and Monaco's ESM-to-AMD interop copies the own descriptor of every `for...in` key
+    // it finds, which an inherited one does not have. Ext only reads the marker as a
+    // truth value, so hiding it costs nothing.
+    hideExtFunctionMarker: function () {
+        let d = Object.getOwnPropertyDescriptor(Function.prototype, '$isFunction');
+        if (d && d.enumerable && d.configurable) {
+            d.enumerable = false;
+            Object.defineProperty(Function.prototype, '$isFunction', d);
+        }
+    },
+
     load: function () {
         let me = PVE.meta.Monaco;
         me.promise =
@@ -18,9 +30,23 @@ PVE.meta.Monaco = {
                             resolve(window.monaco);
                             return;
                         }
+                        me.hideExtFunctionMarker();
                         // Absolute: a language worker resolves its own scripts against
                         // this and has no page URL to make a relative path absolute with.
                         let vs = window.location.origin + me.VS;
+                        // A Monaco chunk that throws does so in its own `<script>`, out
+                        // of reach of the loader's errback: without this the promise
+                        // never settles and the caller's mask never comes off.
+                        let onError = function (event) {
+                            if (String(event.filename || '').indexOf(vs) === 0) {
+                                done(reject, event.error || new Error(event.message));
+                            }
+                        };
+                        let done = function (settle, value) {
+                            window.removeEventListener('error', onError);
+                            settle(value);
+                        };
+                        window.addEventListener('error', onError);
                         window.MonacoEnvironment = { baseUrl: vs };
                         let script = document.createElement('script');
                         script.src = vs + '/loader.js';
@@ -29,14 +55,15 @@ PVE.meta.Monaco = {
                                 window.require.config({ paths: { vs: vs } });
                                 window.require(
                                     ['vs/editor/editor.main'],
-                                    () => resolve(window.monaco),
-                                    reject,
+                                    () => done(resolve, window.monaco),
+                                    (err) => done(reject, err),
                                 );
                             } catch (err) {
-                                reject(err);
+                                done(reject, err);
                             }
                         };
-                        script.onerror = () => reject(new Error('failed to load ' + script.src));
+                        script.onerror = () =>
+                            done(reject, new Error('failed to load ' + script.src));
                         document.head.appendChild(script);
                     }),
             );

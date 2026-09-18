@@ -26,7 +26,7 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return;
         }
-        PVE.meta.Buffer.diff(me.textBuffer(), Ext.String.format(gettext('Changes: {0}'), me.docId));
+        PVE.meta.Buffer.diff(me.textBuffer(), me.docId);
     },
 
     setModeButton: function (value) {

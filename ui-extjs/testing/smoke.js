@@ -404,6 +404,22 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     delete ctx.window.monaco;
 }
 
+console.log('\n--- Monaco loads next to ExtJS ---');
+// Ext's enumerable `$isFunction` made Monaco's ESM-to-AMD interop throw inside its
+// own chunk, where the loader's errback never sees it: the Text view masked itself
+// "Loading..." for good.
+// The marker lives on the editor's own realm's Function.prototype, so the probe runs there.
+{
+    const inCtx = (src) => vm.runInContext(src, ctx);
+    const keys = () => inCtx('(function () { let out = []; for (let k in function () {}) { out.push(k); } return out; })()');
+    inCtx('Function.prototype.$isFunction = true');
+    eq('Ext leaves an enumerable marker on every function', keys(), ['$isFunction']);
+    ctx.PVE.meta.Monaco.hideExtFunctionMarker();
+    eq('... which Monaco no longer walks into', keys(), []);
+    eq('... and which Ext still reads', inCtx('(function () {}).$isFunction'), true);
+    inCtx('delete Function.prototype.$isFunction');
+}
+
 console.log('\n--- row merge: document + shape ---');
 const P = ctx.PVE.meta.TreePanel;
 const TRAEFIK_SCHEMA = {
