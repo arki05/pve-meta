@@ -122,8 +122,8 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decisio
   line and percent-escapes every byte outside printable ASCII plus colon and percent,
   so the YAML round-trips byte for byte, and a blob would only take the readable
   fallback away. The one quirk of that format — a line beginning with `qmdump#` or
-  `vzdump#` is dropped by vzdump — cannot arise from a document and is guarded against
-  in `render` regardless.
+  `vzdump#` is dropped by vzdump — cannot arise from a document: the block's lines are
+  a delimiter, top-level keys of the key charset, and indented lines.
 * **Install.** `pve-meta scan-notes`, run once by `debian/pve-meta.postinst`, walks the
   cluster's vmlist and, for every guest whose notes carry the marker, calls
   `notes_import(..., 'install')`: a document already there was put there by a node
