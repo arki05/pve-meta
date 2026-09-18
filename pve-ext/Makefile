@@ -23,17 +23,7 @@ install:
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/pages
 	mkdir -p $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext
 
-# lintian runs as part of this target, not as a separate step (see
-# docs/reference/PROXMOX-CONVENTIONS.md section 7.6/8, docs/DESIGN.md section 9,
-# README.md "Building and packaging"), mirroring upstream pve-rs's plain
-# `lintian $(DEBS)` (no --fail-on override, so only an E: tag fails the
-# build; a W: is printed, not fatal, same as upstream). `|| true` for a
-# local/dev build (unset $CI); unconditionally fatal when $CI is set
-# (matches .github/workflows/build.yml, which sets it automatically).
-# dpkg-buildpackage drops this package's artifacts in the parent of this
-# directory -- the repo root, or one level further up when this target is
-# invoked from the root Makefile's own `deb` (which then lintians the same
-# .deb again alongside pve-meta's own two).
+# lintian is fatal under $CI and advisory locally, as for pve-meta's own packages.
 deb:
 	dpkg-buildpackage -b -us -uc -d
 	if [ -n "$$CI" ]; then \
