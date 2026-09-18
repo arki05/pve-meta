@@ -74,19 +74,11 @@ in the `pve-meta` package's tree as well. `override_dh_auto_build` runs `make bu
 whose first line is `$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release`, so the cdylib and
 the generated `.pm` files exist before `dh_auto_install` runs.
 
-The alternative that was *not* taken, recorded for whoever revisits this: install
-everything once into `$(CURDIR)/debian/tmp` and add `debian/pve-meta.install` /
-`debian/libpve-meta-rs-perl.install` files listing which paths go to which package. That
-is the more idiomatic debhelper multi-binary pattern, but it is a bigger diff and touches
-the main package's install path too.
-
-`override_dh_auto_test` in `debian/rules` explicitly skips Rust tests during the
-packaging build already (pre-existing comment: no guaranteed network access with
-`dpkg-buildpackage -d`); `PVE::RS::Meta`'s Perl test suite
-(`crates/pve-meta-perl/test/basic.pl`, run via `make check` inside the crate) is
-likewise **not** wired into `dh_auto_test` and should stay a manual/CI step, matching
-upstream `pve-rs` (its own `test/README` notes the same: Perl tests are not run during
-the `.deb` build).
+`override_dh_auto_test` in `debian/rules` skips Rust tests during the packaging build
+(no guaranteed network access under `dpkg-buildpackage -d`); `PVE::RS::Meta`'s Perl test
+suite (`crates/pve-meta-perl/test/basic.pl`, run via `make check` inside the crate) is
+likewise not wired into `dh_auto_test` and stays a manual/CI step, matching upstream
+`pve-rs`.
 
 ## Cargo workspace
 
@@ -97,9 +89,8 @@ builds where `libperl-dev` + a `perl` interpreter are installed (confirmed: it d
 run bare at the workspace root skip it; `cargo build -p pve-meta-rs` /
 `cargo test -p pve-meta-rs` (or an explicit `--workspace`) still target it explicitly.
 
-`perlmod` is **not currently on crates.io** (confirmed 2026-09-07: the crates.io API
-returns 404 for it, despite some documentation suggesting otherwise) -- this crate
-depends on it via git, pinned to the commit upstream `pve-rs` 0.15.3 uses:
+`perlmod` is not on crates.io, so this crate depends on it via git, pinned to the
+commit upstream `pve-rs` 0.15.3 uses:
 
 ```toml
 perlmod = { git = "https://git.proxmox.com/git/perlmod.git", rev = "d85d4ebdd13c1dcb469e15eb0ce7b22640418b8e", features = ["exporter"] }

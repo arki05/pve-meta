@@ -1,47 +1,13 @@
-//! `pve-meta-rs`: the `PVE::RS::Meta` Perl bindings.
-//!
-//! Three families of exports, all thin wrappers over [`pve_meta_core`]:
-//!
-//! * the **lifecycle hooks** (`on_create`/`on_destroy`, and
-//!   `on_snapshot`/`on_rollback`/`on_delsnap`), called from the patched
-//!   `PVE/AbstractConfig.pm` (package `libpve-guest-common-perl`;
-//!   `docs/DESIGN.md` §9), plus `export_for_backup` and `notes_import`, the
-//!   two ends of a backup: called from the patched vzdump `assemble` of
-//!   `qemu-server` and `pve-container`, and from `write_config` in that same
-//!   `AbstractConfig.pm`. Clone is not carried;
-//! * `stored_vmids`, the store's own list of guest vmids, which is what lets
-//!   `pve-meta ls --orphans` and `pve-meta rm` find and remove a document
-//!   whose guest config was deleted out of band (`docs/DESIGN.md` §10); and
-//! * the **`api_*` functions** backing `perl/PVE/API2/Ext/Meta.pm`
-//!   (`docs/DESIGN.md` §8), implemented in [`pve_meta_core::api`] — this
-//!   crate only supplies the store and the registry.
-//!
-//! **Everything crosses as a native Perl structure** (`docs/DESIGN.md` §8):
-//! the caller's ACL hash and tags in, guest rows in, documents and results
-//! out. The single exception is the client-supplied `data` parameter, which
-//! is a JSON string because that is what the REST parameter is; it is decoded
-//! once, in Rust. `perlmod` converts a Perl scalar to a `bool` by truthiness,
-//! so the ACL flags are ordinary `1`/`0` (or `undef`) on the Perl side —
-//! `test/basic.pl` asserts that.
-//!
-//! Built as a `cdylib` (`libpve_meta_rs.so`); the `.pm` glue files
-//! (`PVE/RS/Meta.pm`, `Proxmox/Lib/PVEMeta.pm`) are generated separately by
-//! `genpackage.pl` (see `Makefile`), not by this crate.
-//!
-//! The store root defaults to `/etc/pve/meta` and can be overridden with the
-//! `PVE_META_ROOT` environment variable (used by tests and by
-//! `test/basic.pl`); the prefix directory likewise with
-//! `PVE_META_PREFIX_DIRS`. A store under `/etc/pve` refuses
-//! every call while pmxcfs is not mounted (a `503:`), and
-//! `PVE_META_CLUSTER_MARKER` names the marker it checks instead
-//! (`MetaStore::new`).
+//! `pve-meta-rs`: the `PVE::RS::Meta` Perl bindings — lifecycle hooks,
+//! `stored_vmids`, and the `api_*` functions behind
+//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §6-7), all thin wrappers
+//! over [`pve_meta_core`].
 
 use std::path::PathBuf;
 
 use pve_meta_core::store::{MetaStore, RollbackOutcome};
 
-/// Opens a fresh [`MetaStore`] rooted at `$PVE_META_ROOT`, or
-/// `/etc/pve/meta` if unset. Cheap: `MetaStore::new` does no I/O.
+/// Opens a [`MetaStore`] rooted at `$PVE_META_ROOT` (default `/etc/pve/meta`).
 fn open_store() -> MetaStore {
     let root = std::env::var_os("PVE_META_ROOT")
         .map(PathBuf::from)
@@ -49,17 +15,9 @@ fn open_store() -> MetaStore {
     MetaStore::new(root)
 }
 
-/// A vmid as it arrives from Perl: **an integer or a string**, whichever
-/// the caller happens to hold.
-///
-/// PVE never normalises the scalar. `qemu-server` passes the API parameter
-/// through as the string it was parsed from (`"300"`), while `pve-container`
-/// has usually done arithmetic on it by the time a hook runs, which gives
-/// the scalar an integer slot. perlmod deserialises a `u32` from the
-/// integer slot only and refuses a plain string (`invalid type: string
-/// "300", expected u32`), so a `u32` parameter silently made every hook a
-/// no-op for QEMU guests. This type takes both shapes and is what every
-/// export below declares for a vmid.
+/// A vmid as Perl hands it over: an integer or a digit string. PVE doesn't
+/// normalize the scalar, and perlmod's plain `u32` refuses a string, which
+/// silently no-ops every hook for QEMU guests; this type accepts both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vmid(pub u32);
 
@@ -91,19 +49,16 @@ impl<'de> serde::Deserialize<'de> for Vmid {
     }
 }
 
-/// The node-local directory of restore markers, `$PVE_META_RUN_DIR` or
-/// `/run/pve-meta`: one empty file per vmid whose config was just created
-/// by `create_and_lock_config` and not yet written since. See
-/// [`pve_rs_meta::mark_created`].
+/// The node-local directory of restore markers, `$PVE_META_RUN_DIR` (default
+/// `/run/pve-meta`): one empty file per vmid awaiting [`pve_rs_meta::take_created`].
 fn run_dir() -> PathBuf {
     std::env::var_os("PVE_META_RUN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/pve-meta"))
 }
 
-/// The wall clock as unix seconds, for the notes block's `time=` field. The
-/// core takes the instant as an argument so it never touches the clock
-/// itself (its wasm build has none).
+/// The wall clock as unix seconds, for the notes block's `time=` field
+/// (taken as an argument by the core so its wasm build never touches a clock).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -111,12 +66,9 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// The `Proxmox::Lib::PVEMeta` library-loader package generated by
-/// `genpackage.pl` (`--lib-package=Proxmox::Lib::PVEMeta`, see `Makefile`)
-/// bootstraps itself on `use` (its own generated `BEGIN` block), so this crate
-/// must export a matching `boot_Proxmox__Lib__PVEMeta` symbol even though it
-/// has no functions of its own to export -- mirrors upstream `pve-rs`'s
-/// `Proxmox::Lib::PVE` package (`proxmox-perl-rs/pve-rs/src/bindings/mod.rs`).
+/// `genpackage.pl`'s generated `Proxmox::Lib::PVEMeta` calls
+/// `boot_Proxmox__Lib__PVEMeta` on `use`, so this module must exist even
+/// though it exports no functions of its own.
 #[perlmod::package(name = "Proxmox::Lib::PVEMeta", lib = "pve_meta_rs")]
 mod proxmox_lib_pve_meta {}
 
@@ -132,31 +84,22 @@ mod pve_rs_meta {
 
     use super::{now_unix, open_store, run_dir, RollbackOutcome, Vmid};
 
-    // No `open_prefixes`: a prefix names no principal, so it never gates a
-    // read or write, and the two exports that read prefixes want different
-    // sets -- `api_prefixes` the listing with its failures, `api_put` the set
-    // for the guest's node (`api::effective_prefixes`).
+    // No `open_prefixes`: `api_prefixes` wants every file (with failures);
+    // `api_put` wants only those effective for the guest's node.
 
-    // -- snapshot hooks (`docs/DESIGN.md` §9) -----------------------------
-    //
-    // Called from the patched `PVE/AbstractConfig.pm`. They run inside PVE's
-    // own guest locks and copy whole files; they do not consult permissions.
+    // -- snapshot hooks, called from the patched `PVE/AbstractConfig.pm`
+    // (`docs/DESIGN.md` §7, `docs/LIFECYCLE.md`) ---------------------------
 
     /// Copies `$vmid`'s current document to its `$snapname` snapshot file.
-    /// A no-op if the guest has no document.
-    ///
-    /// Returns `1` if a copy was made, `0` otherwise.
+    /// A no-op if the guest has no document. Returns `1` if a copy was made.
     #[export]
     pub fn on_snapshot(vmid: Vmid, snapname: &str) -> Result<bool, Error> {
         Ok(open_store().snapshot(vmid.0, snapname)?)
     }
 
     /// Restores `$vmid`'s `$snapname` snapshot copy over its current
-    /// document. If no snapshot copy exists but a current document does, the
-    /// current document is removed (the guest had no metadata when the
-    /// snapshot was taken).
-    ///
-    /// Returns `"restored"`, `"removed"`, or `"none"`.
+    /// document, or removes the current document if no copy exists. Returns
+    /// `"restored"`, `"removed"`, or `"none"`.
     #[export]
     pub fn on_rollback(vmid: Vmid, snapname: &str) -> Result<String, Error> {
         let outcome = open_store().rollback(vmid.0, snapname)?;
@@ -168,66 +111,37 @@ mod pve_rs_meta {
         .to_string())
     }
 
-    /// Removes `$vmid`'s `$snapname` snapshot copy. Idempotent.
-    ///
-    /// Returns `1` if a copy existed and was removed, `0` otherwise.
+    /// Removes `$vmid`'s `$snapname` snapshot copy. Idempotent; returns `1`
+    /// if a copy existed.
     #[export]
     pub fn on_delsnap(vmid: Vmid, snapname: &str) -> Result<bool, Error> {
         Ok(open_store().delete_snapshot(vmid.0, snapname)?)
     }
 
-    // -- orphans (`docs/DESIGN.md` §9) -------------------------------------
-
-    /// Clears any metadata left at `$vmid` — the document and every snapshot copy.
-    /// Returns the number of files removed.
-    ///
-    /// Called from the patched `PVE::AbstractConfig::create_and_lock_config` **only when
-    /// that call asserted the vmid was unused** (`$allow_existing` false, i.e.
-    /// `PVE::Cluster::check_vmid_unused` has just passed). A genuinely new guest starts
-    /// with no inherited metadata; a restore *over* an existing guest keeps its document
-    /// here, and the restore itself then replaces it from the backup's notes block
-    /// (`notes_import`), or leaves it if the backup carried none.
-    ///
-    /// This is what closes the vmid-reuse window a periodic sweep cannot: a guest
-    /// destroyed and recreated at the same vmid between two sweeps is never stale from
-    /// the sweep's point of view, because the vmid is back in the vmlist.
+    /// Clears any metadata at `$vmid`. Called from
+    /// `create_and_lock_config` only when it just asserted the vmid unused,
+    /// so a restore over an existing guest keeps its document instead
+    /// (`docs/decisions/009-no-sweeper.md`). Returns the files removed.
     #[export]
     pub fn on_create(vmid: Vmid) -> Result<usize, Error> {
         Ok(open_store().purge(vmid.0)?)
     }
 
-    /// Removes `$vmid`'s document and every snapshot copy. Returns the number of files
-    /// removed; idempotent, and 0 when there was nothing there.
-    ///
-    /// Called from the patched `PVE::AbstractConfig::destroy_config`, after the guest
-    /// config itself has been unlinked — so it runs on every destroy path there is
-    /// (primary destroy, create/restore failure cleanup, clone failure cleanup, remote
-    /// migration abort), all of which funnel through that one method.
+    /// Removes `$vmid`'s document and every snapshot copy. Called from
+    /// `destroy_config` after the guest config itself is unlinked, so it
+    /// runs on every destroy path. Idempotent; returns the files removed.
     #[export]
     pub fn on_destroy(vmid: Vmid) -> Result<usize, Error> {
         let removed = open_store().purge(vmid.0)?;
-        // A create that failed part-way destroys its config; its marker goes
-        // with it, or the vmid's next owner would import on its first write.
+        // A failed create's marker must go with it, or the vmid's next
+        // owner would import a stale one on its first write.
         let _ = std::fs::remove_file(run_dir().join(vmid.0.to_string()));
         Ok(removed)
     }
 
-    // -- the restore marker (`docs/DESIGN.md` §9) ----------------------------
-    //
-    // `write_config` cannot tell a restore from any other config write, but
-    // every restore (and create, and clone) begins with
-    // `create_and_lock_config`, in the same patched file. That hook leaves a
-    // node-local marker for the vmid; `write_config` consumes it on the first
-    // write that carries a block, or the first write of an unlocked config
-    // (a create keeps the config locked and writes it more than once), and
-    // imports a notes block only on the write that consumed it. A block
-    // pasted into a live guest's notes is therefore never imported by a plain
-    // `qm set`; `pve-meta scan-notes` is the explicit way in. Node-local
-    // because a restore runs entirely on one node, and in `/run` because a
-    // marker must not outlive a reboot.
-
-    /// Leaves the restore marker for `$vmid`. Called from the patched
-    /// `create_and_lock_config`, after PVE has written the initial config.
+    /// Leaves the restore marker for `$vmid`, taken by [`take_created`].
+    /// Called from `create_and_lock_config` after PVE writes the initial
+    /// config.
     #[export]
     pub fn mark_created(vmid: Vmid) -> Result<(), Error> {
         let dir = run_dir();
@@ -236,10 +150,9 @@ mod pve_rs_meta {
         Ok(())
     }
 
-    /// Removes `$vmid`'s restore marker and says whether there was one.
-    /// Called from the patched `write_config` on a write that carries a
-    /// block or writes an unlocked config; only a `1` lets that write import
-    /// a notes block.
+    /// Removes `$vmid`'s restore marker and says whether there was one; only
+    /// a `1` lets the calling `write_config` import a notes block
+    /// (`docs/LIFECYCLE.md`).
     #[export]
     pub fn take_created(vmid: Vmid) -> Result<bool, Error> {
         match std::fs::remove_file(run_dir().join(vmid.0.to_string())) {
@@ -249,46 +162,30 @@ mod pve_rs_meta {
         }
     }
 
-    /// Every vmid the store holds any file for -- a document, a snapshot
-    /// copy, or both -- sorted ascending. A file whose name carries no vmid
-    /// is not a guest and is never listed.
-    ///
-    /// What `pve-meta ls --orphans` subtracts the vmlist from, and what
-    /// `pve-meta rm` checks before removing anything: the one case the
-    /// create and destroy hooks cannot see is a guest config deleted out of
-    /// band, and this is how an administrator finds what it left behind.
+    /// Every vmid the store holds a file for, sorted ascending. What
+    /// `pve-meta ls --orphans` subtracts the vmlist from, for a guest config
+    /// deleted out of band (`docs/DESIGN.md` §8).
     #[export]
     pub fn stored_vmids() -> Result<Vec<u32>, Error> {
         Ok(open_store().stored_vmids()?)
     }
 
-    // -- backup and restore (`docs/DESIGN.md` §9) ---------------------------
-    //
-    // A backup carries the document in the archive's copy of the guest's
-    // notes; a restore reads it back out (`pve_meta_core::backup`).
-
-    /// The notes block for `$vmid`'s current document, or `undef` if the
-    /// guest has none. Called from the patched vzdump `assemble` of both
-    /// guest types, which append it to the archive's copy of the notes.
-    ///
-    /// Dies, with the reason, for a document that is not carried: one above
-    /// the size cap, or one that does not parse. The caller warns into the
-    /// backup log and the backup runs without it.
+    /// The notes block for `$vmid`'s current document, or `undef` if none.
+    /// Called from the patched vzdump `assemble` of both guest types
+    /// (`docs/LIFECYCLE.md`). Dies for a document too large or unparsable to
+    /// carry; the caller warns into the backup log and continues.
     #[export]
     pub fn export_for_backup(vmid: Vmid) -> Result<Option<String>, Error> {
         Ok(backup::export(&open_store(), vmid.0, now_unix())?)
     }
 
     /// Reads a notes block out of `$description` into `$vmid`'s document and
-    /// strips it. Returns `{ action, description }`: `action` is `imported`,
-    /// `stripped` or `none`, and `description` is the notes without the
-    /// block, or `undef` when there was nothing to remove.
-    ///
-    /// `$mode` is `restore` (the block is the backup being restored, so it
-    /// replaces whatever document the vmid had) or `install` (the scan
-    /// `pve-meta scan-notes` runs once at install: a document already there
-    /// is kept and the block only stripped). The caller holds the document's
-    /// `cfs_lock_domain` lock. An error leaves the notes untouched.
+    /// strips it. Returns `{ action, description }`: `action` is
+    /// `imported`, `stripped` or `none`. `$mode` is `restore` (the block
+    /// replaces the vmid's document) or `install` (`pve-meta scan-notes`:
+    /// an existing document is kept, the block only stripped). The caller
+    /// holds the document's `cfs_lock_domain` lock; an error leaves the
+    /// notes untouched.
     #[export]
     pub fn notes_import(
         vmid: Vmid,
@@ -299,46 +196,32 @@ mod pve_rs_meta {
         Ok(backup::import(&open_store(), vmid.0, description, mode)?)
     }
 
-    /// Returns this crate's version string. Used by
-    /// `crates/pve-meta-perl/test/basic.pl` and available to operators for
-    /// checking which build a running pvedaemon/pveproxy has loaded.
+    /// This crate's version, checked by `test/basic.pl` and by operators
+    /// against a running pvedaemon/pveproxy.
     #[export]
     pub fn version() -> String {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    // -- API-shaped exports (`PVE::API2::Ext::Meta`, `docs/DESIGN.md` §8) --
-    //
-    // Thin wrappers over `pve_meta_core::api` (see that module's docs for the
-    // wire contract and the authorization rules). All of these die with a
-    // Rust `pve_meta_core::api::ApiError` whose `Display` is `"NNN: message"`
-    // (an HTTP status prefix); the Perl layer parses that prefix and
-    // re-raises via `PVE::Exception::raise`. `perlmod`'s `#[export]` only
-    // needs the error type to be `Display`, so this needs no conversion back
-    // to `anyhow::Error`.
-    //
-    // `$acl` is a native hash: `{ authid, read, write, tags => [...], node }`,
-    // where `read`/`write` are the PVE ACL answers for the document being
-    // addressed and are the whole of access (`docs/DESIGN.md` §4), `tags` are
-    // the guest's PVE tags, which resolve a prefix's selector, and `node` is
-    // the guest's current node, whose prefix files join the packaged and
-    // cluster ones.
+    // -- `api_*`: thin wrappers over `pve_meta_core::api` (`docs/DESIGN.md`
+    // §6) backing `PVE::API2::Ext::Meta`. Each dies with an
+    // `api::ApiError` (`Display` is `"NNN: message"`), which the Perl layer
+    // re-raises via `PVE::Exception::raise`. `$acl` is
+    // `{ authid, read, write, tags => [...], node }`: `read`/`write` are the
+    // caller's PVE ACL answers for the document addressed (`docs/DESIGN.md`
+    // §4), `tags` resolve a prefix's selector, `node` picks its overrides.
 
-    /// `GET /meta/version` -> `{ token }`: one hash over every document and
-    /// every prefix file, unscoped (`docs/DESIGN.md` §6).
+    /// `GET /meta/version` -> `{ token }`, one hash over every document and
+    /// prefix file.
     #[export]
     pub fn api_version() -> Result<api::ApiVersion, api::ApiError> {
         api::version(&open_store())
     }
 
-    /// `GET /meta/prefixes` -> without `$tags`, every prefix file as it is,
-    /// most-specific first, rows carrying `nodes` as parsed; with `$tags`
-    /// (a guest's, possibly empty) and `$node` (its current node), the
-    /// prefixes reaching that guest, resolved -- no `nodes` map, `enforce`/
-    /// `hidden`/`schema` already effective. Either way, plus a row for any
-    /// file that failed to load -- named, with `error` set, and nothing else
-    /// -- so a hand-edit or a bad package upgrade that broke a file is
-    /// visible here instead of just in the log (`docs/DESIGN.md` §1).
+    /// `GET /meta/prefixes` -> without `$tags`, every prefix file as
+    /// declared; with `$tags`/`$node`, those reaching the guest with
+    /// `enforce`/`hidden`/`schema` already resolved. Either way, a row per
+    /// file that failed to load, named with `error` set (`docs/DESIGN.md` §1).
     #[export]
     pub fn api_prefixes(
         node: Option<&str>,
@@ -347,27 +230,24 @@ mod pve_rs_meta {
         api::prefixes(open_store().registry()?, node, tags.as_deref())
     }
 
-    /// `GET /meta/schemas` -> `{ prefix }`, the prefix file format described
-    /// in the same dialect a prefix uses, so the editor can show one as a
-    /// typed tree.
+    /// `GET /meta/schemas` -> `{ prefix }`, the prefix file format in its
+    /// own schema dialect, for the editor to render as a typed tree.
     #[export]
     pub fn api_schemas() -> Result<pve_meta_core::model::Value, Error> {
         Ok(api::schemas())
     }
 
-    /// `GET /meta/access` -> `{ read, write }` for one document -- exactly
-    /// `$acl`'s own ACL answers (`docs/DESIGN.md` §4). `$id` is a vmid or
-    /// `prefixes/<name>`; it is only parsed, to give a 400 for a garbage id
-    /// rather than an answer for a document that could not exist.
+    /// `GET /meta/access` -> `{ read, write }` for one document, exactly
+    /// `$acl`'s own answers. `$id` is only parsed, for a 400 on a garbage id.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, api::ApiError> {
         api::parse_id(id)?;
         api::access(&open_store(), &acl)
     }
 
-    /// `GET /meta/guests`. `$guests` is the array of vmlist rows Perl already
-    /// has — `[{vmid, node, type, name, tags, read}]` — as a native
-    /// array of hashes. Rust never reads `.vmlist` or a guest config itself.
+    /// `GET /meta/guests`. `$guests` is the vmlist rows Perl already has —
+    /// `[{vmid, node, type, name, tags, read}]`; Rust never reads `.vmlist`
+    /// or a guest config itself.
     #[export]
     pub fn api_list_guests(
         guests: Vec<GuestInput>,
@@ -377,9 +257,8 @@ mod pve_rs_meta {
     }
 
     /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
-    /// a vmid or `prefixes/<name>`).
-    /// `$comments` (optional, trailing) keeps the comment keys, which a read
-    /// otherwise leaves out.
+    /// a vmid or `prefixes/<name>`). `$comments` keeps the comment keys a
+    /// read otherwise leaves out.
     #[export]
     pub fn api_get(
         id: &str,
@@ -392,22 +271,13 @@ mod pve_rs_meta {
     }
 
     /// `PUT /meta/guests/{vmid}` and the registry documents' `PUT`.
-    ///
-    /// `$payload` is the only string crossing: the client's `data` (JSON) or
-    /// `text` (YAML) parameter, decoded once in Rust. `$force` (optional,
-    /// trailing) stores the result even where a prefix declares
-    /// `enforce: true` and it would not match that prefix's schema. `$comments`
-    /// (optional, trailing) makes a replace's payload the subtree notes included;
-    /// without it, a key the payload keeps keeps its stored note unless the
-    /// payload gives its own. The prefixes enforced for a guest are those in
-    /// effect on `$acl`'s `node`.
-    ///
-    /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
-    /// `cfs_lock_domain` lock: the digest precondition is re-checked inside
-    /// this call, but only a lock makes the read-modify-write atomic across
-    /// nodes (`docs/DESIGN.md` §7).
+    /// `$payload` is the client's `data` (JSON) or `text` (YAML), decoded
+    /// once in Rust. `$force` stores past an enforcing prefix's schema
+    /// mismatch; `$comments` keeps a replace's own subtree notes. The
+    /// caller must already hold the document's `cfs_lock_domain` lock — the
+    /// digest check here is not itself a cross-node lock.
     #[export]
-    #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
+    #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameters 1:1
     pub fn api_put(
         id: &str,
         view: Option<&str>,
@@ -438,8 +308,8 @@ mod pve_rs_meta {
         )
     }
 
-    /// `DELETE /meta/guests/{vmid}` and the registry documents' `DELETE`. Removes the
-    /// current document only -- never a snapshot copy.
+    /// `DELETE /meta/guests/{vmid}` and the registry documents' `DELETE`.
+    /// Removes the current document only, never a snapshot copy.
     #[export]
     pub fn api_delete(
         id: &str,

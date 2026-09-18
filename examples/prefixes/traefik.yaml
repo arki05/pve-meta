@@ -17,12 +17,9 @@
 # with a warning and contributes nothing; it never affects another one.
 description: Traefik dynamic configuration
 
-# `{ tag: traefik }` rather than `{ all: true }` on purpose. The selector
-# decides which guests this prefix definition reaches, and a schema's declared-but-unset
-# keys show as greyed rows on exactly those guests -- so an `all` example puts
-# traefik's rows on every guest in the cluster, and teaches the wrong default
-# for the one feature it exists to demonstrate. Tag a guest `traefik` to see
-# these rows appear on it.
+# `{ tag: traefik }` rather than `{ all: true }`: the selector decides which
+# guests see this prefix's declared-but-unset rows, so `all` would put them on
+# every guest in the cluster. Tag a guest `traefik` to see them appear on it.
 selector: { tag: traefik }
 
 # Optional, PVE::JSONSchema dialect, describing the subtree under `traefik`.

@@ -1,60 +1,9 @@
 #!/usr/bin/perl
 
-# pve-meta: read a metadata document from the node it runs on.
-#
-# Installed at /usr/sbin/pve-meta. **A local reader, not an API client**: it
-# calls PVE::RS::Meta directly against /etc/pve/meta, so it needs no ticket, no
-# token and no pveproxy, and it works in a hook script that runs before the API
-# is reachable. That is the whole reason it exists --
-# `pvesh get /meta/guests/<vmid>` already does this for anyone who has an API
-# session, and a hook script does not.
-#
-# It therefore enforces **nothing**. It is root reading a file root can already
-# `cat`, and it is refused to anyone else by the permissions on /etc/pve. The
-# access rules in docs/DESIGN.md section 4 are about the API, where a principal
-# other than root exists to be limited; there is no principal here.
-#
-# `set`, `merge` and `delete` are the API's PUT and DELETE, for root on the node:
-# the same Rust functions, the same lint, the same digest compare-and-swap, the
-# same enforced schemas (`--force` is the API's force=1), under the same
-# per-document cluster lock PVE::API2::Ext::Meta holds -- so a hook script, a
-# cloud-init step or an Ansible task can write without a token and without
-# pveproxy. What they skip is permissions, because root can already write the
-# file; the audit line still names root@pam.
-#
-# `ls --orphans` and `rm` are the manual cleanup for the one case the create and
-# destroy hooks cannot see (docs/DESIGN.md section 9): a guest config deleted out
-# of band, so destroy_config never ran and the document stayed. `rm` takes the
-# document's own write lock and re-reads the vmlist inside it, so it can never
-# race a PUT for a guest that came back, and it refuses a live guest outright --
-# that one is removed through the API or the UI, where permissions apply.
-#
-# `scan-notes` is the one-time pass debian/pve-meta.postinst runs. A guest restored
-# on a host without pve-meta carries its document in its notes, as the block every
-# backup taken here appends (docs/LIFECYCLE.md); this reads every such block in the
-# cluster back into the store and strips it.
-#
-# Output is shaped for the caller a hook script is:
-#
-#   pve-meta get 201 homelab.owner     -> arki          (a scalar, bare, no quotes)
-#   pve-meta get 201 homelab           -> YAML          (anything with structure)
-#   pve-meta get 201                   -> the whole document as YAML, without comment keys
-#   pve-meta get 201 --comments        -> the file as it is written, notes and all
-#   pve-meta get prefixes/traefik      -> a prefix definition, same as any document
-#   pve-meta ls                        -> every document id, one per line
-#   pve-meta ls --orphans              -> vmids with files but no guest in the vmlist
-#   pve-meta rm 999500                 -> remove an orphan's document and snapshot copies
-#   pve-meta set 201 traefik --data '{"spec":{"host":"x"}}'   -> replace that view
-#   pve-meta merge 201 traefik --text 'spec: {port: 80}'      -> merge-patch into it
-#   pve-meta delete 201 traefik.spec.port                      -> remove one key
-#
-# so `host=$(pve-meta get $vmid traefik.spec.host)` is the obvious thing and
-# gives the obvious answer. Exit status 2 means "not there" -- a missing
-# document, or a view the document does not have -- which is what lets a hook
-# script tell "nothing configured" from "something is broken" without parsing
-# the output:
-#
-#   if host=$(pve-meta get "$vmid" traefik.spec.host); then ... ; fi
+# pve-meta: a local reader/writer for /etc/pve/meta -- no ticket, no token, no
+# pveproxy, so it also works from a hook script before the API is reachable.
+# `set`/`merge`/`delete` share PVE::API2::Ext::Meta's Rust calls, lock and lint
+# (docs/DESIGN.md §6); root's own file permissions are the only access check.
 
 use strict;
 use warnings;
@@ -103,57 +52,42 @@ EOF
     exit($msg ? 1 : 0);
 }
 
-# The one caller here is root on the node, reading files it already owns. For
-# a guest the ACL carries the guest's tags and its current node, because a
-# prefix's selector is resolved against the tags and a prefix may override its
-# schema/enforce/hidden for that node (docs/DESIGN.md section 3) -- exactly as
-# PVE::API2::Ext::Meta passes them. Called inside `locked`, after its
-# cfs_update().
+# root on the node, reading files it already owns; for a guest the tags and
+# node travel too, since a prefix's selector and node override resolve
+# against them the same way PVE::API2::Ext::Meta resolves them.
 my $ROOT_ACL = { authid => 'root@pam', read => 1, write => 1, tags => [] };
 
 sub acl_for {
     my ($id) = @_;
     return $ROOT_ACL if $id !~ /^\d+$/;
-    require PVE::Cluster;
-    my $props = eval { PVE::Cluster::get_guest_config_properties(['tags'], $id) } || {};
-    my $raw = (($props->{$id} // {})->{tags}) // '';
-    my @tags = grep { length($_) } split(/[;,\s]+/, $raw);
-    my $vmlist = PVE::Cluster::get_vmlist() || {};
-    my $node = ((($vmlist->{ids} // {})->{$id}) // {})->{node};
-    return { %$ROOT_ACL, tags => \@tags, node => $node };
+    require PVE::API2::Ext::Meta;
+    return {
+        %$ROOT_ACL,
+        tags => PVE::API2::Ext::Meta::guest_tags($id),
+        node => PVE::API2::Ext::Meta::guest_node($id),
+    };
 }
 
-# The lock every write to this document holds, on the API and here: one domain
-# per document, named the way PVE::API2::Ext::Meta names it.
-sub lock_id_for {
-    my ($id) = @_;
-    return $id if $id =~ /^\d+$/;
-    my (undef, $name) = split(m{/}, $id, 2);
-    return "prefix-$name";
-}
-
-# Runs $code under the document's cluster lock, with the same thing the API
-# checks inside it: a guest id must be in the vmlist, so a write never creates
-# a file for a vmid that does not exist. The digest is re-checked by the Rust
-# call itself. cfs_lock_domain reports through $@ rather than dying.
+# Runs $code under the document's cluster lock, with the same vmlist check the
+# API makes inside it: a write never creates a file for a vmid that does not
+# exist. The digest is re-checked by the Rust call itself.
 sub locked {
     my ($id, $code) = @_;
     require PVE::Cluster;
+    require PVE::API2::Ext::Meta;
     my $res = PVE::Cluster::cfs_lock_domain(
-        "pve-meta-" . lock_id_for($id),
+        PVE::API2::Ext::Meta::lock_domain_for($id),
         $LOCK_TIMEOUT,
         sub {
             if ($id =~ /^\d+$/) {
-                PVE::Cluster::cfs_update();
-                my $vmlist = PVE::Cluster::get_vmlist() || {};
-                die "guest '$id' does not exist\n" if !(($vmlist->{ids} // {})->{$id});
+                die "guest '$id' does not exist\n"
+                    if !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
             }
             return $code->();
         },
     );
     if (my $err = $@) {
-        chomp(my $msg = "$err");
-        $msg =~ s/^\d{3}:\s*//;
+        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
         print STDERR "$SELF: $msg\n";
         exit 1;
     }
@@ -164,10 +98,12 @@ sub locked {
 # --file (by extension; '-' is stdin, read as YAML). Returns (format, text).
 sub write_payload {
     my ($opts) = @_;
-    my $given = grep { defined $_ } @$opts{qw(data text file)};
-    usage("exactly one of --data, --text or --file is required") if $given != 1;
-    return ('json', $opts->{data}) if defined $opts->{data};
-    return ('yaml', $opts->{text}) if defined $opts->{text};
+    require PVE::API2::Ext::Meta;
+    my $key = PVE::API2::Ext::Meta::require_one_of($opts, [qw(data text file)], sub {
+        usage("exactly one of --data, --text or --file is required");
+    });
+    return ('json', $opts->{data}) if $key eq 'data';
+    return ('yaml', $opts->{text}) if $key eq 'text';
     my $file = $opts->{file};
     my $text;
     if ($file eq '-') {
@@ -244,15 +180,13 @@ sub cmd_delete {
     exit 2 if !report_write('removed', $id, $view, $res);
 }
 
-# `PVE::RS::Meta` reports errors as "NNN: message" (the Rust->Perl contract).
 # A CLI wants the message and a status, not a stack trace.
 sub call {
     my ($code) = @_;
     my $res = eval { $code->() };
     if (my $err = $@) {
-        my $msg = "$err";
-        $msg =~ s/\s+$//;
-        $msg =~ s/^\d{3}:\s*//;
+        require PVE::API2::Ext::Meta;
+        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
         print STDERR "$SELF: $msg\n";
         exit 1;
     }
@@ -276,11 +210,9 @@ sub cmd_get {
     my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) });
     my $data = $doc->{data};
 
-    # A view the document does not have comes back as the empty document, which
-    # is also what an empty map looks like -- the API has one answer for both
-    # (docs/DESIGN.md section 7). For a *view*, treat it as absent: that is the
-    # question a hook script is asking, and an empty map is not an answer it can
-    # use either.
+    # A view the document does not have comes back as the empty document, same as
+    # an empty map (docs/DESIGN.md §5); for a *view* that is what "not there" looks
+    # like, so it is treated as absent.
     if (defined($view) && $view ne '' && ref($data) eq 'HASH' && !%$data) {
         exit 2;
     }
@@ -310,15 +242,13 @@ sub cmd_get {
     print $yaml->{text};
 }
 
-# The vmlist as a set, freshly refreshed. cfs_update() is not optional: a process
-# that has not refreshed the cached cluster filesystem state -- and this one was
-# just spawned -- sees an empty list, and an empty vmlist reads as "every guest
-# is gone" to anything that subtracts it.
+# The vmlist as a set, freshly refreshed: this process was just spawned, and an
+# unrefreshed empty list reads as "every guest is gone" to anything that
+# subtracts it.
 sub live_vmids {
-    require PVE::Cluster;
-    PVE::Cluster::cfs_update();
-    my $vmlist = PVE::Cluster::get_vmlist() || {};
-    return { map { int($_) => 1 } keys %{ $vmlist->{ids} // {} } };
+    require PVE::API2::Ext::Meta;
+    my $ids = PVE::API2::Ext::Meta::vmlist_ids(1);
+    return { map { int($_) => 1 } keys %$ids };
 }
 
 sub orphan_vmids {
@@ -353,10 +283,8 @@ sub cmd_ls {
         return;
     }
 
-    # The store's own walk (docs/DESIGN.md section 8): every guest document,
-    # whether or not it parses, plus every prefix file -- the one an
-    # administrator most needs to find. `api_prefixes` with neither `node`
-    # nor `tags` is the raw listing, packaged and cluster resolved by name.
+    # The store's own walk (docs/DESIGN.md §6): every guest document, parses or
+    # not, plus every prefix file, unscoped.
     my $vmids = call(sub { PVE::RS::Meta::stored_vmids() });
     my $prefixes = call(sub { PVE::RS::Meta::api_prefixes(undef, undef) });
     my @docs = (
@@ -379,31 +307,25 @@ sub cmd_rm {
     $vmid = int($vmid);
 
     require PVE::Cluster;
+    require PVE::API2::Ext::Meta;
     my $removed;
-    # The document's own write lock -- the one PVE::API2::Ext::Meta holds around
-    # every read-modify-write -- with the vmlist re-read inside it. A guest
-    # created at this vmid after the check outside the lock would have its
-    # fresh document deleted otherwise, with its PUT long since answered 200.
-    #
-    # cfs_lock_domain() catches the callback's die and re-raises it through $@,
-    # so the call is followed by an explicit check rather than wrapped in eval.
+    # The document's own write lock, with the vmlist re-read inside it: a guest
+    # created at this vmid after the check outside the lock would otherwise have
+    # its fresh document deleted, with its PUT long since answered 200.
     PVE::Cluster::cfs_lock_domain(
-        "pve-meta-$vmid",
+        PVE::API2::Ext::Meta::lock_domain_for($vmid),
         $LOCK_TIMEOUT,
         sub {
             my $live = live_vmids();
             die "the vmlist is empty; refusing to remove anything\n" if !%$live;
             die "$vmid is a live guest; remove its metadata through the API or the UI\n"
                 if $live->{$vmid};
-            # "This guest is gone, remove everything it had" is exactly what the
-            # destroy hook does on every destroy path PVE has.
             $removed = PVE::RS::Meta::on_destroy($vmid);
         },
     );
     if (my $err = $@) {
-        chomp $err;
-        $err =~ s/^\d{3}:\s*//;
-        print STDERR "$SELF: $err\n";
+        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
+        print STDERR "$SELF: $msg\n";
         exit 1;
     }
     if (!$removed) {
@@ -414,28 +336,15 @@ sub cmd_rm {
 }
 
 # Every guest in the cluster whose notes carry a backup block: import it where the
-# store has no document for that vmid, strip it either way (docs/DESIGN.md section
-# 9). Cluster-wide on purpose: /etc/pve is one filesystem, so every config is
-# readable and writable from here, one install covers the cluster, and a later
-# install on another node finds documents everywhere and blocks nowhere. A document
-# that is already there was put there by a node that already runs pve-meta, so it
-# is kept and only the block goes.
-#
-# The write goes to the config's own node path, never through write_config: that
-# would write under this node's name, and the restore hook it carries has nothing
-# left to do once the block is stripped. The guest lock is node-local, so it is
-# taken for this node's own guests only; for a guest another node owns it would
-# serialise nothing and leave a stray lock file. There, the meta lock serialises
-# the document and the config write is the whole-file replace pmxcfs makes atomic;
-# a write on the owning node in that same instant could lose one side, and the
-# owning node's next scan or restore would import the same text again. An
-# install-time pass over the handful of guests that carry a block is the one place
-# this is accepted.
+# store has no document for that vmid, strip it either way (docs/DESIGN.md §7,
+# docs/LIFECYCLE.md's "Install"). Writes go to each guest's own node path, not
+# through write_config, and take that guest's own-node lock only.
 sub cmd_scan_notes {
     my (@args) = @_;
     usage('too many arguments') if @args;
 
     require PVE::Cluster;
+    require PVE::API2::Ext::Meta;
     require PVE::INotify;
     require PVE::QemuConfig;
     require PVE::LXC::Config;
@@ -466,7 +375,7 @@ sub cmd_scan_notes {
                     return if index($conf->{description}, '[pve-meta v') == -1;
                     my $res;
                     PVE::Cluster::cfs_lock_domain(
-                        "pve-meta-$vmid",
+                        PVE::API2::Ext::Meta::lock_domain_for($vmid),
                         $LOCK_TIMEOUT,
                         sub {
                             $res = PVE::RS::Meta::notes_import(
@@ -492,9 +401,8 @@ sub cmd_scan_notes {
             }
         };
         if (my $err = $@) {
-            chomp $err;
-            $err =~ s/^\d{3}:\s*//;
-            print STDERR "$SELF: $vmid: $err\n";
+            my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
+            print STDERR "$SELF: $vmid: $msg\n";
             $count{failed}++;
             next;
         }

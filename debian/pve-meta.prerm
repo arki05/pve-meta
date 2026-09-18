@@ -1,31 +1,12 @@
 #!/bin/sh
-# prerm for the pve-meta package.
+# prerm for the pve-meta package: reverses the lifecycle managed patch on
+# `remove`, before dpkg deletes this package's own files. A no-op on
+# `upgrade`: the new version's postinst re-applies idempotently.
 #
-# Reverses pve-meta's lifecycle managed-patch *before* dpkg removes this
-# package's own files -- per Debian policy, `prerm remove` runs before the
-# package's files are deleted, while `postrm remove` runs after. This runs
-# correctly before pve-ext itself is removed as long as `Depends: pve-ext`
-# holds (dpkg always removes dependents before their dependencies) -- see
-# pve-ext/debian/prerm for the matching note on its side.
-#
-# On `upgrade` we deliberately do nothing: the new version's postinst
-# re-applies (idempotently) once it's configured, so there is no need
-# (and no benefit) to unpatch in between.
-#
-# No `preinst` and no `postrm` in this package: this is pve-meta's first
-# release, so there is nothing to migrate, and with the GC timer gone
-# (docs/DESIGN.md section 9 -- guest create and destroy clear metadata
-# themselves now) debhelper has no systemd snippet left to put in a
-# `postrm` either. A hand-written one would hold the debhelper-substitution
-# placeholder with nothing else around it, which is exactly the shape
-# lintian's `maintainer-script-empty` flags. Add one back if a future
-# release genuinely needs post-removal cleanup.
-#
-# NOTE: never spell out the literal debhelper-substitution placeholder
-# text anywhere in this file except its own line, below -- dh_installdeb's
-# substitution is a blind string replace, not shell-aware, so a second,
-# quoted-for-prose occurrence (once tried in this comment) gets replaced
-# too and corrupts the script.
+# Never spell out the debhelper-substitution placeholder text anywhere in
+# this file except its own line below: dh_installdeb's substitution is a
+# blind string replace, so a second occurrence gets replaced too and
+# corrupts the script.
 set -e
 
 case "$1" in

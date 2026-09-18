@@ -1,37 +1,15 @@
 #!/usr/bin/perl
 
-# An example PVE hook script: refuse to start a guest that its metadata says is
-# under maintenance.
-#
-#   pve-meta get 201 homelab.maintenance   ->  reason, or exit 2 for "not set"
-#
-# Install it on a guest with:
+# Example PVE hookscript: refuses to start a guest whose metadata sets
+# homelab.maintenance, via `pve-meta` (a local reader, no token, no daemon,
+# works even with pveproxy stopped; docs/DESIGN.md §8). Install with:
 #
 #   cp maintenance-hook.pl /var/lib/vz/snippets/maintenance-hook.pl
 #   chmod +x /var/lib/vz/snippets/maintenance-hook.pl
 #   pct set 201 --hookscript local:snippets/maintenance-hook.pl
-#   # then, to park the guest:
 #   pvesh set /meta/guests/201 --view homelab.maintenance --data '"disk replacement"'
 #
-# and `pct start 201` fails with the reason until the key is removed.
-#
-# The point of the example is what it demonstrates, not what it does:
-#
-# * **Metadata is useful with no operator anywhere.** No token, no permission
-#   file, no daemon -- a key, a hook script and `pve-meta`. That is the smallest
-#   complete use of this system (docs/DESIGN.md section 10).
-# * **`pve-meta` is a local reader.** PVE runs a hook script as root on the node,
-#   at a moment when the API may not be reachable at all -- during boot, or with
-#   pveproxy stopped. This never opens a socket.
-# * **Exit 2 means "not set".** "No maintenance key" and "the value is the empty
-#   string" are different answers, and the exit status is what separates them
-#   without parsing anything.
-#
-# A caution worth stating, because the obvious next example is the dangerous
-# one: a hook script that *executes* something it reads from metadata turns
-# every principal with a write permission on that prefix into root on the node.
-# Metadata is data an operator token can write; a hook script runs as root. Read
-# values and decide with them, as here. Do not run them.
+# `pct start 201` then fails with the reason until the key is removed.
 
 use strict;
 use warnings;

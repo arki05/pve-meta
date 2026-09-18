@@ -1,28 +1,11 @@
 #!/bin/sh
-# postinst for the pve-meta package.
-#
-# pve-meta is a consumer of pve-ext's generic extension layer (see
-# docs/DESIGN.md section 11, pve-ext/README.md): its UI tab is a page
-# manifest (pages/pve-meta.json) pve-ext-loader.js discovers on its own,
-# and its API module (perl/PVE/API2/Ext/Meta.pm) is discovered by
-# PVE::API2::Ext at pvedaemon/pveproxy startup -- neither needs anything
-# from this script. What this package applies itself is its guest-lifecycle
-# managed-patch manifest (see patches/lifecycle.toml), via pve-ext's own
-# `pve-ext-patch` tool, and the one-time notes scan below.
-#
-# Re-running `pve-ext-patch apply` is safe and idempotent. Never allowed
-# to fail the package install/configure -- `pve-ext-patch verify`/`status`
-# exist to diagnose problems afterwards.
+# postinst for the pve-meta package: applies the guest-lifecycle managed
+# patch (patches/lifecycle.toml) via pve-ext-patch, and runs the one-time
+# notes scan. Never allowed to fail the package install/configure.
 set -e
 
-# /etc/pve is pmxcfs, mounted only on a node that has joined (or formed) a
-# cluster; a freshly unpacked package on a not-yet-configured node must
-# never touch it. `/etc/pve/local` is pmxcfs's own per-node symlink and
-# only exists once the filesystem is actually mounted -- the same guard
-# pattern PVE's own packages use before writing under /etc/pve. Creating
-# this drop directory here (rather than lazily, on first read) means an
-# administrator dropping a prefix definition into it right after install
-# never has to first go looking for why the directory doesn't exist yet.
+# /etc/pve/local only exists once pmxcfs is actually mounted, the same guard
+# PVE's own packages use before writing under /etc/pve.
 ensure_dropdirs() {
     if [ -d /etc/pve/local ]; then
         mkdir -p /etc/pve/meta.d/prefixes || {
@@ -41,14 +24,9 @@ apply_lifecycle_patch() {
     fi
 }
 
-# A guest restored from a backup on a host without pve-meta carries its
-# metadata document in its notes, as the block every backup taken with
-# pve-meta appends (docs/LIFECYCLE.md). Once, here, read every such block
-# in the cluster back into /etc/pve/meta and strip it -- cluster-wide, so
-# one install covers the cluster and a later install on another node finds
-# nothing left to do. Idempotent and cheap: a guest without a block costs
-# one config read. Best-effort: never fails the install, and the same
-# command can be run again by hand.
+# Reads every backup notes block left in the cluster's guest configs back
+# into the store and strips it (docs/LIFECYCLE.md's "Install"). Idempotent,
+# cluster-wide, and safe to run again by hand.
 scan_notes() {
     if [ -d /etc/pve/local ] && command -v pve-meta >/dev/null 2>&1; then
         pve-meta scan-notes || {
@@ -57,16 +35,8 @@ scan_notes() {
     fi
 }
 
-# The lifecycle patch changes files pvedaemon has already loaded into
-# memory, so restart both PVE daemons to pick the change up.
-# `deb-systemd-invoke reload-or-try-restart` (not a raw `systemctl
-# restart`) goes through each unit's own `ExecReload` when it has one --
-# pveproxy's is `/usr/bin/pveproxy restart`, PVE's own graceful in-place
-# respawn that does not drop in-flight connections the way a hard
-# stop/start does -- and also respects policy-rc.d (chroots/containers
-# that disable service management). Best-effort only: never fails the
-# package install/configure, and is a harmless no-op off a systemd host
-# (e.g. inside some build/test environments).
+# Restarts pvedaemon/pveproxy to pick up the lifecycle patch; a no-op off a
+# systemd host and never fails the install.
 restart_pve_services() {
     if command -v deb-systemd-invoke >/dev/null 2>&1; then
         deb-systemd-invoke reload-or-try-restart pvedaemon.service pveproxy.service || {

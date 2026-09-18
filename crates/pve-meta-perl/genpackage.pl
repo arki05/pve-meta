@@ -8,8 +8,6 @@ use v5.36;
 
 use File::Path qw(make_path);
 
-my @packages;
-
 my $opts = {
     'lib-tag' => [
         'TAG',
@@ -24,19 +22,6 @@ my $opts = {
     'lib' => [
         'LIBNAME', "The .so name without the 'lib' prefix.",
     ],
-    'debug-libpath' => [
-        'PATH', "Path to a debug library, usually ./target/debug.",
-    ],
-    'include-file' => [
-        'PATH',
-        "Path to additional perl code to include in the package after the 'use' statements",
-    ],
-    'from-notes' => [
-        undef, "Read the package list from ELF notes sections",
-    ],
-    'list-from-notes' => [
-        'FILE', "List the package list from an ELF notes section and exit",
-    ],
 };
 
 sub help : prototype($) ($fd) {
@@ -49,45 +34,12 @@ sub help : prototype($) ($fd) {
     }
 }
 
-sub package_list_from_notes : prototype($) ($file) {
-    open my $cmd, '-|', qw(objcopy -O binary --only-section .note.perlmod.package), $file,
-        '/dev/stdout'
-        or die "failed to run objcopy: $!\n";
-    my $data = do {
-        local $/ = undef;
-        <$cmd>;
-    };
-    close $cmd;
-    die "objcopy exited with errors\n" if $?;
-
-    my @packages;
-
-    while (length($data)) {
-        my ($name_size, $desc_size, $ty) = unpack('LLL', substr($data, 0, 3 * 4, ''));
-        die "unexpected description in package note - incompatible perlmod version?\n"
-            if $desc_size;
-        my $name = substr($data, 0, $name_size, '');
-        my $skip = 3 & (4 - (3 & $name_size));
-        substr($data, 0, $skip, '');
-        my $desc = substr($data, 0, $desc_size, '');
-        push @packages, $name;
-        # notes are 4-byte aligned, the header is already a multiple of 4 bytes, so:
-        $skip = 3 & (4 - (3 & $desc_size));
-        substr($data, 0, $skip, '');
-    }
-    die "trailing data in notes section\n" if length($data);
-
-    return @packages;
-}
-
 if (!@ARGV) {
     help(\*STDERR);
     exit(1);
 }
 
-my $params = {
-    'include-file' => [],
-};
+my $params = {};
 ARGPARSE: while (@ARGV) {
     my $arg = shift @ARGV;
 
@@ -107,19 +59,9 @@ ARGPARSE: while (@ARGV) {
             next;
         }
 
-        if (!defined($opts->{$o}->[0])) {
-            unshift @ARGV, $arg;
-            $params->{$o} = 1;
-            next ARGPARSE;
-        }
-
         die "--$o requires an argument\n" if !defined($arg);
-        if (ref($params->{$o}) eq 'ARRAY') {
-            push $params->{$o}->@*, $arg;
-        } else {
-            die "multiple --$o options provided\n" if defined($params->{$o});
-            $params->{$o} = $arg;
-        }
+        die "multiple --$o options provided\n" if defined($params->{$o});
+        $params->{$o} = $arg;
         next ARGPARSE;
     }
 
@@ -132,11 +74,6 @@ ARGPARSE: while (@ARGV) {
     last;
 }
 
-if (defined(my $list_from_notes = $params->{'list-from-notes'})) {
-    print("$_\n") for (package_list_from_notes($list_from_notes));
-    exit(0);
-}
-
 my $lib_package = $params->{'lib-package'}
     or die "missing --lib-package parameter\n";
 my $lib_prefix = $params->{'lib-prefix'}
@@ -145,15 +82,6 @@ my $lib = $params->{'lib'}
     or die "missing --lib parameter\n";
 my $lib_tag = $params->{'lib-tag'}
     or die "missing --lib-tag parameter\n";
-my $debug_libpath = $params->{'debug-libpath'} // '';
-my $extra_code = '';
-for my $file ($params->{'include-file'}->@*) {
-    open(my $fh, '<', $file) or die "failed to open file '$file' - $!\n";
-    my $more = do { local $/ = undef; <$fh> };
-    die "error reading '$file': $!\n" if !defined($more);
-    $extra_code .= $more;
-}
-my $from_notes = $params->{'from-notes'};
 
 sub pkg2file : prototype($) ($pkg) {
     return ($pkg =~ s@::@/@gr) . ".pm";
@@ -197,7 +125,6 @@ use warnings;
 
 use DynaLoader;
 
-{{EXTRA_CODE}}
 sub library { '{{LIBRARY}}' }
 
 sub autodirs { map { "$_/auto" } @INC; }
@@ -254,12 +181,10 @@ BEGIN {
 
 1;
 EOF
-$template =~ s/\{\{EXTRA_CODE\}\}/$extra_code/g;
 $template =~ s/\{\{LIBRARY_PACKAGE\}\}/$lib_package/g;
 $template =~ s/\{\{LIBRARY_PREFIX\}\}/$lib_prefix/g;
 $template =~ s/\{\{LIBRARY_TAG\}\}/$lib_tag/g;
 $template =~ s/\{\{LIBRARY\}\}/$lib/g;
-$template =~ s/\{\{DEBUG_LIBPATH\}\}/$debug_libpath/g;
 
 if ($lib ne '-') {
     my $path = pkg2file($lib_package);
@@ -269,14 +194,6 @@ if ($lib ne '-') {
     open(my $fh, '>', $path) or die "failed to open '$path' for writing: $!\n";
     print {$fh} $template;
     close($fh);
-}
-
-if ($from_notes) {
-    die "missing library file to read packages from\n" if !@ARGV;
-    die "--from-notes requires exactly one library\n" if @ARGV > 1;
-
-    @ARGV = package_list_from_notes($ARGV[0]);
-    print("Found package '$_'\n") for @ARGV;
 }
 
 for my $package (@ARGV) {
