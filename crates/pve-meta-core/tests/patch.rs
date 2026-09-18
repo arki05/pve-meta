@@ -1,8 +1,7 @@
 //! Integration tests for merge-patch semantics (`pve_meta_core::patch`).
 
 use pretty_assertions::assert_eq;
-use pve_meta_core::patch::{apply_patch, diff, Op};
-use pve_meta_core::path::Path;
+use pve_meta_core::patch::{apply_patch, Op};
 use serde_json::json;
 
 fn touched_paths(touched: &[pve_meta_core::patch::Touched]) -> Vec<(String, bool)> {
@@ -47,70 +46,6 @@ fn apply_patch_full_scenario() {
             ("net.vlan".to_string(), true),
             ("new_ns".to_string(), true),
             ("tags".to_string(), true),
-        ]
-    );
-}
-
-#[test]
-fn apply_patch_nested_delete_yields_leaf_path() {
-    let mut doc = json!({"a": {"b": {"c": 1, "d": 2}}});
-    let patch = json!({"a": {"b": {"c": null}}});
-    let touched = apply_patch(&mut doc, &patch);
-    assert_eq!(doc, json!({"a": {"b": {"d": 2}}}));
-    assert_eq!(touched.len(), 1);
-    assert_eq!(touched[0].path, Path::parse("a.b.c").unwrap());
-    assert_eq!(touched[0].op, Op::Delete);
-}
-
-#[test]
-fn apply_patch_noop_set_yields_nothing() {
-    let mut doc = json!({"a": {"b": 1}});
-    let patch = json!({"a": {"b": 1}});
-    let touched = apply_patch(&mut doc, &patch);
-    assert!(touched.is_empty());
-    assert_eq!(doc, json!({"a": {"b": 1}}));
-}
-
-#[test]
-fn apply_patch_delete_missing_key_is_noop() {
-    let mut doc = json!({"a": 1});
-    let touched = apply_patch(&mut doc, &json!({"nope": null}));
-    assert!(touched.is_empty());
-    assert_eq!(doc, json!({"a": 1}));
-}
-
-#[test]
-fn apply_patch_arrays_always_atomic_replace() {
-    let mut doc = json!({"a": [1, {"x": 1}]});
-    let touched = apply_patch(&mut doc, &json!({"a": [1, {"x": 2}]}));
-    assert_eq!(doc, json!({"a": [1, {"x": 2}]}));
-    assert_eq!(touched, vec![pve_meta_core::patch::Touched {
-        path: Path::parse("a").unwrap(),
-        op: Op::Set,
-    }]);
-}
-
-#[test]
-fn diff_full_document_scenarios() {
-    let old = json!({
-        "a": {"b": 1, "c": 2, "same": true},
-        "removed_top": 1,
-        "arr": [1, 2],
-    });
-    let new = json!({
-        "a": {"b": 10, "c": 2, "same": true, "new_leaf": 5},
-        "arr": [1, 2, 3],
-        "added_top": 1,
-    });
-    let touched = diff(&old, &new);
-    assert_eq!(
-        touched_paths(&touched),
-        vec![
-            ("a.b".to_string(), true),
-            ("a.new_leaf".to_string(), true),
-            ("added_top".to_string(), true),
-            ("arr".to_string(), true),
-            ("removed_top".to_string(), false),
         ]
     );
 }

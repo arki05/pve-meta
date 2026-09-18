@@ -1,9 +1,6 @@
-//! The two supported serialization formats (YAML, JSON): canonical
-//! parse/dump, with format-specific validation.
-//!
-//! YAML is the *only* on-disk format (`docs/DESIGN.md` §2); JSON exists
-//! solely as a wire format for a view's `data` (`docs/DESIGN.md` §7). There
-//! is no TOML support.
+//! The two serialization formats (YAML, JSON): canonical parse/dump, with
+//! format-specific validation. YAML is the only on-disk format
+//! (`docs/DESIGN.md` §2); JSON is a wire format only (§5). No TOML.
 
 use std::fmt;
 use std::str::FromStr;

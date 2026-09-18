@@ -1,14 +1,6 @@
 //! The notes block: how a guest's document travels through a vzdump backup
-//! (`docs/DESIGN.md` §9, `docs/LIFECYCLE.md`).
-//!
-//! A backup carries the guest config, and the config's notes carry arbitrary
-//! text. So at backup time the document is appended to the *archive's copy*
-//! of the notes as one marked block, and at restore time the block is read
-//! back into the store and stripped from the notes again. The live config
-//! never carries it. A host without pve-meta restores the block as ordinary
-//! notes text, readable and harmless.
-//!
-//! The block, as it appears in the notes:
+//! (`docs/DESIGN.md` §7, `docs/LIFECYCLE.md` "Backup and restore", which owns
+//! the mechanism -- this is the block's exact shape).
 //!
 //! `````text
 //! [pve-meta v1 vmid=105 time=2026-09-14T03:00:12Z sha256=9f2c…]
@@ -19,35 +11,13 @@
 //! [/pve-meta]
 //! `````
 //!
-//! * The two bracket lines delimit the block; [`find`] looks for them, never
-//!   for the fence. They render as plain text on a stock host's Summary.
-//! * The fence is for markdown rendering only. Four backticks, so a YAML
-//!   block scalar containing a three-backtick line cannot close it early; a
-//!   plain YAML scalar can never begin with a backtick at all.
-//! * The header carries provenance for humans (`vmid`, `time`) and the
-//!   document's own digest (`sha256`, the store's digest of the file text).
-//!   Restoring to a different vmid is normal, so `vmid` never blocks an
-//!   import; the digest is checked and a mismatch is reported, not refused.
-//!
-//! Plain YAML, verbatim: no base64, no compression. PVE's own text encoder
-//! percent-escapes every byte outside printable ASCII (plus colon and
-//! percent) per notes line and its decoder restores them, so the document
-//! round-trips through both guest config formats byte for byte. One size cap
-//! ([`MAX_YAML_BYTES`]) and one form; a document over the cap is not carried
-//! and the backup log says so.
-//!
-//! One quirk of PVE's format is guarded against here: `#` is not escaped, so
-//! a notes line whose text begins with `qmdump#` or `vzdump#` is written as
-//! `#qmdump#…`, which vzdump silently drops. A document cannot produce such a
-//! line (every top-level line starts with a key from the charset, nested
-//! lines are indented, the marker and fence lines start with a bracket or a
-//! backtick), and [`render`] refuses rather than emit one if it ever did.
-//!
-//! Two more facts about the transit, checked against both guest parsers:
-//! a notes line keeps its trailing whitespace (only the end of the whole
-//! notes text is trimmed, and the block's last line is its end line), and
-//! a document line that is itself one of the block's delimiters is refused
-//! by [`render`], so a block scalar can never end the block early.
+//! [`find`] looks for the two bracket lines, never the fence (markdown
+//! rendering only; four backticks so a YAML block scalar's own triple-
+//! backtick line cannot close it early). The header's `sha256` is the
+//! store's digest of the document text; a mismatch on import is reported,
+//! not refused, since `vmid` differing is normal for a restore. Plain YAML,
+//! verbatim, up to [`MAX_YAML_BYTES`] -- above the cap the document is not
+//! carried and the backup log says so.
 
 use serde::Serialize;
 
@@ -68,11 +38,6 @@ const BEGIN_PREFIX: &str = "[pve-meta v";
 const END_LINE: &str = "[/pve-meta]";
 const FENCE_OPEN: &str = "````yaml";
 const FENCE_CLOSE: &str = "````";
-
-/// Notes-line prefixes that vzdump's `assemble` strips from a config copy
-/// and restore drops again (`#qmdump#…`, `#vzdump#…`), with the leading `#`
-/// that the notes encoder adds removed.
-const DROPPED_PREFIXES: [&str; 2] = ["qmdump#", "vzdump#"];
 
 /// What a block's header line says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,9 +113,7 @@ pub struct Import {
 /// store's digest of that text) and `now` (unix seconds).
 ///
 /// # Errors
-/// [`Error::TooLarge`] above [`MAX_YAML_BYTES`]; [`Error::InvalidName`] if a
-/// line of the block would begin with a prefix vzdump drops (see the module
-/// docs), which a document cannot produce.
+/// [`Error::TooLarge`] above [`MAX_YAML_BYTES`].
 pub fn render(vmid: u32, yaml: &str, digest: &str, now: u64) -> Result<String> {
     let yaml = yaml.trim_end_matches('\n');
     if yaml.len() > MAX_YAML_BYTES {
@@ -159,31 +122,21 @@ pub fn render(vmid: u32, yaml: &str, digest: &str, now: u64) -> Result<String> {
             max: MAX_YAML_BYTES as u64,
         });
     }
-    let block = format!(
+    // A linted document's lines can be neither a block delimiter (a key
+    // charset has no `[`) nor `#qmdump#`/`#vzdump#` (no `#`), at the top
+    // level; nested lines are indented. `export` only ever calls this with
+    // such a document.
+    debug_assert!(
+        yaml.lines().all(|l| {
+            let l = l.trim_end();
+            l != END_LINE && !l.starts_with(BEGIN_PREFIX)
+        }),
+        "a document line was a block delimiter"
+    );
+    Ok(format!(
         "{BEGIN_PREFIX}{VERSION} vmid={vmid} time={} sha256={digest}]\n{FENCE_OPEN}\n{yaml}\n{FENCE_CLOSE}\n{END_LINE}",
         rfc3339_utc(now)
-    );
-    for line in block.lines() {
-        if DROPPED_PREFIXES.iter().any(|p| line.starts_with(p)) {
-            return Err(Error::InvalidName(format!(
-                "a notes line may not begin with '{}': {line:?}",
-                &line[..7]
-            )));
-        }
-    }
-    // The block's own delimiters may not occur inside it either: a block
-    // scalar holding a line that is exactly the end line would end the block
-    // early, and a header line inside it would be a second header. Neither
-    // is likely from a document; both are made impossible here.
-    for line in yaml.lines() {
-        let l = line.trim_end();
-        if l == END_LINE || l.starts_with(BEGIN_PREFIX) {
-            return Err(Error::InvalidName(format!(
-                "a document line may not be a block delimiter: {line:?}"
-            )));
-        }
-    }
-    Ok(block)
+    ))
 }
 
 /// Finds the block in a notes text, if there is one. A block is a header
@@ -406,8 +359,7 @@ fn parse_header(line: &str) -> Option<Header> {
     Some(header)
 }
 
-/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ`, without a date crate. The civil
-/// date is Howard Hinnant's `civil_from_days`.
+/// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (Howard Hinnant's `civil_from_days`).
 fn rfc3339_utc(unix: u64) -> String {
     let days = (unix / 86_400) as i64;
     let secs = unix % 86_400;
@@ -498,28 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn render_refuses_a_document_line_that_is_a_delimiter() {
-        // The guard mirrors `find`: a delimiter is a whole, unindented line.
-        // A document cannot produce one (its top level is a map, and a
-        // block scalar's lines are indented), so these are not documents,
-        // just the text that would break the block if it ever were.
-        assert!(matches!(
-            render(1, "[/pve-meta]\n", "", 0),
-            Err(Error::InvalidName(_))
-        ));
-        assert!(matches!(
-            render(1, "a: 1\n[pve-meta v1 vmid=9]\n", "", 0),
-            Err(Error::InvalidName(_))
-        ));
-        // Indented, a delimiter is neither found by `find` nor refused here.
-        let indented = "note: |\n  [/pve-meta]\n  [pve-meta v1 vmid=9]\n";
-        let block = render(1, indented, "", 0).unwrap();
-        assert_eq!(find(&block).unwrap().unwrap().yaml, indented.trim_end());
-        let inline = "note: '[pve-meta v1] is the marker'\n";
-        assert!(render(1, inline, "", 0).is_ok());
-    }
-
-    #[test]
     fn a_three_backtick_line_inside_the_document_does_not_close_the_block() {
         let yaml = "readme: |\n  ```sh\n  echo hi\n  ```\n";
         let block = render(7, yaml, &digest_of(yaml), 0).unwrap();
@@ -528,28 +458,9 @@ mod tests {
     }
 
     #[test]
-    fn render_refuses_the_size_cap_and_a_dropped_prefix() {
+    fn render_refuses_the_size_cap() {
         let big = format!("k: {}\n", "x".repeat(MAX_YAML_BYTES));
-        assert!(matches!(
-            render(1, &big, "", 0),
-            Err(Error::TooLarge { .. })
-        ));
-        // Not producible by a document (a key cannot contain '#'), but the
-        // guard is what makes that a fact rather than a hope.
-        let bad = "note: |\nqmdump#map:x\n";
-        assert!(matches!(render(1, bad, "", 0), Err(Error::InvalidName(_))));
-    }
-
-    #[test]
-    fn no_rendered_line_carries_a_dropped_prefix_for_a_real_document() {
-        let yaml = "a:\n  note: |\n    qmdump#not-at-line-start\nvzdump: fine\n";
-        let block = render(1, yaml, &digest_of(yaml), 0).unwrap();
-        for line in block.lines() {
-            assert!(
-                !DROPPED_PREFIXES.iter().any(|p| line.starts_with(p)),
-                "{line}"
-            );
-        }
+        assert!(matches!(render(1, &big, "", 0), Err(Error::TooLarge { .. })));
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Integration tests for `pve_meta_core::format`: round trips, order
-//! preservation, and format-specific rejections. YAML is the only on-disk
-//! format; JSON is a wire format only (`docs/DESIGN.md` §7).
+//! Integration tests for `pve_meta_core::format`, through its public API:
+//! a round-trip smoke test, and the pinned canonical-YAML fixture. Format
+//! rejections and other per-rule behaviour are `format.rs`'s own `#[cfg(test)]`
+//! module.
 
 use pretty_assertions::assert_eq;
-use pve_meta_core::error::Error;
 use pve_meta_core::format::{dump, parse, Format};
 use serde_json::json;
 
@@ -44,88 +44,6 @@ fn round_trip_every_format_every_sample() {
             assert_eq!(back, doc, "round trip mismatch for format {fmt}");
         }
     }
-}
-
-#[test]
-fn dump_always_single_trailing_newline() {
-    for doc in sample_documents() {
-        for fmt in Format::ALL {
-            let text = dump(fmt, &doc);
-            assert!(text.ends_with('\n'), "format {fmt} did not end with newline");
-            assert!(!text.ends_with("\n\n"), "format {fmt} had extra trailing newline");
-        }
-    }
-}
-
-#[test]
-fn cross_format_conversion_preserves_order_and_content() {
-    let doc = json!({"zeta": 1, "alpha": {"delta": 1, "beta": 2}, "gamma": [3, 1, 2]});
-    for src in Format::ALL {
-        let text = dump(src, &doc);
-        let value = parse(src, &text).unwrap();
-        for dst in Format::ALL {
-            let converted_text = dump(dst, &value);
-            let converted_value = parse(dst, &converted_text).unwrap();
-            assert_eq!(converted_value, doc, "{src} -> {dst} lost data or order");
-        }
-    }
-}
-
-#[test]
-fn yaml_1_1_boolish_words_stay_strings() {
-    let text = "a: yes\nb: no\nc: on\nd: off\ne: Yes\nf: No\n";
-    let value = parse(Format::Yaml, text).unwrap();
-    assert_eq!(
-        value,
-        json!({"a": "yes", "b": "no", "c": "on", "d": "off", "e": "Yes", "f": "No"})
-    );
-}
-
-#[test]
-fn yaml_true_false_are_real_booleans() {
-    let value = parse(Format::Yaml, "a: true\nb: false\n").unwrap();
-    assert_eq!(value, json!({"a": true, "b": false}));
-}
-
-#[test]
-fn yaml_rejects_anchors_aliases_and_tags() {
-    for text in [
-        "a: &anchor 1\nb: *anchor\n",
-        "a: *undefined\n",
-        "a: !!str 123\n",
-        "a: !custom 123\n",
-    ] {
-        let err = parse(Format::Yaml, text).unwrap_err();
-        assert!(matches!(err, Error::Parse { .. }), "{text:?} -> {err:?}");
-    }
-}
-
-#[test]
-fn yaml_rejects_complex_mapping_keys() {
-    let err = parse(Format::Yaml, "? [1, 2]\n: value\n").unwrap_err();
-    assert!(matches!(err, Error::Parse { .. }));
-}
-
-#[test]
-fn yaml_rejects_null() {
-    for text in ["a: ~\n", "a: null\n", "a:\n"] {
-        let err = parse(Format::Yaml, text).unwrap_err();
-        assert!(matches!(err, Error::Lint(_)), "{text:?} -> {err:?}");
-    }
-}
-
-#[test]
-fn json_rejects_comments_and_trailing_commas() {
-    assert!(parse(Format::Json, "{ \"a\": 1, }").is_err());
-    assert!(parse(Format::Json, "{ // comment\n \"a\": 1 }").is_err());
-}
-
-#[test]
-fn lint_errors_surface_through_parse() {
-    let err = parse(Format::Json, "{\"bad key\": 1}").unwrap_err();
-    assert!(matches!(err, Error::Lint(_)));
-    let err = parse(Format::Json, "[1, 2, 3]").unwrap_err();
-    assert!(matches!(err, Error::Lint(_)));
 }
 
 /// The canonical YAML this crate writes, pinned byte for byte against

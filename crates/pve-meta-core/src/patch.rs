@@ -75,7 +75,7 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
                     });
                 }
                 // A deleted key's note goes with it, unless the patch says
-                // what becomes of the note itself (`docs/DESIGN.md` §7).
+                // what becomes of the note itself (`docs/DESIGN.md` §5).
                 let note = format!("{k}{}", crate::model::COMMENT_SUFFIX);
                 if !patch_map.contains_key(&note) && doc_map.shift_remove(&note).is_some() {
                     touched.push(Touched {
@@ -88,29 +88,20 @@ pub(crate) fn apply_obj(doc: &mut Value, patch: &Value, path: &Path, touched: &m
                 let child = doc_map.get_mut(k).expect("checked above");
                 apply_obj(child, v, &child_path, touched);
             }
-            // A *non-empty* object patch over a target that is absent or is
-            // not an object. Applying it verbatim spliced the patch's own
-            // `null` delete markers into the document as literal nulls, which
-            // `model::lint` then rejects — so the documented combined
-            // set+delete patch shape (`{"sub": {"x": 1, "gone": null}}`)
-            // would be unusable against a container that does not exist yet.
-            // It is applied to an empty scratch map instead —
-            // the same trick `view::merge` already used for the value at the
-            // view prefix itself, one level down.
+            // A *non-empty* object patch over a target that is absent or not
+            // an object: applied to an empty scratch map instead of directly,
+            // so its own `null` delete markers apply there rather than being
+            // spliced into the document as literal nulls (`model::lint` would
+            // then reject them) -- the same trick `view::merge` uses one
+            // level up, for the value at the view prefix itself.
             Value::Object(patch_map) if !patch_map.is_empty() => {
-                // Not an object (the arm above matched that case), so this is
-                // "the key is absent" vs. "the key holds a scalar or array".
                 let existed = doc_map.contains_key(k);
                 let mut scratch = Value::Object(serde_json::Map::new());
                 let mut sub = Vec::new();
                 apply_obj(&mut scratch, v, &child_path, &mut sub);
-                // Replacing an existing scalar/array with a map is a change
-                // in itself, even if the patch body wrote no leaves; creating
-                // a container the patch then writes nothing into is not (a
-                // merge that touches nothing changes nothing,
-                // `docs/DESIGN.md` §7). Either way the *container's* path is
-                // what is reported, keeping this arm's "replacing a whole
-                // subtree yields its root path" convention.
+                // Replacing an existing scalar/array is a change in itself
+                // even if the patch wrote no leaves; creating a container the
+                // patch writes nothing into is not (`docs/DESIGN.md` §5).
                 if existed || !sub.is_empty() {
                     doc_map.insert(k.clone(), scratch);
                     touched.push(Touched {
@@ -343,7 +334,7 @@ mod tests {
 
     #[test]
     fn a_patch_key_that_only_deletes_never_reaches_the_document() {
-        // One lint runs on the planned document (`docs/DESIGN.md` §7). A patch
+        // One lint runs on the planned document (`docs/DESIGN.md` §5). A patch
         // key that would be invalid as a document key is harmless as long as
         // it only ever deletes.
         let mut doc = json!({"a": 1});

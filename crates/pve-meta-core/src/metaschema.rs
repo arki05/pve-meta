@@ -1,34 +1,8 @@
 //! The **meta-schema**: the prefix file format described in the same dialect
-//! a prefix uses to describe a guest's subtree (`docs/DESIGN.md` §6).
-//!
-//! A prefix file is an ordinary document ([`crate::store::DocId::Registry`]),
-//! so the editor can show it as a tree and lint it as it is typed -- but only
-//! if something says what shape it has. That is what this module is:
-//! `prefix.yaml` written out as a schema, served by `GET /meta/schemas`, and
-//! used by the editor exactly the way a prefix's own `schema` is used on a
-//! guest document.
-//!
-//! One rule it cannot express: a selector is **exactly one of** `all` or `tag`
-//! (`registry::parse_selector`). The dialect has no "one of these" keyword, so
-//! both are declared individually optional and the parser is the only thing that
-//! enforces the choice -- which is fine (it is the authority either way), but it
-//! means the editor will happily *offer* you both rows. The test below pins that
-//! as a known limit rather than leaving it to be rediscovered.
-//!
-//! It is deliberately **not** the validator. `registry::parse_prefix` decides
-//! what is storable, on the way in, in one place
-//! (`api::check_registry_shape`); this is the affordance that tells a human
-//! what to type before they try. The test at the bottom is what keeps the two
-//! from drifting: every property this schema marks as required is one the
-//! parser actually refuses to do without.
-//!
-//! The `schema:` property of a prefix is described as a free-form object on
-//! purpose. It is a schema in its own right, in an open-ended dialect, and the
-//! editor's honest offer for it is the text editor (a map row opens Monaco on
-//! its own subtree, DESIGN §12) rather than a form that would only ever cover
-//! the keywords we happened to think of. Free-form here, not on the way in:
-//! `registry::check_schema_dialect` refuses a known keyword whose value the
-//! checker could not act on, since with `enforce` the schema is a write gate.
+//! a prefix uses to describe a guest's subtree (`docs/DESIGN.md` §3), served
+//! by `GET /meta/schemas` so the editor can show a prefix file as a tree and
+//! lint it as it is typed. Advisory only -- `registry::parse_prefix` is the
+//! validator; the contract test below is what keeps the two from drifting.
 
 use crate::format::{self, Format};
 use crate::model::Value;

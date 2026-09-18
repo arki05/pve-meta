@@ -1,59 +1,8 @@
-//! The prefix drop directory: what a prefix is and which guests it reaches
-//! (`docs/DESIGN.md` §3).
-//!
-//! Each file is parsed strictly and independently: a malformed file is
-//! skipped with a warning and contributes nothing, and never affects another
-//! file. That isolation is the whole reason this data left `datacenter.yaml`.
-//!
-//! # Prefixes
-//!
-//! * `/usr/share/pve-meta/prefixes/<prefix>.yaml` — packaged defaults, dropped
-//!   in by an operator's own `.deb`;
-//! * `/etc/pve/meta.d/prefixes/<prefix>.yaml` — cluster overrides, by file name.
-//!
-//! **Precedence is by presence.** The highest-precedence directory that has a
-//! file of a name is the file for that name, whether or not it parses: a
-//! malformed cluster override contributes a failure and nothing else, and the
-//! packaged file it shadows stays inert until the override is fixed or
-//! removed. The alternative -- fall back to the packaged file when the
-//! override is broken -- would let a typo in a deliberate override quietly
-//! re-activate the definition it was written to replace. [`effective_file`]
-//! is that rule, and it is the one both the loader and the document store
-//! ([`crate::store::MetaStore`]) apply, so the file `GET /meta/prefixes/{name}`
-//! opens for repair is always the one the loader judged.
-//!
-//! **The file name is the prefix.** `homelab.docker.yaml` declares the prefix
-//! `homelab.docker`, so a definition and its prefix are one thing and there is
-//! no `prefix:` field for the two to disagree about. A prefix segment is
-//! `[A-Za-z0-9_@!-]+` and dots are only separators
-//! ([`crate::path::is_valid_segment`]), so a prefix file name can never
-//! contain a slash, never start with a dot and never escape its directory.
-//!
-//! ```yaml
-//! # prefixes/traefik.yaml
-//! description: Traefik dynamic configuration
-//! selector: { tag: traefik }
-//! schema:                      # optional, PVE::JSONSchema dialect
-//!   type: object
-//! nodes:                       # optional: per-node overrides
-//!   pve1: { schema: { ... }, enforce: true }   # any of schema/enforce/hidden, whole
-//! ```
-//!
-//! A definition names no principal: saying that a prefix exists and has a shape
-//! is useful with no operator, no token and no automation anywhere near it. It
-//! is also **entirely optional** -- a document may hold any key at all; a
-//! definition is only the "give this one a bit more structure" piece, for the
-//! operators and hook scripts that want it.
-//!
-//! **A node's schema is an override inside the same file** (`docs/DESIGN.md`
-//! §3): `nodes.<node>` replaces the top-level `schema`/`enforce`/`hidden`,
-//! whole -- a schema never merges with the top-level one -- for a guest on
-//! that node. [`Registry::prefixes_for_guest`] is where that replacement
-//! happens, once, for both the listing and the write-time enforcement gate.
-//!
-//! [`crate::shape::Shape::governing`] is the one nesting rule: **most-specific
-//! wins, schemas never merge.** The longest declared prefix covering a path
-//! governs it; no other contributes.
+//! The prefix drop directory: loads `/usr/share/pve-meta/prefixes/*.yaml`
+//! (packaged) and `/etc/pve/meta.d/prefixes/*.yaml` (cluster), and resolves
+//! which ones reach a guest (`docs/DESIGN.md` §3). The file name is the
+//! prefix; precedence between the two directories is by presence
+//! ([`effective_file`]), not content.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -136,12 +85,9 @@ impl Selector {
         }
     }
 
-    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`),
-    /// which is [`Selector`]'s own serialization
-    /// after a trip through Perl -- where `true` becomes `1`. That is the one
-    /// tolerance here; the rule ("exactly one of `all: true` or `tag: <name>`")
-    /// is [`parse_selector`]'s, applied unchanged, so a file and a listing
-    /// cannot mean different things by the same selector.
+    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`): the
+    /// same shape [`Selector`] serializes, tolerating Perl's `true` → `1`.
+    /// The rule itself is [`parse_selector`]'s, applied unchanged.
     ///
     /// # Errors
     /// [`Error::Registry`] as [`parse_selector`].
@@ -168,11 +114,9 @@ impl Selector {
     }
 }
 
-/// Most-specific first: the longer prefix sorts before the shorter, and
-/// equal depths by name, so the order is total and the UI shows something
-/// deterministic. The order [`crate::shape::Shape`] resolves in, and the
-/// order `GET /meta/prefixes` lists in -- one comparator, so the listing a
-/// client sees is the order the server would have resolved.
+/// Most-specific first (longer prefix, then by name): the order
+/// [`crate::shape::Shape`] resolves in and `GET /meta/prefixes` lists in --
+/// one comparator for both.
 pub fn by_specificity(a: &Path, b: &Path) -> std::cmp::Ordering {
     b.segments()
         .len()
@@ -208,40 +152,27 @@ pub struct PrefixDef {
     /// through verbatim for the UI.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<Value>,
-    /// `true` when the server refuses an API write that would leave this
-    /// prefix's subtree not matching `schema`, for the paths that write
-    /// changed (`api::put_document`; `force=1` stores it anyway). Off by
-    /// default: a schema is advisory unless the prefix says otherwise.
+    /// Refuses a write that leaves this subtree not matching `schema`
+    /// (`docs/DESIGN.md` §5). Off by default.
     pub enforce: bool,
-    /// The root default for the schema's per-node `hidden` (`shape::Described`):
-    /// with it set this prefix contributes no declared-but-unset rows unless a
-    /// node asks to be shown. A prefix with a vocabulary rather than a handful of
-    /// keys wants this; one with five keys does not.
+    /// The root default for the schema's per-node `hidden`: with it set, this
+    /// prefix offers no declared-but-unset rows unless a node asks to be shown.
     #[serde(default)]
     pub hidden: bool,
-    /// Per-node overrides of `schema`/`enforce`/`hidden`, as parsed -- so the
-    /// editor can show them. Empty on a row [`Registry::prefixes_for_guest`]
-    /// has already resolved: a resolved row's `schema`/`enforce`/`hidden` are
-    /// the effective ones and it carries no map of its own.
+    /// Per-node overrides, as parsed, so the editor can show them. Empty on a
+    /// row [`Registry::prefixes_for_guest`] has already resolved, since the
+    /// resolved row's own fields are the effective ones.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub nodes: BTreeMap<NodeName, NodeOverride>,
     /// Which directory this one was read from. Not part of the file.
     pub origin: Origin,
-    /// `true` when a lower-precedence directory holds a file of the same name that
-    /// this one displaced. With the configured directories that is exactly "a
-    /// cluster file written over a packaged one"; with more prefix directories
-    /// (only reachable through `PVE_META_PREFIX_DIRS`) a packaged file can
-    /// displace another packaged file and this is true of it too.
+    /// `true` when a lower-precedence directory holds a file of this name
+    /// that this one displaced.
     pub overrides: bool,
 }
 
-/// Where a loaded file came from, and what it displaced.
-///
-/// The loader has always known this -- it walks the directories in precedence
-/// order -- and always thrown it away. A list is where it matters: a packaged
-/// prefix definition and a cluster override of the same name are the same row
-/// in every other respect, and "who owns this file, and is a package's copy
-/// underneath it?" is the first question an administrator asks about one.
+/// Where a loaded file came from, and what it displaced -- a packaged prefix
+/// and a cluster override of the same name are otherwise the same row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
@@ -253,20 +184,11 @@ pub enum Origin {
 }
 
 /// A file in a registry directory that did not load: unreadable, or not
-/// valid as the kind it lives in (a bad `selector`, an unknown field, text
-/// that is not YAML at all). Silently dropping this -- what `load_dirs`
-/// always did -- is the one failure mode in the project with no observable
-/// symptom (see the module docs): the name is missing everywhere a caller
-/// would look for it, and only a log line ever said so.
-///
-/// A failed cluster override also shadows the packaged file of its name
-/// (precedence is by presence), so this row is then the *only* row for that
-/// name: the packaged definition is not in effect and is not listed.
-///
-/// `yaml_files` has already filtered to names [`is_valid_file_name`] accepts
-/// before `load_dirs` calls the parser at all, so `name` here is always
-/// something `GET /meta/prefixes/{name}` can open -- never a name a hand-edit
-/// made unaddressable in the first place.
+/// valid as the kind it lives in. Reported rather than dropped, so a name
+/// missing everywhere a caller looks for it is never explained by nothing
+/// but a log line. A failed cluster override also shadows the packaged file
+/// of its name (precedence is by presence), so this row is then the only one
+/// for that name.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RegistryFailure {
     /// The file name without `.yaml`, which for a prefix IS the prefix.
@@ -306,22 +228,26 @@ struct RawNodeOverride {
     hidden: Option<bool>,
 }
 
-/// A prefix-level flag: `true`/`false`, or `1`/`0` as this dialect already
-/// spells `optional` and `multiline`, and as the same flag reads on a schema
-/// node (`shape`). Anything else is refused, since a file is parsed strictly.
+/// A flag value as a `bool`: `true`/`false`, or `1`/`0` as this dialect
+/// already spells `optional` and `multiline`. `None` if `v` is neither.
+fn as_flag(v: &Value) -> Option<bool> {
+    match v {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) if n.as_i64() == Some(1) => Some(true),
+        Value::Number(n) if n.as_i64() == Some(0) => Some(false),
+        _ => None,
+    }
+}
+
+/// A prefix-level flag field, refused (a file is parsed strictly) unless it
+/// is [`as_flag`].
 fn de_flag<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<bool>, D::Error> {
-    let v = Option::<Value>::deserialize(d)?;
-    Ok(match v {
-        None | Some(Value::Null) => None,
-        Some(Value::Bool(b)) => Some(b),
-        Some(Value::Number(n)) if n.as_i64() == Some(1) => Some(true),
-        Some(Value::Number(n)) if n.as_i64() == Some(0) => Some(false),
-        Some(other) => {
-            return Err(serde::de::Error::custom(format!(
-                "expected true/false or 1/0, got {other}"
-            )))
-        }
-    })
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(other) => as_flag(&other).map(Some).ok_or_else(|| {
+            serde::de::Error::custom(format!("expected true/false or 1/0, got {other}"))
+        }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -340,16 +266,11 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 /// The types a schema may declare: the ones [`crate::shape`] can check.
 const SCHEMA_TYPES: &[&str] = &["string", "integer", "number", "boolean", "object", "array"];
 
-/// Refuses a `schema:` whose known keywords would not do what they say.
-///
-/// The dialect is open-ended (PVE::JSONSchema has more keywords than the
-/// editor reads, and a future one must not make today's files unloadable),
-/// so an unknown keyword passes. A *known* keyword with a value the checker
-/// cannot act on does not: with `enforce: true` the schema is a write gate,
-/// and `type: interger` silently constraining nothing, or `enforce: yes`
-/// silently inheriting, is exactly the failure a strict parser exists to
-/// turn into a loud one. Every other field of the file is already refused
-/// on a typo; the schema was the one part that was not.
+/// Refuses a `schema:` whose known keywords would not do what they say (a
+/// typo'd `type`, an `enum` member of the wrong type, a range with no
+/// meaning) -- since `enforce: true` makes the schema a write gate, and one
+/// that silently enforced nothing would defeat the point. An unknown keyword
+/// still passes: the dialect is open-ended.
 ///
 /// `at` is the dotted place in the file an error names, `schema` for the
 /// root and `schema.properties.<key>` below it.
@@ -381,8 +302,7 @@ fn check_schema_dialect(name: &str, at: &str, node: &Value) -> Result<()> {
     }
     for key in ["hidden", "enforce", "multiline", "optional"] {
         if let Some(v) = map.get(key) {
-            let ok = v.is_boolean() || matches!(v.as_i64(), Some(0) | Some(1));
-            if !ok {
+            if as_flag(v).is_none() {
                 return Err(fail(format!("'{key}' must be true/false or 1/0")));
             }
         }
@@ -464,46 +384,27 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
     }
 }
 
-/// Whether `name` is a usable registry **file** name (the part before `.yaml`).
-///
-/// One rule, because three places need it and they must agree: `parse_id`
-/// turns an API id into a file name, `MetaStore::version` turns a file name
-/// back into a document id, and the loader decides which files it reads at all.
-///
-/// A name is one or more [`crate::path::is_valid_segment`] segments joined by
-/// dots -- which is exactly a prefix, since **the file name is the
-/// prefix**: `homelab.docker.yaml` declares `homelab.docker`. That admits the
-/// dots a prefix needs while still refusing everything that could address
-/// another directory (`/`, `..`, a leading dot) or another file type -- and
-/// it is at most [`MAX_FILE_NAME_LEN`] long, because the name becomes
-/// `<name>.yaml` on disk.
-///
-/// The API's schema for the `{name}` parameter (`perl/PVE/API2/Ext/Meta.pm`,
-/// `pattern` + `maxLength`) mirrors both halves for a friendly 400 before the
-/// request reaches Rust; this is the rule.
+/// Whether `name` is a usable registry **file** name (the part before
+/// `.yaml`): one or more [`crate::path::is_valid_segment`] segments joined by
+/// dots -- exactly a prefix, since the file name IS the prefix -- and at
+/// most [`MAX_FILE_NAME_LEN`] long. `parse_id`, `MetaStore::version` and the
+/// loader all need this same rule and must agree on it.
 pub fn is_valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME_LEN
         && name.split('.').all(crate::path::is_valid_segment)
 }
 
-/// The longest registry file name (without `.yaml`) that is one. Bytes, which
-/// for the segment charset (ASCII) is characters. Linux caps a file name at
-/// 255 bytes; 128 leaves room for the suffix, a temp-name tag and anything
-/// pmxcfs adds, and matches what the API has always accepted -- a longer name
-/// could never have been written through it, so no file that loaded before
-/// stops loading because of this bound.
+/// The longest registry file name (without `.yaml`) that is one. Bytes
+/// (the segment charset is ASCII); Linux caps a file name at 255 bytes, and
+/// 128 leaves room for the suffix and anything pmxcfs adds.
 pub const MAX_FILE_NAME_LEN: usize = 128;
 
 /// A PVE node name: `PVE::JSONSchema::pve_verify_node_name`'s
-/// `[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?`, transliterated, checked when one is
-/// made.
-///
-/// Making or deserializing one is the check, so a node name that reaches a
-/// prefix's `nodes` map or a version token was one, and there is no path by
-/// which a name that is not quietly means "no node". Whether the node is in
-/// the cluster is a question for the caller that holds the nodelist
-/// (`PVE::API2::Ext::Meta`, `pve-meta`); this is the shape only.
+/// `[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?`, transliterated. Making or
+/// deserializing one is the only check, so any `NodeName` in hand was one --
+/// whether it is in the cluster is a question for the caller that holds the
+/// nodelist.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct NodeName(String);
@@ -617,26 +518,18 @@ pub fn prefix_dirs() -> Vec<PathBuf> {
 
 /// Owns the drop-directory lists. Everything that needs to know where a
 /// prefix file lives -- `MetaStore`, the perlmod bindings, a test -- is
-/// handed one of these rather than reading `PVE_META_PREFIX_DIRS` (or the
-/// environment at all) on its own: two callers reading the same variable
-/// independently agree only because nothing changes it mid-process, and that
-/// was never a guarantee, just an accident of everything running in one
-/// process.
+/// handed one of these rather than reading `PVE_META_PREFIX_DIRS` on its own.
 #[derive(Debug, Clone)]
 pub struct Registry {
     prefix_dirs: Vec<PathBuf>,
 }
 
 impl Registry {
-    /// Reads `PVE_META_PREFIX_DIRS` (or the compiled-in defaults) once. See
-    /// [`crate::store::MetaStore::new`]'s doc comment for why that has to
-    /// happen exactly once per store rather than wherever a directory list
-    /// happens to be needed next.
-    ///
-    /// A `Registry` is a building block: it checks nothing about whether its
-    /// directories are there to be read, and neither do the free loaders below.
-    /// [`crate::store::MetaStore::registry`] hands one out behind the store's
-    /// availability check.
+    /// Reads `PVE_META_PREFIX_DIRS` (or the compiled-in defaults) once; see
+    /// [`crate::store::MetaStore::new`] for why that must happen exactly once
+    /// per store. Checks nothing about whether the directories are there to
+    /// be read -- [`crate::store::MetaStore::registry`] hands one out behind
+    /// the store's availability check.
     pub fn from_env() -> Self {
         Registry { prefix_dirs: prefix_dirs() }
     }
@@ -654,15 +547,10 @@ impl Registry {
         }
     }
 
-    /// The one directory of `kind` a write may land in, if any is configured.
-    ///
-    /// **The last directory is the writable one.** This is the one place that
-    /// says so; `load_dirs` derives its origin stamping from the same fact,
-    /// and `MetaStore::registry_write_dir` calls this rather than restating
-    /// it. `None` when `dirs(kind)` is empty, so a caller with no directories
-    /// configured -- `PVE_META_PREFIX_DIRS` set to nothing, or
-    /// [`Registry::new`] given none -- decides its own fallback instead of
-    /// silently writing to the compiled-in default.
+    /// The one directory of `kind` a write may land in, if any is configured:
+    /// the last one. `None` when `dirs(kind)` is empty, so a caller with none
+    /// configured decides its own fallback instead of silently writing to the
+    /// compiled-in default.
     pub fn write_dir(&self, kind: RegistryKind) -> Option<PathBuf> {
         self.dirs(kind).last().cloned()
     }
@@ -675,13 +563,9 @@ impl Registry {
     }
 
     /// Every prefix file as it is, packaged and cluster resolved by name --
-    /// `GET /meta/prefixes` without an `id`: a row may carry `nodes` as
-    /// parsed, so the editor can show it. Plus every file that did not load.
-    ///
-    /// A file that cannot be read is a failure like one that does not parse;
-    /// a directory that cannot be listed, for any reason but not being
-    /// there, is an error for the whole answer, never a set without its
-    /// files.
+    /// `GET /meta/prefixes` without an `id` -- plus every file that did not
+    /// load. A directory that cannot be listed, for any reason but not being
+    /// there, is an error for the whole answer.
     pub fn list_prefixes(&self) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
         prefixes_with_failures(&cluster_layers(self.dirs(RegistryKind::PrefixDef)))
     }
@@ -689,12 +573,8 @@ impl Registry {
     /// The prefixes reaching a guest on `node` carrying `tags`, resolved:
     /// selector-matched, node override applied whole, most-specific first
     /// (`docs/DESIGN.md` §3, §6). What both `GET /meta/prefixes?id=` and
-    /// `api::put_document`'s enforcement gate use -- one function, so the
-    /// two can never resolve a guest's set differently.
-    ///
-    /// Plus every file that did not load, same as [`Registry::list_prefixes`]:
-    /// a broken file is not this guest's business but is still worth telling
-    /// an administrator about from the same call.
+    /// `api::put_document`'s enforcement gate use, plus every file that did
+    /// not load, same as [`Registry::list_prefixes`].
     pub fn prefixes_for_guest(
         &self,
         node: Option<&NodeName>,
@@ -760,13 +640,9 @@ fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Source)> {
 
 /// The file for `name` among `dirs` (lowest precedence first): the one in
 /// the highest-precedence directory that has it, with that directory's
-/// index. Presence decides, not content -- see the module docs.
-///
-/// `name` is a bare file stem; the caller has already checked it with
-/// [`is_valid_file_name`], so it cannot carry a separator out of `dirs`.
-///
-/// A file that cannot even be looked at, for any reason but not being there, is
-/// present: reading it is what fails, and that failure is reported for it.
+/// index. Presence decides, not content. A file that cannot even be looked
+/// at, for any reason but not being there, counts as present: reading it is
+/// what fails, and that failure is reported for it.
 pub fn effective_file(dirs: &[PathBuf], name: &str) -> Option<(usize, PathBuf)> {
     let file = format!("{name}.yaml");
     dirs.iter()
@@ -791,17 +667,9 @@ fn is_file_or_unreadable(path: &FsPath) -> bool {
 type Loaded<T> = (Vec<(String, T)>, Vec<RegistryFailure>);
 
 /// Loads one drop-directory list, later layers overriding earlier by file
-/// name, and stamps each survivor with the [`Source`] of its layer.
-///
-/// One row per name, loaded or failed: every name any directory holds is
-/// resolved to its one effective file ([`effective_file`]), and only that
-/// file is read and parsed. A file it shadows is not looked at -- not loaded,
-/// and not reported either, since nothing it says is in effect.
-///
-/// Returns the failures alongside the parsed items -- an unreadable file and
-/// an unparseable one both count -- so a caller that needs to show them (`GET
-/// /meta/prefixes`) can have both from one walk of the directories, instead
-/// of two.
+/// name, and stamps each survivor with the [`Source`] of its layer. One row
+/// per name, loaded or failed: only the effective file ([`effective_file`])
+/// is read and parsed, so a file it shadows is neither loaded nor reported.
 fn load_dirs<T>(
     layers: &[(PathBuf, Source)],
     kind: &str,
@@ -851,7 +719,7 @@ fn load_dirs<T>(
 }
 
 /// [`load_dirs`] for prefixes, plus the most-specific-first sort the listing
-/// promises (`docs/DESIGN.md` §8) -- shared by [`load_prefixes`] (which drops
+/// promises (`docs/DESIGN.md` §6) -- shared by [`load_prefixes`] (which drops
 /// the failures) and the [`Registry`] listings (which keep them), so the
 /// two can never compute the sort differently.
 fn prefixes_with_failures(layers: &[(PathBuf, Source)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
@@ -889,13 +757,10 @@ fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
         let Some(stem) = file_name.strip_suffix(".yaml") else {
             continue;
         };
-        // The same rule `api::parse_id` and `store::registry_document_id` apply. It
-        // was missing here, which meant a hand-created `my file.yaml` *loaded* and
-        // appeared in the listing while `GET /meta/prefixes/my file` was a 400, so
-        // nothing could open or repair it. `is_valid_file_name`'s own doc says
-        // three places need it and must agree; this was the third.
-        // An entry that cannot be looked at is listed: reading it fails, and that
-        // is a failure row for its name, not a silently shorter set.
+        // Same rule as `api::parse_id`/`store::registry_document_id`: a file
+        // nothing could address must not load either. An entry that cannot be
+        // looked at is still listed -- reading it fails, and that is a
+        // failure row for its name, not a silently shorter set.
         if !is_valid_file_name(stem) || !is_file_or_unreadable(&entry.path()) {
             continue;
         }
@@ -1116,59 +981,94 @@ schema:
         assert!(parse_prefix("x", "selector: {all: true}\nenforce: 2\n").is_err());
     }
 
+    /// "Precedence is by presence" (module docs), one row per shape the two
+    /// directories can give a name: valid, wholesale-overridden, shadowed by
+    /// a malformed override rather than falling back, or simply broken --
+    /// all through the walk [`Registry::list_prefixes`] itself calls.
     #[test]
-    fn a_cluster_file_overrides_the_packaged_one_of_the_same_name() {
-        let packaged = tempfile::tempdir().unwrap();
-        let cluster = tempfile::tempdir().unwrap();
-        write(packaged.path(), "traefik.yaml", NS);
-        write(packaged.path(), "netbird.yaml", "selector: {all: true}\n");
-        write(cluster.path(), "traefik.yaml", "selector: {all: true}\n");
+    fn precedence_is_by_presence_valid_or_not() {
+        struct Case {
+            why: &'static str,
+            packaged: Option<&'static str>,
+            cluster: Option<&'static str>,
+            loaded: Option<(Origin, bool)>,
+            failure: Option<Origin>,
+        }
+        let bad = "selector: {nonsense: true}\n";
+        let cases = [
+            Case {
+                why: "a valid cluster file replaces the packaged one wholesale, not merged",
+                packaged: Some(NS),
+                cluster: Some("selector: {all: true}\n"),
+                loaded: Some((Origin::Cluster, true)),
+                failure: None,
+            },
+            Case {
+                why: "a malformed override shadows the packaged file rather than falling back to it",
+                packaged: Some(NS),
+                cluster: Some(bad),
+                loaded: None,
+                failure: Some(Origin::Cluster),
+            },
+            Case {
+                why: "a malformed packaged file with nothing to override it is just broken",
+                packaged: Some(bad),
+                cluster: None,
+                loaded: None,
+                failure: Some(Origin::Packaged),
+            },
+            Case {
+                why: "a malformed file is skipped and costs nobody else anything",
+                packaged: None,
+                cluster: Some(bad),
+                loaded: None,
+                failure: Some(Origin::Cluster),
+            },
+        ];
+        for Case { why, packaged, cluster, loaded, failure } in cases {
+            let pkg_dir = tempfile::tempdir().unwrap();
+            let cluster_dir = tempfile::tempdir().unwrap();
+            if let Some(t) = packaged {
+                write(pkg_dir.path(), "x.yaml", t);
+            }
+            if let Some(t) = cluster {
+                write(cluster_dir.path(), "x.yaml", t);
+            }
+            let dirs = [pkg_dir.path().to_path_buf(), cluster_dir.path().to_path_buf()];
+            let (found, failures) = prefixes_with_failures(&cluster_layers(&dirs)).unwrap();
+            match loaded {
+                Some((origin, overrides)) => {
+                    assert_eq!(found.len(), 1, "{why}");
+                    assert_eq!(found[0].origin, origin, "{why}");
+                    assert_eq!(found[0].overrides, overrides, "{why}");
+                    assert!(found[0].schema.is_none(), "{why}: wholesale, not merged");
+                }
+                None => assert!(found.is_empty(), "{why}"),
+            }
+            match failure {
+                Some(origin) => {
+                    assert_eq!(failures.len(), 1, "{why}");
+                    assert_eq!(failures[0].name, "x", "{why}");
+                    assert_eq!(failures[0].origin, origin, "{why}");
+                    assert!(!failures[0].error.is_empty(), "{why}");
+                }
+                None => assert!(failures.is_empty(), "{why}"),
+            }
+        }
 
-        let all = load_prefixes(&[packaged.path().into(), cluster.path().into()]).unwrap();
-        assert_eq!(all.len(), 2);
-        let traefik = all.iter().find(|n| n.prefix.to_string() == "traefik").unwrap();
-        assert_eq!(traefik.selector, Selector::All, "the cluster file wins");
-        assert!(traefik.schema.is_none(), "wholesale override, not a merge");
-    }
-
-    /// Precedence is by presence: the override is the file for its name even
-    /// when it does not parse, so a typo in a deliberate override never
-    /// quietly puts the packaged definition back in charge.
-    #[test]
-    fn a_malformed_cluster_override_shadows_the_packaged_file_it_replaces() {
-        let packaged = tempfile::tempdir().unwrap();
-        let cluster = tempfile::tempdir().unwrap();
-        write(packaged.path(), "traefik.yaml", NS);
-        write(packaged.path(), "broken.yaml", "selector: {nonsense: true}\n");
-        write(cluster.path(), "traefik.yaml", "selector: {nonsense: true}\n");
-        write(cluster.path(), "broken.yaml", "selector: {all: true}\n");
-        let dirs = [packaged.path().to_path_buf(), cluster.path().to_path_buf()];
-
-        let (loaded, failures) = prefixes_with_failures(&cluster_layers(&dirs)).unwrap();
-        assert_eq!(
-            loaded.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
-            vec!["broken"],
-            "the valid override loads; the broken one shadows its packaged file rather than falling back to it",
-        );
-        assert!(loaded[0].overrides, "a valid override still says what it displaced");
-        assert_eq!(failures.len(), 1, "one row per name: the shadowed packaged files are not reported");
-        assert_eq!(failures[0].name, "traefik");
-        assert_eq!(failures[0].origin, Origin::Cluster, "the row names the file to repair");
-
-        // The file the store would open for repair is the same one.
-        assert_eq!(effective_file(&dirs, "traefik").unwrap().1, cluster.path().join("traefik.yaml"));
-        assert_eq!(effective_file(&dirs, "netbird"), None);
-    }
-
-    #[test]
-    fn a_malformed_file_is_skipped_and_costs_nobody_else_anything() {
+        // `Registry::list_prefixes` and `prefixes_for_guest` walk the same
+        // directories through the same function, so a broken file is
+        // reported by both and never reaches the resolved set.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "traefik.yaml", NS);
-        write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
-        write(dir.path(), "notyaml.txt", "ignored");
-        let all = load_prefixes(&[dir.path().into()]).unwrap();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0].prefix.to_string(), "traefik");
+        write(dir.path(), "broken.yaml", bad);
+        let reg = Registry::new(vec![dir.path().to_path_buf()]);
+        let (parsed, failures) = reg.list_prefixes().unwrap();
+        assert_eq!(parsed.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(), vec!["traefik"]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].name, "broken");
+        let (resolved, _) = reg.prefixes_for_guest(None, &["traefik".to_string()]).unwrap();
+        assert_eq!(resolved, parsed);
     }
 
     #[test]
@@ -1204,32 +1104,6 @@ schema:
     #[test]
     fn a_missing_directory_is_not_an_error() {
         assert!(load_prefixes(&[PathBuf::from("/nonexistent/pve-meta")]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_malformed_prefix_file_is_listed_named_but_never_loaded() {
-        let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "traefik.yaml", NS);
-        write(dir.path(), "broken.yaml", "selector: {nonsense: true}\n");
-        let reg = Registry::new(vec![dir.path().to_path_buf()]);
-
-        let (parsed, failures) = reg.list_prefixes().unwrap();
-        assert_eq!(
-            parsed.iter().map(|p| p.prefix.to_string()).collect::<Vec<_>>(),
-            vec!["traefik"],
-            "only the good file becomes a prefix",
-        );
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].name, "broken", "the file name, not anything inside it");
-        assert!(!failures[0].error.is_empty());
-        // Same rule as `Registry::write_dir` -- one directory, nothing packaged.
-        assert_eq!(failures[0].origin, Origin::Cluster);
-
-        // What `governing`/the write path actually consult must never see it:
-        // resolving for a guest starts from the same loaded set, with `traefik`
-        // reached once its tag matches.
-        let (resolved, _) = reg.prefixes_for_guest(None, &["traefik".to_string()]).unwrap();
-        assert_eq!(resolved, parsed);
     }
 
     // -- node overrides (docs/DESIGN.md §3, §6) ------------------------------

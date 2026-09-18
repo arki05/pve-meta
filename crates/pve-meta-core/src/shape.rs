@@ -1,27 +1,15 @@
 //! The shape of one document: which declared prefixes reach it, which of
 //! them governs a given path, and what that prefix's schema says about the
-//! value there (`docs/DESIGN.md` §3).
+//! value there (`docs/DESIGN.md` §3). Built once per document from the
+//! prefixes that already reach it; the editor consults this one `Shape`
+//! (through the wasm build of this crate) instead of reimplementing it.
 //!
-//! A [`Shape`] is built once per document from the prefixes that already
-//! reach it -- resolved by [`crate::registry::Registry::prefixes_for_guest`]
-//! against the guest's tags and node, for a guest document. Every remaining
-//! prefix rule -- sort most-specific first, which prefix governs, walk the
-//! schema but stop where a child prefix takes over -- is a method on
-//! `Shape`, and the editor consults that one `Shape` (through the wasm build
-//! of this crate) instead of reimplementing any of them.
-//!
-//! **Schemas shadow; they never merge.** The most specific prefix covering a
-//! path governs it and no other contributes, so with `homelab` and
-//! `homelab.docker` both declared, `homelab`'s own `properties.docker` is
-//! never consulted for anything under `homelab.docker`. That is why
-//! [`Shape::governing`] uses plain containment ([`Path::is_prefix_of`]): a
-//! comment key `a__` is its own prefix here, not `a`'s sibling note, so with
-//! prefixes `a` and `a__` both declared each governs only its own subtree.
-//!
-//! A registry document (a prefix file) is shaped by its meta-schema instead,
-//! rooted at the document itself ([`Shape::rooted`]): the root prefix is a
-//! prefix of every path and the least specific of all, so it governs
-//! everything without a special case anywhere below.
+//! **Schemas shadow; they never merge.** [`Shape::governing`] is plain path
+//! containment ([`Path::is_prefix_of`]), so the most specific prefix covering
+//! a path is the only one consulted for it -- and a comment key `a__` is its
+//! own prefix here, not `a`'s sibling note, unlike the document's own note
+//! rule (`docs/DESIGN.md` §2). A registry document is shaped by its
+//! meta-schema instead, rooted at the document itself ([`Shape::rooted`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -80,7 +68,7 @@ pub struct Described<'a> {
 /// One thing a schema says is wrong with a value, at a document path.
 /// Advisory unless `enforced`: the server's one lint ([`model::lint`])
 /// decides what is storable, a schema only describes what was meant
-/// (`docs/DESIGN.md` §7) -- except where its prefix says `enforce: true`,
+/// (`docs/DESIGN.md` §5) -- except where its prefix says `enforce: true`,
 /// and then a write that introduces such a finding is refused without
 /// `force` ([`Shape::enforced_findings`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,14 +146,9 @@ impl Shape {
 
     /// A shape with one schema rooted at the document itself, which is how a
     /// registry document is described by its meta-schema
-    /// ([`crate::metaschema`], `docs/DESIGN.md` §6).
-    ///
-    /// Through [`Shape::new`] rather than building the struct, because the editor
-    /// constructs exactly this one-entry listing and hands it to the generic path.
-    /// Built by hand here, the two were the same only by coincidence: a change to
-    /// how `new` treats an empty-path entry would have broken the editor's rooted
-    /// shape while this function's own tests carried on passing. Now it must break
-    /// both or neither.
+    /// ([`crate::metaschema`], `docs/DESIGN.md` §3). Through [`Shape::new`]
+    /// rather than building the struct by hand, so this stays the same
+    /// one-entry listing the editor itself constructs.
     pub fn rooted(schema: Value) -> Shape {
         Shape::new([Declared {
             prefix: Path::root(),
@@ -287,15 +270,9 @@ impl Shape {
         inherited_enforce: bool,
         out: &mut Vec<Report>,
     ) {
-        // Inherited with an explicit setting winning at any depth, the same rule
-        // `hidden` follows and the prefix's own `enforce` as the root default.
-        //
-        // A prefix that enforces almost everything is the case this exists for: a
-        // vocabulary with a modelled part worth refusing bad writes into, and a
-        // passthrough subtree that by definition has no shape to check. Without a
-        // way to say `enforce: false` on that subtree, the escape hatch and the
-        // enforcement cannot both exist -- and the escape hatch is what makes a
-        // partial schema honest.
+        // Inherited, an explicit setting winning at any depth -- the escape
+        // hatch that lets a mostly-enforced vocabulary leave one passthrough
+        // subtree unchecked.
         let enforce = flag(schema, "enforce", inherited_enforce);
         if let Some(msg) = check_value(schema, value) {
             out.push(Report::Finding(Finding { path, msg, enforced: enforce }));
@@ -327,10 +304,7 @@ impl Shape {
 
 /// A schema node's `hidden` or `enforce`, or `inherited` when the node does
 /// not say. Spelled `true`/`false` or, as this dialect already spells
-/// `optional: 1` and `multiline: 1`, as `1`/`0` -- a hand-written
-/// `enforce: 0` on a passthrough subtree is exactly the escape hatch these
-/// flags exist for, and it must not be read as "not stated" and inherit the
-/// `true` it was written to override.
+/// `optional`/`multiline`, as `1`/`0`.
 fn flag(schema: &Value, key: &str, inherited: bool) -> bool {
     match schema.get(key) {
         Some(Value::Bool(b)) => *b,
@@ -346,7 +320,7 @@ fn flag(schema: &Value, key: &str, inherited: bool) -> bool {
 /// value onto an already-wrong key still warns, and replacing `homelab`
 /// answers for a finding beneath it. Editing something else in the same
 /// document does not: a tick you pass every time is a tick you stop
-/// reading (`docs/DESIGN.md` §12, "And only for what this edit did").
+/// reading (`docs/DESIGN.md` §8, "And only for what this edit did").
 pub fn introduced(before: &[Finding], after: &[Finding], changed: &[Path]) -> Vec<Finding> {
     let touched = |path: &Path| {
         changed
@@ -439,7 +413,7 @@ fn as_bool(value: &Value) -> Option<bool> {
 
 /// Whether `value` is of the declared `PVE::JSONSchema` type. A boolean
 /// stored as `1`/`0` passes: it is the API's own wire convention
-/// (`docs/DESIGN.md` §7), and a document written through `format=json` holds
+/// (`docs/DESIGN.md` §5), and a document written through `format=json` holds
 /// exactly that. An unknown type constrains nothing here; the registry
 /// refuses to load a prefix that declares one
 /// (`crate::registry::check_schema_dialect`), so through the API and the
