@@ -5,42 +5,26 @@ use std::str::FromStr;
 
 use crate::error::Error;
 
-/// Returns `true` if `s` is a syntactically valid path/object-key segment:
-/// `^[A-Za-z0-9_@!-]+$`. `@` and `!` are allowed (in addition to the base
-/// `^[A-Za-z0-9_-]+$` object-key charset) specifically so a PVE authid
-/// (`user@realm`, or `user@realm!tokenid`) can be used verbatim as a key.
-/// No key is reserved (`docs/DESIGN.md` §2), so an authid-shaped key is
-/// ordinary document data: access-control data lives outside documents
-/// entirely (§4). Neither character is a path separator (those are `.` and
-/// `/`), so this does not introduce any addressing ambiguity.
+/// `true` if `s` is a valid path/object-key segment: `^[A-Za-z0-9_@!-]+$`.
+/// `@`/`!` are included so a PVE authid (`user@realm!tokenid`) can be used
+/// verbatim as a key (`docs/DESIGN.md` §2); neither is a path separator.
 pub fn is_valid_segment(s: &str) -> bool {
     !s.is_empty() && invalid_char(s).is_none()
 }
 
-/// The first character of `s` that the segment charset does not admit, if
-/// any. This is the charset [`is_valid_segment`] is defined by; it is
-/// separate so an editor can *name* the character it refuses ("a space is
-/// not allowed in a key") instead of restating the charset as a regex of its
-/// own -- which is how the browser and the server came to hold two copies.
+/// The first character of `s` outside the segment charset, if any: separate
+/// from [`is_valid_segment`] so an editor can name the character it refuses.
 pub fn invalid_char(s: &str) -> Option<char> {
     s.chars()
         .find(|&c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '@' || c == '!'))
 }
 
-/// A path into a document: a sequence of key segments.
-///
-/// The empty path (`Path::root()`) addresses the document root. `Display`
-/// renders the path in dotted form (`a.b.c`); [`Path::parse`] accepts both
-/// dotted (`a.b.c`) and slash (`a/b/c`, `/a/b/c`) forms.
-///
-/// Every segment satisfies [`is_valid_segment`]; [`Path::parse`] is the only
-/// public way to make one. A segment is a map key wherever a path *addresses*
-/// something -- a view, a scope, a declared prefix, a touched path: array
-/// members are not addressable (`docs/DESIGN.md` §2), and
-/// [`crate::view`] refuses to walk through an array. The one place a segment
-/// is read as an index is diagnostic: [`crate::model::lint`] names the
-/// offending member of a list (`items.2`), and [`crate::model::get_path`]
-/// follows such a path back to it.
+/// A path into a document: a sequence of key segments, each satisfying
+/// [`is_valid_segment`]. `Display` renders dotted form (`a.b.c`);
+/// [`Path::parse`] is the only public way to make one, accepting dotted or
+/// slash (`a/b/c`, `/a/b/c`) forms. Array members are not addressable
+/// (`docs/DESIGN.md` §2); the one exception is diagnostic, in
+/// [`crate::model::lint`] and [`crate::model::get_path`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
 pub struct Path(Vec<String>);
 
@@ -51,10 +35,8 @@ impl Path {
     }
 
     /// Parses a dotted (`a.b.c`) or slash-separated (`a/b/c`, `/a/b/c`) path
-    /// string. An empty string (or `/`) parses to the root path.
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidPath`] if any segment fails validation.
+    /// string; empty (or `/`) parses to the root. [`Error::InvalidPath`] if
+    /// any segment fails validation.
     pub fn parse(s: &str) -> Result<Self, Error> {
         let trimmed = s.strip_prefix('/').unwrap_or(s);
         if trimmed.is_empty() {
@@ -97,9 +79,9 @@ impl Path {
         }
     }
 
-    /// Returns a new path with `segment` appended. Crate-private for the
-    /// same reason as [`Path::new`]: every caller appends a key it read out
-    /// of a document or a schema, never text from a request.
+    /// Returns a new path with `segment` appended. Crate-private: every
+    /// caller appends a key read out of a document or a schema, never
+    /// request text (which must go through [`Path::parse`]).
     pub(crate) fn join(&self, segment: impl Into<String>) -> Path {
         let mut segments = self.0.clone();
         segments.push(segment.into());
@@ -185,9 +167,8 @@ mod tests {
 
     #[test]
     fn authid_shaped_segments_allowed() {
-        // `@` and `!` are allowed so a PVE authid can be used as a segment
-        // of an ordinary document key (`docs/DESIGN.md` §2: no key is
-        // reserved), and are not path separators (those are `.` and `/`).
+        // `@`/`!` let a PVE authid be used as a segment of an ordinary key
+        // (`docs/DESIGN.md` §2: no key is reserved).
         assert!(is_valid_segment("svc@pve!traefik"));
         assert!(is_valid_segment("scoped@pve"));
         let p = Path::parse("scopes/svc@pve!traefik").unwrap();

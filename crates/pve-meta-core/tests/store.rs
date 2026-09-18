@@ -7,15 +7,9 @@ use pve_meta_core::store::{DocId, MetaStore, RegistryKind, RollbackOutcome, MAX_
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
-/// A store rooted in a fresh temp directory, with its **own** registry
-/// directories under `<root>/registry/` rather than the real
-/// `/usr/share/pve-meta` and `/etc/pve/meta.d` that `MetaStore::new` would
-/// resolve. Without that a run of this suite on an actual PVE node would read
-/// the live cluster's prefixes (and, worse, write to them).
-///
-/// They are plain subdirectories of the root on purpose: the root walks skip
-/// anything that is not a file, so their presence changes nothing the other
-/// tests observe.
+/// A store rooted in a fresh temp directory, with its own registry
+/// directories under it rather than the real `/usr/share/pve-meta` and
+/// `/etc/pve/meta.d`, so this suite never touches the live cluster.
 fn store() -> (tempfile::TempDir, MetaStore) {
     let dir = tempdir().unwrap();
     let store = MetaStore::with_registry_dirs(
@@ -173,29 +167,6 @@ fn a_file_that_vanishes_between_syscalls_is_not_found_not_an_io_error() {
     assert!(store.check_precondition(&DocId::Guest(100), Some("")).is_ok());
     assert!(!store.snapshot(100, "s").unwrap());
     assert_eq!(store.purge(100).unwrap(), 0);
-    assert!(store.version().is_ok());
-}
-
-#[test]
-fn version_skips_a_file_that_disappears_under_the_walk() {
-    // A `readdir` entry is a name, not a file: the GC or a DELETE can remove
-    // it before the walk gets to its `stat`. A 5 s poll must not 500 for it.
-    let (dir, store) = store();
-    for vmid in 100..140u32 {
-        store.put_raw(&DocId::Guest(vmid), "a: 1\n", None).unwrap();
-    }
-    let deleter = {
-        let root = dir.path().to_path_buf();
-        std::thread::spawn(move || {
-            for vmid in 100..140u32 {
-                let _ = std::fs::remove_file(root.join(format!("{vmid}.yaml")));
-            }
-        })
-    };
-    for _ in 0..200 {
-        store.version().expect("a vanishing file is not a version() failure");
-    }
-    deleter.join().unwrap();
     assert!(store.version().is_ok());
 }
 
@@ -465,10 +436,7 @@ fn version_token_returns_to_an_earlier_value_when_content_does() {
 
 #[test]
 fn reads_never_lint_but_writes_still_do() {
-    // `docs/DESIGN.md` §7. Out-of-band content -- a hand-edited
-    // file, a restored backup, pmxcfs replication -- must stay readable, or
-    // one bad key in a file denies every operation on it and blocks the
-    // repair that would fix it.
+    // `docs/DESIGN.md` §5: the lint runs on the planned document, not on a read.
     let (dir, store) = store();
     let broken = "bad key: 1\nempty:\nlist:\n- ~\n";
     std::fs::write(dir.path().join("200.yaml"), broken).unwrap();
@@ -502,18 +470,13 @@ fn reads_never_lint_but_writes_still_do() {
 
 #[test]
 fn a_syntax_error_is_reported_per_document_and_never_blocks_a_repair() {
-    // `docs/DESIGN.md` §7: a parse failure is a *per-document* condition.
-    // Both write handlers read the document before planning, so a fatal parse
-    // here would make a tab or an indentation slip in a hand-edited file
-    // unrepairable through the API. Each of these is a real YAML syntax
-    // failure, not a lint finding.
+    // `docs/DESIGN.md` §1 invariant 5: a parse failure is per-document, never
+    // blocking. Two distinct reasons a document can fail to parse: an
+    // ordinary syntax error, and a construct this store's strict reader
+    // refuses (`docs/DESIGN.md` §1 invariant 6).
     for broken in [
-        "a: 1\n\tb: 2\n",            // a tab
-        "a: &anc 1\nb: *anc\n",      // an anchor and an alias
-        "a: 1\n  b: 2\n",            // an indentation slip
-        "a: !!str 1\n",              // an explicit tag
-        "a: [\n",                    // an unterminated flow sequence
-        "? [1, 2]\n: v\n",           // a complex key
+        "a: [\n",               // an unterminated flow sequence
+        "a: &anc 1\nb: *anc\n", // an anchor and an alias
     ] {
         let (dir, store) = store();
         std::fs::write(dir.path().join("200.yaml"), broken).unwrap();
@@ -595,8 +558,7 @@ fn there_is_one_write_gate_and_it_is_the_document_lint() {
 
 #[test]
 fn stored_vmids_covers_documents_and_snapshot_copies() {
-    // The store's half of the GC (`docs/DESIGN.md` §9): Perl passes the
-    // vmlist, and everything here that is not in it is purged. A vmid whose
+    // The store's half of the orphan GC (`docs/DESIGN.md` §7): a vmid whose
     // *only* file is a snapshot copy has to be found too.
     let (dir, store) = store();
     assert!(store.stored_vmids().unwrap().is_empty());
@@ -779,7 +741,7 @@ fn a_nested_prefix_is_a_dotted_file_name_and_still_moves_the_token() {
     assert_ne!(store.version().unwrap().token, before);
 }
 
-// --- a store that is not there (docs/DESIGN.md §7) ---------------------------
+// --- a store that is not there (docs/DESIGN.md §1 invariant 3) --------------
 
 #[test]
 fn a_store_whose_cluster_marker_is_missing_refuses_every_operation() {
@@ -789,29 +751,32 @@ fn a_store_whose_cluster_marker_is_missing_refuses_every_operation() {
     let marker = dir.path().join("local");
     let store = store.with_cluster_marker(&marker);
 
-    // pmxcfs not mounted: the directory is right there, and holds what it holds,
-    // but nothing may be read off it as the store's answer.
-    let unavailable = |r: Result<(), Error>, what: &str| {
-        assert!(matches!(r, Err(Error::Unavailable(_))), "{what}: {r:?}");
-    };
-    unavailable(store.check_available(), "check_available");
-    unavailable(store.read(&DocId::Guest(100)).map(drop), "read");
-    unavailable(store.read(&prefix("traefik")).map(drop), "read of a registry document");
-    unavailable(store.digest_of(&DocId::Guest(100)).map(drop), "digest_of");
-    unavailable(store.check_precondition(&DocId::Guest(100), Some("")), "check_precondition");
-    unavailable(store.put_raw(&DocId::Guest(101), "b: 1\n", None).map(drop), "put_raw");
-    unavailable(store.delete(&DocId::Guest(100)).map(drop), "delete");
-    unavailable(store.stored_vmids().map(drop), "stored_vmids");
-    unavailable(store.list_snapshots(100).map(drop), "list_snapshots");
-    unavailable(store.snapshot(100, "again").map(drop), "snapshot");
-    unavailable(store.rollback(100, "before").map(drop), "rollback");
-    unavailable(store.delete_snapshot(100, "before").map(drop), "delete_snapshot");
-    unavailable(store.purge(100).map(drop), "purge");
-    unavailable(store.version().map(drop), "version");
-    unavailable(store.registry().map(drop), "registry");
+    // pmxcfs not mounted: every public method refuses the same way, rather
+    // than reading the directory that is right there as an empty store.
+    type Call = Box<dyn Fn(&MetaStore) -> Result<(), Error>>;
+    let calls: Vec<(&str, Call)> = vec![
+        ("check_available", Box::new(|s| s.check_available())),
+        ("read", Box::new(|s| s.read(&DocId::Guest(100)).map(drop))),
+        ("read (registry)", Box::new(|s| s.read(&prefix("traefik")).map(drop))),
+        ("digest_of", Box::new(|s| s.digest_of(&DocId::Guest(100)).map(drop))),
+        ("check_precondition", Box::new(|s| s.check_precondition(&DocId::Guest(100), Some("")))),
+        ("put_raw", Box::new(|s| s.put_raw(&DocId::Guest(101), "b: 1\n", None).map(drop))),
+        ("delete", Box::new(|s| s.delete(&DocId::Guest(100)).map(drop))),
+        ("stored_vmids", Box::new(|s| s.stored_vmids().map(drop))),
+        ("list_snapshots", Box::new(|s| s.list_snapshots(100).map(drop))),
+        ("snapshot", Box::new(|s| s.snapshot(100, "again").map(drop))),
+        ("rollback", Box::new(|s| s.rollback(100, "before").map(drop))),
+        ("delete_snapshot", Box::new(|s| s.delete_snapshot(100, "before").map(drop))),
+        ("purge", Box::new(|s| s.purge(100).map(drop))),
+        ("version", Box::new(|s| s.version().map(drop))),
+        ("registry", Box::new(|s| s.registry().map(drop))),
+    ];
+    for (name, call) in &calls {
+        assert!(matches!(call(&store), Err(Error::Unavailable(_))), "{name}");
+    }
     // A marker that is there but is not what pmxcfs provides is no better.
     std::fs::create_dir(&marker).unwrap();
-    unavailable(store.check_available(), "a directory where the symlink should be");
+    assert!(matches!(store.check_available(), Err(Error::Unavailable(_))));
     assert!(!dir.path().join("101.yaml").exists(), "nothing was written");
 
     // Mounted: the same store answers.

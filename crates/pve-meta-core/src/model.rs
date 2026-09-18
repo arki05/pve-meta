@@ -10,15 +10,10 @@ use crate::path::{is_valid_segment, Path};
 /// insertion-ordered map (order = human order).
 pub type Value = serde_json::Value;
 
-/// The suffix that marks an object key as a *comment key*: `foo__` documents
-/// the sibling key `foo` (which need not exist); the bare key `__` documents
-/// the containing map itself. Comment key values must be strings.
-///
-/// Comment keys are **notes** (`docs/DESIGN.md` §2). They are stored, linted
-/// and diffed like any key and travel with the subtree they sit in, and the
-/// API leaves them out of a read and keeps them through a replace unless the
-/// caller asks for them ([`crate::view::strip_comments`],
-/// [`crate::view::keep_comments`]).
+/// The suffix marking an object key as a note: `foo__` documents the sibling
+/// `foo` (need not exist); the bare key `__` documents the containing map
+/// (`docs/DESIGN.md` §2). Stored, linted and diffed like any key; see
+/// [`crate::view::strip_comments`]/[`crate::view::keep_comments`] for reads.
 pub const COMMENT_SUFFIX: &str = "__";
 
 /// `true` if `k` is a comment key, i.e. ends with [`COMMENT_SUFFIX`].
@@ -52,18 +47,9 @@ impl fmt::Display for Lint {
     }
 }
 
-/// The **one** lint (`docs/DESIGN.md` §7), run on the planned document:
-///
-/// 1. the top level must be an object;
-/// 2. no `null` anywhere (absent means unset);
-/// 3. every object key must match `^[A-Za-z0-9_@!-]+$`;
-/// 4. a comment key's value must be a string;
-/// 5. numbers must be integers or finite floats (already guaranteed by
-///    `serde_json::Value` without the `arbitrary_precision` feature, so this
-///    is not checked separately at runtime).
-///
-/// There is deliberately no second variant: the lint runs once, the same way
-/// for every caller, never narrowed by privilege.
+/// The one lint, run the same way for every caller (`docs/DESIGN.md` §5): the
+/// top level is an object, no `null` anywhere, every key matches the charset,
+/// and a comment key's value is a string.
 pub fn lint(doc: &Value) -> Vec<Lint> {
     let mut out = Vec::new();
     if !doc.is_object() {
@@ -166,8 +152,7 @@ mod tests {
 
     #[test]
     fn lint_names_the_offending_path() {
-        // `docs/DESIGN.md` §7: the 400 names the offending path. There is no
-        // redaction rule and no caller-dependent message.
+        // `docs/DESIGN.md` §5: the 400 names the offending path.
         let lints = lint(&json!({"a": {"b": {"bad key": 1}}}));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].to_string(), "a.b.bad key: invalid key 'bad key': keys must match ^[A-Za-z0-9_@!-]+$ and contain no dots");
@@ -195,9 +180,8 @@ mod tests {
 
     #[test]
     fn no_key_is_reserved_in_any_document() {
-        // No key is reserved (`docs/DESIGN.md` §2): `scopes` is ordinary data,
-        // and an authid-shaped key (`user@realm!token`) is unrestricted, but a
-        // dotted key still fails the ordinary key charset (§2).
+        // No key is reserved (`docs/DESIGN.md` §2), but a dotted key still
+        // fails the ordinary key charset.
         assert!(lint(&json!({"scopes": {"a": 1}})).is_empty());
         assert_eq!(lint(&json!({"scopes": {"john.doe@pve": 1}})).len(), 1);
         assert!(lint(&json!({"scopes": {"svc@pve!traefik": 1}})).is_empty());

@@ -70,15 +70,13 @@ pub enum Error {
     #[error("invalid name: {0}")]
     InvalidName(String),
 
-    /// A prefix definition (`docs/DESIGN.md` §6) is malformed; see
+    /// A prefix definition (`docs/DESIGN.md` §3) is malformed; see
     /// [`crate::registry::parse_prefix`].
     #[error("invalid registry file: {0}")]
     Registry(String),
 
-    /// The store's filesystem is not there to answer: `/etc/pve` without
-    /// pmxcfs mounted on it is an empty directory, and "no documents" read off
-    /// it is a wrong answer, not an empty one (`docs/DESIGN.md` §7). See
-    /// [`crate::store::MetaStore::check_available`].
+    /// The store's filesystem is not there to answer (`docs/DESIGN.md` §1
+    /// invariant 3). See [`crate::store::MetaStore::check_available`].
     #[error("cluster filesystem not available: {0}")]
     Unavailable(String),
 

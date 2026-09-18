@@ -1,126 +1,22 @@
-//! `pve-meta-core`: the pure-Rust, platform-independent document model,
-//! formats, patch engine, registry and file store behind `pve-meta`.
-//!
-//! Two consumers, neither of which reimplements anything here:
-//! `crates/pve-meta-perl` (`PVE::RS::Meta`), which exposes the snapshot
-//! hooks, `stored_vmids` and the `api_*` functions backing
-//! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8); and
-//! `crates/pve-meta-wasm`, the browser build the editor asks for the codec,
-//! the path rules and [`shape::Shape`]. There is no daemon and no CLI.
-//!
-//! No networking, no async, no PVE-specific crates. Builds and passes tests
-//! on macOS and Linux, and builds for `wasm32-unknown-unknown` (the
-//! filesystem-facing modules compile there and are simply never called).
-//!
-//! # Module map
-//!
-//! - [`api`] — the request-shaped API layer (view reads/writes, write
-//!   authorization, the lint, `touched` reporting) that
-//!   `PVE::RS::Meta`'s `api_*` functions export to
-//!   `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8).
-//! - [`backup`] — the notes block: a document rendered into, and read back
-//!   out of, a guest config's notes, which is how it rides through a vzdump
-//!   backup and restore (`docs/DESIGN.md` §9).
-//! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
-//!   most-specific first: what governs a path, what its schema says
-//!   (`docs/DESIGN.md` §3). Schemas shadow.
-//! - [`model`] — the [`model::Value`] alias (an order-preserving
-//!   `serde_json::Value`), the one document [`model::lint`], comment keys
-//!   (`foo__`), and path lookup.
-//! - [`path`] — [`path::Path`], dotted/slash addressing into a document.
-//! - [`patch`] — merge-patch semantics (RFC 7386) with explicit delete:
-//!   [`patch::apply_patch`], [`patch::diff`].
-//! - [`crate::format`] — [`format::Format`] (YAML on disk, JSON as a wire
-//!   format only) and canonical [`format::parse`]/[`format::dump`].
-//! - [`digest`] — [`digest::digest`], the SHA-256 content digest used
-//!   throughout the store.
-//! - [`store`] — [`store::MetaStore`], the atomic on-disk file store: guest
-//!   documents, snapshot copies, and content-hashed version polling.
-//! - [`view`] — [`view::extract`]/[`view::replace`]/[`view::merge`]/
-//!   [`view::remove`]/[`view::filter`], the prefix-addressed "view" read/write
-//!   operations (`docs/DESIGN.md` §2), [`view::strip_comments`]/
-//!   [`view::keep_comments`] for the notes a caller did not ask for, plus
-//!   [`view::render`]/[`view::parse`]/
-//!   [`view::parse_patch`] for a view's wire text.
-//! - [`metaschema`] — the two registry file formats, written as schemas in the
-//!   same dialect a prefix uses, so the editor can show a prefix or grant
-//!   file as a typed tree (`docs/DESIGN.md` §6).
-//! - [`registry`] — the prefix drop-directories
-//!   (`/usr/share/pve-meta/prefixes`, `/etc/pve/meta.d/prefixes`), which say
-//!   what a prefix is and carry its schema, shadowing most-specific-first
-//!   ([`shape::Shape::governing`]) (`docs/DESIGN.md` §3).
-//! - [`error`] — the single [`error::Error`] type (and [`error::Result`]
-//!   alias) returned throughout this crate.
-//!
-//! # Example
-//!
-//! ```
-//! use pve_meta_core::format::{self, Format};
-//! use pve_meta_core::model;
-//!
-//! let doc = format::parse(Format::Yaml, "name: web01\ntags: [prod, web]\n").unwrap();
-//! assert!(model::lint(&doc).is_empty());
-//! ```
+//! `pve-meta-core`: the platform-independent document model, store and API
+//! layer behind `pve-meta`, consumed by `pve-meta-perl` and `pve-meta-wasm`.
+//! No networking, no async, no PVE-specific crates.
 
-// Doc comments here reference internal helpers by intra-doc link on purpose:
-// `covers` (the coverage rule), `identify`, `is_valid_segment` and
-// `Stored::unrecoverable` are what the prose is *about*, and a plain code span
-// would drop the navigation under `cargo doc --document-private-items` -- the
-// only way anyone reads this crate, since its sole consumer is the perlmod
-// crate next door. Rustdoc renders such a link as plain text in the public
-// docs, so nothing is broken there either; the lint only warns that it did.
-// `make doc` still fails on a link that resolves to nothing at all.
+// Doc links here reach private items, for navigation under `cargo doc --document-private-items`.
 #![allow(rustdoc::private_intra_doc_links)]
 
-/// Warns about something the caller cannot see: a file being skipped, a
-/// document that would not parse. Tagged `pve-meta:` so the line is greppable
-/// wherever it lands.
-///
-/// **Where a warning has to go, and why it is two places.** Nothing anywhere
-/// initialises a `tracing` subscriber, so a `tracing::warn!` here would be
-/// silently discarded. stderr alone is not enough either: `PVE::Daemon` opens
-/// STDOUT to `/dev/null` and dups STDERR onto it before a worker ever runs
-/// (`/usr/share/perl5/PVE/Daemon.pm`), so a `.so` inside pvedaemon or pveproxy
-/// writes its warnings into the void just as thoroughly.
-///
-/// So both, because the two sinks are each right in a different caller and
-/// neither is right in both:
-///
-/// * **syslog** is the daemons' only route out, and it is the one PVE's own
-///   Perl uses for exactly this kind of line.
-/// * **stderr** is what the `pve-meta` CLI and the test binaries show, where
-///   syslog would be an odd place to look for the answer to a command you just
-///   typed.
-///
-/// Deliberately no `openlog`: the ident is process-global, and setting it
-/// from inside a library would relabel the host process's own log lines with
-/// ours. The line therefore inherits whatever ident that process last set --
-/// on PVE that turns out to be `IPCC.xs`, not `pveproxy`, which is exactly why
-/// the message carries its own tag. Grep the journal for `pve-meta:`, not for
-/// a unit or an ident.
-///
-/// This is a report, not a channel. A caller that must *act* on the failure
-/// needs it in a return value, not in a log line -- see `docs/DESIGN.md` §12
-/// on surfacing an unreadable registry file in the UI.
+/// Warns about something the caller can't see, to both stderr and syslog under the `pve-meta:` tag.
 pub fn warn(msg: &str) {
     eprintln!("pve-meta: {msg}");
     syslog_line(libc_priority::WARNING, msg);
 }
 
-/// Records a write: who changed which document, where, and how much. One
-/// line per `PUT`/`DELETE` that actually changed a file, at `info`, tagged
-/// `pve-meta audit:` so `journalctl | grep 'pve-meta audit'` is the history
-/// of the store. PVE's task log never sees these writes -- they are plain
-/// API calls, not tasks -- and nothing else recorded who did what.
-///
-/// syslog only, deliberately: the daemons have no other route out, and the
-/// CLI prints its own result, so a second line on its stderr would be noise.
+/// Records a write to syslog only, tagged `pve-meta audit:` (`docs/DESIGN.md` §5).
 pub fn audit(msg: &str) {
     syslog_line(libc_priority::INFO, msg);
 }
 
 /// The two syslog priorities this crate uses, named so the calls above read.
-/// Values are libc's on unix and unused elsewhere.
 mod libc_priority {
     #[cfg(unix)]
     pub const WARNING: i32 = libc::LOG_WARNING;
@@ -135,8 +31,7 @@ mod libc_priority {
 #[cfg(unix)]
 fn syslog_line(priority: i32, msg: &str) {
     // An interior NUL would truncate the line at the C boundary; a warning is
-    // often *about* a hostile or corrupt file name, so it is not a case that
-    // can be assumed away.
+    // often about a corrupt or unusual file name.
     let tag = if priority == libc_priority::INFO { "pve-meta audit" } else { "pve-meta" };
     let line: String = format!("{tag}: {msg}")
         .chars()
@@ -145,13 +40,10 @@ fn syslog_line(priority: i32, msg: &str) {
     let Ok(c) = std::ffi::CString::new(line) else {
         return;
     };
-    // `"%s"`, never the message as the format string: a file name containing a
-    // `%` would otherwise be read as a conversion and print whatever happened
-    // to be next on the stack.
+    // `"%s"`, never `msg` itself as the format string: a `%` in a file name
+    // would otherwise be read as a conversion.
     //
-    // SAFETY: `syslog` is async-signal-safe and thread-safe, both pointers are
-    // valid NUL-terminated C strings that outlive the call, and the variadic
-    // argument matches the `%s` in the format.
+    // SAFETY: both pointers are valid, NUL-terminated, and outlive the call.
     unsafe {
         libc::syslog(priority | libc::LOG_DAEMON, c"%s".as_ptr(), c.as_ptr());
     }
@@ -168,6 +60,7 @@ macro_rules! warn_line {
     };
 }
 
+// Each module documents itself with its own `//!` header.
 pub mod api;
 pub mod backup;
 pub mod digest;

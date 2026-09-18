@@ -1,42 +1,6 @@
-//! The on-disk file store: atomic reads/writes of guest documents, snapshots,
-//! and change-version polling.
-//!
-//! Root is `/etc/pve/meta` in production, a tempdir in tests. Documents are
-//! always YAML (`docs/DESIGN.md` §2): `<vmid>.yaml`, and
-//! `<vmid>.<snapname>.yaml` for a guest's snapshot copies. All writes are
-//! atomic (write a hidden, node- and call-unique sibling, then `rename`),
-//! which pmxcfs supports.
-//!
-//! Serialising concurrent writers is *not* this layer's job: the API write
-//! handlers run the whole read-check-write cycle under
-//! `PVE::Cluster::cfs_lock_domain` (`docs/DESIGN.md` §7), and the digest
-//! precondition enforced here ([`MetaStore::put_raw`]'s `expected_digest`) is
-//! the single owner of the compare-and-swap rule.
-//!
-//! ## A file that is not there is never a 500
-//!
-//! Reads run unlocked and writes hold `pve-meta-<id>` (the API's handlers and
-//! `pve-meta rm` alike), so no reader is ever excluded from a directory a
-//! `DELETE` or a removal is working on. Every operation here
-//! is therefore written so that a file disappearing between two syscalls is
-//! an ordinary outcome, never an `io::ErrorKind::NotFound` propagated as
-//! [`Error::Io`] (which the API layer maps to HTTP 500): a read reports
-//! [`Error::NotFound`], [`MetaStore::delete`] and [`MetaStore::delete_snapshot`]
-//! are idempotent and say whether they removed anything, and the directory
-//! walks ([`MetaStore::version`], [`MetaStore::stored_vmids`],
-//! [`MetaStore::list_snapshots`]) skip an entry that vanished under them.
-//! There is deliberately no `exists()`-then-act pair left in this file.
-//!
-//! ## A store that is not there is an error, never an empty one
-//!
-//! Only *not found* is an outcome. Without pmxcfs mounted, `/etc/pve` is an
-//! ordinary empty directory on the root filesystem, and every walk of it would
-//! answer "no documents" -- the answer an operator deletes things on. So a store
-//! over the cluster filesystem checks that it is mounted before every operation
-//! ([`MetaStore::check_available`], [`Error::Unavailable`]), and any other I/O
-//! error reading a document or a directory is an error, not an absence. Neither
-//! is about a document's content, which a read still never fails on
-//! (`docs/decisions/005-reads-never-fail-on-content.md`).
+//! The on-disk file store: atomic guest-document and snapshot I/O, the
+//! digest compare-and-swap, and version polling (`docs/DESIGN.md` §1-§2).
+//! Root is `/etc/pve/meta` in production, a tempdir in tests.
 
 use std::fmt;
 use std::fs;
@@ -56,64 +20,22 @@ use crate::patch::{self, Touched};
 pub use crate::registry::RegistryKind;
 use crate::registry::Registry;
 
-/// Warn threshold for document size (informational only; reported through
-/// [`crate::warn`]).
+/// Size warning threshold, informational only (see [`crate::warn`]).
 pub const WARN_BYTES: u64 = 256 * 1024;
-/// Hard limit for document size; exceeding it is [`Error::TooLarge`].
-///
-/// This is a **backstop, not the operative limit** for an API write: pveproxy
-/// rejects a request body of roughly this size before the request ever
-/// reaches us (measured on PVE 8: 520 000 bytes through, 530 000 bytes
-/// answered "for data too large", HTTP 501). It is the operative limit for a
-/// hand-written or replicated file being rewritten, and it is what keeps a
-/// single document from eating the pmxcfs size budget.
+/// Hard write-size limit; exceeding it is [`Error::TooLarge`].
 pub const MAX_BYTES: u64 = 512 * 1024;
-
-/// Hard limit for what [`MetaStore::read`] will read off the disk at all.
-///
-/// [`MAX_BYTES`] only ever applies to *writes*: without this separate cap, a
-/// multi-megabyte file dropped into `/etc/pve/meta` out of band (a bad
-/// rsync, a replicated file from a future version, a mistake) would be read
-/// and SHA-256'd on every request that touched it.
-///
-/// It is deliberately eight times [`MAX_BYTES`]: nothing this store writes
-/// can ever reach it, so hitting it always means the file arrived out of
-/// band, and the slack means a document that was legally written can always
-/// still be read back (and therefore repaired) even if the write limit is
-/// lowered later.
-///
-/// The cap is applied by **every** path that would otherwise pull a file's
-/// bytes into memory, not just [`MetaStore::read`]: [`MetaStore::digest_of`],
-/// the compare-and-swap precondition and [`MetaStore::version`] all go
-/// through [`identify`], which uses a file's size and mtime instead of its
-/// bytes above the cap rather than hashing megabytes on every 5 s poll and
-/// every listing.
+/// Hard read limit; above it [`identify`] uses `(len, mtime)`, never bytes.
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
+/// The on-disk format (`docs/DESIGN.md` §2: YAML).
 pub const DISK_FORMAT: Format = Format::Yaml;
 
-/// Identifies a top-level document in the store: a guest's metadata or one
-/// registry file. Snapshots are addressed separately, by
-/// `(vmid, name)`, via the dedicated snapshot methods.
-///
-/// A registry file is a document like any other **on purpose**: it is YAML, it
-/// is read, replaced and deleted whole or by view, and it wants exactly the
-/// machinery the other two already have -- the digest compare-and-swap, the
-/// lint, the version poll, and in the editor the tree, the markers and the
-/// diff. The alternative was a second write path beside the first, which is
-/// the shape of every wrong-result bug this project has had.
-///
-/// One thing is *not* uniform, and lives outside this type: a registry
-/// document's content must additionally parse as the kind it claims to be,
-/// which `api::put_document` checks before writing.
+/// A document id: a guest document, or a registry file (a document too: `docs/decisions/003-registry-files-are-documents.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
     Guest(u32),
-    /// A prefix file, named `<name>.yaml` in its kind's directory. The name
-    /// is dotted segments (`crate::registry::is_valid_file_name`), so it can
-    /// never contain a slash or escape that directory.
+    /// A prefix file, named `<name>.yaml` in its kind's directory.
     Registry(RegistryKind, String),
 }
 
@@ -126,9 +48,7 @@ impl DocId {
     }
 }
 
-/// The id as the API spells it and as `parse_id` reads it back: `105`,
-/// `prefixes/<name>`. The one string form of a document id, used on the wire
-/// and in error messages alike.
+/// The wire and error-message spelling: `105`, `prefixes/<name>`.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -147,23 +67,9 @@ pub struct Document {
     pub path: PathBuf,
     /// The raw file text.
     pub raw: String,
-    /// The parsed value, or the **empty document** when [`Document::parse_error`]
-    /// is set. Comment keys (`foo__`) stay in it: the store holds the file, and
-    /// what a caller sees of one is decided further up, by
-    /// [`crate::view::strip_comments`].
+    /// The parsed value, empty when [`Document::parse_error`] is set.
     pub value: Value,
-    /// `Some(message)` when the file's text is not valid YAML at all, in
-    /// which case [`Document::value`] is the empty document
-    /// (`docs/DESIGN.md` §7; see also
-    /// `docs/decisions/005-reads-never-fail-on-content.md`).
-    ///
-    /// A syntax error is reported here rather than failing the read, so one
-    /// unparseable file cannot block reads of every other document or its
-    /// own repair. The file is still on disk, still carries its real
-    /// [`Document::digest`], and can still be replaced; callers decide what
-    /// to do with a document they cannot parse. The digest is over the
-    /// file's actual bytes either way, so the compare-and-swap precondition
-    /// of a repairing write is unaffected.
+    /// `Some(message)` if the text is not valid YAML (`docs/DESIGN.md` §1 invariant 5).
     pub parse_error: Option<String>,
     /// The lowercase hex SHA-256 digest of the raw file bytes.
     pub digest: String,
@@ -176,30 +82,26 @@ pub struct Document {
 pub struct PutResult {
     /// The new document.
     pub document: Document,
-    /// The paths that changed, relative to the previous document (or an
-    /// empty document, if none existed).
+    /// The paths that changed, relative to the previous document.
     pub touched: Vec<Touched>,
 }
 
 /// A poll-friendly summary of the whole store's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreVersion {
-    /// A token that changes whenever any file's content changes (added,
-    /// removed, or modified). Two stores with the same token have identical
-    /// content.
+    /// Changes whenever any file's content changes; equal tokens mean
+    /// identical content.
     pub token: String,
 }
 
-/// What [`MetaStore::rollback`] actually did.
+/// What [`MetaStore::rollback`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RollbackOutcome {
-    /// The snapshot existed and the live document was replaced with its
-    /// content (creating the live document if it did not already exist).
+    /// The snapshot existed; the live document now matches it (created if absent).
     Restored,
-    /// The snapshot did not exist, but a live document did: the guest had no
-    /// metadata at snapshot time, so the live document was removed.
+    /// No such snapshot, but a live document did exist: it was removed.
     RemovedNoSnapshot,
-    /// Neither the snapshot nor a live document existed; nothing to do.
+    /// Neither existed; nothing to do.
     NoOp,
 }
 
@@ -208,20 +110,13 @@ fn snapshot_name_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_-]*$").unwrap())
 }
 
-/// `true` if `name` is a valid snapshot name: `^[A-Za-z][A-Za-z0-9_-]*$`,
-/// excluding anything that is itself a format extension (so a snapshot file
-/// name can never be confused with a live document's).
+/// `true` for a valid snapshot name: `^[A-Za-z][A-Za-z0-9_-]*$`, excluding a
+/// format extension (so a snapshot file can't be mistaken for a live one).
 pub fn is_valid_snapshot_name(name: &str) -> bool {
     snapshot_name_regex().is_match(name) && Format::from_ext(name).is_none()
 }
 
-/// `Ok(None)` for an `io::ErrorKind::NotFound`, `Ok(Some(v))` otherwise, and
-/// every other I/O error an error.
-///
-/// The one idiom for "the file was not there (any more)": every caller in
-/// this module and in [`crate::registry`]'s directory walks treats that as an
-/// outcome rather than an error, because a concurrent `DELETE` or `pve-meta rm`
-/// can remove a file between any two syscalls (see the module docs).
+/// `Ok(None)` for not-found (it may just have vanished), `Ok(Some(v))` otherwise, anything else an error.
 pub(crate) fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
     match r {
         Ok(v) => Ok(Some(v)),
@@ -230,25 +125,7 @@ pub(crate) fn gone_is_none<T>(r: io::Result<T>) -> Result<Option<T>> {
     }
 }
 
-/// The identity of one file's content: the SHA-256 of its bytes, or — for a
-/// file above [`MAX_READ_BYTES`] — a *surrogate* derived from its size and
-/// mtime, computed without reading it. `Ok(None)` if the file is not there.
-///
-/// Everything that needs a file's identity goes through here:
-/// [`MetaStore::digest_of`], the compare-and-swap precondition, and
-/// [`MetaStore::version`]'s per-file entry. One function means the digest a
-/// caller reads out of a `GET` is the same string the precondition of their
-/// next `PUT` is compared against — including for a file the store refuses
-/// to read, which is exactly the file that has to stay repairable.
-///
-/// The surrogate is only ever produced above the read cap, i.e. for a file
-/// nothing in this store could have written (`MAX_BYTES` is an eighth of the
-/// cap) and that pmxcfs itself cannot hold. Such a file's only legal write is
-/// a whole-file replace or a `DELETE`, so the surrogate has one job: change
-/// when the file changes. Two different oversized contents of identical
-/// length written within the same mtime tick would collide; the consequence
-/// is a compare-and-swap that accepts a replacement of unreadable content by
-/// a document, which is what the caller asked for either way.
+/// A file's content identity: SHA-256, or above [`MAX_READ_BYTES`] a `(len, mtime)` surrogate.
 fn identify(path: &std::path::Path) -> Result<Option<String>> {
     let Some(meta) = gone_is_none(fs::metadata(path))? else {
         return Ok(None);
@@ -261,9 +138,7 @@ fn identify(path: &std::path::Path) -> Result<Option<String>> {
         .map(digest::digest))
 }
 
-/// The surrogate identity of a file above [`MAX_READ_BYTES`]: a domain-separated
-/// SHA-256 over `(len, mtime)`. Deliberately shaped like a real digest — it is
-/// compared, never parsed.
+/// A digest-shaped surrogate over `(len, mtime)`; compared, never parsed.
 fn oversized_identity(len: u64, mtime: SystemTime) -> String {
     let nanos = mtime
         .duration_since(UNIX_EPOCH)
@@ -276,76 +151,35 @@ fn oversized_identity(len: u64, mtime: SystemTime) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// A process-wide counter making [`MetaStore::write_atomic`]'s temp file name
-/// unique per call (the hostname and pid alone are not: two writes from one
-/// pvedaemon worker would otherwise collide, and pmxcfs shares one directory
-/// across every node).
+/// Per-call counter making [`MetaStore::write_atomic`]'s temp name unique.
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// The on-disk metadata store.
-///
-/// Two things, not one: `root` holds the guest documents and
-/// the snapshot copies, and `registry` holds the prefix drop-directory list
-/// ([`DocId::Registry`]). That list is ordered lowest precedence first,
-/// exactly as [`Registry`] loads it, so the **last**
-/// entry is the one a write goes to -- the cluster directory, with
-/// the packaged one below it staying read-only. Writing a prefix whose name a
-/// packaged file already uses therefore creates the cluster override rather
-/// than editing the package's file, and deleting it falls back to the
-/// packaged one, which is the same rule the loader has always applied.
+/// `root` holds documents and snapshots; `registry` holds the prefix drop-directories (`docs/DESIGN.md` §3).
 pub struct MetaStore {
     root: PathBuf,
     registry: Registry,
     marker: Option<PathBuf>,
 }
 
-/// The cluster filesystem's mount point: a store rooted below it is a store over
-/// pmxcfs.
+/// pmxcfs's mount point: a store rooted below it is a store over the cluster fs.
 pub const CLUSTER_ROOT: &str = "/etc/pve";
-/// What says pmxcfs is mounted on [`CLUSTER_ROOT`]: the `local` symlink to this
-/// node's directory, which pmxcfs itself provides and which is not there
-/// otherwise. `PVE::Cluster::check_cfs_is_mounted` asks the same question.
+/// The `local` symlink pmxcfs provides when mounted.
 pub const CLUSTER_MARKER: &str = "/etc/pve/local";
-/// Environment variable naming the marker [`MetaStore::new`] checks instead of
-/// [`CLUSTER_MARKER`], for any root; set to nothing, no marker is checked. A test
-/// knob, so the check can be exercised under a temporary root.
+/// Overrides [`CLUSTER_MARKER`] for any root; empty means "check nothing" (a test knob).
 pub const CLUSTER_MARKER_ENV: &str = "PVE_META_CLUSTER_MARKER";
 
 impl MetaStore {
-    /// Opens a store rooted at `root` (created on first write; does not need
-    /// to exist yet), with the registry directories [`Registry::from_env`]
-    /// would load -- the packaged and cluster defaults, or whatever
-    /// `PVE_META_PREFIX_DIRS` says.
-    ///
-    /// Reading that variable here, once, is deliberate: the alternative
-    /// is reading it again deeper in the call path, where a test (or a
-    /// caller that changed it between constructing a store and using it)
-    /// would get a store whose reads and writes disagree about where a file
-    /// lives. Tests that want their own directories pass them explicitly with
-    /// [`MetaStore::with_registry_dirs`].
-    ///
-    /// The cluster marker ([`MetaStore::check_available`]) is decided once too, by
-    /// every constructor alike: `$PVE_META_CLUSTER_MARKER` when it is set, otherwise
-    /// [`CLUSTER_MARKER`] for a root under [`CLUSTER_ROOT`] and none for any other.
+    /// Opens a store rooted at `root` (created lazily), with [`Registry::from_env`]'s directories.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         MetaStore::with_registry(root, Registry::from_env())
     }
 
-    /// [`MetaStore::new`] with the registry directories given explicitly,
-    /// lowest precedence first. For tests, and for any caller that already
-    /// knows its directories and does not want the environment consulted.
+    /// [`MetaStore::new`] with the registry directories given explicitly, lowest precedence first.
     pub fn with_registry_dirs(root: impl Into<PathBuf>, prefix_dirs: Vec<PathBuf>) -> Self {
         MetaStore::with_registry(root, Registry::new(prefix_dirs))
     }
 
-    /// [`MetaStore::new`] with a [`Registry`] given directly, for a caller
-    /// that already built or was handed one and would otherwise have to take
-    /// it apart into two `Vec<PathBuf>` just to satisfy
-    /// [`MetaStore::with_registry_dirs`], which is defined in terms of this
-    /// rather than the other way around.
-    ///
-    /// The cluster marker is decided from `root` as [`MetaStore::new`] decides it,
-    /// so no way of opening a store over `/etc/pve` skips the check.
+    /// [`MetaStore::new`] with a [`Registry`] given directly; the cluster marker is still decided from `root`.
     pub fn with_registry(root: impl Into<PathBuf>, registry: Registry) -> Self {
         let root = root.into();
         let marker = match std::env::var_os(CLUSTER_MARKER_ENV) {
@@ -356,23 +190,13 @@ impl MetaStore {
         MetaStore { root, registry, marker }
     }
 
-    /// This store, checking `marker` before every operation
-    /// ([`MetaStore::check_available`]).
+    /// This store, checking `marker` before every operation instead.
     pub fn with_cluster_marker(mut self, marker: impl Into<PathBuf>) -> Self {
         self.marker = Some(marker.into());
         self
     }
 
-    /// `Ok` when the store's filesystem is there to answer: always, without a
-    /// cluster marker; with one, when the marker is a symlink. Every public
-    /// operation of the store calls this first, so no caller -- the API, the CLI,
-    /// the lifecycle hooks, an operator linking the core -- can read an unmounted
-    /// `/etc/pve` as an empty store.
-    ///
-    /// # Errors
-    /// [`Error::Unavailable`] when the marker is not a symlink, is not there, or
-    /// cannot be looked at: a pmxcfs that went away answers the `lstat` with
-    /// `ENOTCONN`, not with *not found*.
+    /// Checked first by every public method: `Ok` unless a cluster marker exists and is not a symlink (`docs/DESIGN.md` §1 invariant 3).
     pub fn check_available(&self) -> Result<()> {
         let Some(marker) = &self.marker else {
             return Ok(());
@@ -387,38 +211,20 @@ impl MetaStore {
         }
     }
 
-    /// The [`Registry`] this store reads and writes registry documents
-    /// through, for a caller that needs the same directory list (loading the
-    /// prefixes themselves, say) rather than a second, independently-read
-    /// copy. Behind [`MetaStore::check_available`], like every other way into
-    /// the store's files.
-    ///
-    /// # Errors
-    /// [`Error::Unavailable`].
+    /// The [`Registry`] this store reads and writes through.
     pub fn registry(&self) -> Result<&Registry> {
         self.check_available()?;
         Ok(&self.registry)
     }
 
-    /// The one directory of `kind` a write may land in: the highest-precedence
-    /// one -- [`Registry::write_dir`]'s rule.
-    ///
-    /// An empty list -- `PVE_META_*_DIRS` set to nothing, or
-    /// [`MetaStore::with_registry_dirs`] given none -- means no directory was
-    /// configured, and falls back **inside `root`** rather than to the
-    /// compiled-in `/etc/pve` default. A caller that went out of its way to
-    /// have no registry directories (a test, a `--root` sandbox) must not have
-    /// its writes land in the live cluster because of it. That fallback needs
-    /// `root`, which `Registry` does not have, so it stays here.
+    /// The highest-precedence directory of `kind` a write lands in, falling back inside `root` if none is configured.
     fn registry_write_dir(&self, kind: RegistryKind) -> PathBuf {
         self.registry
             .write_dir(kind)
             .unwrap_or_else(|| self.root.join("meta.d").join(kind.as_str()))
     }
 
-    /// Where `id` is **written**, and where it is read from unless a
-    /// lower-precedence registry directory is the only one that has it (see
-    /// [`MetaStore::read_path_for`]).
+    /// Where `id` is written (see [`MetaStore::read_path_for`] for reads).
     fn path_for(&self, id: &DocId) -> Result<PathBuf> {
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
         Ok(match id {
@@ -427,12 +233,7 @@ impl MetaStore {
         })
     }
 
-    /// Where `id` is **read** from. For a registry document that is
-    /// [`Registry::locate`]'s answer -- the highest-precedence directory that
-    /// has the file, parseable or not, which is the same rule the loader
-    /// applies, so the document opened for repair is the one in effect.
-    /// Falls back to [`MetaStore::path_for`] when none has it, so a "not
-    /// found" error names the place a write would create it.
+    /// Where `id` is read from: [`Registry::locate`]'s file, or [`MetaStore::path_for`] when none has it.
     fn read_path_for(&self, id: &DocId) -> Result<PathBuf> {
         match id {
             DocId::Registry(kind, name) => match self.registry.locate(*kind, name) {
@@ -461,18 +262,7 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Writes `bytes` to `path` atomically: a hidden sibling, then `rename`.
-    ///
-    /// The temp name carries the node's hostname, the pid *and* a per-call
-    /// counter, because `/etc/pve/meta` is one pmxcfs directory shared by
-    /// every node in the cluster: `.<name>.tmp.<host>.<pid>.<seq>`.
-    ///
-    /// The sibling is created in **`path`'s own directory**, not in `root`:
-    /// `rename` is only atomic within one filesystem, and a registry document
-    /// lives in `/etc/pve/meta.d/...`, a directory away from the documents.
-    /// Writing the temp file next to its target keeps the rename atomic
-    /// wherever the target is, and keeps a failed write's leftovers in the
-    /// directory an administrator would look in.
+    /// Writes `bytes` to `path` atomically, via a temp sibling and `rename`.
     fn write_atomic(&self, path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         let dir = path.parent().unwrap_or(&self.root).to_path_buf();
         fs::create_dir_all(&dir)?;
@@ -494,47 +284,18 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Reads and parses one document file. **Reads never lint, and never
-    /// fail on the document's own content** (`docs/DESIGN.md` §7; see
-    /// `docs/decisions/005-reads-never-fail-on-content.md`).
-    ///
-    /// Every API write is already lint-gated, so invalid content can only
-    /// arrive out of band (a hand-edited `/etc/pve/meta/*.yaml`, a restored
-    /// backup, pmxcfs replication). Strict validation belongs to the content
-    /// being written, and lives in [`MetaStore::put_raw`]'s parse of the
-    /// *new* text.
-    ///
-    /// A syntax error is reported per document, in [`Document::parse_error`],
-    /// with the empty document as the value — the caller decides
-    /// (`api::effective` grants nothing and warns; a read answers with
-    /// `parse_error` and no data; a full-write caller may replace the whole
-    /// document to repair it).
-    ///
-    /// # Errors
-    /// [`Error::NotFound`] if the file is not there — including the case
-    /// where it vanished between this function's own `stat` and its read,
-    /// which is a racing `DELETE` or `pve-meta rm` and must answer 404, not 500
-    /// (see the module docs). [`Error::TooLarge`] if the file exceeds
-    /// [`MAX_READ_BYTES`], and I/O errors. [`Error::Parse`] only for bytes
-    /// that are not UTF-8 at all — a YAML syntax error is
-    /// [`Document::parse_error`], not an error. Never [`Error::Lint`].
+    /// Reads and parses one document file; a syntax error becomes [`Document::parse_error`], never an error (`docs/DESIGN.md` §1 invariant 5).
     fn read_document(&self, id: &DocId, path: &std::path::Path) -> Result<Document> {
         let Some(meta) = gone_is_none(fs::metadata(path))? else {
             return Err(Error::NotFound(id.clone()));
         };
-        // Checked from the metadata, before the bytes are read: the point is
-        // not to pull a multi-megabyte file into memory (and hash it) on
-        // every request that touches this document.
         Self::check_read_size(meta.len())?;
         let mtime = meta.modified()?;
         let Some(bytes) = gone_is_none(fs::read(path))? else {
             return Err(Error::NotFound(id.clone()));
         };
-        // Bytes that are not text have no `raw` to report and nothing to
-        // parse, so they are the one read failure that is not a per-document
-        // `parse_error`: [`Error::Parse`] (a 400/repairable condition), never
-        // [`Error::Other`] (a 500 on every GET of the document, and an
-        // unrepairable one, since every write reads before it plans).
+        // Not UTF-8 is the one read failure that is not a parse_error: there
+        // is no `raw` to report.
         let raw = String::from_utf8(bytes.clone()).map_err(|e| Error::Parse {
             format: DISK_FORMAT,
             msg: format!("invalid utf-8: {e}"),
@@ -571,42 +332,20 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Reads `id`'s document. **Reads never lint and never fail on the
-    /// document's own content**: text the YAML parser rejects is reported in
-    /// [`Document::parse_error`], with the empty document as the value
-    /// (`docs/DESIGN.md` §7).
-    ///
-    /// # Errors
-    /// [`Error::NotFound`] if it does not exist (or ceases to, mid-read);
-    /// [`Error::TooLarge`] if the file is bigger than [`MAX_READ_BYTES`].
+    /// Reads `id`'s document. See [`MetaStore::read_document`].
     pub fn read(&self, id: &DocId) -> Result<Document> {
         self.check_available()?;
-        // Deliberately no `locate` first: an `is_file()` followed by a read
-        // is a check-then-act pair, and the racing loser of that pair would
-        // otherwise surface as an `Error::Io` (HTTP 500) instead of a 404.
+        // No existence check first: that races a concurrent delete into `Io` (500).
         self.read_document(id, &self.read_path_for(id)?)
     }
 
-    /// `id`'s current content identity without parsing (or even keeping) the
-    /// document, or `None` if it does not exist. See [`identify`].
-    ///
-    /// This is what lets a write repair a document [`MetaStore::read`]
-    /// refuses to read — one above [`MAX_READ_BYTES`] — while still carrying
-    /// a compare-and-swap precondition: the caller needs the digest, and the
-    /// digest is the one thing about such a file that is cheap and safe to
-    /// compute. Above the read cap it is a surrogate over `(len, mtime)`, so
-    /// this never reads a file the store refuses to read.
+    /// `id`'s current content identity without reading the whole document; see [`identify`].
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
         self.check_available()?;
         identify(&self.read_path_for(id)?)
     }
 
-    /// The digest precondition, enforced in exactly one place: `None`
-    /// means "no precondition";
-    /// `Some("")` matches a *missing* document (that is the digest
-    /// `GET` reports for one, `docs/DESIGN.md` §8, so the documented
-    /// GET-then-PUT create flow works); any other `Some(_)` must equal the
-    /// current file's digest.
+    /// `None` means no precondition; `Some("")` matches a missing document (`docs/DESIGN.md` §5); else must match exactly.
     fn check_digest(current: Option<&str>, expected: Option<&str>) -> Result<()> {
         let Some(expected) = expected else {
             return Ok(());
@@ -621,14 +360,7 @@ impl MetaStore {
         Ok(())
     }
 
-    /// Checks the compare-and-swap precondition for `id` without writing
-    /// anything — the same rule [`MetaStore::put_raw`] enforces, exposed so a
-    /// `dry_run` can validate exactly what the real write validates
-    /// (`docs/DESIGN.md` §7) without a second implementation
-    /// of the rule living in the API layer.
-    ///
-    /// # Errors
-    /// [`Error::DigestMismatch`].
+    /// Checks the compare-and-swap precondition without writing, for `dry_run` (`docs/DESIGN.md` §5).
     pub fn check_precondition(&self, id: &DocId, expected: Option<&str>) -> Result<()> {
         if expected.is_none() {
             return Ok(());
@@ -636,44 +368,20 @@ impl MetaStore {
         Self::check_digest(self.digest_of(id)?.as_deref(), expected)
     }
 
-    /// Replaces `id`'s document with `text` verbatim (only normalized to end
-    /// with a single newline), creating it if it does not exist.
-    ///
-    /// The *new* text is parsed and linted: nothing this store writes can
-    /// ever fail [`crate::model::lint`]. There is one gate, for every
-    /// caller.
-    ///
-    /// # Errors
-    /// [`Error::Parse`] / [`Error::Lint`] if `text` does not parse as a valid
-    /// document; [`Error::DigestMismatch`] if `expected_digest` is given and
-    /// does not match (`Some("")` matches a missing document);
-    /// [`Error::TooLarge`] if `text` exceeds [`MAX_BYTES`].
+    /// Replaces `id`'s document with `text` (normalized to one trailing newline), creating it if absent; parses and lints the new text.
     pub fn put_raw(
         &self,
         id: &DocId,
         text: &str,
         expected_digest: Option<&str>,
     ) -> Result<PutResult> {
-        // Written where a write goes; compared and diffed against where a read
-        // comes from. For a guest or the datacenter those are the same file.
-        // For a registry document shadowing a packaged one they are not: the
-        // precondition is checked against the content the caller actually saw
-        // (the packaged file), and the write creates the cluster override.
         self.check_available()?;
         let path = self.path_for(id)?;
         let read_path = self.read_path_for(id)?;
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
 
-        // The *old* content is only read to diff against, so it is parsed
-        // leniently: an out-of-band edit that broke it must not stop an
-        // administrator from writing the repair (`docs/DESIGN.md` §7).
-        // That includes a *syntax* error: it is the last thing that would
-        // otherwise stand between a hand-edited document and its repair.
-        // Unparseable old content — and content that vanished under us, and
-        // content above the read cap, which is never pulled through the YAML
-        // parser — diffs as the empty document: the repair reports everything
-        // it writes as newly set, which is exactly true of a document that had
-        // no readable structure.
+        // Old content diffs as empty if unparseable, vanished or oversized:
+        // a repair is never blocked by what it is fixing.
         let old_value = match self.read_document(id, &read_path) {
             Ok(doc) => doc.value,
             Err(Error::NotFound(_) | Error::TooLarge { .. } | Error::Parse { .. }) => {
@@ -684,17 +392,14 @@ impl MetaStore {
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
-        // The write-time gate: the content being stored parses and passes
-        // the lint.
         let new_value = format::parse(DISK_FORMAT, &normalized)?;
 
         self.write_atomic(&path, normalized.as_bytes())?;
 
         let touched = patch::diff(&old_value, &new_value);
         let dig = digest::digest(normalized.as_bytes());
-        // The file we just wrote can already be gone again (a racing DELETE
-        // or `pve-meta rm`): report the write's own moment rather than 500-ing on
-        // a `stat` of something that is no longer there.
+        // The file just written can already be gone again (a race): report
+        // this write's own moment rather than a `stat` of nothing.
         let mtime = match gone_is_none(fs::metadata(&path))? {
             Some(meta) => meta.modified()?,
             None => SystemTime::now(),
@@ -705,7 +410,6 @@ impl MetaStore {
                 path,
                 raw: normalized,
                 value: new_value,
-                // It was just parsed, on the way in.
                 parse_error: None,
                 digest: dig,
                 mtime,
@@ -714,31 +418,13 @@ impl MetaStore {
         })
     }
 
-    /// Deletes `id`'s document — **only** the current document. Snapshot
-    /// copies are owned by the snapshot hooks (`docs/DESIGN.md` §9) and are
-    /// removed by [`MetaStore::purge`], never by this.
-    ///
-    /// **Idempotent**: returns `Ok(false)` if there was nothing to remove.
-    /// Deleting a document is a request for it to be gone, and it being
-    /// already gone — because a concurrent `DELETE` or `pve-meta rm` won the race —
-    /// is that request satisfied, not a failure.
-    /// A registry document is removed from the **write** directory only: a
-    /// packaged prefix belongs to its `.deb`, and deleting the cluster file
-    /// that shadowed it is a revert to the packaged one, not a removal. When
-    /// only the packaged file exists there is nothing of ours to remove and
-    /// this returns `Ok(false)`, with the prefix still there afterwards --
-    /// `api::delete_document` says so rather than reporting a deletion that
-    /// did not happen.
+    /// Deletes `id`'s current document only, never its snapshots ([`MetaStore::purge`]); idempotent.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
         self.check_available()?;
         Ok(gone_is_none(fs::remove_file(self.path_for(id)?))?.is_some())
     }
 
-    /// Every vmid the store holds *any* file for — a live document, a
-    /// snapshot copy, or both — sorted ascending. Temp files and any other
-    /// file whose name is not `<vmid>[.<snap>].yaml` are not guests.
-    ///
-    /// What `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §9).
+    /// Every vmid with any file, sorted; what `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §7).
     pub fn stored_vmids(&self) -> Result<Vec<u32>> {
         self.check_available()?;
         let mut out = std::collections::BTreeSet::new();
@@ -749,8 +435,6 @@ impl MetaStore {
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            // An entry that vanished between the `readdir` and the `stat` is
-            // simply not there to collect.
             let Some(file_type) = gone_is_none(entry.file_type())? else {
                 continue;
             };
@@ -803,11 +487,7 @@ impl MetaStore {
         Ok(out)
     }
 
-    /// Snapshots `vmid`'s current document under `name`. A no-op (returns
-    /// `Ok(false)`) if the guest has no document.
-    ///
-    /// # Errors
-    /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
+    /// Snapshots `vmid`'s document under `name`, or `Ok(false)` if it has none.
     pub fn snapshot(&self, vmid: u32, name: &str) -> Result<bool> {
         self.check_available()?;
         if !is_valid_snapshot_name(name) {
@@ -820,11 +500,7 @@ impl MetaStore {
         Ok(true)
     }
 
-    /// Rolls `vmid` back to snapshot `name`. See [`RollbackOutcome`] for the
-    /// possible outcomes.
-    ///
-    /// # Errors
-    /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
+    /// Rolls `vmid` back to snapshot `name`; see [`RollbackOutcome`].
     pub fn rollback(&self, vmid: u32, name: &str) -> Result<RollbackOutcome> {
         self.check_available()?;
         if !is_valid_snapshot_name(name) {
@@ -842,11 +518,7 @@ impl MetaStore {
         }
     }
 
-    /// Deletes a guest's snapshot. Idempotent: returns `Ok(false)` if there
-    /// was nothing to remove.
-    ///
-    /// # Errors
-    /// [`Error::InvalidName`] if `name` is not a valid snapshot name.
+    /// Deletes a guest's snapshot, idempotently.
     pub fn delete_snapshot(&self, vmid: u32, name: &str) -> Result<bool> {
         self.check_available()?;
         if !is_valid_snapshot_name(name) {
@@ -855,12 +527,7 @@ impl MetaStore {
         Ok(gone_is_none(fs::remove_file(self.snapshot_path(vmid, name)))?.is_some())
     }
 
-    /// Removes `vmid`'s document **and every snapshot copy** — the guest is
-    /// gone. Used by the lifecycle hooks and `pve-meta rm` (`docs/DESIGN.md` §9); the REST API's
-    /// `DELETE` uses [`MetaStore::delete`], which never touches snapshots.
-    ///
-    /// Returns the number of files removed. Idempotent: a missing document is
-    /// not an error.
+    /// Removes `vmid`'s document and every snapshot (`docs/DESIGN.md` §7); the API's `DELETE` uses [`MetaStore::delete`] instead.
     pub fn purge(&self, vmid: u32) -> Result<usize> {
         let mut removed = 0;
         if self.delete(&DocId::Guest(vmid))? {
@@ -874,35 +541,14 @@ impl MetaStore {
         Ok(removed)
     }
 
-    /// A summary of the whole store's content, suitable for polling: the
-    /// token changes whenever any file's content changes, and is stable
-    /// otherwise (including across mere reads).
-    ///
-    /// The token is a SHA-256 over the sorted list of `(file name, content
-    /// identity)` -- every guest document and every file in the two prefix
-    /// directories -- hashed from the files' actual bytes on every call.
-    /// There is deliberately no `(mtime, len)` cache: the bindings build a
-    /// fresh `MetaStore` per request (so it could never hit), and pmxcfs's
-    /// mtime granularity cannot distinguish two same-length writes within
-    /// one tick (so it would be unsound if it did). Documents are tiny.
-    ///
-    /// "Tiny" is what [`MAX_READ_BYTES`] enforces, and this poll is the
-    /// reason it has to: a single multi-megabyte file dropped into
-    /// `/etc/pve/meta` out of band would otherwise be read and SHA-256'd by
-    /// every open UI's 5 s poll, forever. Above the cap [`identify`] uses the
-    /// file's size and mtime instead, which still changes when the file does.
-    ///
-    /// An entry that disappears mid-walk is skipped: the store is not locked
-    /// against a concurrent `DELETE` or `pve-meta rm`, and a poll must not 500
-    /// because a file it had just listed is gone.
+    /// A poll-friendly summary of the store, hashed fresh from every file's bytes each call (no `(mtime, len)` cache: pmxcfs can't tell two same-tick writes apart).
     pub fn version(&self) -> Result<StoreVersion> {
         self.check_available()?;
         let mut entries: Vec<(String, String)> = Vec::new();
         self.scan_for_version(&self.root.clone(), "", &mut entries)?;
         for dir in self.registry.dirs(RegistryKind::PrefixDef) {
-            // The full directory path, not just the kind: two directories
-            // of the same kind hold same-named files on purpose, and the
-            // token must be able to tell them apart.
+            // Full path, not just the kind: two directories of one kind hold
+            // same-named files on purpose.
             let prefix = format!("{}/", dir.display());
             self.scan_for_version(&dir.clone(), &prefix, &mut entries)?;
         }
@@ -917,15 +563,7 @@ impl MetaStore {
         Ok(StoreVersion { token: hex::encode(hasher.finalize()) })
     }
 
-    /// One directory's contribution to [`MetaStore::version`]: every file in
-    /// it as a `(prefix + name, identity)` entry.
-    ///
-    /// An entry that disappears mid-walk is skipped rather than failing the
-    /// poll, and a directory that does not exist contributes nothing -- the
-    /// packaged prefix directory is absent on a node with no operator
-    /// package installed, which is not a condition to report. A directory that
-    /// cannot be read is an error. `symlink_metadata`, not `metadata`, so a
-    /// symlink is skipped rather than followed.
+    /// One directory's `(name, identity)` entries for [`MetaStore::version`]; a symlink is skipped, not followed.
     fn scan_for_version(
         &self,
         dir: &std::path::Path,
@@ -957,8 +595,7 @@ impl MetaStore {
     }
 }
 
-/// A filesystem-safe tag identifying this node, for temp file names. Falls
-/// back to `"node"` when the hostname is unavailable or unusable.
+/// A filesystem-safe node tag for temp file names; falls back to `"node"`.
 fn hostname_tag() -> String {
     let raw = std::env::var("HOSTNAME")
         .ok()
