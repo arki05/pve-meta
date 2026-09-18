@@ -1,8 +1,6 @@
 // ---------------------------------------------------------------------------
-// Markers for the text editor: which line a finding goes on, and what a hover
-// says. The findings themselves come from the Shape (the core); this only places
-// them, by scanning the YAML the editor holds. The pairing holds while the buffer
-// still is what the server sent, so the caller clears both once it is dirty.
+// Markers for the text editor: which line a finding (from the Shape) goes on,
+// and what a hover says, by scanning the YAML the editor holds.
 // ---------------------------------------------------------------------------
 
 PVE.meta.Markers = {

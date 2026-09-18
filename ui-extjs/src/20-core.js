@@ -1,20 +1,7 @@
 // ---------------------------------------------------------------------------
-// The core: pve-meta-core, built for the browser (crates/pve-meta-wasm).
-//
-// The server's own code answers the questions this editor needs: how a document
-// reads and dumps, which key names are legal, which prefix governs a path, and what
-// a schema makes of a value. Below it: `Codec`, a stateless face over the core's
-// functions, and `Shape`, an object that owns its input (the prefix listing) and
-// whose methods are the core's -- so a call site reads as the concept and not as a
-// string passed to `call`, and what a Shape derives is computed once.
-//
-// The ABI is four exports and a JSON document each way (see the crate's own
-// doc comment): `pm_alloc`/`pm_free` for the request, `pm_call` to run it, and
-// `pm_output` for the response. No wasm-bindgen, no generated glue, no build
-// step beyond `cargo build --target wasm32-unknown-unknown`.
-//
-// Loaded lazily on first use like Monaco, and `attach`ed directly by the offline
-// test harness, which instantiates the same `.wasm` the package ships.
+// The core: pve-meta-core, built for the browser (crates/pve-meta-wasm). Loaded
+// lazily on first use like Monaco, and `attach`ed directly by the offline test
+// harness, which instantiates the same `.wasm` the package ships.
 // ---------------------------------------------------------------------------
 
 PVE.meta.CoreError = function (err) {
@@ -36,10 +23,8 @@ PVE.meta.Core = {
     load: function () {
         let me = PVE.meta.Core;
         if (!me.promise) {
-            // `instantiateStreaming` compiles as the bytes arrive but insists on
-            // `Content-Type: application/wasm`, which pveproxy's static file
-            // table may or may not know; the buffered path takes whatever type
-            // it was given. Try the fast one, fall back to the sure one.
+            // `instantiateStreaming` needs `Content-Type: application/wasm`, which
+            // pveproxy's static table may not know; fall back to the buffered path.
             let buffered = () =>
                 fetch(me.SRC)
                     .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(r.status + ' ' + me.SRC))))

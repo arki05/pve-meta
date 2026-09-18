@@ -1,11 +1,6 @@
 // ---------------------------------------------------------------------------
-// The registry list: prefix definitions.
-//
-// A grid rather than a tree, because the interesting facts about these files are
-// *columns*: which guests a prefix reaches, whether it carries a schema, and
-// whether what you are looking at is a package's file or the cluster's on top of
-// one. A tree could show none of that, and showed a packaged definition and a
-// cluster override as the same thing.
+// The registry list: prefix definitions, as a grid -- the interesting facts about
+// these files (reach, schema, packaged vs. cluster override) are columns.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.RegistryGrid', {
@@ -21,13 +16,9 @@ Ext.define('PVE.meta.RegistryGrid', {
         rowsFrom: function (list) {
             let U = PVE.meta.Utils;
             return (list || []).map(function (e) {
-                // A file in the directory that did not load. It is named -- the
-                // loader only ever tries files whose name is already valid -- and
-                // that is the whole point: before this it was simply absent, so a
-                // prefix that stopped parsing ceased to exist with nothing anywhere
-                // saying so. Its row says what is wrong, in the column that would
-                // otherwise say what it does, and Edit still opens it, which is
-                // where it gets repaired.
+                // A file in the directory that did not load: its row says what is
+                // wrong, in the column that would otherwise say what it does, and
+                // Edit still opens it, which is where it gets repaired.
                 if (e.error) {
                     return {
                         name: e.prefix,
@@ -51,9 +42,8 @@ Ext.define('PVE.meta.RegistryGrid', {
                     schema: e.schema ? gettext('yes') : '',
                     enforce: e.enforce && e.enforce !== '0' ? gettext('yes') : '',
                     hidden: e.hidden && e.hidden !== '0' ? gettext('yes') : '',
-                    // Per-node overrides live inside the file now (DESIGN §3); the
-                    // grid has no per-node row to show them on, so their node names
-                    // ride along on this one.
+                    // Per-node overrides live inside the file (DESIGN §3); the grid
+                    // has no per-node row, so their names ride along on this one.
                     nodes: e.nodes ? Object.keys(e.nodes).sort().join(', ') : '',
                     origin: e.origin || 'cluster',
                     overrides: !!e.overrides,
@@ -174,11 +164,8 @@ Ext.define('PVE.meta.RegistryGrid', {
         };
         // Add writes to the cluster directory by default, which is Sys.Modify on `/`.
         set('addBtn', !may);
-        // Any file opens: read is open to everyone, and the document editor asks
-        // about write for that one id. A packaged file is editable -- the write
-        // creates the cluster override rather than touching the package's copy
-        // (DESIGN §6) -- and removing one is not, since there would be nothing of
-        // ours to remove.
+        // Any file opens (read is open to everyone); a packaged file is editable --
+        // the write creates the cluster override (DESIGN §3) -- but not removable.
         set('editBtn', !rec);
         set('removeBtn', !rec || rec.data.origin === 'packaged' || !may);
     },
@@ -191,8 +178,7 @@ Ext.define('PVE.meta.RegistryGrid', {
         let me = this;
         me.request({
             url: '/meta/access',
-            // No id: the registry's own answer, whose `write` is Sys.Modify on `/`
-            // (DESIGN §6). A list needs no file to ask about.
+            // No id: the registry's own answer, `write` is Sys.Modify on `/` (DESIGN §3).
             params: {},
             success: function (response) {
                 me.access = response.result.data || { write: 0 };

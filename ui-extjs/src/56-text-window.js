@@ -44,16 +44,9 @@ Ext.define('PVE.meta.TextWindow', {
         me.on('afterrender', function () {
             Proxmox.Utils.setErrorMask(me, true);
             PVE.meta.Monaco.load().then(
-                function (monaco) {
+                function () {
                     Proxmox.Utils.setErrorMask(me, false);
-                    me.editor = monaco.editor.create(me.lookupReference('mount').getEl().dom, {
-                        value: me.original,
-                        language: 'yaml',
-                        theme: PVE.meta.Monaco.theme(),
-                        automaticLayout: true,
-                        minimap: { enabled: false },
-                        scrollBeyondLastLine: false,
-                    });
+                    me.editor = PVE.meta.Monaco.create(me.lookupReference('mount').getEl().dom, me.original);
                     // Without this the footer never learns there is a buffer, and OK
                     // stays the disabled button it was built as.
                     me.down('#metaApply').setDisabled(false);
@@ -114,7 +107,7 @@ Ext.define('PVE.meta.TextWindow', {
         try {
             value = PVE.meta.Codec.parse(text, lang);
         } catch (err) {
-            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            PVE.meta.Utils.alertError(err);
             return;
         }
         me.tree.writeSubtree(me.view, value);

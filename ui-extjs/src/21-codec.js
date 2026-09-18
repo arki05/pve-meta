@@ -1,10 +1,6 @@
 // ---------------------------------------------------------------------------
-// Codec: a buffer as a document and back (`format::parse` / `format::dump`).
-//
-// The store writes documents with serde_yaml_ng; so does this, because it *is*
-// serde_yaml_ng. There is no second emitter to keep in step, and no setting on
-// this side that could drift -- every line the editor shows is a line the file
-// would hold.
+// Codec: a buffer as a document and back (`format::parse` / `format::dump`), the
+// same serde_yaml_ng the store writes with -- no second emitter to drift from it.
 // ---------------------------------------------------------------------------
 
 PVE.meta.Codec = {
@@ -20,11 +16,8 @@ PVE.meta.Codec = {
         return PVE.meta.Core.call('dump', lang === 'json' ? 'json' : 'yaml', value);
     },
 
-    // As `dump`, but for a switch *into* YAML prefers `originalYaml` when it renders
-    // the same text. The store rewrites a file only when asked to write one, so what
-    // the editor is handed can be a file as somebody *wrote* it -- valid YAML in a
-    // layout no emitter would choose -- and re-dumping that on a presentation toggle
-    // invents changes to a document nobody edited.
+    // As `dump`, but a switch *into* YAML prefers `originalYaml` when it renders the
+    // same text, so a presentation toggle never invents changes to a hand-laid-out file.
     render: function (value, lang, originalYaml) {
         if (lang !== 'json' && originalYaml !== undefined && PVE.meta.Codec.same(value, originalYaml)) {
             return originalYaml;

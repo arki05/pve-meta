@@ -2,15 +2,9 @@
 // compose: merge plain objects into one, member name by member name.
 // ---------------------------------------------------------------------------
 
-// TreePanel's methods are composed from three sets below (`PVE.meta.Doc`,
-// `PVE.meta.TextCard`, and the tree itself), all sharing one `this`.
-// `Ext.apply`-style merging would resolve a name defined in two of them by
-// keeping whichever was applied last -- silently, the same way a write that
-// does not check its digest silently overwrites somebody else's. The loser
-// here is not a row, it is a method: one definition quietly replaces the
-// other, and the dead one still looks used because its name is still in the
-// file. Throwing on the collision turns that into a load-time error instead
-// of a "why doesn't this do what the comment says" bug report.
+// TreePanel's methods are composed from three sets (`PVE.meta.Doc`, `PVE.meta.TextCard`,
+// the tree itself) sharing one `this`. Throws on a duplicate member name rather than
+// letting `Ext.apply`-style merging silently keep whichever was applied last.
 PVE.meta.compose = function (...parts) {
     let out = {};
     parts.forEach(function (part) {
@@ -24,16 +18,12 @@ PVE.meta.compose = function (...parts) {
     return out;
 };
 
-// One API request on behalf of a component that may be destroyed before the
-// answer lands: a tab switch tears the panel down while requests are in flight,
-// and no callback may touch a destroyed one. Everything in `opts` goes to
-// `API2Request` as given (method defaults to GET); `success` and `failure` are
-// wrapped so they become no-ops once `owner` is gone.
+// One API request on behalf of a component that may be destroyed before the answer
+// lands (a tab switch tears the panel down mid-flight): `success`/`failure` become
+// no-ops once `owner` is gone. Everything else in `opts` goes to `API2Request` as given.
 PVE.meta.request = function (owner, opts) {
     let guard = (fn) => (fn ? (...args) => (owner.isDestroyed ? undefined : fn(...args)) : undefined);
-    // Two-argument `Ext.apply`s, applied in order, so the guarded callbacks are
-    // what wins. The three-argument form puts its last argument *under* the
-    // config, which would have handed API2Request the unguarded originals.
+    // Two two-argument `Ext.apply`s, so the guarded callbacks win over the originals.
     let req = Ext.apply({ method: 'GET' }, opts);
     Ext.apply(req, { success: guard(opts.success), failure: guard(opts.failure) });
     Proxmox.Utils.API2Request(req);

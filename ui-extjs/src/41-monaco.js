@@ -10,8 +10,7 @@ PVE.meta.Monaco = {
         let me = PVE.meta.Monaco;
         me.promise =
             me.promise ||
-            // The core first: every caller of Monaco here also needs the codec, and
-            // a buffer rendered before it is loaded is a buffer rendered from nothing.
+            // Every caller of Monaco also needs the codec, so load it first.
             PVE.meta.Core.load().then(
                 () =>
                     new Promise(function (resolve, reject) {
@@ -19,9 +18,8 @@ PVE.meta.Monaco = {
                             resolve(window.monaco);
                             return;
                         }
-                        // Absolute, because a language worker resolves its own scripts
-                        // against this and has no page URL to make a root-relative path
-                        // absolute with.
+                        // Absolute: a language worker resolves its own scripts against
+                        // this and has no page URL to make a relative path absolute with.
                         let vs = window.location.origin + me.VS;
                         window.MonacoEnvironment = { baseUrl: vs };
                         let script = document.createElement('script');
@@ -65,17 +63,26 @@ PVE.meta.Monaco = {
             : 'vs';
     },
 
+    // A standalone editor with the options every text buffer in this editor shares.
+    create: function (mount, value) {
+        return window.monaco.editor.create(mount, {
+            value: value,
+            language: 'yaml',
+            theme: PVE.meta.Monaco.theme(),
+            automaticLayout: true,
+            minimap: { enabled: false },
+            scrollBeyondLastLine: false,
+        });
+    },
+
     dispose: function (editor) {
         if (!editor) {
             return;
         }
         let model = editor.getModel();
         if (model && model.original) {
-            // A diff editor does not own its two models, so they have to be detached
-            // before they are disposed - disposing them under a live DiffEditorWidget
-            // is what "TextModel got disposed before ... model got reset" complains
-            // about. A standalone editor created with a `value` owns its model and
-            // disposes it itself.
+            // A diff editor does not own its two models; they must be detached
+            // before disposal, or Monaco complains the model got reset live.
             editor.setModel(null);
             model.original.dispose();
             model.modified.dispose();
@@ -83,23 +90,14 @@ PVE.meta.Monaco = {
         editor.dispose();
     },
 
-    // Monaco's other job: the buffer against the stored file, side by side. A look,
-    // not a decision -- the write is the Apply beside the button that opened this.
-    //
-    // cfg: { title, original, modified, lang }. Both sides are text, shown exactly as
-    // given: the buffer is what Apply writes, and a diff that parsed and re-dumped it
-    // would canonicalise away the `#` comment or the reordering that is the reason to
-    // write text at all.
-    //
-    // **It loads Monaco itself.** It cannot draw without it, every caller had to
-    // remember to, and the one that forgot threw "YAML support is not loaded" before
-    // it could reach the server. A function that needs a thing should get the thing;
-    // `Monaco.load()` is a cached promise, so callers that already awaited it pay
-    // nothing.
+    // The buffer against the stored file, side by side: a look, not a decision.
+    // cfg: { title, original, modified, lang }. Both sides are shown as given text,
+    // never re-dumped, so a diff never canonicalises away the reason to write text
+    // at all. Loads Monaco itself, since it cannot draw without it.
     showDiff: function (cfg) {
         PVE.meta.Monaco.load().then(
             () => PVE.meta.Monaco.showDiffWindow(cfg),
-            (err) => Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err))),
+            PVE.meta.Utils.alertError,
         );
     },
 
@@ -109,9 +107,7 @@ PVE.meta.Monaco = {
             title: gettext('Changes') + ': ' + Ext.htmlEncode(cfg.title),
             itemId: 'pveMetaDiffWindow',
             modal: true,
-            // Fitted to the viewport, not fixed: at 620px tall on a shorter window it
-            // pushed its own Close button off the bottom of the screen with nothing to
-            // scroll, so the only way out was Escape -- which nothing says.
+            // Fitted to the viewport, not fixed, so Close never falls off a short screen.
             width: Math.min(1000, Ext.Element.getViewportWidth() - 40),
             height: Math.min(620, Ext.Element.getViewportHeight() - 40),
             maxHeight: Ext.Element.getViewportHeight() - 40,
@@ -136,10 +132,8 @@ PVE.meta.Monaco = {
                 readOnly: true,
                 renderSideBySide: true,
                 minimap: { enabled: false },
-                // Monaco defaults this to true, which hides indentation-only changes --
-                // exactly what a YAML -> JSON -> YAML round trip produces, and exactly
-                // what a Format is for. A diff that shows nothing while the buffer is
-                // dirty is worse than no diff, so show them.
+                // Monaco defaults this to true, which would hide the indentation-only
+                // changes a Format or a YAML<->JSON round trip produces.
                 ignoreTrimWhitespace: false,
             });
             state.editor.setModel({

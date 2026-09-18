@@ -1,73 +1,58 @@
 // ---------------------------------------------------------------------------
 // "New Prefix" — the two fields a prefix definition cannot be created without.
-//
-// Everything else about a prefix definition is optional and is filled in by
-// editing the document it creates; this only gets far enough that the file parses,
-// because a file the loader would skip is refused on the way in (DESIGN §6).
+// Everything else is optional and filled in by editing the document it creates;
+// this only gets far enough that the file parses (DESIGN §3).
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.NewRegistryWindow', {
-    extend: 'Ext.window.Window',
+    extend: 'PVE.meta.FormWindow',
     xtype: 'pveMetaNewRegistryWindow',
 
     title: gettext('New Prefix'),
-    modal: true,
     width: 620,
-    layout: 'fit',
+    primaryText: gettext('Create'),
+
+    formItems: function () {
+        let me = this;
+        return [
+            {
+                xtype: 'textfield',
+                name: 'name',
+                allowBlank: false,
+                fieldLabel: gettext('Prefix'),
+                // The file name *is* the prefix, so a nested one is dotted and this
+                // field is the whole identity of what is being created. The rule is
+                // the core's (`registry::is_valid_file_name`); the server refuses the
+                // same names on its own, this only says so before the round trip.
+                emptyText: gettext('e.g. homelab.docker'),
+                validator: (v) => PVE.meta.Utils.fileNameError(v) || true,
+            },
+            {
+                xtype: 'proxmoxKVComboBox',
+                name: 'selector',
+                fieldLabel: gettext('Applies to'),
+                value: 'all',
+                comboItems: [
+                    ['all', gettext('Every guest')],
+                    ['tag', gettext('Guests with a tag')],
+                ],
+                listeners: {
+                    change: (f, v) => me.down('[name=tag]').setHidden(v !== 'tag'),
+                },
+            },
+            {
+                xtype: 'textfield',
+                name: 'tag',
+                fieldLabel: gettext('Tag'),
+                hidden: true,
+            },
+            { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
+        ];
+    },
 
     initComponent: function () {
-        let me = this;
-        Ext.apply(me, {
-            items: [
-                {
-                    xtype: 'form',
-                    reference: 'form',
-                    bodyPadding: 10,
-                    border: false,
-                    defaults: { anchor: '100%', labelWidth: 110 },
-                    items: [
-                        {
-                            xtype: 'textfield',
-                            name: 'name',
-                            allowBlank: false,
-                            fieldLabel: gettext('Prefix'),
-                            // The file name *is* the prefix, so a nested one is dotted and this
-                            // field is the whole identity of what is being created. The rule is
-                            // the core's (`registry::is_valid_file_name`); the server refuses the
-                            // same names on its own, this only says so before the round trip.
-                            emptyText: gettext('e.g. homelab.docker'),
-                            validator: (v) => PVE.meta.Utils.fileNameError(v) || true,
-                        },
-                        {
-                            xtype: 'proxmoxKVComboBox',
-                            name: 'selector',
-                            fieldLabel: gettext('Applies to'),
-                            value: 'all',
-                            comboItems: [
-                                ['all', gettext('Every guest')],
-                                ['tag', gettext('Guests with a tag')],
-                            ],
-                            listeners: {
-                                change: (f, v) => me.down('[name=tag]').setHidden(v !== 'tag'),
-                            },
-                        },
-                        {
-                            xtype: 'textfield',
-                            name: 'tag',
-                            fieldLabel: gettext('Tag'),
-                            hidden: true,
-                        },
-                        { xtype: 'textfield', name: 'description', fieldLabel: gettext('Description') },
-                    ],
-                },
-            ],
-            buttons: [
-                { text: gettext('Create'), handler: () => me.submit() },
-                { text: gettext('Cancel'), handler: () => me.close() },
-            ],
-        });
-        me.callParent();
-        me.on('show', () => me.down('[name=name]').focus(true, 50));
+        this.callParent();
+        this.on('show', () => this.down('[name=name]').focus(true, 50));
     },
 
     statics: {
@@ -86,8 +71,8 @@ Ext.define('PVE.meta.NewRegistryWindow', {
 
     submit: function () {
         let me = this;
-        let form = me.down('form').getForm();
-        if (!form.isValid()) {
+        let form = me.validForm();
+        if (!form) {
             return;
         }
         let v = form.getValues();

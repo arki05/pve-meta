@@ -1,18 +1,16 @@
 // ---------------------------------------------------------------------------
-// The row editor — opened by Edit, double-click or Enter (DESIGN §12).
+// The row editor — opened by Edit, double-click or Enter (DESIGN §8).
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.EditValueWindow', {
-    extend: 'Ext.window.Window',
+    extend: 'PVE.meta.FormWindow',
     xtype: 'pveMetaEditValueWindow',
 
-    modal: true,
     width: 480,
-    layout: 'fit',
     defaultButton: 'okBtn',
     // configs: rec (the tree record being edited)
 
-    initComponent: function () {
+    formItems: function () {
         let me = this;
         let U = PVE.meta.Utils;
         let d = me.rec.data;
@@ -63,31 +61,18 @@ Ext.define('PVE.meta.EditValueWindow', {
                 value: Ext.htmlEncode(U.displayValue(d.defaultValue, U.kindOf(d.defaultValue))),
             });
         }
+        return items;
+    },
 
-        Ext.apply(me, {
-            items: [
-                {
-                    xtype: 'form',
-                    reference: 'form',
-                    bodyPadding: 10,
-                    border: false,
-                    defaults: { anchor: '100%', labelWidth: 110 },
-                    items: items,
-                },
-            ],
-            buttons: [
-                { text: gettext('OK'), itemId: 'okBtn', handler: () => me.submit() },
-                { text: gettext('Cancel'), handler: () => me.close() },
-            ],
-        });
-        me.callParent();
-        me.on('show', () => me.down('#valueField').focus(true, 50));
+    initComponent: function () {
+        this.callParent();
+        this.on('show', () => this.down('#valueField').focus(true, 50));
     },
 
     submit: function () {
         let me = this;
-        let form = me.down('form').getForm();
-        if (!form.isValid()) {
+        let form = me.validForm();
+        if (!form) {
             return;
         }
         let d = me.rec.data;
@@ -95,7 +80,7 @@ Ext.define('PVE.meta.EditValueWindow', {
         try {
             value = PVE.meta.Utils.parseValue(me.down('#valueField').getValue(), d.kind);
         } catch (err) {
-            Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+            PVE.meta.Utils.alertError(err);
             return;
         }
         if (d.present && Ext.encode(value) === Ext.encode(d.rawValue)) {
@@ -106,4 +91,3 @@ Ext.define('PVE.meta.EditValueWindow', {
         me.close();
     },
 });
-

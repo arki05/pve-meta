@@ -29,78 +29,13 @@ The behaviour is specified in `docs/DESIGN.md` §8 and not repeated here: one tr
 the document the caller can see; lists as containers with one row per member; **an
 edit is one write with the digest, and a 409 reloads**; Tree and Text as two views of
 the same document; the schema markers; the datacenter tab's registry grid and the
-form behind it. What follows is what is specific to *this* file.
+form behind it.
 
-### The Tree card
-
-* Columns **Key | Value | Description**, one line per row. A declared-but-unset key
-  renders faded, showing `not set (default: …)`.
-* **Row icons.** A folder on a map row (`fa fa-folder`, `fa fa-folder-open` while it is
-  expanded — swapped on `itemexpand`/`itemcollapse`, since ExtJS has no per-node
-  "expanded icon"), a document (`fa fa-file-text-o`) on a value row. No CSS ships with
-  this file: ExtJS marks any node carrying an `iconCls` with `x-tree-icon-custom`, which
-  is the class PVE's own `ext6-pve.css` sizes and colours for the resource tree (1.25em,
-  `#555`; `#e6e6e6` in proxmox-dark), so the icons match the rest of the UI by
-  construction.
-* **Comment keys are not rows.** `k__` is the **Description** of row `k`; a bare `__`
-  documents the map it sits in. They are ordinary data everywhere else. The schema's
-  own `description` is a different thing: it is the row's **tooltip**, never the
-  Description column.
-* **The toolbar** acts on the document's *contents*: Add, Edit, Set to Default, Declare
-  Key (prefix files only), Remove, Edit selection as text, Reload, and at the right the
-  muted *Read-only* label that appears only when the document is not writable. Each of
-  those is **one write** — `PUT ?view=<the row's path>&mode=replace&digest=…`, or
-  `DELETE ?view=…` for Remove — followed by a reload; a list member has no path of its
-  own, so acting on one writes the whole list at the list's path. The footer
-  (`PVE.meta.Footer`) carries the Tree | Text toggle and, in Text, that card's own
-  Format, Diff, Apply and Revert.
-* **A new key** is written at its own dotted path: `view::replace` creates the maps
-  above it, so `added.by.ui` needs no write of its own to make room.
-* **`Doc.writeFor(docId, edit, digest, force)`** is that whole write path as a pure
-  function — every editor hands it an edit and sends what comes back, and the smoke
-  suite drives it as a table.
-* **The row editor** is a modal window opened by Edit, a double-click, or Enter on the
-  selected row. Its field comes from the schema's type first and the stored value's type
-  second: `enum` → combobox, `boolean` → `proxmoxcheckbox`, `integer`/`number` →
-  numberfield, a `multiline` string or one that already has newlines → textarea,
-  everything else → textfield. A map, or a list of maps, skips the row editor and opens
-  Monaco on that subtree. A declared type wins, deliberately: it is the operator's
-  statement of what the key means.
-* **Editability is per document**, from `GET /meta/access`: every row is editable when
-  the document is writable, none when it is not -- nothing is decided per path.
-
-### The Text card
-
-* The **whole document** in Monaco as YAML, with the presentation-only YAML/JSON view
-  toggle, loaded with the file's own text. Apply sends the buffer as `text` at the root
-  view (`PUT ?view=&mode=replace&digest=…`) — the one write that is text rather than a
-  subtree, and therefore the only way a `#` comment or a hand-written key order reaches
-  the file. Revert re-reads it; Diff shows the buffer against what is stored.
-* The buffer is **the only unwritten state in the editor**, so leaving Text with a
-  dirty one asks once whether to discard it. A document that does not parse opens here
-  and can only be repaired here, by a whole-document write.
-* The **Text** segment is disabled when `/meta/access` reports no read, rather than
-  offering a button that can only fail.
-
-### Everywhere
-
-* **No background poll.** The toolbar's Reload is manual; a reload preserves which
-  rows were expanded.
-* **Conflicts.** Every write carries the digest. On 409 the panel reloads (or re-reads
-  the text buffer) and shows the API's message verbatim under a *Conflict* title. Every
-  other error is the API's message verbatim too. This is what catches a concurrent
-  change without a poll: the next write finds out.
-* **Enforced schemas.** A prefix with `enforce: true` makes the server refuse a write
-  that breaks it: 422, naming the paths. That message is the dialog, and *Save anyway*
-  sends the same write again with `force=1`. Every other schema finding is advisory and
-  only marks the row amber (and squiggles the line in Text).
-* **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window,
-  whose OK is one `replace` of that subtree), the Text card (the whole document, in the
-  panel body), and the diff behind the Diff button. Its AMD loader is fetched lazily on first use from
-  `/pve2/js/pve-meta-extjs/vs/loader.js` — Monaco is vendored into the package by the
-  top-level `make ui` (npm), never fetched from a CDN — and every editor and model is
-  disposed when its owner goes away. `PVE.meta.Monaco.load()` waits for the core first,
-  since every Monaco caller also needs the codec.
+Two things worth knowing that are specific to *this* implementation, not the design:
+row icons ride on ExtJS's own `x-tree-icon-custom` class, so no CSS ships with this
+file; and `Doc.writeFor(docId, edit, digest, force)` is the whole write path as one
+pure function, so every editor hands it an edit and sends back what it builds, rather
+than each assembling its own request.
 
 ## The core
 
@@ -180,26 +115,20 @@ first, which is what its `waitForXtype()` does.
   when `node` is present). It loads the real file into `node:vm` behind a small
   `Ext`/`Proxmox` shim, instantiates the *built* `pve-meta-core.wasm` synchronously and
   hands it to `PVE.meta.Core.attach`, so the shipped bytes and the shipped glue are what
-  gets tested. It starts *before* attaching the core, so the pre-load branches (the two
-  name validators fail open, `Core.call` says "not loaded" rather than trapping) are
-  exercised; then the raw ABI (a megabyte through the buffer, a memory growth, non-ASCII,
-  error locations); then the editor's own logic: the row-editor field choice, the
-  document+shape row merge, per-row editability, the request each kind of edit produces
-  (`Doc.writeFor`, as a table), and the codec — including a
-  **round-trip property test**: a fixed corpus of hostile documents plus 500 generated
-  ones (keys and values with colons, quotes, hashes, unicode, numeric-looking strings,
-  booleans, nested maps and arrays), asserting `parse(dump(x))` deep-equals `x` with key
-  order intact. The rules themselves are tested where they live, in Rust.
-* `testing/lab/` is not a test suite: the two scripts there need a live PVE host and
-  nothing in `make check` or CI runs them. `headless-tab-check.js` and
-  `headless-flows-check.js` (open the tab, add a key, edit it, remove it, apply from the
-  Text card, provoke a 409) run headless Chromium against the real pve-manager SPA:
-  `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
-  [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` payload; `--ro` stubs
-  `GET /meta/access` with a read-only answer so the "Read-only" toolbar label and the
-  per-row editability can be seen without a second principal's credentials. They need
-  `puppeteer-core` and a chromium binary and write their screenshots to
-  `/root/headless/shots`; they were run from the lab build host, not from a workstation.
+  gets tested: the raw ABI (a megabyte through the buffer, a memory growth, non-ASCII,
+  error locations, a trap-vs-error distinction), one marshaling spot-check per wasm
+  export, and the editor's own logic on top of it (the row-editor field choice, the
+  document+shape row merge, the request each kind of edit produces as a table, the
+  byte-exact YAML the store writes). The rules themselves are tested where they live,
+  in Rust; this suite does not re-prove them.
+* `testing/lab/headless-check.js` is not a test suite: it needs a live PVE host and
+  nothing in `make check` or CI runs it. It drives headless Chromium through the real
+  pve-manager SPA over one path -- open the tab, add a key, edit it, remove it, apply
+  from the Text card, provoke a 409, then the datacenter tab's registry grid:
+  `node headless-check.js <host> <vmid> [light|dark] [--ro]`. `--ro` stubs
+  `GET /meta/access` read-only, so the "Read-only" toolbar label can be seen without a
+  second principal's credentials. Needs `puppeteer-core` and a chromium binary; writes
+  screenshots to `/root/headless/shots`; run from the lab build host, not a workstation.
 
 ## Screenshots
 
@@ -207,6 +136,6 @@ first, which is what its `waitForXtype()` does.
 guest tree, Text mode with the diff, the Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
 (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
 Anything else -- the row editor, the JSON view, a read-only caller's tab -- is a run of
-`testing/lab/headless-tab-check.js` away, which writes a full set into the directory
-you give it; that set is not committed.
+`testing/lab/headless-check.js` away, which writes a full set into the directory you
+give it; that set is not committed.
 

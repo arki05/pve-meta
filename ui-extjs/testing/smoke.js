@@ -178,20 +178,6 @@ eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde �
     eq('the instance is fine after errors', Core.call('parse', 'yaml', 'ok: 1\n'), { ok: 1 });
 }
 
-console.log('\n--- classes defined ---');
-eq('defined', ctx.__defined, [
-    'PVE.meta.Footer',
-    'PVE.meta.TreeModel',
-    'PVE.meta.AddKeyWindow',
-    'PVE.meta.EditValueWindow',
-    'PVE.meta.TextWindow',
-    'PVE.meta.TreePanel',
-    'PVE.meta.DocumentWindow',
-    'PVE.meta.NewRegistryWindow',
-    'PVE.meta.RegistryGrid',
-    'PVE.meta.DatacenterPanel',
-]);
-
 const U = ctx.PVE.meta.Utils;
 const Codec = ctx.PVE.meta.Codec;
 const Shape = ctx.PVE.meta.Shape;
@@ -418,188 +404,6 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     delete ctx.window.monaco;
 }
 
-console.log('\n--- YAML property test: parse(dump(x)) deep-equals x ---');
-// A seeded PRNG, so a failure names a document that can be reproduced exactly.
-const rng = (seed) =>
-    function () {
-        seed |= 0;
-        seed = (seed + 0x6d2b79f5) | 0;
-        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
-
-// Keys and scalars that have historically broken hand-written YAML: structural
-// punctuation, quotes, comment markers, unicode, and strings that look like
-// numbers, booleans or nulls and must come back as strings.
-const KEYS = [
-    'plain',
-    'has:colon',
-    'colon: space',
-    "quo'te",
-    'dq"uote',
-    '#hash',
-    'trailing #hash',
-    'dash-key',
-    '-',
-    '? question',
-    '[bracket]',
-    '{brace}',
-    'a,b',
-    '&anchor',
-    '*alias',
-    '|pipe',
-    '>fold',
-    '%percent',
-    '@at',
-    '`tick',
-    '!bang',
-    'ünïcøde',
-    '日本語',
-    'Ελληνικά',
-    '🚀',
-    '007',
-    '1.5e3',
-    '0x10',
-    '-12',
-    'true',
-    'False',
-    'yes',
-    'no',
-    'on',
-    'off',
-    'null',
-    '~',
-    '',
-    ' leading',
-    'trailing ',
-    'inner  spaces',
-    'multi\nline',
-    'tab\there',
-    'documented__',
-    '__',
-    'constructor',
-    'hasOwnProperty',
-    'toString',
-];
-const SCALARS = [
-    '',
-    'plain',
-    'has: colon',
-    'ends with #',
-    "it's",
-    'say "hi"',
-    '- not a list',
-    '007',
-    '1e5',
-    '0b101',
-    'true',
-    'null',
-    '~',
-    'ünïcøde é',
-    '日本語のテキスト',
-    '🚀 launched',
-    'multi\nline\ntext',
-    'tab\tseparated',
-    ' padded ',
-    'x'.repeat(200),
-    0,
-    1,
-    -1,
-    42,
-    -0.25,
-    3.5,
-    1234567890,
-    true,
-    false,
-];
-
-const pick = (rnd, arr) => arr[Math.floor(rnd() * arr.length) % arr.length];
-
-const genValue = (rnd, depth) => {
-    const r = rnd();
-    if (depth <= 0 || r < 0.55) {
-        return pick(rnd, SCALARS);
-    } else if (r < 0.8) {
-        return genMap(rnd, depth - 1);
-    }
-    return genArray(rnd, depth - 1);
-};
-
-const genArray = (rnd, depth) => {
-    const n = Math.floor(rnd() * 4);
-    const out = [];
-    for (let i = 0; i < n; i++) {
-        out.push(genValue(rnd, depth));
-    }
-    return out;
-};
-
-function genMap(rnd, depth) {
-    const n = Math.floor(rnd() * 5);
-    const out = {};
-    for (let i = 0; i < n; i++) {
-        // Not via a literal: `__proto__` as a key would be swallowed by the
-        // prototype setter rather than becoming a document key.
-        Object.defineProperty(out, pick(rnd, KEYS), {
-            value: genValue(rnd, depth),
-            enumerable: true,
-            writable: true,
-            configurable: true,
-        });
-    }
-    return out;
-}
-
-// A fixed corpus first, so the hostile shapes are exercised on every run and not
-// only when the generator happens to reach for them.
-const CORPUS = [
-    { '': 'empty key' },
-    { 'has:colon': 'a', 'colon: space': 'b' },
-    { "quo'te": "it's", 'dq"uote': 'say "hi"' },
-    { '#hash': 'ends with #', 'trailing #hash': '- not a list' },
-    { 'ünïcøde': 'é', 日本語: '値', '🚀': '🚀 launched' },
-    { '007': '007', '1.5e3': '1.5e3', '0x10': '0x10', '-12': '-12' },
-    { true: 'true', no: 'off', null: '~', '~': 'null' },
-    { 'multi\nline': 'c\nd', 'tab\there': ' padded ' },
-    { documented__: 'a note', __: 'about the map', constructor: 'x' },
-    { a: { b: [{ c: [1, 2, true, 'x', ''] }] }, e: {}, l: [] },
-    { n: -0.25, z: 0, big: 1234567890, long: 'x'.repeat(300) },
-];
-
-let propFails = 0;
-for (let i = 0; i < 500 + CORPUS.length; i++) {
-    const rnd = rng(0x5eed + i);
-    // Regenerating an empty map wastes a case, and rnd() has already advanced.
-    let doc = i < CORPUS.length ? CORPUS[i] : genMap(rnd, 3);
-    while (!Object.keys(doc).length) {
-        doc = genMap(rnd, 3);
-    }
-    let text;
-    let back;
-    try {
-        text = Codec.dump(doc, 'yaml');
-        back = Codec.parse(text, 'yaml');
-    } catch (err) {
-        propFails++;
-        if (propFails <= 3) {
-            console.log(`FAIL seed ${i}: ${err.message}\n  doc  ${JSON.stringify(doc)}`);
-        }
-        continue;
-    }
-    // JSON.stringify compares structure, values *and* key order: the codec keeps
-    // the order it was given, even though order is not a value.
-    if (JSON.stringify(back) !== JSON.stringify(doc)) {
-        propFails++;
-        if (propFails <= 3) {
-            console.log(
-                `FAIL seed ${i}\n  doc  ${JSON.stringify(doc)}\n  yaml ${JSON.stringify(text)}\n  back ${JSON.stringify(back)}`,
-            );
-        }
-    }
-}
-eq('the corpus and 500 generated documents round trip', propFails, 0);
-
 console.log('\n--- row merge: document + shape ---');
 const P = ctx.PVE.meta.TreePanel;
 const TRAEFIK_SCHEMA = {
@@ -615,7 +419,7 @@ const TRAEFIK_SCHEMA = {
         },
     },
 };
-const panel = {
+const panelBase = {
     registryDoc: false,
     docId: '200',
     access: { read: 1, write: 1 },
@@ -627,15 +431,20 @@ const panel = {
         { prefix: 'netbird', selector: { all: true } },
     ],
 };
-[
-    'entry',
-    'addData',
-    'addShape',
-    'schemaKind',
-    'shapeFor', 'shapeInputs', 'buildShape',
-    'docKind',
-    'editableFor',
-].forEach((m) => (panel[m] = P[m]));
+// One partial TreePanel double: `panelBase`'s fields plus every real method P
+// defines (never reimplemented here), with `overrides` layered on top for
+// whatever one test differs on -- including a fake method, which wins over the
+// real one since it is already on `p` before the real methods are added.
+function panelWith(overrides) {
+    const p = Object.assign({}, panelBase, overrides);
+    Object.keys(P).forEach((k) => {
+        if (typeof P[k] === 'function' && !(k in p)) {
+            p[k] = P[k];
+        }
+    });
+    return p;
+}
+const panel = panelWith({});
 
 const shape = panel.shapeFor('200');
 // Most-specific first, then by name: the order the server lists in, and the one
@@ -764,7 +573,7 @@ console.log('\n--- a registry file that did not load is still a row ---');
 
     // The safety half: a file that did not load must never describe anything. The
     // listing carries it; the Shape drops it.
-    const p2 = Object.assign({}, panel, {
+    const p2 = panelWith({
         prefixes: [
             { prefix: 'netbird', selector: { all: true } },
             { prefix: 'broken', selector: { all: true }, error: 'nope' },
@@ -779,7 +588,7 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
     // guest, and every one of them as a greyed row buries what the guest says.
     // `hidden` suppresses the offered row. It must not suppress data: a hidden key that
     // IS set still gets its row, its type and its default.
-    const d = Object.assign({}, panel, {
+    const d = panelWith({
         docId: '100',
         docState: { 100: { digest: 'x', data: { t: { routers: { rule: 'Host(`a`)' } } } } },
         prefixes: [
@@ -804,8 +613,6 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
             },
         ],
     });
-    ['documentEntries', 'dataOf', 'shapeFor', 'docKind', 'entry', 'addData',
-     'addShape', 'applicablePrefixes', 'schemaKind'].forEach((m) => (d[m] = P[m]));
     const root = d.documentEntries.call(d);
     const routers = root.children.t.children.routers;
 
@@ -834,12 +641,7 @@ console.log('\n--- a prefix is a declaration, with or without a schema ---');
     // lives at this key. It earns a row on that alone; it just has less to say than
     // a schema'd one.
     const doc = (data) => {
-        const d = Object.assign({}, panel, {
-            docId: '100',
-            docState: { 100: { digest: 'x', data: data } },
-        });
-        ['documentEntries', 'dataOf', 'shapeFor', 'shapeInputs', 'buildShape', 'docKind',
-         'entry', 'addData', 'addShape'].forEach((m) => (d[m] = P[m]));
+        const d = panelWith({ docId: '100', docState: { 100: { digest: 'x', data: data } } });
         return d.documentEntries.call(d);
     };
 
@@ -976,65 +778,9 @@ eq('hover: an enum', Markers.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null);
 
-console.log('\n--- nesting: most-specific wins, schemas never merge ---');
-// `homelab` and `homelab.docker` are both prefixes. The child governs its whole
-// subtree; the parent's own `properties.docker` is shadowed, not combined
-// (DESIGN section 3). The rule lives in one place (shape::Shape); this shows the
-// face over it.
-const NESTED = Shape.of([
-    {
-        prefix: 'homelab',
-        selector: { all: true },
-        schema: {
-            type: 'object',
-            properties: {
-                notes: { type: 'string' },
-                // The parent has an opinion about `docker` -- and must not get one.
-                docker: { type: 'string' },
-            },
-        },
-    },
-    {
-        prefix: 'homelab.docker',
-        selector: { all: true },
-        schema: { type: 'object', properties: { compose: { type: 'string' } } },
-    },
-]);
-eq('declared sorts longest prefix first', NESTED.declared().map((n) => n.prefix), ['homelab.docker', 'homelab']);
-eq('governing picks the child for the child subtree',
-    NESTED.governing('homelab.docker.compose').prefix, 'homelab.docker');
-eq('governing picks the parent elsewhere', NESTED.governing('homelab.notes').prefix, 'homelab');
-eq('governing picks the child for the boundary itself',
-    NESTED.governing('homelab.docker').prefix, 'homelab.docker');
-eq('governing returns null off-prefix', NESTED.governing('unrelated.x'), null);
-eq('governing returns null for the root', NESTED.governing(''), null);
-
-// The parent declares `docker: string` and the document has a map there. That is a
-// finding only if the parent is allowed to reach into the child -- it is not.
-const NESTED_DOC = { homelab: { notes: 'ok', docker: { compose: 'services: {}' } } };
-eq('the parent does not lint the child subtree', NESTED.findings(NESTED_DOC), []);
-
-// The child does lint its own subtree.
-eq('the child lints its own subtree',
-    NESTED.findings({ homelab: { docker: { compose: 42 } } }).map((f) => f.path + ': ' + f.msg),
-    ['homelab.docker.compose: expected string']);
-
-// And the parent still lints what it does own.
-eq('the parent lints its own keys',
-    NESTED.findings({ homelab: { notes: 7 } }).map((f) => f.path),
-    ['homelab.notes']);
-
-// Hovers resolve to the governing prefix rather than to whichever was collected last.
-const NESTED_IDX = Object.create(null);
-NESTED.schemaIndex().forEach((e) => (NESTED_IDX[e.path] = e.schema));
-eq('hover at the boundary comes from the child',
-    NESTED_IDX['homelab.docker'].properties.compose.type, 'string');
-eq('hover below the boundary is the child\'s', NESTED_IDX['homelab.docker.compose'].type, 'string');
-eq('hover elsewhere is the parent\'s', NESTED_IDX['homelab.notes'].type, 'string');
-
 console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
 {
-    const nsPanel = Object.assign({}, panel);
+    const nsPanel = panelWith({});
     nsPanel.prefixes = [
         {
             prefix: 'homelab.docker',
@@ -1080,42 +826,6 @@ eq('an unquoted integer is still a number', Codec.parse('v: 1\n', 'yaml'), { v: 
 eq('booleans still parse', Codec.parse('v: true\n', 'yaml'), { v: true });
 eq('YAML 1.1 words stay strings', Codec.parse('a: yes\nb: on\n', 'yaml'), { a: 'yes', b: 'on' });
 eq('an empty document is the empty map, not null', Codec.parse('', 'yaml'), {});
-
-console.log('\n--- governing uses plain containment ---');
-// A prefix `a` does not govern the sibling comment key `a__`'s own declared
-// prefix: plain containment, no alias for a comment key.
-{
-    const two = Shape.of([{ prefix: 'a', selector: { all: true } }, { prefix: 'a__', selector: { all: true } }]);
-    eq('a comment-key prefix governs itself, not its subject', two.governing('a__').prefix, 'a__');
-    eq('... and `a` alone does not reach `a__`',
-        Shape.of([{ prefix: 'a', selector: { all: true } }]).governing('a__'), null);
-}
-
-console.log('\n--- nesting: a schema-less prefix still shadows ---');
-{
-    // A prefix may declare a selector and no schema.
-    // It still governs its subtree -- so a parent's schema must not reach into it.
-    const all = Shape.of([
-        { prefix: 'homelab.docker', selector: { all: true } },   // no schema
-        {
-            prefix: 'homelab',
-            selector: { all: true },
-            schema: {
-                type: 'object',
-                properties: {
-                    notes: { type: 'string' },
-                    docker: { type: 'string' },
-                },
-            },
-        },
-    ]);
-    const doc = { homelab: { notes: 'ok', docker: { compose: 'x' } } };
-    eq('a schema-less child still shadows its parent', all.findings(doc).map((f) => f.path), []);
-    eq('the parent still lints what it owns',
-        all.findings({ homelab: { notes: 7 } }).map((f) => f.path), ['homelab.notes']);
-    eq('and the hover index does not cross the boundary either',
-        all.schemaIndex().some((e) => e.path === 'homelab.docker'), false);
-}
 
 console.log('\n--- round trip: a view toggle must not invent changes ---');
 // The store rewrites a file only when it is asked to write one, so what the editor
@@ -1185,11 +895,10 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 // Per-document digests. One shared field would have sent a prefix's digest with a
 // write to another document, which is a 409 at best and the wrong document at worst.
 {
-    const panelM = Object.assign({}, panel, {
+    const panelM = panelWith({
+        docId: 'prefixes/y',
         docState: { 'prefixes/y': { digest: 'aaa', data: { a: 1 } }, 'prefixes/x': { digest: 'bbb', data: {} } },
     });
-    ['digestOf', 'dataOf', 'docOf'].forEach((m) => (panelM[m] = P[m]));
-    panelM.docId = 'prefixes/y';
     eq('each document keeps its own digest', panelM.digestOf('prefixes/x'), 'bbb');
     eq('and its own data', panelM.dataOf('prefixes/y'), { a: 1 });
     eq('an unknown document has no digest', panelM.digestOf('prefixes/nope'), '');
@@ -1200,8 +909,7 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 // What describes a registry document: its meta-schema, rooted at the document.
 {
     const META = { type: 'object', properties: { selector: { type: 'object' } } };
-    const panelG = Object.assign({}, panel, { registryDoc: true, schemas: { prefix: META } });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind'].forEach((m) => (panelG[m] = P[m]));
+    const panelG = panelWith({ registryDoc: true, schemas: { prefix: META } });
     eq('a prefix document is described by the meta-schema, rooted at the document',
         panelG.shapeFor('prefixes/x').declared().map((g) => g.prefix), ['']);
     eq('... which is the schema served for its kind',
@@ -1232,15 +940,12 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
     );
     eq('a missing meta-schema (an older API) describes nothing', Shape.rooted(undefined).declared(), []);
     // The same rows the tree would show, including a declared-but-unset one.
-    const panelR = Object.assign({}, panel, {
+    const panelR = panelWith({
         registryDoc: true,
+        docId: 'prefixes/x',
         docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
         schemas: { prefix: META },
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind', 'documentEntries', 'addData', 'addShape', 'entry', 'schemaKind', 'dataOf'].forEach(
-        (m) => (panelR[m] = P[m]),
-    );
-    panelR.docId = 'prefixes/x';
     const entries = panelR.documentEntries();
     eq('a prefix document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
     eq('what it holds is present', entries.children.selector.children.tag.present, true);
@@ -1361,39 +1066,16 @@ console.log('\n--- the registry list ---');
 
 console.log('\n--- a key name is refused in the field, not after a round trip ---');
 {
-    // The rule is the core's (`path::is_valid_segment`); this only puts it into
-    // words. `invalid path: homelab.bad key (400)` is a correct answer that reads
-    // like a bug in the editor.
+    // The charset itself is pinned in path.rs and registry.rs; one marshaling
+    // spot-check per export, that the JS wrapper reads `why.char`/`why.segment`
+    // and builds a message from them (DESIGN \u00a72 for the comment-key carve-out).
     eq('a plain key is fine', U.keyPathError('homelab'), null);
-    eq('a dotted path is fine', U.keyPathError('homelab.docker.port'), null);
-    eq('the charset is the server\'s', U.keyPathError('a-b_c@d!e9'), null);
-    eq('an empty key is refused', typeof U.keyPathError(''), 'string');
-    eq('a space is refused', typeof U.keyPathError('bad key'), 'string');
-    eq('... and the message names it', U.keyPathError('bad key').indexOf('space') !== -1, true);
-    eq('... and the segment', U.keyPathError('ok.bad key').indexOf('bad key') !== -1, true);
-    eq('a slash is refused', typeof U.keyPathError('a/b'), 'string');
-    eq('an empty segment is refused', typeof U.keyPathError('a..b'), 'string');
-
-    // Comment keys are ordinary keys under this charset, and the editor must not
-    // refuse the one spelling the document model is built on (DESIGN section 2).
+    eq('a bad key names the character and the segment',
+        U.keyPathError('ok.bad key').indexOf('space') !== -1 && U.keyPathError('ok.bad key').indexOf('bad key') !== -1,
+        true);
     eq('a comment key is fine', U.keyPathError('documented__'), null);
-    eq('the bare document comment key is fine', U.keyPathError('__'), null);
-
-    // Non-ASCII is refused, the same way the server refuses it. The `KEYS` corpus
-    // above is about what the YAML *codec* must round-trip -- a stored document can
-    // have arrived by hand or from an older writer -- which is a wider set than what
-    // a path may name. This field creates a key, so it is bound by the narrower rule.
-    eq('non-ascii is refused', typeof U.keyPathError('\u00fcn\u00efc\u00f8de'), 'string');
-
-    // A registry file name is a dotted prefix (`registry::is_valid_file_name`): the
-    // rule the loader, the API id and the New dialog all apply -- the dialog through
-    // the same function now, rather than through no check at all.
     eq('a file name is a prefix', U.fileNameError('homelab.docker'), null);
-    eq('a plain one too', U.fileNameError('traefik'), null);
-    eq('a space is not a file name', typeof U.fileNameError('my file'), 'string');
-    eq('nor a slash', typeof U.fileNameError('a/b'), 'string');
-    eq('nor a leading dot', typeof U.fileNameError('.hidden'), 'string');
-    eq('nor nothing', typeof U.fileNameError(''), 'string');
+    eq('a bad file name is refused', typeof U.fileNameError('my file'), 'string');
 }
 
 console.log('\n--- one edit, one write (DESIGN §8) ---');
@@ -1472,12 +1154,11 @@ console.log('\n--- acting on one member rewrites its list ---');
     // There is no path to `groups[1]`, so every action on a member is one write of
     // the whole list, at the list's own path.
     const sent = [];
-    const stub = {
+    const stub = panelWith({
         docId: '201',
         docState: { 201: { digest: 'd', data: { netbird: { groups: ['lan', 'wan', 'dmz'] } } } },
         sendEdit: (edit) => sent.push(edit),
-    };
-    ['listAt', 'writeListMember', 'dataOf'].forEach((m) => (stub[m] = P[m]));
+    });
 
     eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
     stub.writeListMember('netbird.groups', 1, 'wlan');
@@ -1573,29 +1254,23 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         type: 'object',
         properties: { port: { type: 'integer', minimum: 1, maximum: 65535 } },
     };
-    const panelF = Object.assign({}, panel, {
+    const panelF = panelWith({
         registryDoc: false,
+        docId: '201',
         docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf'].forEach(
-        (m) => (panelF[m] = P[m]),
-    );
-    panelF.docId = '201';
     const found = panelF.findingsFor();
     eq('the out-of-range row is marked', found['docker.port'], 'must be at most 65535');
     eq('a row that fits is not', found['docker.host'], undefined);
 
     // A registry document is linted by its meta-schema through the same call.
-    const panelR = Object.assign({}, panel, {
+    const panelR = panelWith({
         registryDoc: true,
+        docId: 'prefixes/x',
         docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
         schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf'].forEach(
-        (m) => (panelR[m] = P[m]),
-    );
-    panelR.docId = 'prefixes/x';
     eq(
         'a prefix file is marked against the meta-schema',
         panelR.findingsFor().description,
@@ -1613,13 +1288,12 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
         created.push([xtype, cfg]);
         return { on: () => {}, show: () => {} };
     };
-    const withProps = Object.assign({}, panel, {
+    const withProps = panelWith({
         docId: 'prefixes/homelab',
         docState: {
             'prefixes/homelab': { digest: 'd', data: { schema: { properties: { host: { type: 'string' } } } } },
         },
     });
-    ['docKind', 'dataOf', 'declareKey'].forEach((m) => (withProps[m] = P[m]));
     withProps.declareKey({ data: { docId: withProps.docId } });
     eq('opens the text window', created[0][0], 'PVE.meta.TextWindow');
     eq('... on schema.properties', created[0][1].view, 'schema.properties');

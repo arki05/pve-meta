@@ -1,18 +1,6 @@
 // ---------------------------------------------------------------------------
-// The editor footer — one bar, three editors.
-//
-// There are three places you edit a document here: the tree, the text card behind
-// the Tree | Text toggle, and the text window over one subtree. They had grown
-// three different chromes — the subtree window put its view switch on *top* and had
-// no Format button at all, the tree put Apply and Revert on top, and a document
-// window's Close sat at the bottom while the Apply for the same document sat at the
-// top of the panel inside it. Nothing about the three is different enough to
-// justify that.
-//
-// So: **which view you are looking at goes bottom-left, what you can do about it
-// goes bottom-right**, and every editor builds both halves from here. The top
-// toolbar is left for acting on the document's *contents* (Add, Edit, Remove,
-// Declare Key), which is a different kind of thing from committing.
+// The editor footer, shared by the tree, the text card and the text window: which
+// view you are looking at goes bottom-left, what you can do about it bottom-right.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.Footer', {
@@ -32,9 +20,7 @@ Ext.define('PVE.meta.Footer', {
             });
         }
         out.push('->');
-        // Diff belongs with Apply, not with the view switches on the left: it answers
-        // the same question Apply does -- what am I about to do to this document --
-        // and it answers it without committing.
+        // Diff belongs with Apply, not the view switches: same question, no commit.
         if (cfg.diff) {
             out.push({
                 text: gettext('Diff'),
@@ -45,34 +31,26 @@ Ext.define('PVE.meta.Footer', {
             });
         }
         out.push({
-            // Named by the caller, because the two mean different things: the panel's
-            // footer Apply *writes* the buffer, and a modal editor's button only hands
-            // its result back -- the same OK the row editor and Add Key use.
+            // Named by the caller: writes the buffer in the panel's footer, only
+            // hands the result back in a modal editor (the row editor's OK).
             text: cfg.applyText || gettext('Apply'),
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
-            // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
-            // a caller that never enabled it got a button that looked ordinary and
-            // did nothing at all -- no click, no request, no message -- which is
-            // exactly what happened to the subtree window.
             disabled: !!cfg.applyDisabled,
             handler: cfg.apply,
         });
         out.push({
             text: cfg.secondaryText || gettext('Cancel'),
             itemId: 'metaSecondary',
-            // The icon has to agree with the word, and only the panel's Revert throws
-            // anything away: the panel swaps in the undo arrow when it says Revert.
-            iconCls: 'fa fa-times',
+            iconCls: 'fa fa-times', // the panel swaps in the undo arrow when it says Revert
             handler: cfg.secondary,
         });
         return out;
     },
 
     // The YAML | JSON view switch every text editor and the diff window carry.
-    // `ui` per item, not the container's `defaultUI`: the latter only reaches a
-    // child that has no `ui` of its own, and the theme's plain `default` is PVE's
-    // blue primary button -- far too loud for a view switch in a bar of grey ones.
+    // `ui` per item, not the container's `defaultUI`, which would only reach a
+    // child with no `ui` of its own -- the theme's default is too loud here.
     // cfg: { onChange(lang), value?, itemId?, reference?, hidden? }
     langToggle: function (cfg) {
         let out = {

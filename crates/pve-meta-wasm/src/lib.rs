@@ -1,43 +1,14 @@
-//! `pve-meta-wasm`: `pve-meta-core` for the browser, so the editor asks the
-//! same code the server runs instead of keeping a JavaScript copy of it.
+//! `pve-meta-core` for the browser: five exports over one byte buffer.
 //!
-//! # The ABI
+//! * `pm_alloc`/`pm_free(ptr, len)` -- a buffer the caller fills and frees.
+//! * `pm_call(ptr, len) -> out_len` -- runs a `{"fn", "args"}` JSON request,
+//!   writing `{"ok": v}` or `{"err": {message, line?, column?}}` to the
+//!   output buffer, read back with `pm_output()` and reused next call.
+//! * `pm_abi() -> u32` -- [`ABI`], checked on attach so mismatched builds
+//!   fail loudly instead of mis-reading each other.
 //!
-//! A plain `cargo build --target wasm32-unknown-unknown`; no `wasm-bindgen`,
-//! no build tool beyond cargo. Five exports:
-//!
-//! * `pm_alloc(len) -> ptr` / `pm_free(ptr, len)` -- a buffer the caller
-//!   copies its request into and releases afterwards;
-//! * `pm_call(ptr, len) -> out_len` -- runs one request and leaves the
-//!   response in an output buffer this module owns;
-//! * `pm_output() -> ptr` -- that buffer. It is reused by the next call, so
-//!   the caller copies the response out before calling again;
-//! * `pm_abi() -> u32` -- [`ABI`], which the glue checks on attach so a
-//!   `.wasm` and a script from different builds fail loudly rather than
-//!   mis-read each other.
-//!
-//! A request is one UTF-8 JSON document, `{"fn": <name>, "args": [...]}`,
-//! and a response is `{"ok": <value>}` or `{"err": {"message": ..., "line"?,
-//! "column"?}}`. Every function in this crate takes and returns documents
-//! anyway -- a `Value`, a path -- so JSON is the interface's natural type,
-//! and the glue on the JavaScript side is a dozen lines
-//! ([`ui-extjs/pve-meta-tree.js`, `PVE.meta.Core`]).
-//!
-//! # What crosses
-//!
-//! The concepts, one group each ([`call`]): the **codec** (`format::parse`,
-//! `format::dump`), the **path** rules and **`Shape`** (which prefixes reach
-//! a document, what governs a path, what a schema says). Nothing here
-//! decides anything: it deserializes the wire shape the API hands the
-//! browser -- where Perl has rendered `true` as `1` -- into the core's own
-//! types, and calls.
-//!
-//! # Not a security boundary
-//!
-//! The browser predicts; the server enforces. Everything this crate answers
-//! the server answers again on the real write, from the same functions.
-//! What a shared implementation buys is that the prediction is *right*: a
-//! row the editor offers to write is a row the server will take.
+//! [`call`] groups functions by concept (codec, path, `Shape`); nothing here
+//! decides what the server will not decide again on the real write.
 
 use std::cell::RefCell;
 
@@ -177,14 +148,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
     let out = match name {
         "abi" => json!(ABI),
 
-        // -- codec: format::parse / format::dump ---------------------
-        //
-        // `parse` reads a *buffer*, which may be a whole document or a view
-        // of one, so it is `view::parse`: no lint and no "must be a map" --
-        // the one lint runs on the planned document, server side, where its
-        // findings name real paths. A null top level -- an empty buffer, or
-        // `~` -- is the empty map, because the model has no nulls and an
-        // empty editor is an empty document.
+        // A buffer may be a whole document or a view of one, so no lint runs here.
         "parse" => {
             let fmt = a.format()?;
             let text = a.str()?;
@@ -199,11 +163,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             json!(format::dump(fmt, &value))
         }
 
-        // -- paths -----------------------------------------------------
-        //
-        // Why a key name is not one: `null` if it is fine. A dotted path is
-        // checked segment by segment, since a Key field takes one. The
-        // caller words it; this only says which rule, and which character.
+        // `null` if the path is fine; otherwise which rule and which character.
         "key_path_check" => {
             let text = a.str()?;
             if text.is_empty() {
@@ -221,14 +181,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
         }
         "file_name_valid" => json!(registry::is_valid_file_name(a.str()?)),
 
-        // -- shape: shape::Shape -----------------------------------------
-        //
-        // Each takes the rows `GET /meta/prefixes?id=` returns for this
-        // guest -- already resolved (selector-matched, node override
-        // applied) -- and builds the Shape afresh: a listed file that did
-        // not load reaches nothing. A registry document passes its
-        // meta-schema as one entry with the empty prefix, which is a prefix
-        // of everything.
+        // Each builds a fresh `Shape` from the already-resolved prefix rows (`Args::shape`).
         "shape_prefixes" => {
             let shape = a.shape()?;
             json!(shape.prefixes().iter().map(|d| d.prefix.to_string()).collect::<Vec<_>>())

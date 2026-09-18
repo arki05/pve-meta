@@ -2,11 +2,8 @@
 // Helpers: paths, the JSON data model, and YAML in and out.
 // ---------------------------------------------------------------------------
 
-// Row icons. Plain FontAwesome classes: ExtJS marks any node that carries an
-// `iconCls` with `x-tree-icon-custom`, which is the class PVE's own stylesheet
-// sizes and colours for the resource tree (ext6-pve.css: 1.25em, #555; #e6e6e6
-// in proxmox-dark), so these come out the same size and muted grey as every
-// other PVE tree icon without this file shipping a line of CSS.
+// Plain FontAwesome classes, sized and coloured by PVE's own resource-tree
+// stylesheet via `x-tree-icon-custom`, so no CSS ships with this file.
 PVE.meta.Icons = {
     map: 'fa fa-folder',
     mapExpanded: 'fa fa-folder-open',
@@ -14,10 +11,7 @@ PVE.meta.Icons = {
 };
 
 PVE.meta.Utils = {
-    // One finding as the warning banner lists it. An enforced one -- its prefix says
-    // `enforce: true`, so the server refuses the write unless saved anyway -- says so
-    // first, since that is the difference between "you have been told" and "it will
-    // not go through".
+    // One finding as the warning banner lists it; an enforced one says so first.
     findingText: function (f) {
         return (f.enforced ? gettext('enforced') + ': ' : '') + f.path + ': ' + f.msg;
     },
@@ -29,17 +23,11 @@ PVE.meta.Utils = {
     // The path above `path`, or '' for a top-level key (and for the root itself).
     parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
-    // Two document values are the same value: the core's own dump of each, compared,
-    // rather than a canonical form spelled a second time here.
+    // Two document values are the same value: the core's own dump of each, compared.
     sameValue: (a, b) => PVE.meta.Core.call('same', a, b),
 
-    // Why a key name is not one, or `null` if it is fine. A dotted path is
-    // accepted and checked segment by segment, since the Key field takes one.
-    //
-    // The rule is the core's (`path::is_valid_segment`, through `key_path_check`);
-    // this only puts it into words, naming the character it refused, so the answer
-    // arrives in the field rather than as `invalid path: homelab.bad key (400)`
-    // after a round trip. The server still refuses on its own, with the same rule.
+    // Why a key name is not one (`path::is_valid_segment`, via `key_path_check`),
+    // or `null` if it is fine; the server refuses the same names on its own.
     keyPathError: function (text) {
         if (!PVE.meta.Core.loaded()) {
             return null; // no early answer, then; the server's is still the answer
@@ -61,8 +49,7 @@ PVE.meta.Utils = {
         );
     },
 
-    // Why a registry file name is not one (`registry::is_valid_file_name`: a dotted
-    // prefix, which is what the file name is), or `null`.
+    // Why a registry file name is not one (`registry::is_valid_file_name`), or `null`.
     fileNameError: function (text) {
         if (!PVE.meta.Core.loaded()) {
             return null; // as `keyPathError`
@@ -85,28 +72,21 @@ PVE.meta.Utils = {
         return 'string';
     },
 
-    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §12).
+    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §8).
     displayValue: function (value, kind) {
         if (kind === 'map') {
             return '';
         } else if (kind === 'boolean') {
-            // The API's JSON view returns YAML booleans as 1/0 (a Perl JSON artifact),
-            // so render whatever arrived the way PVE renders every other boolean.
+            // The API's JSON view renders YAML booleans as 1/0 (a Perl artifact).
             return Proxmox.Utils.format_boolean(value);
         }
         return kind === 'string' ? String(value) : Ext.encode(value);
     },
 
-    // A grammar's `format` is a PVE::JSONSchema format name, and proxmoxlib already
-    // ships the matching client-side validator as an ExtJS vtype -- so a format is
-    // wired to PVE's own checker, with PVE's own (translated) error message, rather
-    // than to a regex of ours. A format with no vtype (or one we do not know) simply
-    // does not constrain the field: an unknown constraint must never block an edit.
-    // This is the ONLY implementation of the format set anywhere: the server passes a
-    // prefix's `schema` through verbatim and never validates `format` (DESIGN §7 --
-    // the lint is the authority, a schema is an affordance), and the shared core's
-    // schema findings hand a `format` back here to be checked (`Shape.findings`)
-    // rather than carrying a third implementation of what `ipv4` means.
+    // A grammar's `format` is a PVE::JSONSchema format name, wired to proxmoxlib's
+    // own vtype for it rather than a second regex; an unmapped format constrains
+    // nothing. The server never validates `format` (DESIGN §5), so this is the
+    // only place it is checked at all.
     FORMAT_VTYPES: {
         'ip': 'IP64Address',
         'ipv4': 'IPAddress',
@@ -145,8 +125,8 @@ PVE.meta.Utils = {
     },
 
     // The value at a dotted path, through maps only -- `undefined` where a segment
-    // is missing or the path runs into a list or a scalar. A render-time lookup;
-    // the same addressing rule a view has (DESIGN §2).
+    // is missing or the path runs into a list or a scalar (the addressing rule a
+    // view has, DESIGN §2).
     valueAt: function (data, path) {
         let cur = data;
         if (!path) {
@@ -162,13 +142,8 @@ PVE.meta.Utils = {
         return cur;
     },
 
-    // Rolls a set of `path -> message` facts up to every ancestor path.
-    //
-    // A collapsed branch hides everything under it, so a marker that only ever sits
-    // on the offending row is a marker you cannot see: collapse `homelab` and the
-    // amber `port` disappears along with the fact that something is wrong. Ancestors
-    // therefore carry a count of what is beneath them, and the first few messages,
-    // which is what their tooltip says.
+    // Rolls a set of `path -> message` facts up to every ancestor path, so a
+    // collapsed branch still shows a count and the first few messages beneath it.
     rollUp: function (byPath) {
         let out = Object.create(null);
         Object.keys(byPath || {}).forEach(function (path) {
@@ -185,10 +160,8 @@ PVE.meta.Utils = {
         return out;
     },
 
-    // One element of a list, on one line. Presentation only -- like `format`, it
-    // describes nothing and constrains nothing; it is there so a list of maps reads
-    // as something other than JSON in a grid cell. There is no shape this recognises
-    // beyond a scalar, so a map member falls back to its JSON.
+    // One element of a list, on one line: presentation only. A map member falls
+    // back to its JSON, since there is no shape this recognises beyond a scalar.
     itemSummary: function (v) {
         if (!v || typeof v !== 'object' || Array.isArray(v)) {
             return PVE.meta.Utils.scalarText(v);
@@ -196,8 +169,8 @@ PVE.meta.Utils = {
         return Ext.encode(v);
     },
 
-    // A schema `type` as the kind `parseValue` speaks: both integers and numbers are
-    // parsed as numbers, and a map or a list of one is not a scalar to parse at all.
+    // A schema `type` as the kind `parseValue` speaks: integers and numbers both
+    // parse as numbers; a map or a list of one is not a scalar to parse at all.
     schemaValueKind: function (type) {
         if (type === 'integer' || type === 'number') {
             return 'number';
@@ -205,22 +178,9 @@ PVE.meta.Utils = {
         return type === 'boolean' || type === 'array' ? type : 'string';
     },
 
-    // Which editor a row's *shape* calls for: 'inline' (the one-line row editor),
-    // 'multiline' (a textarea) or 'text' (Monaco on that subtree).
-    //
-    // One function, because four places have to agree on it -- the Edit button's
-    // enabled state, the double-click, the Enter key and the window that opens -- and
-    // when they did not, a map row was simply not editable by any of the three
-    // gestures while the toolbar's "Edit selection as text" quietly did the job.
-    //
-    // The rule is the value's shape, not a declaration: **a value with structure
-    // inside it is edited as text**. A map is nested YAML and belongs in Monaco; so is
-    // an array of maps. An array of scalars stays a one-line leaf (`[lan, wan]` reads
-    // and edits fine). A string is one line unless it has newlines in it -- or the
-    // schema said so with `multiline`, which is the only way to know before the
-    // first value exists. Adding a `nested yaml` *type* instead would be the string
-    // blob wearing a hat: it costs the per-key rows, diffs and writes that nesting is
-    // for (docs/DESIGN.md §12).
+    // Which editor a row's *shape* calls for: 'inline', 'multiline' (a textarea) or
+    // 'text' (Monaco). A value with structure (a map, an array of maps) is edited as
+    // text; a string is inline unless it has a newline or `multiline` says so (DESIGN §8).
     editorKind: function (d) {
         if (!d) {
             return 'none';
@@ -240,8 +200,8 @@ PVE.meta.Utils = {
     },
 
     // What the Value column shows for a value that does not fit on a line. The row
-    // keeps its exact `valueText` -- the editor opens on that, so truncating it here
-    // and nowhere else is the difference between a summary and data loss.
+    // keeps its exact `valueText`, which the editor opens on, so truncation here
+    // never touches the data.
     previewText: function (text) {
         let s = String(text === undefined || text === null ? '' : text);
         let nl = s.indexOf('\n');
@@ -254,9 +214,9 @@ PVE.meta.Utils = {
         return more ? first + ' ' + Ext.String.format(gettext('(+{0} lines)'), more) : first;
     },
 
-    // The field a row's value is edited with. The grammar's declared type wins over the
-    // type inferred from the stored value: it is the operator's statement of what the
-    // key means, so a stored `1` under a declared `boolean` still gets the checkbox.
+    // The field a row's value is edited with. A declared type wins over the type
+    // inferred from the stored value: a stored `1` under a declared `boolean`
+    // still gets the checkbox.
     editorFor: function (d) {
         if (d.enumValues) {
             return {
@@ -279,8 +239,7 @@ PVE.meta.Utils = {
             return f;
         }
         if (PVE.meta.Utils.editorKind(d) === 'multiline') {
-            // No `format` here: a PVE format validates one line (an address, a name),
-            // and none of them describe a block of text.
+            // No `format` here: a PVE format validates one line, none of them a block.
             return { xtype: 'textarea', height: 260, grow: false };
         }
         let f = { xtype: 'textfield', selectOnFocus: true };
@@ -296,15 +255,12 @@ PVE.meta.Utils = {
         return typeof value === 'string' ? value : Ext.encode(value);
     },
 
-    // Runs the vtype a format maps to, and returns that vtype's own message on failure.
-    // Reusing proxmoxlib's validator rather than a second regex of ours is what keeps
-    // the marker and the row editor agreeing about the same string -- they are literally
-    // the same check. An unmapped format constrains nothing.
+    // Runs the vtype a format maps to, and returns that vtype's own message on
+    // failure; an unmapped format constrains nothing.
     checkFormat: function (format, value) {
         let vtype = PVE.meta.Utils.vtypeFor(format);
-        // Defensive down the whole chain: this runs before any form field has been
-        // instantiated, so nothing guarantees the VTypes singleton exists yet, and a
-        // validator we cannot reach must constrain nothing rather than throw.
+        // Runs before any form field is instantiated, so the VTypes singleton may
+        // not exist yet; a validator we cannot reach must constrain nothing.
         let vtypes = Ext.form && Ext.form.field && Ext.form.field.VTypes;
         if (!vtype || !vtypes || typeof vtypes[vtype] !== 'function') {
             return null;
@@ -327,5 +283,6 @@ PVE.meta.Utils = {
     },
 
     errText: (err) => String((err && (err.message || err.msg)) || err),
-};
 
+    alertError: (err) => Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err))),
+};

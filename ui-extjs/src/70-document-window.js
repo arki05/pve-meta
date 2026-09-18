@@ -1,9 +1,6 @@
 // ---------------------------------------------------------------------------
-// One document in a window — what the registry grid opens.
-//
-// It is the ordinary editor panel, unchanged: tree, row editors, markers, the
-// Tree | Text toggle, the diff. A prefix definition is a document (DESIGN §6), so
-// "edit one" was never a thing that needed its own editor.
+// One document in a window — what the registry grid opens: the ordinary editor
+// panel, unchanged, since a prefix definition is a document too (DESIGN §3).
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.DocumentWindow', {

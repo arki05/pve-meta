@@ -1,19 +1,13 @@
 // ---------------------------------------------------------------------------
-// Buffer: what both text editors do to a Monaco buffer, independent of where
-// the buffer came from -- the loaded text in the buffer's language, Format,
-// the YAML | JSON switch, Diff, and "did anything change".
-//
-// The whole-document Text card and the subtree window each held a copy of all
-// of these, and copies drift. A `buffer` is the small interface both editors hold:
-// `{ editor, lang, original }` -- the Monaco editor, the language it is
-// showing, and the text it was loaded with, which is always the store's YAML.
+// Buffer: what both text editors (the Text card, the subtree window) do to a
+// Monaco buffer -- `{ editor, lang, original }` -- independent of where it came
+// from: Format, the YAML | JSON switch, Diff, and "did anything change".
 // ---------------------------------------------------------------------------
 
 PVE.meta.Buffer = {
-    // The loaded text as the buffer's language shows it: what a diff or a "did
-    // anything change" is measured against. A stored file that cannot be read as
-    // YAML cannot be rendered as JSON; the comparison then falls back to the YAML
-    // rather than being lost. Returns `{ lang, text }`.
+    // The loaded text as the buffer's language shows it, for a diff or a "did
+    // anything change"; falls back to YAML if it cannot be rendered as JSON.
+    // Returns `{ lang, text }`.
     baseline: function (buffer) {
         try {
             return { lang: buffer.lang, text: PVE.meta.Codec.originalInLang(buffer.original, buffer.lang) };
@@ -22,13 +16,8 @@ PVE.meta.Buffer = {
         }
     },
 
-    // True when the buffer holds exactly what was loaded.
-    //
-    // A predicate, and only that. It used to raise "No changes." itself, which is
-    // how a dialog appeared in editors that never asked for one: a function that
-    // answers a question and interrupts the user is two functions, and only one of
-    // them was in its name. Applying an unchanged buffer resolves to nothing to
-    // write, which is the honest outcome and not something to stop for.
+    // True when the buffer holds exactly what was loaded. A predicate, and only
+    // that: applying an unchanged buffer resolves to nothing to write.
     unchanged: function (buffer) {
         return buffer.editor.getValue() === PVE.meta.Buffer.baseline(buffer).text;
     },
@@ -44,10 +33,9 @@ PVE.meta.Buffer = {
         });
     },
 
-    // Re-dump the buffer canonically in the language showing: two-space indent, no
-    // folding, key order preserved -- the same dumper the YAML | JSON toggle uses, so
-    // formatting then toggling is a no-op. Refuses a buffer that does not parse
-    // rather than mangling it. Returns true when the text changed.
+    // Re-dump the buffer canonically in the language showing, the same dumper the
+    // YAML | JSON toggle uses. Refuses a buffer that does not parse. Returns true
+    // when the text changed.
     format: function (buffer) {
         let text = buffer.editor.getValue();
         try {
@@ -63,11 +51,9 @@ PVE.meta.Buffer = {
         }
     },
 
-    // The first half of the YAML | JSON switch: the buffer as a value, ready to be
-    // shown in `lang`. If it does not parse, says so, puts the toggle `btn` back,
-    // and returns undefined -- the buffer stays as it was. Between this and
-    // `render` the caller records the new language, because rendering fires the
-    // editor's change listeners and they read it.
+    // The first half of the YAML | JSON switch: the buffer as a value. If it does
+    // not parse, says so, puts `btn` back, and returns undefined. The caller
+    // records the new language before calling `render`, whose change listeners read it.
     convert: function (buffer, lang, btn) {
         try {
             return PVE.meta.Codec.parse(buffer.editor.getValue(), buffer.lang);
@@ -87,10 +73,8 @@ PVE.meta.Buffer = {
         }
     },
 
-    // The second half: show `value` in `buffer.lang`. `Codec.render`, not a bare
-    // dump: switching back to YAML prefers the server's own text when the document
-    // is unchanged, so a presentation toggle never turns a no-op into a whitespace
-    // diff.
+    // The second half: show `value` in `buffer.lang`, via `Codec.render` so a
+    // no-op toggle back to YAML never becomes a whitespace diff.
     render: function (buffer, value) {
         window.monaco.editor.setModelLanguage(buffer.editor.getModel(), buffer.lang);
         buffer.editor.setValue(PVE.meta.Codec.render(value, buffer.lang, buffer.original));

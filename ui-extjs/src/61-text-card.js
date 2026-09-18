@@ -1,15 +1,7 @@
 // ---------------------------------------------------------------------------
-// The whole-document Monaco card and the Tree | Text mode switch.
-//
-// Everything about looking at the document as one text buffer instead of
-// rows: building the card, entering and leaving text mode, Format/Diff/Apply/
-// Revert, and the squiggles and hovers that annotate the buffer. It reads
-// and writes through `PVE.meta.Doc` the same way the tree does; it does not
-// know a row exists.
-//
-// This is the one editor that writes **text**: a `#` comment and a key order are
-// not part of the document model (DESIGN §2), so they survive only for as long as
-// nothing rewrites the file from that model. Apply sends the buffer.
+// The whole-document Monaco card and the Tree | Text mode switch: the document as
+// one text buffer instead of rows. The one editor that writes **text**, so a `#`
+// comment or key order (outside the document model, DESIGN §2) survives.
 // ---------------------------------------------------------------------------
 
 PVE.meta.TextCard = {
@@ -109,7 +101,7 @@ PVE.meta.TextCard = {
     showTextEditor: function () {
         let me = this;
         PVE.meta.Monaco.load().then(
-            function (monaco) {
+            function () {
                 if (me.isDestroyed || me.mode !== 'text') {
                     return;
                 }
@@ -119,14 +111,10 @@ PVE.meta.TextCard = {
                     me.annotateText();
                     return;
                 }
-                me.textEditor = monaco.editor.create(me.down('#metaTextMount').getEl().dom, {
-                    value: me.textRendered(me.textLang),
-                    language: 'yaml',
-                    theme: PVE.meta.Monaco.theme(),
-                    automaticLayout: true,
-                    minimap: { enabled: false },
-                    scrollBeyondLastLine: false,
-                });
+                me.textEditor = PVE.meta.Monaco.create(
+                    me.down('#metaTextMount').getEl().dom,
+                    me.textRendered(me.textLang),
+                );
                 // Squiggles describe the text the server sent; typing moves the lines,
                 // so they are dropped on the first edit and come back on the next load.
                 me.textEditor.onDidChangeModelContent(function () {
@@ -136,7 +124,7 @@ PVE.meta.TextCard = {
             },
             function (err) {
                 Proxmox.Utils.setErrorMask(me, false);
-                Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                PVE.meta.Utils.alertError(err);
                 me.abortTextMode();
             },
         );
@@ -151,9 +139,7 @@ PVE.meta.TextCard = {
         me.syncButtons();
     },
 
-    // Going back to the tree drops the buffer: the tree shows the stored document and
-    // there is nothing else it could show, so a buffer nobody applied is lost. That is
-    // worth one question, and only when there is something to lose.
+    // Going back to the tree drops the buffer, so ask first when there is something to lose.
     leaveTextMode: function () {
         let me = this;
         if (!me.textIsDirty()) {
@@ -186,9 +172,8 @@ PVE.meta.TextCard = {
         me.reload();
     },
 
-    // Presentation only. `textLang` is recorded between convert and render: rendering
-    // fires the change listener, which annotates the buffer in whatever language it
-    // finds there.
+    // Presentation only. `textLang` is recorded between convert and render, since
+    // rendering fires the change listener that reads it.
     switchTextLang: function (lang) {
         let me = this;
         if (!me.textEditor || lang === me.textLang) {
@@ -215,9 +200,8 @@ PVE.meta.TextCard = {
         }
     },
 
-    // One write of the whole document at the root view, as **text** -- which is how a
-    // `#` comment or a reordering reaches the file at all. `force` is the retry a 422
-    // offers (`submit`).
+    // One write of the whole document at the root view, as **text** -- the only way
+    // a `#` comment or a reordering reaches the file. `force` retries after a 422.
     applyText: function (force) {
         let me = this;
         if (!me.textEditor) {
@@ -257,24 +241,10 @@ PVE.meta.TextCard = {
         );
     },
 
-    // Underline what is wrong with the buffer *as it is now*, and describe the key on
-    // each declared line on hover.
-    //
-    // Two kinds of finding, both advisory -- Apply is never blocked, the server's lint
-    // is the authority (DESIGN section 5):
-    //
-    //   * a YAML syntax error, as one Error marker on the line the parser reports. Monaco
-    //     ships a JSON language service that does this for the JSON view already, but
-    //     nothing validates YAML, so this is ours.
-    //   * every schema finding, as Warning markers (the Shape, placed by PVE.meta.Markers).
-    //
-    // This runs on every keystroke (onDidChangeModelContent), against the *buffer* --
-    // not against the document the server last sent. Parsing is the core on a document
-    // that is a few KB at most; if that ever shows up in typing latency, debounce it.
-    //
-    // Grammar findings are YAML-only: the line index is a YAML scan, so in the JSON
-    // view the document still gets Monaco's own syntax validation but no schema
-    // squiggles.
+    // Underline what is wrong with the buffer *as it is now* and describe the key on
+    // hover. Advisory only, on every keystroke: a YAML syntax error as an Error
+    // marker (Monaco validates JSON itself but not YAML), every schema finding
+    // (the Shape) as a Warning -- YAML-only, since the line index is a YAML scan.
     annotateText: function () {
         let me = this;
         if (!me.textEditor || !window.monaco) {

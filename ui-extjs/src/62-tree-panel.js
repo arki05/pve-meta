@@ -2,11 +2,9 @@
 // The panel: a card layout over the tree and the full-document text editor.
 // ---------------------------------------------------------------------------
 
-// PVE.meta.compose, not Ext's `mixins`: the offline smoke harness stubs
-// Ext.define as "store the config object on the namespace" and reads
-// PVE.meta.TreePanel's members straight off it, so the members have to be
-// on the config object *before* Ext.define ever sees it -- composing here
-// has no class-loader order to get right, a real mixin merge would.
+// PVE.meta.compose, not Ext's `mixins`: the offline smoke harness stubs Ext.define
+// to read members straight off the config object, so they must be on it before
+// Ext.define ever sees it.
 Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     extend: 'Ext.panel.Panel',
     xtype: 'pveMetaTreePanel',
@@ -25,23 +23,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let sel = (me.pveSelNode && me.pveSelNode.data) || {};
 
         me.vmid = me.vmid || sel.vmid;
-        // This panel is ONE document's editor, named by `docId`: a guest's, or a
-        // prefix file's -- they are all documents (DESIGN §6), so the same tree,
-        // markers, text editor and diff serve both, and the registry grid opens one
-        // of these in a window rather than reimplementing any of it.
-        //
-        // Rows still carry their document's id even though there is only ever one:
-        // it is what every write threads through, and a panel that had to remember
-        // which document it was on top of which row was selected is how the digest of
-        // one document ends up on a write to another.
+        // This panel is ONE document's editor, named by `docId`: a guest's or a
+        // prefix file's -- both documents (DESIGN §3), so the same tree, markers,
+        // text editor and diff serve both. Rows carry their document's id too,
+        // since that is what every write threads through.
         me.docId = me.docId || String(me.vmid);
-        // A registry document: no tags to resolve, and the meta-schema describes it
-        // instead of the prefixes.
+        // A registry document: no tags to resolve, the meta-schema describes it.
         me.registryDoc = me.docKind(me.docId) !== 'guest';
-        // Start fetching the core now rather than at the first document read: the
-        // registry grids open their dialogs before that read lands, and a validator
-        // with no core to ask checks nothing.
-        // `loadDocument` awaits the same promise and reports its failure.
+        // Start fetching the core now: the registry grids open their dialogs before
+        // the first document read, and a validator with no core checks nothing.
+        // `loadDocument` awaits the same promise and reports its own failure.
         PVE.meta.Core.load().catch(Ext.emptyFn);
         me.docState = Object.create(null); // id -> { digest, data }
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
@@ -66,9 +57,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
         me.tree = me.down('#metaTree');
         me.on('afterrender', function () {
-            // The load first: it is asynchronous and cannot be hurt by what follows,
-            // whereas a button sync that threw before it used to leave the panel
-            // empty for good.
+            // The load first: asynchronous, so a throw in the button sync cannot
+            // leave it un-started.
             me.reload();
             me.syncButtons();
         });
@@ -187,7 +177,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             '-',
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
-            // Only shown when the caller is restricted (DESIGN §12).
+            // Only shown when the caller is restricted (DESIGN §8).
             { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
         ];
     },
@@ -226,7 +216,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // Revert in Text, and in a window the way out. In the tree there is nothing
-    // unwritten to revert: an edit is a write (DESIGN §8).
+    // unwritten to revert: an edit is a write (DESIGN §6).
     footerSecondary: function () {
         let me = this;
         if (me.mode === 'text') {
@@ -248,9 +238,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(html) + '"';
             }
         };
-        // The grammar's description is the tooltip of every cell in the row (DESIGN §12)
-        // -- unless the row does not match its schema, in which case that is the more
-        // urgent thing to say and goes first.
+        // The grammar's description is the tooltip of every cell in the row (DESIGN §8),
+        // unless the row does not match its schema, which is more urgent and goes first.
         let rowTip = function (rec, meta) {
             let d = rec.data;
             let parts = [];
@@ -296,11 +285,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     rowTip(rec, meta);
                     let d = rec.data;
                     let out = fade(rec, Ext.htmlEncode(value));
-                    // Collapsing a branch must not hide what is inside it. This is the
-                    // *branch's* marker -- something beneath this row -- so it sits in
-                    // the Key column, next to the thing you would collapse, rather than
-                    // in the Value column, which is empty for a map. The row's own
-                    // trouble is still shown on its own value.
+                    // The *branch's* marker (something beneath this row, invisible once
+                    // collapsed) sits in the Key column, since Value is empty for a map.
                     if (d.belowCount) {
                         out += ' <i class="fa fa-exclamation-triangle warning"></i>';
                     }
@@ -317,16 +303,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     if (d.kind === 'map') {
                         return '';
                     }
-                    // A block of text collapses into one unreadable line in a grid
-                    // cell. Show its first line and how much more there is; the row's
+                    // Show the first line and how much more there is; the row's own
                     // `valueText` is untouched, so the editor still opens on all of it.
                     let shown = d.present
                         ? Ext.htmlEncode(PVE.meta.Utils.previewText(value))
                         : '<span class="faded">' + unsetText(rec) + '</span>';
                     if (d.finding) {
-                        // Advisory, like every other schema signal: the row is still
-                        // editable, the value is still there, and the message is in
-                        // the tooltip. `warning` is proxmoxlib's own class.
+                        // Advisory: the row stays editable, the message is in the
+                        // tooltip. `warning` is proxmoxlib's own class.
                         shown =
                             '<i class="fa fa-exclamation-triangle warning"></i> ' +
                             '<span class="warning">' + shown + '</span>';
@@ -335,10 +319,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 },
             },
             {
-                // Guest documents only, structurally: a registry document's top-level
-                // keys are fixed and `deny_unknown_fields` refuses a fourth, so a
-                // comment key cannot exist there to describe one (DESIGN §6). An
-                // always-empty column is a column that teaches you to ignore columns.
+                // Guest documents only: a registry document's top-level keys are fixed
+                // (`deny_unknown_fields`), so no comment key can describe one (DESIGN §3).
                 hidden: me.docKind(me.docId) !== 'guest',
                 // The row's own comment key (`k__`) if present, else nothing.
                 text: gettext('Description'),
@@ -355,13 +337,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         ];
     },
 
-    // Every path in `docId` whose value does not match its schema, by path. The tree
-    // shows these on the rows themselves: the text editor already squiggles them, but
-    // the tree is the view people actually open, and a value the schema refuses would
-    // otherwise look exactly like one it liked. The same Shape answers here and for
-    // the text editor's squiggles: one question asked twice, through one
-    // implementation. Advisory, always: an enforcing prefix is the server's 422, not
-    // a step before the write (DESIGN §5).
+    // Every path in `docId` whose value does not match its schema, by path -- shown
+    // on the rows themselves, from the same Shape the text editor's squiggles use.
+    // Advisory, always: an enforcing prefix is the server's 422, not a pre-write
+    // step (DESIGN §4).
     findingsFor: function () {
         let out = Object.create(null);
         let shape = this.shapeFor(this.docId);
@@ -376,9 +355,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // --- writes --------------------------------------------------------------
 
-    // Sends one edit as one write, and reloads (`submit`). Every editor here goes
-    // through this: the row editor, Add Key, Set to Default, Remove, the list helpers
-    // and the subtree text editor.
+    // Sends one edit as one write, and reloads. Every editor here goes through this.
     sendEdit: function (edit, force) {
         let me = this;
         me.submit(
@@ -395,8 +372,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // Writes the list at `path` with member `index` replaced, or dropped when `value`
-    // is undefined. One `replace` of the whole list, because a view addresses through
-    // maps only -- the same reason the member rows are not addressable.
+    // is undefined. One `replace` of the whole list: a view addresses through maps only.
     writeListMember: function (path, index, value) {
         let list = this.listAt(path);
         if (index < 0 || index >= list.length) {
@@ -422,20 +398,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return (rec && rec.data && rec.data.docId) || this.docId;
     },
 
-    // What describes this document's shape (`PVE.meta.Shape`). A guest document is
-    // described by the prefixes that reach it, most-specific first (they shadow); a
-    // prefix file by the one meta-schema for its kind, rooted at the document itself.
-    // One function, every caller that needs it -- the row builder, the row markers,
-    // and the text editor's squiggles and hovers -- so they cannot disagree about
-    // what describes the document.
-    //
-    // One Shape per document, kept for as long as its inputs are the panel's
-    // current ones: a Shape caches what the core derives from the listing and the
-    // tags, and a render asks it three or four times. The cache is checked against
-    // the inputs by identity rather than cleared at the right moment -- every load
-    // replaces `prefixes`, `tags` or `schemas` with a new object, and a cache that
-    // had to be told about each of those is a cache that is stale the first time
-    // one is forgotten.
+    // What describes this document's shape (`PVE.meta.Shape`): every caller that
+    // needs one goes through here, so the row builder, markers and text-editor
+    // squiggles cannot disagree. One Shape per document, kept as long as its
+    // inputs (`shapeInputs`) are the ones currently in memory -- checked by
+    // identity each call, rather than invalidated by hand on every load.
     shapeFor: function (id) {
         let me = this;
         me.shapes = me.shapes || Object.create(null);
@@ -491,12 +458,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     parentPath: (rec) => (rec.parentNode && rec.parentNode.data.path) || '',
 
-    // Add goes into the selected map, the parent of a selected leaf, or the root.
-    // Where a new key goes: into the selected map, beside the selected leaf, or --
-    // with nothing selected -- at the root of this panel's document.
-    //
-    // A list is the exception: `Add` on one, or on a member of one, appends to the
-    // list rather than adding a key beside it, because a list has no keys to add.
+    // Where a new key goes: into the selected map, beside a selected leaf, or --
+    // nothing selected -- the document root. A list is the exception: `Add` on one,
+    // or on a member of one, appends to it instead, since a list has no keys to add.
     addTarget: function () {
         let me = this;
         let rec = me.getSelection()[0];
@@ -526,8 +490,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             }
         };
         let target = me.addTarget();
-        // On a prefix definition Add is disabled at its root: `schema` holds
-        // whatever you declare, but the document's own top-level keys are fixed.
+        // On a prefix definition Add is disabled at its root: the document's own
+        // top-level keys are fixed, even though `schema` holds whatever you declare.
         let kind = me.docKind(me.docId);
         let fixedRoot = kind === 'prefix' && target && target.path === '';
         set('addBtn', text || !target || fixedRoot || !me.editableFor());
@@ -539,20 +503,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.syncFooter();
         let dflt = me.down('#defaultBtn');
         if (dflt) {
-            // Disabled, not hidden. What varies per *document* may hide (Declare Key
-            // is a missing concept on a guest); what varies per *row* must not, or the
-            // buttons beside it shift under the pointer every time the selection
-            // changes -- which is how you click Remove and hit something else.
-            // Hidden entirely when nothing in this document declares a default.
-            // Disabled, not hidden, when the document has defaults but this row is
-            // not one of them: that varies per row, and a button that moves under
-            // the pointer is how you aim for one thing and hit another.
-            //
-            // Offered on any row that has a default and is not already at it --
-            // not just on unset ones. A default is the answer to "what should
-            // this be", and the moment you most want that answer is when the
-            // value in front of you is wrong; refusing then meant the only way
-            // back to a declared default was to remember it and retype it.
+            // Hidden when nothing in the document declares a default (a per-document
+            // fact); disabled per row, never hidden per row, so buttons beside it do
+            // not shift under the pointer as the selection changes. Offered on any
+            // row with a default it is not already at -- not just unset ones, since
+            // the value most worth resetting is the one already there and wrong.
             let offers =
                 !!row &&
                 row.defaultValue !== undefined &&
@@ -563,9 +518,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.syncAccessLabel();
         let declare = me.down('#declareBtn');
         if (declare) {
-            // Hidden by the *document*, disabled by the *row* -- the rule above. Hidden
-            // reads `me.docId`, not the selected row, because the document kind cannot
-            // change while you are in the tree, but the selected row does on every click.
+            // Hidden by the document (its kind cannot change mid-tree), disabled by the row.
             declare.setHidden(me.docKind(me.docId) !== 'prefix');
             declare.setDisabled(text || !row || !row.editable);
         }
@@ -649,10 +602,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         parent.children[key] = parent.children[key] || {
             key: key,
             path: path,
-            // Object.create(null): `key` is a document key (attacker-chosen, and
-            // no key is reserved - DESIGN §2), so a plain `{}` here lets a key
-            // like `constructor` or `hasOwnProperty` resolve through the
-            // prototype chain instead of being treated as absent.
+            // Object.create(null): a document key is unrestricted (DESIGN §2), so a
+            // plain `{}` would let `constructor` or `hasOwnProperty` resolve through
+            // the prototype chain instead of being treated as absent.
             children: Object.create(null),
             present: false,
         };
@@ -683,16 +635,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             child.present = true;
             child.kind = U.kindOf(v);
             child.value = v;
-            // **A list is a container, like a map.** Its members are rows, so you can
-            // see them, select one and act on it -- which is the whole reason a map
-            // is a tree and not a blob of JSON in a cell. A list was the one shape
-            // that stayed a blob, for no reason other than that it came second.
-            //
-            // The member rows are **not addressable**: a view addresses through maps
-            // only, so there is no path to `groups[1]` (DESIGN §2) and nothing may try
-            // to write one. They carry their index instead, and everything that acts
-            // on one rewrites the list it is in -- which is exactly what staging is
-            // for (§12), so this needs no new write path.
+            // A list is a container, like a map: its members are rows you can select
+            // and act on. They are **not addressable** (a view addresses through maps
+            // only, DESIGN §2) so they carry their index instead, and everything that
+            // acts on one rewrites the list it is in.
             if (child.kind === 'array') {
                 v.forEach(function (item, i) {
                     let row = me.entry(child, String(i), child.path);
@@ -714,22 +660,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // The rows a document's shape declares, on top of what `addData` found in it.
-    //
-    // Two things, from the one Shape. Every prefix that reaches the document gets a
-    // row: declaring a prefix *is* a statement about the document -- "something of
-    // mine lives at this key". Hiding the row until someone had already put content
-    // there meant a prefix that applied to every guest was invisible on every guest
-    // that had not used it yet, which reads as "netbird is missing" rather than
-    // "netbird is empty". Then every path a schema declares gets its declared type,
-    // default, enum, range, format and description -- from the core's schema index,
-    // which is already pruned where a more specific prefix governs, so a parent's
-    // `properties` never reach into a child prefix's subtree and rewrite its row
-    // kind. Schemas shadow, they never merge (DESIGN section 3); the same rule
-    // the findings and the hovers come through, from the same Shape.
-    //
-    // A registry document's meta-schema is rooted at the document (DESIGN §6):
-    // its "prefix" is the empty path, which is the root row itself and gets nothing.
+    // The rows a document's shape declares, on top of what `addData` found: every
+    // reaching prefix gets a row, and every schema-declared path gets its type,
+    // default, enum, range, format and description from the core's already-pruned
+    // schema index (schemas shadow, never merge, DESIGN §3).
     addShape: function (root, shape) {
         let me = this;
         let U = PVE.meta.Utils;
@@ -762,29 +696,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 return;
             }
             let entry = ensure(d.prefix);
-            // `||`, not `=`: `addData` ran first, so a value already stored here
-            // keeps the kind it actually has. That is what lets a prefix hold a
-            // single scalar -- a prefix is a key like any other, and one that needs
-            // to say nothing but `true` should not have to grow a subkey to say it.
-            // Only an *absent* prefix falls back to a map, which is the shape
-            // almost every one of them turns out to have.
+            // `||`, not `=`: `addData` ran first, so a value already stored here keeps
+            // its actual kind; only an absent prefix falls back to a map.
             entry.kind = entry.kind || 'map';
-            // The prefix's own description, which for a prefix with no schema is
-            // the only thing its row can say about itself.
             entry.grammarDescription = entry.grammarDescription || d.description;
         });
-        // Two passes over the index. A hidden declaration decorates a row that
-        // exists; it never creates one. That is the whole difference: a schema the
-        // size of Traefik's is mostly keys nobody sets on a given guest, and every
-        // one of them as a greyed row buries what the guest actually says. `addData`
-        // ran first, so a hidden key that *is* set already has its row and still
-        // gets its type, enum, range and default -- hiding a declaration must never
-        // hide data, nor excuse it from its own schema.
-        //
-        // Rows first, then decoration, because a shown key inside a hidden subtree
-        // creates the rows above it on its way in, and the subtree's own node --
-        // visited earlier, hidden, with nothing stored there -- would have found no
-        // row to decorate and left a bare shell where a typed map should be.
+        // Two passes: a hidden declaration decorates a row that exists, never
+        // creates one, so a schema nobody has set does not bury real data under
+        // greyed rows. Rows first, then decoration, so a shown key inside a hidden
+        // subtree still creates the rows above it.
         let index = shape.schemaIndex().filter((ix) => ix.path !== ix.prefix);
         index.forEach(function (ix) {
             if (!ix.hidden) {
@@ -798,20 +718,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 return;
             }
             // The comment key stays the Description column; the grammar's own
-            // description is the tooltip (DESIGN §12), so they are two fields.
+            // description is the tooltip (DESIGN §8), so they are two fields.
             child.grammarDescription = child.grammarDescription || ps.description;
             if (ps.type === 'object') {
                 child.kind = 'map';
                 return;
             }
-            // A declared type wins over the type inferred from the stored value:
-            // it is the operator's statement of what the key means, and the API's
-            // JSON view cannot tell a boolean from the integer 1 anyway.
+            // A declared type wins over the type inferred from the stored value.
             child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
-            // First writer wins, like `grammarDescription` above: the index lists
-            // each path once, under the prefix that governs it, so this is only
-            // ever the same declaration twice -- it is here so the six fields
-            // cannot disagree if that ever changes.
+            // First writer wins: the index lists each path once, under the prefix
+            // that governs it, so these six fields cannot disagree.
             if (ps.default !== undefined && child.defaultValue === undefined) {
                 child.defaultValue = ps.default;
             }
@@ -827,11 +743,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (ps.format !== undefined && child.format === undefined) {
                 child.format = ps.format;
             }
-            // One of two extensions to the PVE::JSONSchema dialect (`hidden` is the
-            // other): "this string is a block of text". Only a declaration can say so before the key has
-            // a value, which is exactly what `Utils.editorKind` cannot see for
-            // itself. It is an editor hint and nothing else -- the server neither
-            // reads it nor validates against it, like `format` (DESIGN §7).
+            // One of two dialect extensions (`hidden` the other): an editor hint the
+            // server neither reads nor validates, like `format` (DESIGN §5).
             if (ps.multiline !== undefined && child.multiline === undefined) {
                 child.multiline = !!ps.multiline;
             }
@@ -846,7 +759,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // The merged rows of ONE document: what is present in it, plus what its grammar
-    // declares (DESIGN §12). Two sources, one set of entries.
+    // declares (DESIGN §8). Two sources, one set of entries.
     documentEntries: function () {
         let me = this;
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
@@ -915,10 +828,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
-        // Reloading must not fold the tree up. Keyed by document *and* path, even
-        // though one panel shows one document: a window opened on a prefix file and
-        // the tab behind it are two panels with their own stores, and a key that
-        // named only the path would be the same string in both.
+        // Reloading must not fold the tree up. Keyed by document and path, since two
+        // panels (a window and the tab behind it) can each hold a different document.
         let key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
         let expanded = Object.create(null);
         let seen = false;
@@ -943,13 +854,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // --- editing ------------------------------------------------------------
 
-    // Opens one of this panel's modal editor windows (Edit Value, Add Key) and wires
-    // the one thing every call site did by hand: `editing` goes true so a reload
-    // cannot pull the document out from under an open window, `on`/`handler` is the
-    // window's one result event, and `editing` goes false again on `destroy` --
-    // whether the window committed or was cancelled. A copy of this that forgot the
-    // `destroy` listener would leave `editing` stuck true and quietly stop this
-    // panel from ever reloading again.
+    // Opens one of this panel's modal editor windows. `editing` goes true so a
+    // reload cannot pull the document out from under it, and false again on
+    // `destroy`, committed or cancelled.
     openEditor: function (xtype, cfg, on, handler) {
         let me = this;
         me.editing = true;
@@ -971,10 +878,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.editListMember(rec);
             return;
         }
-        // A value with structure inside it is edited as text, wherever the request came
-        // from (button, double-click, Enter). Before this, all three simply did nothing
-        // on a map row. A declaration is a map like any other, so this is also how one
-        // is edited: as YAML, on `schema.properties.<key>` (DESIGN §3).
+        // A value with structure inside it is edited as text (button, double-click or
+        // Enter alike). A declaration is a map like any other, edited as YAML on
+        // `schema.properties.<key>` (DESIGN §3).
         if (PVE.meta.Utils.editorKind(rec.data) === 'text') {
             me.editAsText(rec);
             return;
@@ -997,13 +903,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         );
     },
 
-    // Write a declared default, because someone asked for it. Never on its own: an
-    // unset key stays unset, and a set one keeps whatever it was set to, until this
-    // click.
-    //
-    // A row already at its default is refused here as well as disabled in the
-    // toolbar, so the two cannot drift apart -- the button's state is a hint, this is
-    // the rule.
+    // Write a declared default, only on this click: an unset key stays unset
+    // otherwise. Refused here, as well as disabled in the toolbar, if already at it.
     setToDefault: function (rec) {
         let me = this;
         let U = PVE.meta.Utils;

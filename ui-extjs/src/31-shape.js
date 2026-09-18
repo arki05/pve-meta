@@ -1,19 +1,7 @@
 // ---------------------------------------------------------------------------
-// Shape: what describes one document (`shape::Shape`).
-//
-// Which of the prefixes that reach a guest governs a path; what its schema says
-// about the value there. Schemas shadow, they never merge (DESIGN §3). A registry
-// document is shaped by its meta-schema rooted at the document itself.
-//
-// A Shape owns its one input -- the `GET /meta/prefixes` listing, already resolved
-// for this guest by the server (selector and node override applied, most-specific
-// first) -- and caches what the core derives from it alone (the schema index, each
-// `governing` answer). Only `findings` takes a document, so only `findings` goes to
-// the core every time. The panel keeps one Shape per document and drops it when the
-// listing or the meta-schema changes (`shapeFor`), which is what makes a render two
-// core calls rather than a dozen. Nothing is held inside the wasm between calls: the
-// core rebuilds its own Shape from the listing on each question, which costs
-// microseconds and no lifetime for this side to manage.
+// Shape: what describes one document (`shape::Shape`) -- which prefix governs a path
+// and what its schema says there (schemas shadow, never merge, DESIGN §3). Owns the
+// `GET /meta/prefixes` listing and caches what the core derives from it alone.
 // ---------------------------------------------------------------------------
 
 PVE.meta.Shape = function (prefixes) {
@@ -62,13 +50,9 @@ Object.assign(PVE.meta.Shape.prototype, {
         return this.declared().some((d) => d.schema);
     },
 
-    // The prefix governing `path`, as its listing entry, or `null`.
-    //
-    // No production caller: the row builder asks `schemaIndex`, which the core has
-    // already pruned by governance. It stays because its tests are what drive
-    // `shape_governing` across the boundary, and most-specific-wins is a rule this
-    // project has got wrong before -- a wrapper nobody calls is cheap, and losing
-    // the only cross-boundary check of that rule is not.
+    // The prefix governing `path`, as its listing entry, or `null`. No production
+    // caller (the row builder uses `schemaIndex`); kept as the cross-boundary test
+    // of `shape_governing`'s most-specific-wins rule.
     governing: function (path) {
         let me = this;
         let hit = me.cache.governing;
@@ -88,12 +72,9 @@ Object.assign(PVE.meta.Shape.prototype, {
         return me.cache.index;
     },
 
-    // Everything in `doc` that does not match what its governing schema says:
-    // `[{ path, msg }]`, in the core's one order (by path). Type, enum and range
-    // are decided by the core; a `format` comes back undecided, at its place in
-    // that order, and is checked here with proxmoxlib's own validator for that
-    // name -- the one thing the core leaves to whoever holds one. Resolved in
-    // place, so the order is never sorted twice by two rules.
+    // Everything in `doc` that does not match its governing schema: `[{ path, msg }]`,
+    // in the core's order. A `format` comes back undecided and is checked here with
+    // proxmoxlib's own validator, resolved in place so nothing is sorted twice.
     findings: function (doc) {
         let out = [];
         this.ask('shape_findings', doc).forEach(function (r) {
