@@ -82,36 +82,46 @@ fn get(
     get_document(store, id, view, fmt, true, acl)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn put(
-    store: &MetaStore,
-    id: &str,
-    view: Option<&str>,
-    fmt: &str,
-    payload: &str,
-    mode: &str,
-    digest: Option<&str>,
-    dry_run: bool,
-    acl: &CallerAcl,
-) -> Result<ApiPutResult, ApiError> {
-    put_with(store, &[], id, view, fmt, payload, mode, digest, dry_run, false, acl)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn put_with(
-    store: &MetaStore,
-    prefixes: &[PrefixDef],
-    id: &str,
-    view: Option<&str>,
-    fmt: &str,
-    payload: &str,
-    mode: &str,
-    digest: Option<&str>,
+/// A `put_document`/`delete_document` call, defaultable like the API's own
+/// optional parameters: `PutReq { view: Some("x"), data: "1", ..Default::default() }`.
+struct PutReq<'a> {
+    prefixes: &'a [PrefixDef],
+    id: &'a str,
+    view: Option<&'a str>,
+    fmt: &'a str,
+    data: &'a str,
+    mode: &'a str,
+    digest: Option<&'a str>,
     dry_run: bool,
     force: bool,
-    acl: &CallerAcl,
-) -> Result<ApiPutResult, ApiError> {
-    put_document(store, prefixes, id, view, fmt, payload, mode, digest, dry_run, force, true, acl)
+    comments: bool,
+    acl: CallerAcl,
+}
+
+impl Default for PutReq<'_> {
+    fn default() -> Self {
+        PutReq {
+            prefixes: &[],
+            id: "100",
+            view: None,
+            fmt: "json",
+            data: "{}",
+            mode: "replace",
+            digest: None,
+            dry_run: false,
+            force: false,
+            comments: true,
+            acl: full(),
+        }
+    }
+}
+
+fn put(store: &MetaStore, req: PutReq) -> Result<ApiPutResult, ApiError> {
+    put_document(store, req.prefixes, req.id, req.view, req.fmt, req.data, req.mode, req.digest, req.dry_run, req.force, req.comments, &req.acl)
+}
+
+fn del(store: &MetaStore, req: PutReq) -> Result<ApiPutResult, ApiError> {
+    delete_document(store, req.id, req.view, req.digest, &req.acl)
 }
 
 /// The enforcing prefix the schema-gate tests use: `traefik`, reaching every
@@ -128,54 +138,43 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
     let (_dir, store) = store();
     let strict = enforcing(true);
     let wrong = r#"{"port": "eighty"}"#;
+    let req = |view, data, force| PutReq { prefixes: &strict, view: Some(view), data, force, ..Default::default() };
 
     // Refused, naming the path.
-    let err = put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, false, &full())
-        .unwrap_err();
+    let err = put(&store, req("traefik", wrong, false)).unwrap_err();
     assert_eq!(status(&err), 422, "{err}");
     assert!(err.msg.contains("traefik.port") && err.msg.contains("force=1"), "{err}");
     assert!(read_raw(&store, "100").is_none(), "nothing was written");
     // A dry run answers the same.
-    let err = put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, true, false, &full())
-        .unwrap_err();
+    let err = put(&store, PutReq { dry_run: true, ..req("traefik", wrong, false) }).unwrap_err();
     assert_eq!(status(&err), 422);
 
     // `force` stores it anyway -- the deliberate act.
-    put_with(&store, &strict, "100", Some("traefik"), "json", wrong, "replace", None, false, true, &full()).unwrap();
+    put(&store, req("traefik", wrong, true)).unwrap();
     assert_eq!(read_raw(&store, "100").as_deref(), Some("traefik:\n  port: eighty\n"));
 
     // The document is now wrong under `traefik`; a write elsewhere is not
     // answerable for that and goes through.
-    put_with(&store, &strict, "100", Some("other"), "json", r#"{"k": 1}"#, "replace", None, false, false, &full()).unwrap();
+    put(&store, req("other", r#"{"k": 1}"#, false)).unwrap();
     // ... but writing a differently-wrong value onto the wrong key still is.
-    let err = put_with(&store, &strict, "100", Some("traefik.port"), "json", r#""ninety""#, "replace", None, false, false, &full())
-        .unwrap_err();
+    let err = put(&store, req("traefik.port", r#""ninety""#, false)).unwrap_err();
     assert_eq!(status(&err), 422);
     // Fixing it is fine, of course.
-    put_with(&store, &strict, "100", Some("traefik.port"), "json", "80", "replace", None, false, false, &full()).unwrap();
+    put(&store, req("traefik.port", "80", false)).unwrap();
 
     // A format check is never enforced: the server cannot judge a dns-name.
-    put_with(&store, &strict, "100", Some("traefik.host"), "json", r#""not a host!!""#, "replace", None, false, false, &full()).unwrap();
+    put(&store, req("traefik.host", r#""not a host!!""#, false)).unwrap();
 
     // Without `enforce`, the same schema is advisory and the same write goes through.
-    put_with(&store, &enforcing(false), "100", Some("traefik.port"), "json", r#""eighty""#, "replace", None, false, false, &full()).unwrap();
+    let advisory = enforcing(false);
+    put(&store, PutReq { prefixes: &advisory, ..req("traefik.port", r#""eighty""#, false) }).unwrap();
 
     // `put_document` trusts its `prefixes` argument as already resolved for
     // this guest (`api::effective_prefixes`/`Registry::prefixes_for_guest`,
     // which selector-matching now lives behind): an empty set -- what a guest
     // outside every selector resolves to -- enforces nothing, whatever the
     // prefix directory declares elsewhere.
-    put_with(&store, &[], "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
-}
-
-fn del(
-    store: &MetaStore,
-    id: &str,
-    view: Option<&str>,
-    digest: Option<&str>,
-    acl: &CallerAcl,
-) -> Result<ApiPutResult, ApiError> {
-    delete_document(store, id, view, digest, acl)
+    put(&store, PutReq { prefixes: &[], ..req("traefik.port", r#""x""#, false) }).unwrap();
 }
 
 // -- version polling ----------------------------------------------------
@@ -204,12 +203,12 @@ fn a_caller_without_write_access_cannot_create_structure_through_a_write() {
         (Some("zzz_hacked.deep"), "replace", "{}"),
         (None, "merge", "{}"),
     ] {
-        let err = put(&store, "100", view, "json", payload, mode, None, false, &none())
+        let err = put(&store, PutReq { view, data: payload, mode, acl: none().clone(), ..Default::default() })
             .expect_err("must be refused");
         assert_eq!(status(&err), 403, "{view:?}/{mode}: {err}");
         assert_eq!(read_raw(&store, "100").unwrap(), before, "{view:?}/{mode} mutated");
     }
-    let err = del(&store, "100", None, None, &none()).expect_err("root delete");
+    let err = del(&store, PutReq { acl: none().clone(), ..Default::default() }).expect_err("root delete");
     assert_eq!(status(&err), 403, "{err}");
 }
 
@@ -220,11 +219,11 @@ fn write_access_does_not_require_read_access() {
     // the one place that survives all the way to the root view.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
-    put(&store, "100", None, "json", r#"{"a": 1}"#, "replace", None, false, &write_only())
+    put(&store, PutReq { data: r#"{"a": 1}"#, acl: write_only().clone(), ..Default::default() })
         .expect("write access alone is enough to replace the whole document");
     assert_eq!(read_raw(&store, "100").as_deref(), Some("a: 1\n"));
 
-    del(&store, "101", None, None, &write_only()).expect("write access alone is enough to delete");
+    del(&store, PutReq { id: "101", acl: write_only().clone(), ..Default::default() }).expect("write access alone is enough to delete");
 }
 
 #[test]
@@ -234,7 +233,7 @@ fn a_reordering_write_touches_nothing_but_is_still_a_write() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n");
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
-    let res = put(&store, "100", None, "json", reordered, "replace", None, false, &full())
+    let res = put(&store, PutReq { data: reordered, ..Default::default() })
         .expect("a reordering changes no path");
     assert!(res.touched.is_empty(), "{:?}", res.touched);
     assert_eq!(
@@ -254,7 +253,7 @@ fn a_reader_with_no_write_access_cannot_cause_a_write() {
     let stored = "traefik:\n  host: a\nnetbird:\n  groups:\n  - lan\n";
     seed(&store, "100", stored);
     let reordered = r#"{"netbird":{"groups":["lan"]},"traefik":{"host":"a"}}"#;
-    let err = put(&store, "100", None, "json", reordered, "replace", None, false, &read_only())
+    let err = put(&store, PutReq { data: reordered, acl: read_only().clone(), ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
     assert_eq!(read_raw(&store, "100").as_deref(), Some(stored));
@@ -274,7 +273,7 @@ fn a_read_403_names_the_view_it_refused() {
 
 #[test]
 fn one_lint_runs_on_the_planned_document_for_every_caller() {
-    // `docs/DESIGN.md` §7: there is one lint, and it names the offending
+    // `docs/DESIGN.md` §5: there is one lint, and it names the offending
     // path.
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
@@ -294,7 +293,7 @@ fn one_lint_runs_on_the_planned_document_for_every_caller() {
             // materialising `q__` as a map is what the lint refuses.
             (Some("traefik.q__.r"), "replace", "1", "comment key value must be a string"),
         ] {
-            let err = put(&store, "100", view, "json", payload, mode, None, false, &acl)
+            let err = put(&store, PutReq { view, data: payload, mode, acl: acl.clone(), ..Default::default() })
                 .map(|ok| panic!("{view:?}/{payload} was accepted: {ok:?}"))
                 .unwrap_err()
                 .to_string();
@@ -305,7 +304,7 @@ fn one_lint_runs_on_the_planned_document_for_every_caller() {
     }
 
     // ... and a legitimate comment-key write still goes through.
-    put(&store, "100", Some("traefik__"), "json", "\"the ingress config\"", "replace", None, false, &full())
+    put(&store, PutReq { view: Some("traefik__"), data: "\"the ingress config\"", ..Default::default() })
         .expect("a string comment value is fine");
 }
 
@@ -321,7 +320,7 @@ fn the_lint_names_the_offending_path_whoever_asks() {
     .unwrap();
 
     for acl in [full(), write_only()] {
-        let err = put(&store, "100", Some("traefik"), "json", "{\"host\":\"y\"}", "replace", None, false, &acl)
+        let err = put(&store, PutReq { view: Some("traefik"), data: "{\"host\":\"y\"}", acl: acl.clone(), ..Default::default() })
             .unwrap_err();
         assert_eq!(status(&err), 400, "{err}");
         assert!(err.to_string().contains("customer name"), "{err}");
@@ -333,8 +332,8 @@ fn dry_run_validates_exactly_what_the_write_validates() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
 
-    let dry = put(&store, "100", Some("foo__"), "json", "{\"a\": 1}", "replace", None, true, &full());
-    let wet = put(&store, "100", Some("foo__"), "json", "{\"a\": 1}", "replace", None, false, &full());
+    let dry = put(&store, PutReq { view: Some("foo__"), data: "{\"a\": 1}", dry_run: true, ..Default::default() });
+    let wet = put(&store, PutReq { view: Some("foo__"), data: "{\"a\": 1}", ..Default::default() });
     assert_eq!(status(&dry.unwrap_err()), 400);
     assert_eq!(status(&wet.unwrap_err()), 400);
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: x\n");
@@ -344,11 +343,11 @@ fn dry_run_validates_exactly_what_the_write_validates() {
 fn dry_run_checks_the_digest_and_never_writes() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
-    let err = put(&store, "100", Some("traefik"), "json", "{\"host\": \"y\"}", "replace", Some("deadbeef"), true, &full())
+    let err = put(&store, PutReq { view: Some("traefik"), data: "{\"host\": \"y\"}", digest: Some("deadbeef"), dry_run: true, ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 409);
 
-    let ok = put(&store, "100", Some("traefik"), "json", "{\"host\": \"y\"}", "replace", None, true, &full())
+    let ok = put(&store, PutReq { view: Some("traefik"), data: "{\"host\": \"y\"}", dry_run: true, ..Default::default() })
         .unwrap();
     assert_eq!(ok.touched.len(), 1);
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: x\n");
@@ -385,27 +384,11 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
     );
 }
 
-// -- comment keys are notes (docs/DESIGN.md §2, §7) ---------------------
+// -- comment keys are notes (docs/DESIGN.md §2, §5) ---------------------
 
 /// A read that did not ask for the notes.
 fn get_bare(store: &MetaStore, id: &str, view: Option<&str>, fmt: &str, acl: &CallerAcl) -> Result<ApiViewDocument, ApiError> {
     get_document(store, id, view, fmt, false, acl)
-}
-
-/// A JSON write with `comments` as given, against `prefixes`.
-#[allow(clippy::too_many_arguments)]
-fn put_notes(
-    store: &MetaStore,
-    prefixes: &[PrefixDef],
-    id: &str,
-    view: Option<&str>,
-    payload: &str,
-    mode: &str,
-    dry_run: bool,
-    comments: bool,
-    acl: &CallerAcl,
-) -> Result<ApiPutResult, ApiError> {
-    put_document(store, prefixes, id, view, "json", payload, mode, None, dry_run, false, comments, acl)
 }
 
 fn touched_paths(r: &ApiPutResult) -> Vec<String> {
@@ -502,20 +485,20 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
     // A stripped read written straight back changes nothing, touches nothing and
     // rewrites nothing.
     let bare = get_bare(&store, "100", None, "json", &full()).unwrap().data.unwrap().to_string();
-    let r = put_notes(&store, &[], "100", None, &bare, "replace", false, false, &full()).unwrap();
+    let r = put(&store, PutReq { data: &bare, comments: false, ..Default::default() }).unwrap();
     assert!(r.touched.is_empty(), "{:?}", r.touched);
     assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
 
     // An edit keeps every note whose subject it keeps, where it was.
     let edited = bare.replace("\"retention\":7", "\"retention\":14");
-    let r = put_notes(&store, &[], "100", None, &edited, "replace", false, false, &full()).unwrap();
+    let r = put(&store, PutReq { data: &edited, comments: false, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["set backup.retention"]);
     assert_eq!(read_raw(&store, "100").unwrap(), NOTED.replace("retention: 7", "retention: 14"));
 
     // A note whose subject the write drops goes with it -- and says so; a map's
     // own `__` stays while the map does. Inside the list nothing is kept.
-    let dry = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
-    let r = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
+    let dry = put(&store, PutReq { view: Some("backup"), data: r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, dry_run: true, comments: false, ..Default::default() }).unwrap();
+    let r = put(&store, PutReq { view: Some("backup"), data: r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, comments: false, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__", "set backup.targets"]);
     assert_eq!(touched_paths(&dry), touched_paths(&r), "a dry run plans the same write");
     assert_eq!(
@@ -523,7 +506,7 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
         json!({"__": "the backup job's settings", "targets": [{"host": "nas"}, {"host": "tape"}]})
     );
     // Replacing a scalar keeps the note beside it, which is outside the view anyway.
-    put_notes(&store, &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
+    put(&store, PutReq { view: Some("traefik.host"), data: r#""www""#, comments: false, ..Default::default() }).unwrap();
     assert_eq!(
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
         json!({"host__": "public name", "host": "www"})
@@ -534,7 +517,7 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
 fn a_replace_with_comments_is_the_whole_subtree_notes_included() {
     let (_dir, store) = store();
     seed(&store, "100", NOTED);
-    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"host": "web", "port__": "later"}"#, "replace", false, true, &full()).unwrap();
+    let r = put(&store, PutReq { view: Some("traefik"), data: r#"{"host": "web", "port__": "later"}"#, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.host__", "set traefik.port__"]);
     assert_eq!(
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
@@ -548,12 +531,12 @@ fn a_merge_is_the_same_with_or_without_comments() {
     seed(&store, "100", NOTED);
     // It names what it changes: a note it writes is written, a note it does not
     // name is left, and a key it deletes takes its note along.
-    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"host__": "renamed", "port": 80}"#, "merge", false, false, &full()).unwrap();
+    let r = put(&store, PutReq { view: Some("traefik"), data: r#"{"host__": "renamed", "port": 80}"#, mode: "merge", comments: false, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["set traefik.host__", "set traefik.port"]);
-    let r = put_notes(&store, &[], "100", Some("backup"), r#"{"retention": null}"#, "merge", false, false, &full()).unwrap();
+    let r = put(&store, PutReq { view: Some("backup"), data: r#"{"retention": null}"#, mode: "merge", comments: false, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__"]);
     // ... unless the same patch says what becomes of the note.
-    let r = put_notes(&store, &[], "100", Some("traefik"), r#"{"port": null, "port__": "was 80"}"#, "merge", false, true, &full()).unwrap();
+    let r = put(&store, PutReq { view: Some("traefik"), data: r#"{"port": null, "port__": "was 80"}"#, mode: "merge", ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.port", "set traefik.port__"]);
 }
 
@@ -569,7 +552,7 @@ fn a_broken_note_says_so() {
     // A stored note that is not a string, from out of band: a replace that did
     // not ask for notes kept it, and the lint says what it is.
     std::fs::write(dir.path().join("100.yaml"), "a__: 5\na: 1\n").unwrap();
-    let err = put_notes(&store, &[], "100", None, r#"{"a": 2}"#, "replace", false, false, &full()).unwrap_err();
+    let err = put(&store, PutReq { data: r#"{"a": 2}"#, comments: false, ..Default::default() }).unwrap_err();
     assert_eq!(status(&err), 400);
     assert!(err.msg.contains("a stored note; fix it with comments=1"), "{err}");
 
@@ -583,7 +566,7 @@ fn a_broken_note_says_so() {
 fn a_delete_takes_the_note_about_what_it_removes() {
     let (_dir, store) = store();
     seed(&store, "100", NOTED);
-    let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
+    let r = del(&store, PutReq { view: Some("traefik"), ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete traefik.host", "delete traefik.host__", "delete traefik__"]);
 }
 
@@ -592,7 +575,7 @@ fn a_kept_note_is_not_a_finding_under_an_enforced_schema() {
     let (_dir, store) = store();
     seed(&store, "100", NOTED);
     // Move the value away from "web" first, so writing it back is a real change.
-    put_notes(&store, &[], "100", Some("traefik.host"), "\"www\"", "replace", false, false, &full()).unwrap();
+    put(&store, PutReq { view: Some("traefik.host"), data: "\"www\"", comments: false, ..Default::default() }).unwrap();
 
     // An enforcing schema that says nothing about notes finds nothing in one kept.
     let strict = vec![registry::parse_prefix(
@@ -600,7 +583,7 @@ fn a_kept_note_is_not_a_finding_under_an_enforced_schema() {
         "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {host: {type: string}}}\n",
     )
     .unwrap()];
-    let r = put_notes(&store, &strict, "100", Some("traefik"), r#"{"host": "web"}"#, "replace", false, false, &full()).unwrap();
+    let r = put(&store, PutReq { prefixes: &strict, view: Some("traefik"), data: r#"{"host": "web"}"#, comments: false, ..Default::default() }).unwrap();
     assert_eq!(touched_paths(&r), vec!["set traefik.host"]);
     assert!(read_raw(&store, "100").unwrap().contains("host__: public name"));
 }
@@ -610,13 +593,13 @@ fn merge_with_null_deletes_end_to_end() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  spec:\n    host: a\n    port: 1\n");
 
-    let r = put(&store, "100", Some("traefik.spec"), "json", "{\"host\": null}", "merge", None, false, &full())
+    let r = put(&store, PutReq { view: Some("traefik.spec"), data: "{\"host\": null}", mode: "merge", ..Default::default() })
         .unwrap();
     assert_eq!(r.touched.len(), 1);
     assert_eq!(r.touched[0].op, "delete");
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    port: 1\n");
 
-    put(&store, "100", Some("traefik"), "yaml", "spec: null\n", "merge", None, false, &full()).unwrap();
+    put(&store, PutReq { view: Some("traefik"), fmt: "yaml", data: "spec: null\n", mode: "merge", ..Default::default() }).unwrap();
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik: {}\n");
 }
 
@@ -624,7 +607,7 @@ fn merge_with_null_deletes_end_to_end() {
 fn replace_with_an_empty_object_stores_an_empty_map() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik: {}\n");
-    let r = put(&store, "100", Some("traefik"), "json", "{}", "replace", None, false, &full())
+    let r = put(&store, PutReq { view: Some("traefik"), data: "{}", ..Default::default() })
         .unwrap();
     assert!(r.touched.is_empty());
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik: {}\n");
@@ -636,12 +619,12 @@ fn get_then_put_with_the_empty_digest_creates_a_document() {
     let got = get(&store, "999", None, "yaml", &full()).unwrap();
     assert_eq!(got.digest, "");
 
-    let put1 = put(&store, "999", Some("traefik"), "json", "{\"host\": \"new\"}", "replace", Some(""), false, &full())
+    let put1 = put(&store, PutReq { id: "999", view: Some("traefik"), data: "{\"host\": \"new\"}", digest: Some(""), ..Default::default() })
         .unwrap();
     assert!(!put1.digest.is_empty());
     assert_eq!(read_raw(&store, "999").unwrap(), "traefik:\n  host: new\n");
 
-    let err = put(&store, "999", Some("traefik"), "json", "{\"host\": \"o\"}", "replace", Some(""), false, &full())
+    let err = put(&store, PutReq { id: "999", view: Some("traefik"), data: "{\"host\": \"o\"}", digest: Some(""), ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 409);
     assert!(err.to_string().contains("<empty>"), "{err}");
@@ -651,154 +634,129 @@ fn get_then_put_with_the_empty_digest_creates_a_document() {
 fn delete_of_a_view_leaves_the_rest_and_reports_touched() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\nnetbird:\n  groups:\n  - lan\n");
-    let r = del(&store, "100", Some("traefik"), None, &full()).unwrap();
+    let r = del(&store, PutReq { view: Some("traefik"), ..Default::default() }).unwrap();
     assert_eq!(r.touched.len(), 1);
     assert_eq!(r.touched[0].op, "delete");
     assert_eq!(read_raw(&store, "100").unwrap(), "netbird:\n  groups:\n  - lan\n");
 }
 
-// -- unparseable documents ----------------------------------------------
+// -- a document that cannot be read back is repairable only as a whole ---
+
+/// One way `id`'s stored content ends up unrecoverable (`docs/DESIGN.md`
+/// §5): bad YAML, a parse that is not a mapping, a file above the read cap,
+/// or (for a registry document, through the same read/write machinery,
+/// §3) the same. This is a per-document condition: nothing reads
+/// `datacenter.yaml` on a guest request, so it is never cluster-wide.
+struct Unrecoverable<'a> {
+    id: &'a str,
+    rel_path: &'a str,
+    broken: String,
+    /// Whether `format=yaml&comments=1` answers `200` with the raw text
+    /// (`false` only above the read cap, where the bytes are never read).
+    readable: bool,
+    reason: Option<&'a str>,
+    repair: &'a str,
+    check_has_oracle: bool,
+    check_listing_survives: bool,
+}
 
 #[test]
-fn an_unparseable_document_is_yaml_plus_parse_error_json_422_and_root_repairable() {
-    // `docs/DESIGN.md` §7. This is a *per-document* condition: nothing
-    // reads `datacenter.yaml` on a guest request, so it is never
-    // cluster-wide.
-    for broken in ["a: 1\n\tb: 2\n", "a: &x 1\nb: *x\n", "a: 1\n  b: 2\n", "a: [\n"] {
+fn repairable_only_as_a_whole_cases() {
+    let secret = "TOPSECRET";
+    let cases = [
+        Unrecoverable {
+            id: "100", rel_path: "100.yaml", broken: format!("a: [\n# {secret}\n"),
+            readable: true, reason: None, repair: "traefik:\n  host: y\n",
+            check_has_oracle: false, check_listing_survives: false,
+        },
+        Unrecoverable {
+            id: "100", rel_path: "100.yaml", broken: format!("- a\n- {secret}\n"),
+            readable: true, reason: None, repair: "traefik:\n  host: y\n",
+            check_has_oracle: true, check_listing_survives: false,
+        },
+        Unrecoverable {
+            id: "100", rel_path: "100.yaml", broken: format!("a: \"{}{secret}\"\n", "x".repeat(4 * 1024 * 1024)),
+            readable: false, reason: Some("too large"), repair: "a: 1\n",
+            check_has_oracle: false, check_listing_survives: true,
+        },
+        Unrecoverable {
+            id: "prefixes/broken", rel_path: "registry/prefixes/broken.yaml", broken: format!("selector: [\n# {secret}\n"),
+            readable: true, reason: None, repair: "selector:\n  all: true\n",
+            check_has_oracle: false, check_listing_survives: false,
+        },
+    ];
+
+    for c in cases {
         let (dir, store) = store();
-        std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
+        let path = dir.path().join(c.rel_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &c.broken).unwrap();
+        let doc_id = parse_id(c.id).unwrap();
 
-        let got = get(&store, "100", None, "yaml", &full()).unwrap();
-        assert_eq!(got.text.as_deref(), Some(broken), "{broken:?}");
-        assert!(got.parse_error.is_some());
-        assert!(!got.digest.is_empty());
+        // A full reader either sees exactly what is on disk (told why it is
+        // not a document), or -- above the read cap -- gets the same 422 as
+        // everyone else, since the bytes were never pulled in.
+        if c.readable {
+            let got = get(&store, c.id, None, "yaml", &full()).unwrap();
+            assert_eq!(got.text.as_deref(), Some(c.broken.as_str()), "{}", c.id);
+            assert!(got.parse_error.is_some(), "{}", c.id);
+            assert!(!got.digest.is_empty(), "{}", c.id);
+        } else {
+            assert_eq!(status(&get(&store, c.id, None, "yaml", &full()).unwrap_err()), 422, "{}", c.id);
+        }
 
-        let err = get(&store, "100", None, "json", &full()).unwrap_err();
-        assert_eq!(status(&err), 422, "{broken:?}: {err}");
-        // Any reader gets the same 422 for `format=json`: read access is a
-        // boolean, so there is no narrower structure to filter to.
-        let err = get(&store, "100", None, "json", &read_only()).unwrap_err();
-        assert_eq!(status(&err), 422, "{broken:?}: {err}");
+        // Nobody else gets it rendered as an empty document, whether or not
+        // they may write it -- and no content of it leaks in the message.
+        for acl in [full(), read_only()] {
+            let err = get(&store, c.id, None, "json", &acl).unwrap_err();
+            assert_eq!(status(&err), 422, "{}: {err}", c.id);
+            if let Some(reason) = c.reason {
+                assert!(err.to_string().contains(reason), "{}: {err}", c.id);
+            }
+            assert!(!err.to_string().contains(secret), "{err}");
+        }
 
-        // A narrower write would plan against the empty document and drop
-        // the file's content: refused.
+        if c.check_has_oracle {
+            // `?has=` cannot be used as an oracle over it either.
+            let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
+            assert!(list_guests(&store, &rows, Some("traefik")).unwrap().is_empty());
+        }
+        if c.check_listing_survives {
+            // One unrecoverable document does not take the listing down.
+            seed(&store, "101", "traefik:\n  host: x\n");
+            let rows = vec![
+                GuestInput { vmid: 100, read: true, ..Default::default() },
+                GuestInput { vmid: 101, read: true, ..Default::default() },
+            ];
+            let listed = list_guests(&store, &rows, None).unwrap();
+            assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
+            assert!(!listed[0].digest.is_empty(), "it still reports its real digest");
+        }
+
+        // Nothing narrower than a whole-document replace, a root merge
+        // included, would plan against anything but the empty document.
         for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
-            let err = put(&store, "100", view, "json", "{\"host\":\"y\"}", mode, None, false, &full())
+            let err = put(&store, PutReq { id: c.id, view, mode, data: "{\"host\":\"y\"}", ..Default::default() })
                 .expect_err("must be refused");
-            assert_eq!(status(&err), 400, "{view:?}/{mode}: {err}");
+            assert_eq!(status(&err), 400, "{}: {view:?}/{mode}: {err}", c.id);
             assert!(err.to_string().contains("repaired as a whole"), "{err}");
         }
-        assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), broken);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), c.broken, "{}", c.id);
 
-        // The documented repair, with the compare-and-swap precondition.
-        let fixed = "traefik:\n  host: y\n";
-        put(&store, "100", None, "yaml", fixed, "replace", Some(&got.digest), false, &full())
-            .unwrap_or_else(|e| panic!("{broken:?}: repair refused: {e}"));
-        assert_eq!(read_raw(&store, "100").unwrap(), fixed);
+        // The compare-and-swap precondition still holds for the repair ...
+        let stale = put(&store, PutReq { id: c.id, fmt: "yaml", data: c.repair, digest: Some("deadbeef"), ..Default::default() })
+            .unwrap_err();
+        assert_eq!(status(&stale), 409, "{}: {stale}", c.id);
+        // ... using the digest reported even though the content was never read.
+        let digest = store.digest_of(&doc_id).unwrap().unwrap();
+        put(&store, PutReq { id: c.id, fmt: "yaml", data: c.repair, digest: Some(&digest), ..Default::default() })
+            .unwrap_or_else(|e| panic!("{}: repair refused: {e}", c.id));
+        assert_eq!(read_raw(&store, c.id).as_deref(), Some(c.repair), "{}", c.id);
 
         // ... and a root DELETE is the other repair shape.
-        std::fs::write(dir.path().join("100.yaml"), broken).unwrap();
-        del(&store, "100", None, None, &full()).unwrap();
-        assert!(read_raw(&store, "100").is_none());
-    }
-}
-
-#[test]
-fn a_document_above_the_read_cap_is_refused_on_read_and_repairable_on_write() {
-    let (dir, store) = store();
-    let big = format!("a: \"{}\"\n", "x".repeat(4 * 1024 * 1024));
-    std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
-
-    // A GET *reports* the condition rather than rendering the document
-    // or 400-ing on the size: the bytes were never read, so there is no
-    // `text` to hand back and every caller gets the same 422 naming the
-    // two repairs.
-    for fmt in ["json", "yaml"] {
-        let err = get(&store, "100", None, fmt, &full()).unwrap_err();
-        assert_eq!(status(&err), 422, "{fmt}: {err}");
-        assert!(err.to_string().contains("too large"), "{err}");
-        assert!(err.to_string().contains("mode=replace"), "{err}");
-    }
-
-    // One oversized document does not take the listing down.
-    seed(&store, "101", "traefik:\n  host: x\n");
-    let rows = vec![
-        GuestInput { vmid: 100, read: true, ..Default::default() },
-        GuestInput { vmid: 101, read: true, ..Default::default() },
-    ];
-    let listed = list_guests(&store, &rows, None).unwrap();
-    assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
-    assert!(!listed[0].digest.is_empty(), "it still reports its real digest");
-
-    // Nothing narrower than a whole-file replace, a root merge included.
-    for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
-        let err = put(&store, "100", view, "json", "{\"a\":1}", mode, None, false, &full())
-            .unwrap_err();
-        assert_eq!(status(&err), 400, "{view:?}/{mode}: {err}");
-        assert!(err.to_string().contains("repaired as a whole"), "{err}");
-    }
-
-    let stale = put(&store, "100", None, "yaml", "a: 1\n", "replace", Some("deadbeef"), false, &full())
-        .unwrap_err();
-    assert_eq!(status(&stale), 409, "{stale}");
-    // The digest the listing reported is the one the repair's
-    // compare-and-swap accepts, even though the file was never read.
-    put(&store, "100", None, "yaml", "a: 1\n", "replace", Some(&listed[0].digest), false, &full())
-        .unwrap();
-    assert_eq!(read_raw(&store, "100").unwrap(), "a: 1\n");
-
-    // ... and a root DELETE is the other repair shape.
-    std::fs::write(dir.path().join("100.yaml"), &big).unwrap();
-    del(&store, "100", None, None, &full()).unwrap();
-    assert!(!dir.path().join("100.yaml").exists());
-}
-
-#[test]
-fn a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole() {
-    // An empty or comment-only file parses *fine* — to `null` — so a
-    // repair path keyed on the parse alone let a narrower write through
-    // against a document with no structure to preserve. A root `merge`
-    // in particular would have replaced the file wholesale while
-    // reporting only the merge's own touched paths.
-    for text in ["", "# just a comment\n", "- a\n- secret\n", "just a scalar\n"] {
-        let (dir, store) = store();
-        std::fs::write(dir.path().join("100.yaml"), text).unwrap();
-
-        // A full reader still sees exactly what is on disk, and is told
-        // why it is not a document.
-        let got = get(&store, "100", None, "yaml", &full()).unwrap();
-        assert_eq!(got.text.as_deref(), Some(text), "{text:?}");
-        assert!(got.parse_error.is_some(), "{text:?}");
-        assert!(!got.digest.is_empty(), "{text:?}");
-
-        // Nobody else gets it rendered as an empty document ...
-        for acl in [full(), read_only()] {
-            let err = get(&store, "100", None, "json", &acl).unwrap_err();
-            assert_eq!(status(&err), 422, "{text:?}: {err}");
-            // ... and no content of it leaks in the message.
-            assert!(!err.to_string().contains("secret"), "{err}");
-        }
-
-        // `?has=` cannot be used as an oracle over it either.
-        let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
-        assert!(list_guests(&store, &rows, Some("traefik")).unwrap().is_empty());
-
-        for (view, mode) in [(Some("traefik"), "replace"), (Some("traefik"), "merge"), (None, "merge")] {
-            let err = put(&store, "100", view, "json", "{\"host\":\"y\"}", mode, None, false, &full())
-                .expect_err("must be refused");
-            assert_eq!(status(&err), 400, "{text:?} {view:?}/{mode}: {err}");
-            assert!(err.to_string().contains("repaired as a whole"), "{err}");
-        }
-        assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
-
-        // The two repairs, with the compare-and-swap precondition.
-        put(&store, "100", None, "yaml", "traefik:\n  host: y\n", "replace", Some(&got.digest), false, &full())
-            .unwrap_or_else(|e| panic!("{text:?}: repair refused: {e}"));
-        assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: y\n");
-
-        std::fs::write(dir.path().join("100.yaml"), text).unwrap();
-        del(&store, "100", None, None, &full()).unwrap();
-        assert!(!dir.path().join("100.yaml").exists(), "{text:?}");
+        std::fs::write(&path, &c.broken).unwrap();
+        del(&store, PutReq { id: c.id, ..Default::default() }).unwrap();
+        assert!(read_raw(&store, c.id).is_none(), "{}", c.id);
     }
 }
 
@@ -813,13 +771,13 @@ fn an_unrecoverable_document_is_repaired_only_by_a_writer() {
     let before = std::fs::read_to_string(dir.path().join("100.yaml")).unwrap();
 
     // No write access at all: refused before the content is even looked at.
-    let err = put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &read_only())
+    let err = put(&store, PutReq { data: r#"{"traefik":{"host":"b"}}"#, acl: read_only().clone(), ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
     assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), before);
 
     // Write access repairs it, exactly as documented.
-    put(&store, "100", None, "json", r#"{"traefik":{"host":"b"}}"#, "replace", None, false, &full())
+    put(&store, PutReq { data: r#"{"traefik":{"host":"b"}}"#, ..Default::default() })
         .expect("the documented repair path");
 }
 
@@ -838,7 +796,7 @@ fn a_write_that_changes_nothing_does_not_rewrite_the_file() {
         (Some("traefik.spec"), "replace", "{\"host\": \"x\"}"),
         (Some("traefik.spec.gone"), "merge", "{\"nope\": null}"),
     ] {
-        let r = put(&store, "100", view, "json", payload, mode, None, false, &full())
+        let r = put(&store, PutReq { view, data: payload, mode, ..Default::default() })
             .unwrap_or_else(|e| panic!("{view:?}/{mode}/{payload}: {e}"));
         assert!(r.touched.is_empty(), "{view:?}/{mode}/{payload}");
         assert_eq!(
@@ -854,19 +812,19 @@ fn a_write_that_changes_nothing_does_not_rewrite_the_file() {
     // write still rewrites it: skipping is only ever a byte-for-byte
     // no-op, never a silently declined canonicalisation.
     std::fs::write(&path, "traefik:\n    spec:\n        host: x\n").unwrap();
-    put(&store, "100", Some("traefik.spec"), "json", "{}", "merge", None, false, &full()).unwrap();
+    put(&store, PutReq { view: Some("traefik.spec"), data: "{}", mode: "merge", ..Default::default() }).unwrap();
     assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  spec:\n    host: x\n");
 }
 
 #[test]
 fn a_document_that_is_not_a_map_can_never_be_written_back() {
     // The read side of the same condition is
-    // `a_document_that_parses_to_a_non_mapping_is_repairable_only_as_a_whole`;
-    // this is the write gate that keeps one from being *stored*.
+    // `repairable_only_as_a_whole_cases`; this is the write gate that keeps
+    // one from being *stored*.
     let (dir, store) = store();
     for text in ["- a\n- secret\n", "just a scalar\n"] {
         std::fs::write(dir.path().join("100.yaml"), text).unwrap();
-        let err = put(&store, "100", None, "yaml", text, "replace", None, false, &full()).unwrap_err();
+        let err = put(&store, PutReq { fmt: "yaml", data: text, ..Default::default() }).unwrap_err();
         assert_eq!(status(&err), 400, "{text:?}: {err}");
         assert!(err.to_string().contains("top level must be an object"), "{err}");
         assert_eq!(std::fs::read_to_string(dir.path().join("100.yaml")).unwrap(), text);
@@ -901,7 +859,7 @@ fn list_guests_uses_the_rows_perl_passes_and_gates_on_read_access() {
     ];
 
     // Only the guests the caller has read access on are listed, with every
-    // field unconditional (`docs/DESIGN.md` §4, §8): no read, no row at all.
+    // field unconditional (`docs/DESIGN.md` §4, §6): no read, no row at all.
     let list = list_guests(&store, &rows, None).unwrap();
     assert_eq!(list.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 300]);
     assert_eq!(list[0].node.as_deref(), Some("node1"));
@@ -977,13 +935,13 @@ fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
 
     // A DELETE of a document another caller already removed is that
     // caller's request satisfied.
-    let r = del(&store, "100", None, None, &full()).unwrap();
+    let r = del(&store, PutReq::default()).unwrap();
     assert_eq!(r.digest, "");
     assert!(r.touched.is_empty());
 
     // ... and the stale digest of the vanished document is still a
     // precondition failure, not a 500.
-    let err = put(&store, "100", None, "yaml", "a: 1\n", "replace", Some(&digest), false, &full())
+    let err = put(&store, PutReq { fmt: "yaml", data: "a: 1\n", digest: Some(&digest), ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 409, "{err}");
 }
@@ -1024,34 +982,14 @@ fn parse_id_reads_a_registry_id_and_refuses_anything_that_could_leave_the_direct
 #[test]
 fn a_prefix_is_read_and_written_like_any_other_document() {
     let (_dir, store) = store();
-    let created = put(
-        &store,
-        "prefixes/homelab",
-        None,
-        "yaml",
-        "selector:\n  all: true\ndescription: Home\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
+    let created = put(&store, PutReq { id: "prefixes/homelab", fmt: "yaml", data: "selector:\n  all: true\ndescription: Home\n", digest: Some(""), ..Default::default() })
     .unwrap();
     assert_eq!(created.id, "prefixes/homelab");
 
     // A view write reaches into it like into any document, with the same
     // digest compare-and-swap.
     let doc = get(&store, "prefixes/homelab", None, "json", &full()).unwrap();
-    put(
-        &store,
-        "prefixes/homelab",
-        Some("schema.type"),
-        "json",
-        "\"object\"",
-        "replace",
-        Some(&doc.digest),
-        false,
-        &full(),
-    )
+    put(&store, PutReq { id: "prefixes/homelab", view: Some("schema.type"), data: "\"object\"", digest: Some(&doc.digest), ..Default::default() })
     .unwrap();
 
     // And what came back out is what the loader parses -- the check that
@@ -1069,7 +1007,7 @@ fn a_registry_document_uses_only_the_acl_it_is_given() {
     seed(&store, "prefixes/traefik", "selector: {all: true}\n");
     let err = get(&store, "prefixes/traefik", None, "yaml", &none()).unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
-    let err = put(&store, "prefixes/traefik", Some("description"), "json", "\"x\"", "replace", None, false, &none())
+    let err = put(&store, PutReq { id: "prefixes/traefik", view: Some("description"), data: "\"x\"", acl: none().clone(), ..Default::default() })
         .unwrap_err();
     assert_eq!(status(&err), 403, "{err}");
 }
@@ -1079,34 +1017,14 @@ fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
     let (_dir, store) = store();
     // No selector: `parse_prefix` refuses it, so the loader would skip
     // the file and the prefix would vanish on a 200.
-    let err = put(
-        &store,
-        "prefixes/homelab",
-        None,
-        "yaml",
-        "description: Home\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
+    let err = put(&store, PutReq { id: "prefixes/homelab", fmt: "yaml", data: "description: Home\n", digest: Some(""), ..Default::default() })
     .unwrap_err();
     assert_eq!(status(&err), 400, "{err}");
     assert!(format!("{err}").contains("not be a valid prefix"), "{err}");
     assert_eq!(read_raw(&store, "prefixes/homelab"), None, "nothing was written");
 
     // A dry run is refused for the same reason, and by the same check.
-    let err = put(
-        &store,
-        "prefixes/homelab",
-        None,
-        "yaml",
-        "description: Home\n",
-        "replace",
-        Some(""),
-        true,
-        &full(),
-    )
+    let err = put(&store, PutReq { id: "prefixes/homelab", fmt: "yaml", data: "description: Home\n", digest: Some(""), dry_run: true, ..Default::default() })
     .unwrap_err();
     assert_eq!(status(&err), 400, "{err}");
 }
@@ -1122,24 +1040,14 @@ fn on_node(node: &str) -> CallerAcl {
 fn put_on(store: &MetaStore, id: &str, view: &str, payload: &str, acl: &CallerAcl) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id).unwrap();
     let prefixes = api::effective_prefixes(store.registry().unwrap(), &doc_id, acl).unwrap();
-    put_with(store, &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
+    put(store, PutReq { prefixes: &prefixes, id, view: Some(view), data: payload, acl: acl.clone(), ..Default::default() })
 }
 
 #[test]
 fn a_nodes_override_applies_only_to_a_guest_on_that_node() {
     let (_dir, store) = store();
-    put(
-        &store,
-        "prefixes/gpu",
-        None,
-        "yaml",
-        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n\
-         nodes:\n  pve1: {enforce: false}\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
+    put(&store, PutReq { id: "prefixes/gpu", fmt: "yaml", data: "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n\
+         nodes:\n  pve1: {enforce: false}\n", digest: Some(""), ..Default::default() })
     .unwrap();
 
     // Enforced on pve2 (the top-level default) ...
@@ -1155,17 +1063,7 @@ fn a_nodes_override_applies_only_to_a_guest_on_that_node() {
 #[test]
 fn the_resolved_prefixes_listing_carries_no_nodes_map_and_the_raw_one_does() {
     let (_dir, store) = store();
-    put(
-        &store,
-        "prefixes/gpu",
-        None,
-        "yaml",
-        "selector: {all: true}\nschema: {type: object}\nnodes:\n  pve1: {enforce: true}\n",
-        "replace",
-        Some(""),
-        false,
-        &full(),
-    )
+    put(&store, PutReq { id: "prefixes/gpu", fmt: "yaml", data: "selector: {all: true}\nschema: {type: object}\nnodes:\n  pve1: {enforce: true}\n", digest: Some(""), ..Default::default() })
     .unwrap();
 
     let raw = api::prefixes(store.registry().unwrap(), None, None).unwrap();
@@ -1183,7 +1081,7 @@ fn the_resolved_prefixes_listing_carries_no_nodes_map_and_the_raw_one_does() {
     }
 }
 
-// -- a store that is not there (docs/DESIGN.md §7) ------------------------------
+// -- a store that is not there (docs/DESIGN.md §1) ------------------------------
 
 #[test]
 fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
@@ -1196,9 +1094,9 @@ fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
 
     unavailable(get(&store, "100", None, "json", &full()).unwrap_err().status, "get");
     unavailable(get(&store, "prefixes/traefik", None, "yaml", &full()).unwrap_err().status, "get of a registry document");
-    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, true, &full()).unwrap_err().status, "dry run");
-    unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, false, &full()).unwrap_err().status, "put");
-    unavailable(del(&store, "100", None, None, &full()).unwrap_err().status, "delete");
+    unavailable(put(&store, PutReq { view: Some("traefik.host"), data: "\"y\"", dry_run: true, ..Default::default() }).unwrap_err().status, "dry run");
+    unavailable(put(&store, PutReq { view: Some("traefik.host"), data: "\"y\"", ..Default::default() }).unwrap_err().status, "put");
+    unavailable(del(&store, PutReq::default()).unwrap_err().status, "delete");
     unavailable(version(&store).unwrap_err().status, "version");
     unavailable(list_guests(&store, &rows, None).unwrap_err().status, "list");
     unavailable(access(&store, &full()).unwrap_err().status, "access");

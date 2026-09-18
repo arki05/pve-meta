@@ -1,39 +1,6 @@
-//! Views: prefix-addressed reads/writes into a document (`docs/DESIGN.md` §2).
-//!
-//! A *view* is a key-path [`Path`] prefix into a document's object tree,
-//! addressing only through maps, never through an array: [`extract`] reads
-//! the subtree at a prefix (with the prefix itself stripped); [`replace`]
-//! and [`merge`] write it back (whole-subtree replace vs. RFC 7386-style
-//! merge-patch, both scoped to the prefix); [`remove`] deletes it.
-//! [`strip_comments`] and [`keep_comments`] are what a read and a `replace`
-//! that did not ask for comment keys do with them (`docs/DESIGN.md` §2).
-//! [`render`]/[`parse`]/[`parse_patch`] convert a view's value to and from
-//! wire text (YAML/JSON), independent of the whole-document
-//! [`crate::format`] contract (a view's value need not itself be an object;
-//! a *merge patch* may additionally contain `null` delete markers).
-//!
-//! Nothing in this module lints. A payload is not a document until it has
-//! been spliced in, so the one lint (`docs/DESIGN.md` §7) runs on the
-//! planned document in [`crate::api`], where its findings name real
-//! document paths.
-//!
-//! The touched paths returned by [`replace`], [`merge`] and [`remove`] are
-//! reported *below* the view prefix rather than at it (see
-//! [`patch::diff`]/[`patch::apply_patch`]): unlike [`patch::apply_patch`]'s
-//! "replacing/deleting a whole subtree yields its root path" convention
-//! (which exists to keep a merge-patch's own change summary concise), this
-//! module's touched list feeds [`crate::api`]'s enforced-schema check and the
-//! API's own `touched` response, both of which want every leaf a replaced or
-//! removed subtree carried, not just the subtree's own path.
-//!
-//! **The touched list is complete**: every
-//! one of these operations reports at least one touched path whenever it
-//! changes the document at all — including the corner cases where the
-//! leaf-granular diff of the *content* is empty because the content is an
-//! empty map (creating `a: {}` where `a` was absent, or removing an existing
-//! `a: {}`). A caller must never be able to create or destroy structure with
-//! a vacuous `touched: []`. Correspondingly, a [`merge`] that touches
-//! nothing does not mutate `doc` at all: it creates no containers.
+//! Views: prefix-addressed reads/writes into a document, through maps only
+//! (`docs/DESIGN.md` §2). [`replace`]/[`merge`]/[`remove`] report touched
+//! paths below the prefix, never vacuously for a write that changes structure.
 
 use serde_json::Map;
 
@@ -108,14 +75,12 @@ pub fn extract(doc: &Value, prefix: &Path) -> Option<Value> {
 
 /// Replaces the subtree at `prefix` with `subtree` wholesale (not a merge),
 /// creating any missing intermediate maps along the way. An empty-object
-/// `subtree` stores an **empty map** — it does not remove the key
-/// (`docs/DESIGN.md` §7; deleting a view is [`remove`], i.e.
-/// `DELETE …?view=`). Replacing at the root replaces the whole document
-/// (`subtree` must then itself satisfy the full document rules: an object,
-/// no nulls, valid keys).
+/// `subtree` stores an **empty map**, not a delete (`docs/DESIGN.md` §5;
+/// deleting a view is [`remove`]). Replacing at the root replaces the whole
+/// document.
 ///
-/// The result is **not** linted here: the one lint runs on the planned
-/// document, in [`crate::api`] (`docs/DESIGN.md` §7).
+/// Not linted here: the one lint runs on the planned document, in
+/// [`crate::api`] (`docs/DESIGN.md` §5).
 ///
 /// # Errors
 /// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar.
@@ -165,7 +130,7 @@ pub fn replace(doc: &mut Value, prefix: &Path, subtree: Value) -> Result<Vec<Tou
 ///
 /// A merge that changes nothing **mutates nothing**: intermediate maps are
 /// only materialised once the patch is known to write something
-/// (`docs/DESIGN.md` §7). A non-object value at `prefix` is
+/// (`docs/DESIGN.md` §5). A non-object value at `prefix` is
 /// merged over as if it were `{}`.
 ///
 /// # Errors
@@ -352,7 +317,7 @@ pub fn render(value: &Value, format: Format) -> String {
 /// The payload is not validated here because it is not yet a document: the
 /// one lint runs on the *planned* document, after the payload has been
 /// spliced in, so its findings name real document paths
-/// (`docs/DESIGN.md` §7).
+/// (`docs/DESIGN.md` §5).
 ///
 /// # Errors
 /// [`Error::Parse`] on a syntax error.
@@ -362,7 +327,7 @@ pub fn parse(text: &str, format: Format) -> Result<Value> {
 
 /// Parses `text` as `format` into a `mode=merge` payload: an RFC 7386 merge
 /// patch, in which `null` is the delete marker *anywhere*
-/// (`docs/DESIGN.md` §7: "`merge` with `null` deletes").
+/// (`docs/DESIGN.md` §5: "`merge` with `null` deletes").
 ///
 /// The only structural rule is that a patch is an object — otherwise
 /// [`patch::apply_patch`] would silently do nothing. Everything else the
@@ -402,108 +367,59 @@ mod tests {
     // -- extract --------------------------------------------------------
 
     #[test]
-    fn extract_root_returns_whole_doc() {
-        let doc = json!({"a": 1, "b": {"c": 2}});
-        assert_eq!(extract(&doc, &Path::root()), Some(doc.clone()));
-    }
-
-    #[test]
-    fn extract_nested_subtree_strips_prefix() {
-        let doc = json!({"traefik": {"spec": {"host": "x"}}});
-        assert_eq!(extract(&doc, &p("traefik.spec")), Some(json!({"host": "x"})));
-    }
-
-    #[test]
-    fn extract_missing_is_none() {
-        let doc = json!({"a": 1});
-        assert_eq!(extract(&doc, &p("missing")), None);
-        assert_eq!(extract(&doc, &p("a.deeper")), None);
-    }
-
-    #[test]
-    fn extract_through_array_is_none() {
-        let doc = json!({"a": [1, 2, 3]});
-        assert_eq!(extract(&doc, &p("a.0")), None);
-    }
-
-    #[test]
-    fn extract_comment_keys_travel_with_subtree() {
-        let doc = json!({"a": {"__": "doc", "x__": "about x", "x": 1}});
-        assert_eq!(extract(&doc, &p("a")), Some(json!({"__": "doc", "x__": "about x", "x": 1})));
+    fn extract_cases() {
+        let notes = json!({"__": "doc", "x__": "about x", "x": 1});
+        for (doc, prefix, expected) in [
+            (json!({"a": 1, "b": {"c": 2}}), "", Some(json!({"a": 1, "b": {"c": 2}}))),
+            (json!({"traefik": {"spec": {"host": "x"}}}), "traefik.spec", Some(json!({"host": "x"}))),
+            (json!({"a": 1}), "missing", None),
+            (json!({"a": 1}), "a.deeper", None),
+            (json!({"a": [1, 2, 3]}), "a.0", None), // a view addresses maps only, never an array
+            (json!({"a": notes}), "a", Some(json!({"__": "doc", "x__": "about x", "x": 1}))), // comment keys travel with the subtree
+        ] {
+            assert_eq!(extract(&doc, &p(prefix)), expected, "{prefix}");
+        }
     }
 
     // -- replace ----------------------------------------------------------
 
     #[test]
-    fn replace_at_root_replaces_whole_document() {
-        let mut doc = json!({"a": 1, "b": 2});
-        let touched = replace(&mut doc, &Path::root(), json!({"b": 2, "c": 3})).unwrap();
-        assert_eq!(doc, json!({"b": 2, "c": 3}));
-        assert_eq!(paths(&touched), vec!["a".to_string(), "c".to_string()]);
+    fn replace_cases() {
+        for (doc, prefix, subtree, expected_doc, expected_touched) in [
+            (json!({"a": 1, "b": 2}), "", json!({"b": 2, "c": 3}), json!({"b": 2, "c": 3}), vec!["a", "c"]),
+            (json!({}), "a.b.c", json!({"x": 1}), json!({"a": {"b": {"c": {"x": 1}}}}), vec!["a.b.c.x"]),
+            (
+                json!({"traefik": {"spec": {"host": "old", "port": 1}}}),
+                "traefik.spec",
+                json!({"host": "new"}),
+                json!({"traefik": {"spec": {"host": "new"}}}),
+                vec!["traefik.spec.host", "traefik.spec.port"],
+            ),
+        ] {
+            let mut doc = doc;
+            let touched = replace(&mut doc, &p(prefix), subtree).unwrap();
+            assert_eq!(doc, expected_doc, "{prefix}");
+            assert_eq!(paths(&touched), expected_touched, "{prefix}");
+        }
     }
 
     #[test]
-    fn replace_creates_intermediate_maps() {
-        let mut doc = json!({});
-        let touched = replace(&mut doc, &p("a.b.c"), json!({"x": 1})).unwrap();
-        assert_eq!(doc, json!({"a": {"b": {"c": {"x": 1}}}}));
-        assert_eq!(paths(&touched), vec!["a.b.c.x".to_string()]);
-    }
-
-    #[test]
-    fn replace_overwrites_existing_subtree_atomically() {
-        let mut doc = json!({"traefik": {"spec": {"host": "old", "port": 1}}});
-        let touched = replace(&mut doc, &p("traefik.spec"), json!({"host": "new"})).unwrap();
-        assert_eq!(doc, json!({"traefik": {"spec": {"host": "new"}}}));
-        let mut ps = paths(&touched);
-        ps.sort();
-        assert_eq!(ps, vec!["traefik.spec.host".to_string(), "traefik.spec.port".to_string()]);
-    }
-
-    #[test]
-    fn replace_with_empty_object_stores_an_empty_map() {
-        // docs/DESIGN.md §7: `replace` with `{}` stores an empty map;
-        // deleting a view is `DELETE ?view=`.
-        let mut doc = json!({"traefik": {"spec": {"host": "x"}}, "other": 1});
-        let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();
-        assert_eq!(doc, json!({"traefik": {}, "other": 1}));
-        assert_eq!(paths(&touched), vec!["traefik.spec".to_string()]);
-    }
-
-    #[test]
-    fn replace_empty_object_round_trips_an_empty_prefix() {
-        // Opening a view whose value is legitimately `{}` and applying it
-        // unchanged must not delete the key.
-        let mut doc = json!({"traefik": {}, "other": 1});
-        let touched = replace(&mut doc, &p("traefik"), json!({})).unwrap();
-        assert_eq!(doc, json!({"traefik": {}, "other": 1}));
-        assert!(touched.is_empty());
-    }
-
-    #[test]
-    fn replace_with_empty_object_on_scalar_sets_an_empty_map() {
-        let mut doc = json!({"tags": "prod"});
-        let touched = replace(&mut doc, &p("tags"), json!({})).unwrap();
-        assert_eq!(doc, json!({"tags": {}}));
-        assert_eq!(touched, vec![Touched { path: p("tags"), op: Op::Set }]);
-    }
-
-    #[test]
-    fn replace_with_empty_object_on_missing_key_creates_it_and_reports_touched() {
-        // Creating structure must never report `touched: []` -- that is the
-        // authorization bypass a vacuous `touched: []` would allow.
-        let mut doc = json!({"a": 1});
-        let touched = replace(&mut doc, &p("missing"), json!({})).unwrap();
-        assert_eq!(doc, json!({"a": 1, "missing": {}}));
-        assert_eq!(touched, vec![Touched { path: p("missing"), op: Op::Set }]);
-    }
-
-    #[test]
-    fn replace_deep_empty_object_reports_touched_for_the_structure_it_creates() {
-        let mut doc = json!({});
-        let touched = replace(&mut doc, &p("zzz.deep"), json!({})).unwrap();
-        assert_eq!(doc, json!({"zzz": {"deep": {}}}));
-        assert_eq!(touched, vec![Touched { path: p("zzz.deep"), op: Op::Set }]);
+    fn replace_with_empty_object_cases() {
+        // `replace` with `{}` stores an empty map, never a delete
+        // (`docs/DESIGN.md` §5); creating structure must never report
+        // `touched: []`, or an authorization check on `touched` misses it.
+        for (doc, prefix, expected_doc, expected_touched) in [
+            (json!({"traefik": {"spec": {"host": "x"}}, "other": 1}), "traefik", json!({"traefik": {}, "other": 1}), vec![Touched { path: p("traefik.spec"), op: Op::Delete }]),
+            (json!({"traefik": {}, "other": 1}), "traefik", json!({"traefik": {}, "other": 1}), vec![]),
+            (json!({"tags": "prod"}), "tags", json!({"tags": {}}), vec![Touched { path: p("tags"), op: Op::Set }]),
+            (json!({"a": 1}), "missing", json!({"a": 1, "missing": {}}), vec![Touched { path: p("missing"), op: Op::Set }]),
+            (json!({}), "zzz.deep", json!({"zzz": {"deep": {}}}), vec![Touched { path: p("zzz.deep"), op: Op::Set }]),
+        ] {
+            let mut doc = doc;
+            let touched = replace(&mut doc, &p(prefix), json!({})).unwrap();
+            assert_eq!(doc, expected_doc, "{prefix}");
+            assert_eq!(touched, expected_touched, "{prefix}");
+        }
     }
 
     #[test]
@@ -552,64 +468,36 @@ mod tests {
     }
 
     #[test]
-    fn merge_creates_intermediate_maps() {
-        let mut doc = json!({});
-        let touched = merge(&mut doc, &p("a.b"), &json!({"x": 1})).unwrap();
-        assert_eq!(doc, json!({"a": {"b": {"x": 1}}}));
-        assert_eq!(paths(&touched), vec!["a.b.x".to_string()]);
-    }
-
-    #[test]
-    fn merge_recurses_into_existing_subtree() {
-        let mut doc = json!({"traefik": {"spec": {"host": "old", "port": 1}}});
-        let touched = merge(&mut doc, &p("traefik.spec"), &json!({"host": "new"})).unwrap();
-        assert_eq!(doc, json!({"traefik": {"spec": {"host": "new", "port": 1}}}));
-        assert_eq!(paths(&touched), vec!["traefik.spec.host".to_string()]);
-    }
-
-    #[test]
-    fn merge_delete_does_not_prune_the_parent_when_it_becomes_empty() {
-        let mut doc = json!({"traefik": {"spec": {"host": "x"}}});
-        let touched = merge(&mut doc, &p("traefik.spec"), &json!({"host": null})).unwrap();
-        // The spec says merge does *not* remove an emptied parent: the map
-        // stays, empty.
-        assert_eq!(doc, json!({"traefik": {"spec": {}}}));
-        assert_eq!(touched, vec![Touched { path: p("traefik.spec.host"), op: Op::Delete }]);
-    }
-
-    #[test]
-    fn merge_delete_against_a_not_yet_existing_prefix_is_a_noop_not_a_literal_null() {
-        let mut doc = json!({});
-        let touched = merge(&mut doc, &p("a.b"), &json!({"gone": null})).unwrap();
-        // "delete a key that never existed" is a no-op, same as apply_patch;
-        // critically this must not splice a literal `null` into the doc --
-        // and it must not create `a.b` either.
-        assert_eq!(doc, json!({}));
-        assert!(touched.is_empty());
-    }
-
-    #[test]
-    fn merge_with_empty_patch_never_mutates_the_document() {
-        // An empty merge at an arbitrary
-        // deep prefix must create nothing and touch nothing: a vacuous
-        // `touched: []` must never be produced by a write that built structure.
-        for prefix in ["zzz_hacked", "zzz_hacked.deep", "traefik.spec.deeper"] {
-            let mut doc = json!({"traefik": {"spec": {"host": "x"}}});
-            let before = doc.clone();
-            let touched = merge(&mut doc, &p(prefix), &json!({})).unwrap();
-            assert!(touched.is_empty(), "{prefix}: expected no touched paths");
-            assert_eq!(doc, before, "{prefix}: merge mutated the document");
+    fn merge_cases() {
+        let traefik_host_x = json!({"traefik": {"spec": {"host": "x"}}});
+        for (doc, prefix, patch, expected_doc, expected_touched) in [
+            (json!({}), "a.b", json!({"x": 1}), json!({"a": {"b": {"x": 1}}}), vec!["a.b.x"]),
+            (
+                json!({"traefik": {"spec": {"host": "old", "port": 1}}}),
+                "traefik.spec",
+                json!({"host": "new"}),
+                json!({"traefik": {"spec": {"host": "new", "port": 1}}}),
+                vec!["traefik.spec.host"],
+            ),
+            // A delete does not prune the parent it empties.
+            (traefik_host_x.clone(), "traefik.spec", json!({"host": null}), json!({"traefik": {"spec": {}}}), vec!["traefik.spec.host"]),
+            // Deleting a key that never existed is a no-op, not a literal `null`, and creates nothing.
+            (json!({}), "a.b", json!({"gone": null}), json!({}), vec![]),
+            // Same value: nothing is spliced.
+            (json!({"a": {"b": 1}}), "a", json!({"b": 1}), json!({"a": {"b": 1}}), vec![]),
+            // A scalar at `prefix` is merged over as if it were `{}` -- even an empty patch still sets it.
+            (json!({"a": "scalar"}), "a", json!({"x": 1}), json!({"a": {"x": 1}}), vec!["a.x"]),
+            (json!({"a": "scalar"}), "a", json!({}), json!({"a": {}}), vec!["a"]),
+            // An empty merge at an arbitrary or not-yet-existing prefix touches and mutates nothing.
+            (traefik_host_x.clone(), "zzz_hacked", json!({}), traefik_host_x.clone(), vec![]),
+            (traefik_host_x.clone(), "zzz_hacked.deep", json!({}), traefik_host_x.clone(), vec![]),
+            (traefik_host_x.clone(), "traefik.spec.deeper", json!({}), traefik_host_x.clone(), vec![]),
+        ] {
+            let mut doc = doc;
+            let touched = merge(&mut doc, &p(prefix), &patch).unwrap();
+            assert_eq!(doc, expected_doc, "{prefix} + {patch}");
+            assert_eq!(paths(&touched), expected_touched, "{prefix} + {patch}");
         }
-    }
-
-    #[test]
-    fn merge_that_writes_nothing_leaves_an_existing_document_byte_identical() {
-        let mut doc = json!({"a": {"b": 1}});
-        let before = doc.clone();
-        // Same value: apply_obj reports nothing, so nothing is spliced.
-        let touched = merge(&mut doc, &p("a"), &json!({"b": 1})).unwrap();
-        assert!(touched.is_empty());
-        assert_eq!(doc, before);
     }
 
     #[test]
@@ -640,20 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_over_a_scalar_replaces_it_with_a_map() {
-        let mut doc = json!({"a": "scalar"});
-        let touched = merge(&mut doc, &p("a"), &json!({"x": 1})).unwrap();
-        assert_eq!(doc, json!({"a": {"x": 1}}));
-        assert_eq!(paths(&touched), vec!["a.x".to_string()]);
-
-        // An *empty* patch over a scalar still empties it -- and says so.
-        let mut doc2 = json!({"a": "scalar"});
-        let touched2 = merge(&mut doc2, &p("a"), &json!({})).unwrap();
-        assert_eq!(doc2, json!({"a": {}}));
-        assert_eq!(touched2, vec![Touched { path: p("a"), op: Op::Set }]);
-    }
-
-    #[test]
     fn merge_through_array_is_invalid_path() {
         let mut doc = json!({"a": [1, 2, 3]});
         assert!(matches!(merge(&mut doc, &p("a.0.b"), &json!({"x": 1})), Err(Error::InvalidPath(_))));
@@ -674,19 +548,17 @@ mod tests {
     }
 
     #[test]
-    fn remove_of_an_existing_empty_map_reports_a_delete() {
-        let mut doc = json!({"a": {}, "b": 1});
-        let touched = remove(&mut doc, &p("a")).unwrap();
-        assert_eq!(doc, json!({"b": 1}));
-        assert_eq!(touched, vec![Touched { path: p("a"), op: Op::Delete }]);
-    }
-
-    #[test]
-    fn remove_of_a_scalar_reports_a_delete() {
-        let mut doc = json!({"tags": "prod"});
-        let touched = remove(&mut doc, &p("tags")).unwrap();
-        assert_eq!(doc, json!({}));
-        assert_eq!(touched, vec![Touched { path: p("tags"), op: Op::Delete }]);
+    fn remove_cases() {
+        for (doc, prefix, expected_doc, expected_touched) in [
+            (json!({"a": {}, "b": 1}), "a", json!({"b": 1}), vec![Touched { path: p("a"), op: Op::Delete }]),
+            (json!({"tags": "prod"}), "tags", json!({}), vec![Touched { path: p("tags"), op: Op::Delete }]),
+            (json!({"a": 1}), "missing", json!({"a": 1}), vec![]),
+        ] {
+            let mut doc = doc;
+            let touched = remove(&mut doc, &p(prefix)).unwrap();
+            assert_eq!(doc, expected_doc, "{prefix}");
+            assert_eq!(touched, expected_touched, "{prefix}");
+        }
     }
 
     #[test]
@@ -695,12 +567,6 @@ mod tests {
         let touched = remove(&mut doc, &Path::root()).unwrap();
         assert_eq!(doc, json!({}));
         assert_eq!(paths(&touched), vec!["a".to_string(), "b".to_string()]);
-    }
-
-    #[test]
-    fn remove_missing_is_noop() {
-        let mut doc = json!({"a": 1});
-        assert!(remove(&mut doc, &p("missing")).unwrap().is_empty());
     }
 
     #[test]
@@ -770,7 +636,7 @@ mod tests {
 
     #[test]
     fn parse_does_not_lint_the_payload() {
-        // `docs/DESIGN.md` §7: the one lint runs on the planned *document*,
+        // `docs/DESIGN.md` §5: the one lint runs on the planned *document*,
         // so a payload's `null` is refused there -- naming the path it would
         // land on -- rather than here, at the payload's own root.
         let value = parse("[1, null]", Format::Yaml).unwrap();
@@ -799,7 +665,7 @@ mod tests {
 
     #[test]
     fn parse_patch_carries_null_delete_markers_through() {
-        // `docs/DESIGN.md` §7: `merge` with `null` deletes, in both wire
+        // `docs/DESIGN.md` §5: `merge` with `null` deletes, in both wire
         // formats, top-level and nested.
         for (text, fmt) in [
             ("{\"host\": null}", Format::Json),
