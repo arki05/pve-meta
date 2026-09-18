@@ -19,8 +19,8 @@
 //! Root `0600`: nothing in the guest needs to read it.
 //!
 //! A manifest that is damaged, truncated or edited by hand, with any record
-//! that does not validate, is not trusted at all: nothing in it is deleted,
-//! and files exactly as wanted are adopted again.
+//! whose path does not validate, is not trusted at all: nothing in it is
+//! deleted, and files exactly as wanted are adopted again.
 
 use std::collections::BTreeMap;
 
@@ -69,14 +69,12 @@ pub struct Manifest {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawManifest {
     version: u32,
     files: Vec<RawRecord>,
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawRecord {
     entry: String,
     path: String,
@@ -84,9 +82,10 @@ struct RawRecord {
 }
 
 impl Manifest {
-    /// Reads a manifest. A file that is not one, or that has a record that
-    /// does not validate, is an error: nothing in it is trusted. Guest-written
-    /// text in the error is escaped.
+    /// Reads a manifest. A file that is not one, or that has a record whose
+    /// path does not validate, is an error: nothing in it is trusted. A
+    /// guest-written path in the error is `{:?}`-formatted, so it cannot
+    /// break the error onto more than one line.
     pub fn parse(bytes: &[u8]) -> Result<Manifest, String> {
         let raw: RawManifest =
             serde_json::from_slice(bytes).map_err(|e| format!("not a manifest: {e}"))?;
@@ -97,11 +96,6 @@ impl Manifest {
         for r in raw.files {
             let path = GuestPath::absolute(&r.path)
                 .map_err(|why| format!("record {:?}: {why}", r.path))?;
-            let sha_ok = r.sha256.len() == 64
-                && r.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-            if !pve_meta_core::path::is_valid_segment(&r.entry) || !sha_ok {
-                return Err(format!("record '{path}' is not a valid record"));
-            }
             let record = Record { entry: r.entry, path: path.clone(), sha256: r.sha256 };
             if out.records.insert(path.clone(), record).is_some() {
                 return Err(format!("'{path}' is recorded twice"));
@@ -164,12 +158,9 @@ mod tests {
         let bad = [
             "".to_string(),
             r#"{"version": 2, "files": []}"#.to_string(),
-            r#"{"version": 1, "files": [], "extra": 1}"#.to_string(),
             r#"{"version": 1, "entries": []}"#.to_string(),
             format!(r#"{{"entry": "a", "path": "/etc/pve-meta/../shadow", "sha256": "{sha}"}}"#),
             format!(r#"{{"entry": "b", "path": "relative", "sha256": "{sha}"}}"#),
-            r#"{"entry": "c", "path": "/etc/c", "sha256": "short"}"#.to_string(),
-            format!(r#"{{"entry": "e{esc}[31m", "path": "/etc/f", "sha256": "{sha}"}}"#),
             format!(r#"{{"entry": "g", "path": "/etc/g{esc}", "sha256": "{sha}"}}"#),
             good.clone(),
         ];

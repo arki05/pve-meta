@@ -28,7 +28,7 @@
 //! refusal, a failing write or sync, a lock, the store being unavailable) once
 //! when it begins.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -116,16 +116,14 @@ pub fn due(
     }
 }
 
-/// Lines logged once per state: by guest (0 for the node) and key, the line
-/// last logged.
+/// Lines logged once per state: by guest (0 for the node) and key, the last one logged.
 #[derive(Default)]
 pub struct Log {
     seen: HashMap<(u32, String), String>,
 }
 
 impl Log {
-    /// Logs `line` unless it is what `key` last logged; `None` ends the state.
-    /// `true` when something changed.
+    /// Logs `line` unless `key` last logged it; `None` ends the state; `true` if it changed.
     pub fn once(&mut self, vmid: u32, key: &str, line: Option<String>) -> bool {
         let k = (vmid, key.to_string());
         match line {
@@ -227,7 +225,7 @@ impl Daemon {
         }
         queue.sort();
         for (reason, vmid) in queue {
-            if self.sync(node, vmid, reason, timing, now) {
+            if self.sync(node, vmid, &active, reason, timing, now) {
                 self.memos.entry(vmid).or_default().inode = active.get(&vmid).copied();
             }
         }
@@ -239,14 +237,15 @@ impl Daemon {
         &mut self,
         node: &str,
         vmid: u32,
+        active: &BTreeMap<u32, u64>,
         reason: Reason,
         timing: Timing,
         now: Instant,
     ) -> bool {
-        let lock = node::container_lock(node, vmid).map_err(|e| format!("{e:#}"));
-        let held = match &lock {
+        let status = node::stopped_or_locked(node, vmid, active).map_err(|e| format!("{e:#}"));
+        let held = match &status {
             Err(e) => Some(e.clone()),
-            Ok(Some(l)) => Some(format!("locked ({l}); waiting")),
+            Ok(Some(s)) => Some(format!("{s}; waiting")),
             Ok(None) => None,
         };
         let skip = held.is_some();

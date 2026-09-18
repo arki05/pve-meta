@@ -1,38 +1,6 @@
 //! `pve-meta-publish`: writes views of a container's pve-meta document into
-//! that container as files, one way, host to guest (`docs/DESIGN.md`
-//! §13).
-//!
-//! ```yaml
-//! publish:
-//!   swap:
-//!     view: llm.swap              # a view into this guest's own document
-//!     path: llm/llama-swap.yaml   # under /etc/pve-meta inside the guest
-//!     format: yaml                # yaml | json | raw
-//!     mode: "0444"
-//!     owner: "0:0"
-//!     local_edits: keep           # keep | overwrite
-//! ```
-//!
-//! The store stays passive: nothing here is linked into pveproxy or
-//! pvedaemon. This crate reads documents with [`pve_meta_core`] directly, as
-//! root on the node, and does everything inside a guest through `pct exec`.
-//!
-//! # Module map
-//!
-//! - [`entry`] — the `publish` key: entries, their validation (paths, modes,
-//!   owners) and the rendered content of each; reading it from the store.
-//! - [`manifest`] — `/etc/pve-meta/.published`, what was written, so only
-//!   that is ever replaced or removed.
-//! - [`plan`] — the decision table: desired entries, the manifest and the
-//!   files as they are in the guest, in; the file operations and the next
-//!   manifest, out.
-//! - [`guest`] — [`guest::Guest`], the file operations inside a guest the
-//!   plan needs, and [`guest::sync`], which runs one reconcile through them.
-//! - [`pct`] — [`guest::Guest`] over `pct exec`.
-//! - [`node`] — the vmlist, the node name, and which containers run.
-//! - [`daemon`] — the loop: document changes, container starts, drift.
-//! - [`lock`] — one lock per guest, so the daemon and a hand-run `sync` take
-//!   turns.
+//! that container as files, one way, host to guest (`docs/PUBLISH.md`).
+//! Reads documents with [`pve_meta_core`]; acts inside a guest via `pct exec`.
 
 pub mod daemon;
 pub mod entry;

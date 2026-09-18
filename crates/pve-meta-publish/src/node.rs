@@ -103,6 +103,19 @@ pub fn container_lock(node: &str, vmid: u32) -> Result<Option<String>> {
     Ok(parse_lock(&text))
 }
 
+/// Why `vmid` cannot be synced right now: not in `active`, or locked (a
+/// backup, snapshot or migration); `None` when it can be.
+pub fn stopped_or_locked(
+    node: &str,
+    vmid: u32,
+    active: &BTreeMap<u32, u64>,
+) -> Result<Option<String>> {
+    if !active.contains_key(&vmid) {
+        return Ok(Some("stopped".into()));
+    }
+    Ok(container_lock(node, vmid)?.map(|l| format!("locked ({l})")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

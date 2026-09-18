@@ -15,7 +15,8 @@
 //! A broken or hung container cannot wedge or bloat the daemon: a call's
 //! stdout is capped at [`MAX_OUTPUT`] and its stderr at [`STDERR_CAP`], and a
 //! call past either, or past [`TIMEOUT`], is killed with its whole process
-//! group and is an error. Text from the guest is escaped wherever it is shown.
+//! group and is an error. Text from the guest is always `{:?}`-formatted where
+//! it is shown, so it cannot break a log line onto more than one.
 //!
 //! Every path handed to a script is a [`crate::entry::GuestPath`] or the
 //! manifest's, whose charset has no quote, space or glob character, and is

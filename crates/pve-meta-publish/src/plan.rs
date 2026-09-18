@@ -1,4 +1,4 @@
-//! The decision table of `docs/DESIGN.md` §13: what a guest's document asks
+//! The decision table of `docs/PUBLISH.md`: what a guest's document asks
 //! for, what the manifest says was written, and what is in the guest now, in;
 //! the file operations and the manifest they leave, out. Pure: nothing here
 //! touches a guest.

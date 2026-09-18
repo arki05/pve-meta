@@ -72,10 +72,7 @@ fn not_syncable(vmid: u32) -> Result<Option<String>> {
     if g.node != here {
         bail!("{vmid} is on node {}; run this there", g.node);
     }
-    if !node::active_containers()?.contains_key(&vmid) {
-        return Ok(Some("stopped".into()));
-    }
-    Ok(node::container_lock(&here, vmid)?.map(|l| format!("locked ({l})")))
+    node::stopped_or_locked(&here, vmid, &node::active_containers()?)
 }
 
 fn sync(vmid: u32, force: bool) -> Result<bool> {

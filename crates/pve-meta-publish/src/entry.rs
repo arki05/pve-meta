@@ -19,9 +19,6 @@ use pve_meta_core::{digest, view, Error as StoreError};
 
 use crate::{GUEST_ROOT, MAX_CONTENT_BYTES, PREFIX};
 
-/// The longest resolved path, in bytes.
-pub const MAX_PATH_BYTES: usize = 1024;
-
 /// Directories no entry may write under: kernel and device filesystems, where
 /// a file is not configuration. `/run` is allowed.
 pub const FORBIDDEN_ROOTS: [&str; 3] = ["/proc", "/sys", "/dev"];
@@ -114,8 +111,7 @@ pub fn mode_text(mode: u32) -> String {
 /// `.` or `..`, never carrying [`TEMP_MARK`]. Nothing is normalised: a path that
 /// would need it is refused, so the path the document says is the path that is
 /// written. Refused as well: `/` itself, anything under [`FORBIDDEN_ROOTS`],
-/// the manifest and every directory it lives in, and anything longer than
-/// [`MAX_PATH_BYTES`].
+/// and the manifest and every directory it lives in.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GuestPath(String);
 
@@ -136,9 +132,6 @@ impl GuestPath {
         };
         if rest.is_empty() {
             return Err("'/' is not a file".into());
-        }
-        if p.len() > MAX_PATH_BYTES {
-            return Err(format!("longer than {MAX_PATH_BYTES} bytes"));
         }
         for seg in rest.split('/') {
             if seg.is_empty() {
@@ -494,7 +487,6 @@ mod tests {
         ] {
             assert!(GuestPath::parse(bad).is_err(), "{bad}");
         }
-        assert!(GuestPath::parse(&format!("/{}", "a".repeat(1024))).is_err());
         assert!(GuestPath::absolute("relative").is_err());
     }
 

@@ -1,4 +1,4 @@
-# The `publish` prefix (docs/DESIGN.md §13), shipped by the pve-meta-publish
+# The `publish` prefix (docs/PUBLISH.md), shipped by the pve-meta-publish
 # package to /usr/share/pve-meta/prefixes/publish.yaml; a cluster file of the
 # same name at /etc/pve/meta.d/prefixes/publish.yaml overrides it, and a
 # node's /etc/pve/nodes/<node>/meta.d/prefixes/publish.yaml does for the
