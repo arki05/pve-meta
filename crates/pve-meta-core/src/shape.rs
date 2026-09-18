@@ -2,12 +2,13 @@
 //! them governs a given path, and what that prefix's schema says about the
 //! value there (`docs/DESIGN.md` §3).
 //!
-//! A [`Shape`] is built once per document from the prefix registry and the
-//! guest's tags. Every prefix rule -- does this selector match, sort
-//! most-specific first, which prefix governs, walk the schema but stop
-//! where a child prefix takes over -- is a method on it, and the editor
-//! consults that one `Shape` (through the wasm build of this crate) instead
-//! of reimplementing any of them.
+//! A [`Shape`] is built once per document from the prefixes that already
+//! reach it -- resolved by [`crate::registry::Registry::prefixes_for_guest`]
+//! against the guest's tags and node, for a guest document. Every remaining
+//! prefix rule -- sort most-specific first, which prefix governs, walk the
+//! schema but stop where a child prefix takes over -- is a method on
+//! `Shape`, and the editor consults that one `Shape` (through the wasm build
+//! of this crate) instead of reimplementing any of them.
 //!
 //! **Schemas shadow; they never merge.** The most specific prefix covering a
 //! path governs it and no other contributes, so with `homelab` and
@@ -26,15 +27,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{self, Value};
 use crate::path::Path;
-use crate::registry::{by_specificity, PrefixDef, Selector};
+use crate::registry::{by_specificity, PrefixDef};
 
-/// One declared prefix as a [`Shape`] sees it: where it sits, whom it
-/// reaches, and what it says. A [`PrefixDef`] minus where the file came
-/// from, which shape does not care about.
+/// One declared prefix as a [`Shape`] sees it: where it sits, and what it
+/// says. A [`PrefixDef`] minus where the file came from and which guests it
+/// reaches -- resolved before a [`Shape`] is built
+/// ([`crate::registry::Registry::prefixes_for_guest`]), so `Shape` itself
+/// never matches a selector.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Declared {
     pub prefix: Path,
-    pub selector: Selector,
     pub description: Option<String>,
     pub schema: Option<Value>,
     /// The server refuses a write that leaves this subtree not matching
@@ -53,7 +55,6 @@ impl From<&PrefixDef> for Declared {
     fn from(p: &PrefixDef) -> Self {
         Declared {
             prefix: p.prefix.clone(),
-            selector: p.selector.clone(),
             description: p.description.clone(),
             schema: p.schema.clone(),
             enforce: p.enforce,
@@ -138,22 +139,21 @@ pub struct Shape {
 }
 
 impl Shape {
-    /// The prefixes among `declared` whose selector matches a guest carrying
-    /// `tags`, sorted most-specific first. Anything that did not parse never
-    /// gets this far -- a malformed prefix file describes nothing
-    /// (`docs/DESIGN.md` §4) -- so the caller drops those before building.
-    pub fn new(declared: impl IntoIterator<Item = Declared>, tags: &[String]) -> Shape {
-        let mut prefixes: Vec<Declared> = declared
-            .into_iter()
-            .filter(|d| d.selector.matches(tags))
-            .collect();
+    /// `declared`, sorted most-specific first. `declared` is already the
+    /// prefixes that reach this document -- selector-matched and, for a
+    /// guest, node-resolved
+    /// ([`crate::registry::Registry::prefixes_for_guest`]) -- so nothing
+    /// here filters by tag; a malformed prefix file never gets this far
+    /// either (`docs/DESIGN.md` §4).
+    pub fn new(declared: impl IntoIterator<Item = Declared>) -> Shape {
+        let mut prefixes: Vec<Declared> = declared.into_iter().collect();
         prefixes.sort_by(|a, b| by_specificity(&a.prefix, &b.prefix));
         Shape { prefixes }
     }
 
-    /// [`Shape::new`] over the registry's own definitions.
-    pub fn of_guest(defs: &[PrefixDef], tags: &[String]) -> Shape {
-        Shape::new(defs.iter().map(Declared::from), tags)
+    /// [`Shape::new`] over the registry's own (already-resolved) definitions.
+    pub fn of_guest(defs: &[PrefixDef]) -> Shape {
+        Shape::new(defs.iter().map(Declared::from))
     }
 
     /// A shape with one schema rooted at the document itself, which is how a
@@ -167,17 +167,13 @@ impl Shape {
     /// shape while this function's own tests carried on passing. Now it must break
     /// both or neither.
     pub fn rooted(schema: Value) -> Shape {
-        Shape::new(
-            [Declared {
-                prefix: Path::root(),
-                selector: Selector::All,
-                description: None,
-                schema: Some(schema),
-                enforce: false,
-                hidden: false,
-            }],
-            &[],
-        )
+        Shape::new([Declared {
+            prefix: Path::root(),
+            description: None,
+            schema: Some(schema),
+            enforce: false,
+            hidden: false,
+        }])
     }
 
     /// A document nothing describes: a guest no prefix reaches.
@@ -472,85 +468,59 @@ mod tests {
         Path::parse(s).unwrap()
     }
 
-    fn tags(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    fn decl(prefix: &str, selector: Selector, schema: Option<Value>) -> Declared {
-        Declared { prefix: p(prefix), selector, description: None, schema, enforce: false, hidden: false }
+    fn decl(prefix: &str, schema: Option<Value>) -> Declared {
+        Declared { prefix: p(prefix), description: None, schema, enforce: false, hidden: false }
     }
 
     fn all(prefix: &str) -> Declared {
-        decl(prefix, Selector::All, None)
-    }
-
-    fn tagged(prefix: &str, tag: &str) -> Declared {
-        decl(prefix, Selector::Tag(tag.into()), None)
+        decl(prefix, None)
     }
 
     /// The schema-shadowing rule, one case per line. The editor consults
     /// this same table, through `crates/pve-meta-wasm`, rather than keeping
-    /// its own copy.
-    ///
-    /// Each case hands over the declared prefixes in arbitrary order with
-    /// their selectors, so the whole chain runs -- selector, sort, containment
-    /// -- and not just the last predicate.
-    /// (declared prefixes, the guest's tags, the path, who governs it, why)
-    type Case = (Vec<Declared>, Vec<&'static str>, &'static str, Option<&'static str>, &'static str);
+    /// its own copy. Which prefixes reach a guest at all is decided before a
+    /// `Shape` is built (`crate::registry::Registry::prefixes_for_guest`);
+    /// this table is only about containment and specificity among the ones
+    /// that already do.
+    /// (declared prefixes, the path, who governs it, why)
+    type Case = (Vec<Declared>, &'static str, Option<&'static str>, &'static str);
 
     #[test]
-    fn governing_is_the_most_specific_prefix_whose_selector_matches() {
+    fn governing_is_the_most_specific_prefix_containing_the_path() {
         let cases: Vec<Case> = vec![
-            (vec![all("homelab"), all("homelab.docker")], vec![], "homelab.docker.compose", Some("homelab.docker"),
+            (vec![all("homelab"), all("homelab.docker")], "homelab.docker.compose", Some("homelab.docker"),
              "most specific wins; the parent's own `properties.docker` is shadowed, never merged"),
-            (vec![all("homelab.docker"), all("homelab")], vec![], "homelab.notes", Some("homelab"),
+            (vec![all("homelab.docker"), all("homelab")], "homelab.notes", Some("homelab"),
              "a sibling of the nested prefix falls back to the parent"),
-            (vec![all("homelab")], vec![], "homelab", Some("homelab"), "the prefix governs its own key"),
-            (vec![all("homelab")], vec![], "netbird.groups", None, "no prefix covers it, so nothing describes its shape"),
-            (vec![all("homelab")], vec![], "", None, "the document root is above every prefix, not under one"),
-            (vec![all("homelab")], vec![], "homelabx.key", None, "a longer name is not a child -- the separator is what makes one"),
-            (vec![all("homelab"), all("homelab.docker")], vec![], "homelab.docker", Some("homelab.docker"),
+            (vec![all("homelab")], "homelab", Some("homelab"), "the prefix governs its own key"),
+            (vec![all("homelab")], "netbird.groups", None, "no prefix covers it, so nothing describes its shape"),
+            (vec![all("homelab")], "", None, "the document root is above every prefix, not under one"),
+            (vec![all("homelab")], "homelabx.key", None, "a longer name is not a child -- the separator is what makes one"),
+            (vec![all("homelab"), all("homelab.docker")], "homelab.docker", Some("homelab.docker"),
              "the child's own key is the child's, not the parent's"),
-            (vec![all("a"), all("a__")], vec![], "a__.note", Some("a__"),
+            (vec![all("a"), all("a__")], "a__.note", Some("a__"),
              "plain containment: `a__` is its own prefix here, not `a`'s comment key"),
-            (vec![all("a")], vec![], "a__", None,
+            (vec![all("a")], "a__", None,
              "... and without `a__` declared, `a` does not reach the comment key either"),
-            (vec![tagged("traefik", "traefik"), all("homelab")], vec![], "traefik.spec", None,
-             "a prefix whose selector does not match the guest reaches nothing"),
-            (vec![tagged("traefik", "traefik"), all("homelab")], vec!["traefik"], "traefik.spec", Some("traefik"),
-             "... and reaches it once the guest carries the tag"),
-            (vec![tagged("homelab.docker", "docker"), all("homelab")], vec![], "homelab.docker.compose", Some("homelab"),
-             "a more specific prefix that does not reach this guest does not shadow: the parent governs"),
-            (vec![tagged("homelab.docker", "docker"), all("homelab")], vec!["docker"], "homelab.docker.compose", Some("homelab.docker"),
-             "... until it does"),
-            (vec![tagged("traefik", "traefik"), tagged("traefik.spec", "web")], vec!["traefik"], "traefik.spec.host", Some("traefik"),
-             "two independently tagged levels: the more specific prefix's selector missed, so the one that does reach this guest governs -- shadowing is decided among the prefixes that apply, not among all of them"),
-            (vec![tagged("traefik", "traefik"), tagged("traefik.spec", "web")], vec!["traefik", "web"], "traefik.spec.host", Some("traefik.spec"),
-             "... and once its selector matches too, the more specific one takes over"),
-            (vec![tagged("traefik", "traefik")], vec![], "traefik.spec", None,
-             "an untagged guest is not reached by a tag selector at all"),
-            (vec![all("a"), all("a__")], vec![], "a__", Some("a__"),
+            (vec![all("a"), all("a__")], "a__", Some("a__"),
              "the comment-key prefix queried directly: its own, not `a`'s -- `covers` would have said `a`"),
-            (vec![all("a")], vec![], "a.b__", Some("a"),
+            (vec![all("a")], "a.b__", Some("a"),
              "a comment key *inside* the subtree is part of it, on both rules"),
-            (vec![all("b"), all("a"), all("a.b.c"), all("a.b")], vec![], "a.b.c.d", Some("a.b.c"),
+            (vec![all("b"), all("a"), all("a.b.c"), all("a.b")], "a.b.c.d", Some("a.b.c"),
              "three deep, given in a scrambled order"),
-            (vec![all("x.y.z"), all("x"), all("x.y")], vec![], "x.y.other", Some("x.y"),
+            (vec![all("x.y.z"), all("x"), all("x.y")], "x.y.other", Some("x.y"),
              "... and the answer changes with the path, not with the input order"),
         ];
-        for (declared, guest_tags, path, want, why) in cases {
-            let shape = Shape::new(declared, &tags(&guest_tags));
+        for (declared, path, want, why) in cases {
+            let shape = Shape::new(declared);
             let got = shape.governing(&p(path)).map(|d| d.prefix.to_string());
-            assert_eq!(got.as_deref(), want, "governing({path:?}) with tags {guest_tags:?}: {why}");
+            assert_eq!(got.as_deref(), want, "governing({path:?}): {why}");
         }
     }
 
     #[test]
     fn prefixes_are_sorted_most_specific_first_then_by_name() {
-        let shape = Shape::new(
-            vec![all("zeta"), all("alpha.b"), all("alpha"), all("beta.a")],
-            &[],
-        );
+        let shape = Shape::new(vec![all("zeta"), all("alpha.b"), all("alpha"), all("beta.a")]);
         let order: Vec<String> = shape.prefixes().iter().map(|d| d.prefix.to_string()).collect();
         assert_eq!(order, ["alpha.b", "beta.a", "alpha", "zeta"]);
     }
@@ -581,8 +551,8 @@ mod tests {
                 },
             },
         });
-        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema)) };
-        let shape = Shape::new([strict], &tags(&[]));
+        let strict = Declared { enforce: true, ..decl("t", Some(schema)) };
+        let shape = Shape::new([strict]);
         let doc = serde_json::json!({ "t": { "port": "no", "extra": { "n": "also no" } } });
 
         let enforced: Vec<String> =
@@ -613,8 +583,8 @@ mod tests {
                 "h": { "type": "integer", "hidden": 1 },
             },
         });
-        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema)) };
-        let shape = Shape::new([strict], &tags(&[]));
+        let strict = Declared { enforce: true, ..decl("t", Some(schema)) };
+        let shape = Shape::new([strict]);
         let doc = serde_json::json!({ "t": { "a": "x", "b": "x", "c": "x" } });
         let enforced: Vec<String> =
             shape.enforced_findings(&doc).into_iter().map(|f| f.path.to_string()).collect();
@@ -629,7 +599,6 @@ mod tests {
         let shape = Shape::new(
             [decl(
                 "t",
-                Selector::All,
                 Some(serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -645,7 +614,6 @@ mod tests {
                     },
                 })),
             )],
-            &tags(&[]),
         );
         let hidden_at = |path: &str| {
             shape
@@ -671,10 +639,9 @@ mod tests {
         let child = json!({"type": "object", "properties": {"compose": {"type": "string"}}});
         let shape = Shape::new(
             vec![
-                decl("homelab", Selector::All, Some(parent)),
-                decl("homelab.docker", Selector::All, Some(child)),
+                decl("homelab", Some(parent)),
+                decl("homelab.docker", Some(child)),
             ],
-            &[],
         );
         assert_eq!(shape.schema_at(&p("homelab.notes")), Some(&json!({"type": "string"})));
         // The parent declared `docker.compose` too; the child's wins, whole.
@@ -703,7 +670,7 @@ mod tests {
             "on": {"type": "boolean"},
             "sub": {"type": "object", "properties": {"x": {"type": "number"}}},
         }});
-        let shape = Shape::new(vec![decl("t", Selector::All, Some(schema))], &[]);
+        let shape = Shape::new(vec![decl("t", Some(schema))]);
 
         let doc = json!({"t": {"port": 70000, "host": "web.example", "mode": "c", "on": 1, "sub": "not a map"}});
         let got = shape.findings(&doc);
@@ -740,7 +707,7 @@ mod tests {
         // `a` is a shorter segment than `a-c` -- not the string order a `.` and a
         // `-` would give. There is exactly one sort, here.
         let flat = json!({"type": "object", "properties": {"a-c": {"type": "integer"}, "a": {"type": "object", "properties": {"b": {"type": "integer"}}}}});
-        let shape = Shape::new(vec![decl("t", Selector::All, Some(flat))], &[]);
+        let shape = Shape::new(vec![decl("t", Some(flat))]);
         let paths: Vec<String> = shape.findings(&json!({"t": {"a-c": "x", "a": {"b": "y"}}})).iter().map(|r| r.path().to_string()).collect();
         assert_eq!(paths, ["t.a.b", "t.a-c"]);
         assert!(serde_json::to_string(&shape.findings(&json!({"t": {"a-c": "x"}}))).unwrap().starts_with(r#"[{"path":"t.a-c","msg":"#));
@@ -808,9 +775,9 @@ mod tests {
             "port": {"type": "integer"},
             "host": {"type": "string", "format": "dns-name"},
         }});
-        let strict = Declared { enforce: true, ..decl("t", Selector::All, Some(schema.clone())) };
-        let lax = decl("u", Selector::All, Some(schema));
-        let shape = Shape::new(vec![strict, lax], &[]);
+        let strict = Declared { enforce: true, ..decl("t", Some(schema.clone())) };
+        let lax = decl("u", Some(schema));
+        let shape = Shape::new(vec![strict, lax]);
         let doc = json!({"t": {"port": "x", "host": "not a host"}, "u": {"port": "x"}});
         let enforced = shape.enforced_findings(&doc);
         assert_eq!(enforced.len(), 1, "{enforced:?}");
@@ -841,21 +808,19 @@ mod tests {
         let doc = json!({"homelab": {"docker": {"compose": "services: {}"}}});
 
         let both = Shape::new(
-            vec![decl("homelab", Selector::All, Some(parent.clone())), decl("homelab.docker", Selector::All, Some(child))],
-            &[],
+            vec![decl("homelab", Some(parent.clone())), decl("homelab.docker", Some(child))],
         );
         assert!(both.findings(&doc).is_empty());
 
         // A schema-less child prefix still shadows: it governs its subtree and
         // says nothing about it, which is not the same as letting the parent say something.
         let silent_child = Shape::new(
-            vec![decl("homelab", Selector::All, Some(parent.clone())), decl("homelab.docker", Selector::All, None)],
-            &[],
+            vec![decl("homelab", Some(parent.clone())), decl("homelab.docker", None)],
         );
         assert!(silent_child.findings(&doc).is_empty());
 
         // Without the child, the parent's opinion counts.
-        let parent_only = Shape::new(vec![decl("homelab", Selector::All, Some(parent))], &[]);
+        let parent_only = Shape::new(vec![decl("homelab", Some(parent))]);
         assert_eq!(parent_only.findings(&doc).len(), 1);
         assert_eq!(parent_only.findings(&doc)[0].path().to_string(), "homelab.docker.compose");
     }

@@ -45,7 +45,7 @@ use pve_meta_core::edit::EditSet;
 use pve_meta_core::error::Error;
 use pve_meta_core::format::{self, Format};
 use pve_meta_core::path::{self, Path};
-use pve_meta_core::registry::{self, Selector};
+use pve_meta_core::registry;
 use pve_meta_core::shape::{self, Declared, Finding, Shape};
 use pve_meta_core::{view, Value};
 use serde::{Deserialize, Serialize};
@@ -224,10 +224,12 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
 
         // -- shape: shape::Shape -----------------------------------------
         //
-        // Each takes the `GET /meta/prefixes` listing and the guest's tags,
-        // and builds the Shape afresh: a listed file that did not load
-        // reaches nothing. A registry document passes its meta-schema as one
-        // entry with the empty prefix, which is a prefix of everything.
+        // Each takes the rows `GET /meta/prefixes?id=` returns for this
+        // guest -- already resolved (selector-matched, node override
+        // applied) -- and builds the Shape afresh: a listed file that did
+        // not load reaches nothing. A registry document passes its
+        // meta-schema as one entry with the empty prefix, which is a prefix
+        // of everything.
         "shape_prefixes" => {
             let shape = a.shape()?;
             json!(shape.prefixes().iter().map(|d| d.prefix.to_string()).collect::<Vec<_>>())
@@ -355,15 +357,12 @@ impl<'a> Args<'a> {
         Ok(Path::parse(self.str()?)?)
     }
 
-    fn tags(&mut self) -> Result<Vec<String>, CallError> {
-        self.parsed()
-    }
-
-    /// A `GET /meta/prefixes` listing plus the guest's tags, as a Shape.
+    /// The rows `GET /meta/prefixes?id=` returns for this guest, as a
+    /// `Shape`: already resolved (selector-matched, node override applied),
+    /// so nothing here matches a tag.
     fn shape(&mut self) -> Result<Shape, CallError> {
         let entries: Vec<WirePrefix> = self.parsed()?;
-        let tags = self.tags()?;
-        Ok(Shape::new(entries.into_iter().filter_map(WirePrefix::declared), &tags))
+        Ok(Shape::new(entries.into_iter().filter_map(WirePrefix::declared)))
     }
 }
 
@@ -378,13 +377,12 @@ fn truthy(v: &Value) -> bool {
     }
 }
 
-/// One row of `GET /meta/prefixes`: a prefix, or the name of a file that
-/// did not load (`error`), which describes nothing.
+/// One row of `GET /meta/prefixes?id=`: a prefix already resolved for this
+/// guest, or the name of a file that did not load (`error`), which describes
+/// nothing.
 #[derive(Deserialize)]
 struct WirePrefix {
     prefix: String,
-    #[serde(default)]
-    selector: Option<Value>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -404,7 +402,6 @@ impl WirePrefix {
         }
         Some(Declared {
             prefix: Path::parse(&self.prefix).ok()?,
-            selector: Selector::from_wire(self.selector.as_ref()?).ok()?,
             description: self.description,
             schema: self.schema,
             // Perl's `1`/`0` on the wire.
@@ -469,7 +466,7 @@ mod tests {
         assert!(err("parse", json!([1, "a: 1"])).message.contains("must be a string"));
         assert!(err("parse", json!(["toml", "a = 1"])).message.contains("unknown format"));
         assert!(err("nope", json!([])).message.contains("unknown function"));
-        assert!(err("shape_governing", json!([[], [], "a b"])).message.contains("invalid path"));
+        assert!(err("shape_governing", json!([[], "a b"])).message.contains("invalid path"));
     }
 
     #[test]
@@ -492,20 +489,21 @@ mod tests {
     }
 
     #[test]
-    fn a_shape_is_built_from_the_listing_and_ignores_what_did_not_load() {
+    fn a_shape_is_built_from_the_resolved_listing_and_ignores_what_did_not_load() {
+        // The rows `GET /meta/prefixes?id=` returns: already resolved for the
+        // guest (selector-matched, node override applied), so no `selector`
+        // and no tags argument here -- unlike `a_wire_selector...` in
+        // `pve_meta_core::registry`, which is the one place selector-matching
+        // is still tested.
         let listing = json!([
-            {"prefix": "homelab", "selector": {"all": 1}, "schema": {"type": "object", "properties": {"notes": {"type": "string"}}}},
-            {"prefix": "homelab.docker", "selector": {"all": true}},
-            {"prefix": "traefik", "selector": {"tag": "traefik"}, "schema": {"type": "object"}},
+            {"prefix": "homelab", "schema": {"type": "object", "properties": {"notes": {"type": "string"}}}},
+            {"prefix": "homelab.docker"},
             {"prefix": "broken", "error": "selector: nonsense"},
-            {"prefix": "odd", "selector": {"pool": "p"}},
         ]);
-        assert_eq!(ok("shape_prefixes", json!([listing, []])), json!(["homelab.docker", "homelab"]));
-        assert_eq!(ok("shape_prefixes", json!([listing, ["traefik"]])), json!(["homelab.docker", "homelab", "traefik"]));
-        assert_eq!(ok("shape_governing", json!([listing, [], "homelab.docker.compose"])), json!("homelab.docker"));
-        assert_eq!(ok("shape_governing", json!([listing, [], "traefik.spec"])), Value::Null);
-        assert_eq!(ok("shape_governing", json!([listing, [], "broken.x"])), Value::Null);
-        let index = ok("shape_schema_index", json!([listing, []]));
+        assert_eq!(ok("shape_prefixes", json!([listing])), json!(["homelab.docker", "homelab"]));
+        assert_eq!(ok("shape_governing", json!([listing, "homelab.docker.compose"])), json!("homelab.docker"));
+        assert_eq!(ok("shape_governing", json!([listing, "broken.x"])), Value::Null);
+        let index = ok("shape_schema_index", json!([listing]));
         assert_eq!(index[0]["path"], "homelab");
         // `hidden` rides with every indexed path: the editor decides from it whether
         // to offer a row before anything is stored there (decision 018).
@@ -518,23 +516,23 @@ mod tests {
                 "hidden": false,
             })
         );
-        let findings = ok("shape_findings", json!([listing, [], {"homelab": {"notes": 5}}]));
+        let findings = ok("shape_findings", json!([listing, {"homelab": {"notes": 5}}]));
         assert_eq!(findings, json!([{"path": "homelab.notes", "msg": "expected string"}]));
         // An enforcing prefix's findings say so, in Perl's spelling of true.
-        let strict = json!([{"prefix": "homelab", "selector": {"all": 1}, "enforce": 1, "schema": {"type": "object", "properties": {"notes": {"type": "string"}}}}]);
+        let strict = json!([{"prefix": "homelab", "enforce": 1, "schema": {"type": "object", "properties": {"notes": {"type": "string"}}}}]);
         assert_eq!(
-            ok("shape_findings", json!([strict, [], {"homelab": {"notes": 5}}])),
+            ok("shape_findings", json!([strict, {"homelab": {"notes": 5}}])),
             json!([{"path": "homelab.notes", "msg": "expected string", "enforced": true}])
         );
 
         // A registry document: its meta-schema rooted at the document.
-        let rooted = json!([{"prefix": "", "selector": {"all": true}, "schema": {"type": "object", "properties": {"authid": {"type": "string"}}}}]);
-        assert_eq!(ok("shape_governing", json!([rooted, [], "rules"])), json!(""));
-        assert_eq!(ok("shape_findings", json!([rooted, [], {"authid": 1}]))[0]["msg"], "expected string");
+        let rooted = json!([{"prefix": "", "schema": {"type": "object", "properties": {"authid": {"type": "string"}}}}]);
+        assert_eq!(ok("shape_governing", json!([rooted, "rules"])), json!(""));
+        assert_eq!(ok("shape_findings", json!([rooted, {"authid": 1}]))[0]["msg"], "expected string");
         // A format check rides in the same list, at its place in the one order.
-        let fmt = json!([{"prefix": "t", "selector": {"all": true}, "schema": {"type": "object", "properties": {"host": {"type": "string", "format": "dns-name"}, "z": {"type": "integer"}}}}]);
+        let fmt = json!([{"prefix": "t", "schema": {"type": "object", "properties": {"host": {"type": "string", "format": "dns-name"}, "z": {"type": "integer"}}}}]);
         assert_eq!(
-            ok("shape_findings", json!([fmt, [], {"t": {"host": "h", "z": "no"}}])),
+            ok("shape_findings", json!([fmt, {"t": {"host": "h", "z": "no"}}])),
             json!([{"path": "t.host", "format": "dns-name", "value": "h"}, {"path": "t.z", "msg": "expected integer"}])
         );
     }

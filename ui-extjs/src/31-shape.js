@@ -1,42 +1,40 @@
 // ---------------------------------------------------------------------------
 // Shape: what describes one document (`shape::Shape`).
 //
-// The prefixes that reach a guest, most-specific first; which of them governs a
-// path; what its schema says about the value there. Schemas shadow, they never
-// merge (DESIGN §3). A registry document is shaped by its meta-schema rooted at
-// the document itself.
+// Which of the prefixes that reach a guest governs a path; what its schema says
+// about the value there. Schemas shadow, they never merge (DESIGN §3). A registry
+// document is shaped by its meta-schema rooted at the document itself.
 //
-// A Shape owns its two inputs -- the `GET /meta/prefixes` listing and the guest's
-// tags -- and caches what the core derives from them alone (the applicable
-// prefixes, the schema index, each `governing` answer). Only `findings` takes a
-// document, so only `findings` goes to the core every time. The panel keeps one
-// Shape per document and drops it when the listing, the tags or the meta-schema
-// change (`shapeFor`), which is what makes a render two core calls rather than
-// a dozen. Nothing is held inside the wasm between calls: the core rebuilds its
-// own Shape from the listing on each question, which costs microseconds and no
-// lifetime for this side to manage.
+// A Shape owns its one input -- the `GET /meta/prefixes` listing, already resolved
+// for this guest by the server (selector and node override applied, most-specific
+// first) -- and caches what the core derives from it alone (the schema index, each
+// `governing` answer). Only `findings` takes a document, so only `findings` goes to
+// the core every time. The panel keeps one Shape per document and drops it when the
+// listing or the meta-schema changes (`shapeFor`), which is what makes a render two
+// core calls rather than a dozen. Nothing is held inside the wasm between calls: the
+// core rebuilds its own Shape from the listing on each question, which costs
+// microseconds and no lifetime for this side to manage.
 // ---------------------------------------------------------------------------
 
-PVE.meta.Shape = function (prefixes, tags) {
+PVE.meta.Shape = function (prefixes) {
     let me = this;
     me.prefixes = prefixes || [];
-    me.tags = tags || [];
     me.byPrefix = Object.create(null);
     me.prefixes.forEach((p) => (me.byPrefix[p.prefix] = p));
     me.cache = { names: null, index: null, governing: Object.create(null) };
 };
 
-// The shape of a guest document: the listed prefixes (loaded or not), the guest's
-// tags.
-PVE.meta.Shape.of = (prefixes, tags) => new PVE.meta.Shape(prefixes, tags);
+// The shape of a guest document: the listing `GET /meta/prefixes?id=<vmid>` already
+// resolved for it.
+PVE.meta.Shape.of = (prefixes) => new PVE.meta.Shape(prefixes);
 
 // The shape of a registry document: one schema, rooted at the document. The empty
 // prefix is a prefix of everything and the least specific of all, so it governs
 // the whole document without a special case anywhere.
 PVE.meta.Shape.rooted = (schema) =>
-    new PVE.meta.Shape(schema ? [{ prefix: '', selector: { all: true }, schema: schema }] : [], []);
+    new PVE.meta.Shape(schema ? [{ prefix: '', selector: { all: true }, schema: schema }] : []);
 
-PVE.meta.Shape.empty = () => new PVE.meta.Shape([], []);
+PVE.meta.Shape.empty = () => new PVE.meta.Shape([]);
 
 // Of the findings `after` has, those an edit is answerable for: not already in
 // `before`, or on a path in `changed` (in either direction). `shape::introduced`.
@@ -45,7 +43,7 @@ PVE.meta.Shape.introduced = (before, after, changed) =>
 
 Object.assign(PVE.meta.Shape.prototype, {
     ask: function (fn, ...rest) {
-        return PVE.meta.Core.call(fn, this.prefixes, this.tags, ...rest);
+        return PVE.meta.Core.call(fn, this.prefixes, ...rest);
     },
 
     // The prefixes that reach this document, most-specific first, by name.

@@ -39,7 +39,6 @@
 //! (`docs/decisions/005-reads-never-fail-on-content.md`).
 
 use std::fmt;
-use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -55,7 +54,7 @@ use crate::format::{self, Format};
 use crate::model::Value;
 use crate::patch::{self, Touched};
 pub use crate::registry::RegistryKind;
-use crate::registry::{NodeName, Registry};
+use crate::registry::Registry;
 
 /// Warn threshold for document size (informational only; reported through
 /// [`crate::warn`]).
@@ -86,9 +85,9 @@ pub const MAX_BYTES: u64 = 512 * 1024;
 /// The cap is applied by **every** path that would otherwise pull a file's
 /// bytes into memory, not just [`MetaStore::read`]: [`MetaStore::digest_of`],
 /// the compare-and-swap precondition and [`MetaStore::version`] all go
-/// through [`identify`], which substitutes a surrogate identity for a file
-/// above the cap rather than hashing megabytes on every 5 s poll and every
-/// listing.
+/// through [`identify`], which uses a file's size and mtime instead of its
+/// bytes above the cap rather than hashing megabytes on every 5 s poll and
+/// every listing.
 pub const MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The one on-disk format (`docs/DESIGN.md` §2: YAML on disk).
@@ -107,8 +106,7 @@ pub const DISK_FORMAT: Format = Format::Yaml;
 ///
 /// One thing is *not* uniform, and lives outside this type: a registry
 /// document's content must additionally parse as the kind it claims to be,
-/// which `api::put_document` checks before writing. A node's prefix file is a
-/// registry document in that respect too.
+/// which `api::put_document` checks before writing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DocId {
     /// A guest's metadata document, named `<vmid>.yaml`.
@@ -117,30 +115,25 @@ pub enum DocId {
     /// is dotted segments (`crate::registry::is_valid_file_name`), so it can
     /// never contain a slash or escape that directory.
     Registry(RegistryKind, String),
-    /// One node's prefix file, `<name>.yaml` in that node's prefix directory
-    /// (`crate::registry::Registry::node_prefix_dir`) and nowhere else. With
-    /// no nodes directory configured the store refuses every one.
-    NodePrefix { node: NodeName, name: String },
 }
 
 impl DocId {
     fn base_name(&self) -> String {
         match self {
             DocId::Guest(vmid) => vmid.to_string(),
-            DocId::Registry(_, name) | DocId::NodePrefix { name, .. } => name.clone(),
+            DocId::Registry(_, name) => name.clone(),
         }
     }
 }
 
 /// The id as the API spells it and as `parse_id` reads it back: `105`,
-/// `prefixes/<name>`, `nodes/<node>/prefixes/<name>`. The one string form of
-/// a document id, used on the wire and in error messages alike.
+/// `prefixes/<name>`. The one string form of a document id, used on the wire
+/// and in error messages alike.
 impl fmt::Display for DocId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DocId::Guest(vmid) => write!(f, "{vmid}"),
             DocId::Registry(kind, name) => write!(f, "{kind}/{name}"),
-            DocId::NodePrefix { node, name } => write!(f, "nodes/{node}/prefixes/{name}"),
         }
     }
 }
@@ -195,16 +188,6 @@ pub struct StoreVersion {
     /// removed, or modified). Two stores with the same token have identical
     /// content.
     pub token: String,
-    /// The most recent modification time observed among the store's files.
-    pub changed: SystemTime,
-    /// Every **document** in the store with its own digest, sorted by id — the
-    /// per-document half of the same walk the token is hashed from.
-    ///
-    /// Snapshot copies are deliberately absent: they are not addressable through
-    /// the API, so a caller diffing this list has nothing to do about one. They
-    /// still move [`Self::token`], which is the honest answer — something in the
-    /// store changed, just nothing this caller can read.
-    pub documents: Vec<(DocId, String)>,
 }
 
 /// What [`MetaStore::rollback`] actually did.
@@ -433,23 +416,6 @@ impl MetaStore {
             .unwrap_or_else(|| self.root.join("meta.d").join(kind.as_str()))
     }
 
-    /// `node`'s prefix directory: [`Registry::node_prefix_dir`], the same one
-    /// the loader reads.
-    ///
-    /// With no nodes directory configured -- `PVE_META_NODES_DIR` set to
-    /// nothing, or a [`Registry::new`] given none -- there is no such directory
-    /// and no fallback: a write the loader would never read back is refused, and
-    /// the cluster directories' fallback inside `root` is not repeated here for
-    /// a file nothing would load.
-    ///
-    /// # Errors
-    /// [`Error::Registry`] when no nodes directory is configured.
-    fn node_prefix_dir(&self, node: &NodeName) -> Result<PathBuf> {
-        self.registry
-            .node_prefix_dir(node)
-            .ok_or_else(|| Error::Registry("no nodes directory is configured".to_string()))
-    }
-
     /// Where `id` is **written**, and where it is read from unless a
     /// lower-precedence registry directory is the only one that has it (see
     /// [`MetaStore::read_path_for`]).
@@ -457,7 +423,6 @@ impl MetaStore {
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
         Ok(match id {
             DocId::Registry(kind, _) => self.registry_write_dir(*kind).join(file),
-            DocId::NodePrefix { node, .. } => self.node_prefix_dir(node)?.join(file),
             DocId::Guest(_) => self.root.join(file),
         })
     }
@@ -467,16 +432,14 @@ impl MetaStore {
     /// has the file, parseable or not, which is the same rule the loader
     /// applies, so the document opened for repair is the one in effect.
     /// Falls back to [`MetaStore::path_for`] when none has it, so a "not
-    /// found" error names the place a write would create it. A node's prefix
-    /// file is read from its node's directory only: `nodes/<node>/prefixes/<name>`
-    /// is that file, never the cluster file of the same name it shadows.
+    /// found" error names the place a write would create it.
     fn read_path_for(&self, id: &DocId) -> Result<PathBuf> {
         match id {
             DocId::Registry(kind, name) => match self.registry.locate(*kind, name) {
                 Some(path) => Ok(path),
                 None => self.path_for(id),
             },
-            _ => self.path_for(id),
+            DocId::Guest(_) => self.path_for(id),
         }
     }
 
@@ -916,139 +879,32 @@ impl MetaStore {
     /// otherwise (including across mere reads).
     ///
     /// The token is a SHA-256 over the sorted list of `(file name, content
-    /// identity)`, hashed from the files' actual bytes on every call. There
-    /// is deliberately no `(mtime, len)` cache: the bindings build a fresh
-    /// `MetaStore` per request (so it could never hit), and pmxcfs's mtime
-    /// granularity cannot distinguish two same-length writes within one tick
-    /// (so it would be unsound if it did). Documents are tiny.
+    /// identity)` -- every guest document and every file in the two prefix
+    /// directories -- hashed from the files' actual bytes on every call.
+    /// There is deliberately no `(mtime, len)` cache: the bindings build a
+    /// fresh `MetaStore` per request (so it could never hit), and pmxcfs's
+    /// mtime granularity cannot distinguish two same-length writes within
+    /// one tick (so it would be unsound if it did). Documents are tiny.
     ///
     /// "Tiny" is what [`MAX_READ_BYTES`] enforces, and this poll is the
     /// reason it has to: a single multi-megabyte file dropped into
     /// `/etc/pve/meta` out of band would otherwise be read and SHA-256'd by
-    /// every open UI's 5 s poll, forever. Above the cap the file contributes
-    /// [`identify`]'s surrogate instead, which still changes when it does.
+    /// every open UI's 5 s poll, forever. Above the cap [`identify`] uses the
+    /// file's size and mtime instead, which still changes when the file does.
     ///
     /// An entry that disappears mid-walk is skipped: the store is not locked
     /// against a concurrent `DELETE` or `pve-meta rm`, and a poll must not 500
     /// because a file it had just listed is gone.
     pub fn version(&self) -> Result<StoreVersion> {
-        self.version_of(None, None)
-    }
-
-    /// [`MetaStore::version`], restricted to the one document a caller is
-    /// actually watching.
-    ///
-    /// `None` is the whole store. `Some(id)` covers `id`'s own file plus the
-    /// registry directory and nothing else, which is exactly what an open
-    /// editor needs: its document's content, and the prefixes that decide how
-    /// that content is rendered.
-    ///
-    /// The registry directories are still walked whole, because they are the
-    /// unit of *shadowing*: a prefix appearing in the cluster directory
-    /// changes the governing schema without any document changing, and the
-    /// token has to move for that. They hold tens of files for a cluster, not
-    /// one per guest, which is the whole reason this scoping is worth having.
-    ///
-    /// What a scoped token deliberately does **not** see: other documents, and
-    /// `id`'s own snapshot copies. The unscoped token moves for both — every
-    /// file in the store root is an entry — so the two tokens are not
-    /// comparable, and a caller that changes scope sees its token move once
-    /// and reloads once. That is the only cost.
-    ///
-    /// The cost it removes is per open tab, per tick: the unscoped poll reads
-    /// and hashes every document *and every snapshot copy* in the cluster to
-    /// answer a question about one guest. At four guests that is invisible; at
-    /// three hundred with snapshots it is a thousand pmxcfs round-trips every
-    /// five seconds, per open editor.
-    ///
-    /// `node` is the one a guest document's prefixes come from. The unscoped
-    /// token covers every node's prefix directory. A guest's
-    /// scoped token covers `node`'s -- the one whose files join that guest's
-    /// prefix set -- and hashes `node` itself as well, so the token moves when
-    /// the guest migrates even between two nodes whose directories hold the same
-    /// files: its set came from somewhere else, and an open editor has to rebuild
-    /// its rows from the other node's listing. A node prefix document's token
-    /// covers the cluster-wide directories and its own node's; `node` is
-    /// ignored there and for every other id.
-    pub fn version_of(&self, only: Option<&DocId>, node: Option<&NodeName>) -> Result<StoreVersion> {
         self.check_available()?;
         let mut entries: Vec<(String, String)> = Vec::new();
-        // A map, not a list: a prefix present in both the packaged and the
-        // cluster directory is *one* document, and the effective one is the
-        // last write wins here because the directories are walked lowest
-        // precedence first -- the same rule `registry::load_prefixes` applies
-        // by file name. The shadowed file still contributes to `entries`, so
-        // editing it moves the token even though no document's digest changed:
-        // over-notifying a poll is a reload, under-notifying it is a stale UI.
-        let mut documents: BTreeMap<DocId, String> = BTreeMap::new();
-        let mut latest: Option<SystemTime> = None;
-
-        // The node directories this token walks, by node name.
-        let mut node_dirs: Vec<NodeName> = Vec::new();
-        match only {
-            // A registry document's own file is one the registry walk below
-            // already covers, and no guest document can affect it: the store
-            // root is not read at all.
-            Some(DocId::Registry(..)) => {}
-            Some(DocId::NodePrefix { node, .. }) => node_dirs.push(node.clone()),
-            Some(id) => {
-                if let Some(node) = node {
-                    // Not a file: a pseudo-entry no file name can collide with,
-                    // since every real entry is a name or starts with a directory.
-                    entries.push(("\0node".to_string(), node.to_string()));
-                    node_dirs.push(node.clone());
-                }
-                let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-                self.add_version_entry(
-                    &self.root.join(&file),
-                    &file,
-                    "",
-                    &mut entries,
-                    &mut documents,
-                    &mut latest,
-                    &document_id,
-                )?;
-            }
-            None => {
-                self.scan_for_version(
-                    &self.root.clone(),
-                    "",
-                    &mut entries,
-                    &mut documents,
-                    &mut latest,
-                    &document_id,
-                )?;
-                node_dirs = self.registry.nodes()?;
-            }
-        }
-        for kind in [RegistryKind::PrefixDef] {
-            for dir in self.registry.dirs(kind) {
-                // The full directory path, not just the kind: two directories
-                // of the same kind hold same-named files on purpose, and the
-                // token must be able to tell them apart.
-                let prefix = format!("{}/", dir.display());
-                self.scan_for_version(
-                    &dir.clone(),
-                    &prefix,
-                    &mut entries,
-                    &mut documents,
-                    &mut latest,
-                    &|name| registry_document_id(kind, name),
-                )?;
-            }
-        }
-        for node in &node_dirs {
-            // refuses one before it gets here.
-            let Some(dir) = self.registry.node_prefix_dir(node) else { continue };
+        self.scan_for_version(&self.root.clone(), "", &mut entries)?;
+        for dir in self.registry.dirs(RegistryKind::PrefixDef) {
+            // The full directory path, not just the kind: two directories
+            // of the same kind hold same-named files on purpose, and the
+            // token must be able to tell them apart.
             let prefix = format!("{}/", dir.display());
-            self.scan_for_version(
-                &dir,
-                &prefix,
-                &mut entries,
-                &mut documents,
-                &mut latest,
-                &|name| node_prefix_document_id(node, name),
-            )?;
+            self.scan_for_version(&dir.clone(), &prefix, &mut entries)?;
         }
 
         entries.sort();
@@ -1058,31 +914,23 @@ impl MetaStore {
             hasher.update(name.as_bytes());
             hasher.update(dig.as_bytes());
         }
-        let token = hex::encode(hasher.finalize());
-        Ok(StoreVersion {
-            token,
-            changed: latest.unwrap_or(SystemTime::UNIX_EPOCH),
-            documents: documents.into_iter().collect(),
-        })
+        Ok(StoreVersion { token: hex::encode(hasher.finalize()) })
     }
 
-    /// One directory's contribution to [`MetaStore::version`]: every file in it
-    /// as a `(prefix + name, identity)` entry, and every file that addresses a
-    /// document as a `(DocId, identity)` too.
+    /// One directory's contribution to [`MetaStore::version`]: every file in
+    /// it as a `(prefix + name, identity)` entry.
     ///
     /// An entry that disappears mid-walk is skipped rather than failing the
     /// poll, and a directory that does not exist contributes nothing -- the
     /// packaged prefix directory is absent on a node with no operator
     /// package installed, which is not a condition to report. A directory that
-    /// cannot be read is an error.
+    /// cannot be read is an error. `symlink_metadata`, not `metadata`, so a
+    /// symlink is skipped rather than followed.
     fn scan_for_version(
         &self,
         dir: &std::path::Path,
         prefix: &str,
         entries: &mut Vec<(String, String)>,
-        documents: &mut BTreeMap<DocId, String>,
-        latest: &mut Option<SystemTime>,
-        id_of: &dyn Fn(&str) -> Option<DocId>,
     ) -> Result<()> {
         let Some(listing) = gone_is_none(fs::read_dir(dir))? else {
             return Ok(());
@@ -1093,88 +941,20 @@ impl MetaStore {
             if name.starts_with('.') {
                 continue;
             }
-            self.add_version_entry(
-                &entry.path(),
-                &name,
-                prefix,
-                entries,
-                documents,
-                latest,
-                id_of,
-            )?;
+            let path = entry.path();
+            let Some(meta) = gone_is_none(fs::symlink_metadata(&path))? else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(dig) = identify(&path)? else {
+                continue;
+            };
+            entries.push((format!("{prefix}{name}"), dig));
         }
         Ok(())
     }
-
-    /// One file's contribution to a version token: a `(prefix + name,
-    /// identity)` entry, plus a `documents` row when the name addresses a
-    /// document.
-    ///
-    /// A path that is not there, is not a regular file, or disappears between
-    /// two of the syscalls here contributes nothing rather than failing: a
-    /// poll must not 500 because a document was deleted between two ticks.
-    /// `symlink_metadata`, not `metadata`, so a symlink is skipped the same
-    /// way the directory walk's `file_type()` check skipped it.
-    #[allow(clippy::too_many_arguments)]
-    fn add_version_entry(
-        &self,
-        path: &std::path::Path,
-        name: &str,
-        prefix: &str,
-        entries: &mut Vec<(String, String)>,
-        documents: &mut BTreeMap<DocId, String>,
-        latest: &mut Option<SystemTime>,
-        id_of: &dyn Fn(&str) -> Option<DocId>,
-    ) -> Result<()> {
-        let Some(meta) = gone_is_none(fs::symlink_metadata(path))? else {
-            return Ok(());
-        };
-        if !meta.is_file() {
-            return Ok(());
-        }
-        let mtime = meta.modified()?;
-        let Some(dig) = identify(path)? else {
-            return Ok(());
-        };
-        if let Some(id) = id_of(name) {
-            documents.insert(id, dig.clone());
-        }
-        entries.push((format!("{prefix}{name}"), dig));
-        *latest = Some(match *latest {
-            Some(t) if t >= mtime => t,
-            _ => mtime,
-        });
-        Ok(())
-    }
-}
-
-/// The [`DocId`] a store file name addresses, or `None` when it addresses no
-/// document: a snapshot copy (`<vmid>.<snapname>.yaml`), a temp file, or
-/// anything else that happens to be in the directory.
-/// The [`DocId`] a registry file name addresses, or `None` for anything that
-/// is not a `<name>.yaml` the loader would read: the same filter
-/// `registry::yaml_files` applies, so the poll and the loader agree on what a
-/// registry document is.
-fn registry_document_id(kind: RegistryKind, name: &str) -> Option<DocId> {
-    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
-    crate::registry::is_valid_file_name(stem).then(|| DocId::Registry(kind, stem.to_string()))
-}
-
-/// The [`DocId`] a file name in `node`'s prefix directory addresses, by the
-/// same filter as [`registry_document_id`].
-fn node_prefix_document_id(node: &NodeName, name: &str) -> Option<DocId> {
-    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
-    crate::registry::is_valid_file_name(stem)
-        .then(|| DocId::NodePrefix { node: node.clone(), name: stem.to_string() })
-}
-
-fn document_id(name: &str) -> Option<DocId> {
-    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
-    // `<vmid>.<snapname>.yaml` also ends with the suffix; its stem is not a
-    // bare number, which is exactly what tells the two apart. So does a stray
-    // `datacenter.yaml` left by a release that had such a document: it moves
-    // the token like any file in the directory and addresses nothing.
-    stem.parse::<u32>().ok().map(DocId::Guest)
 }
 
 /// A filesystem-safe tag identifying this node, for temp file names. Falls

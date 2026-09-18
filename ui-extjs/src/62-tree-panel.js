@@ -52,12 +52,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0 };
         me.prefixes = [];
-        // Not sourced from anywhere any more: `GET /meta/access` carried the
-        // guest's tags alongside the access answer, and that answer is now just
-        // `{ read, write }` (DESIGN §4). A tag-selected prefix therefore cannot be
-        // resolved here until something else supplies the guest's tags.
-        me.tags = [];
-        me.token = null;
         me.editing = false; // a row editor is open
         me.mode = 'tree';
         me.textLang = 'yaml';
@@ -83,9 +77,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.reload();
             me.syncButtons();
         });
-        me.pollTask = Ext.TaskManager.start({ run: () => me.poll(), interval: 5000, fireOnStart: false });
         me.on('destroy', function () {
-            Ext.TaskManager.stop(me.pollTask);
             if (me.textWindow) {
                 me.textWindow.close();
             }
@@ -493,8 +485,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // Records one edit: a `set` is `view::replace` at `path` and a `delete` is
     // `view::remove`, applied to the document as it stands -- so a set at `selector`
     // says everything about `selector.tag`, whatever was staged there before. The one
-    // door every editor stages through: the row editor, Add Key, Add Rule, Declare
-    // Key, Set to Default, the list helpers and the subtree text editor.
+    // door every editor stages through: the row editor, Add Key, Set to Default, the
+    // list helpers and the subtree text editor.
     stage: function (path, op, value) {
         let me = this;
         let U = PVE.meta.Utils;
@@ -637,14 +629,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return have.shape;
     },
 
-    // What a document's Shape is built from. A guest's: the prefix listing and the
-    // guest's tags (see `me.tags` above -- always empty for now). A registry file's:
-    // the meta-schema for its kind.
+    // What a document's Shape is built from. A guest's: the prefix listing, already
+    // resolved for it by the server (DESIGN §3). A registry file's: the
+    // meta-schema for its kind.
     shapeInputs: function (id) {
         let me = this;
         let kind = me.docKind(id);
         if (kind === 'guest') {
-            return [me.prefixes, me.tags];
+            return [me.prefixes];
         }
         if (kind === 'prefix') {
             return [(me.schemas || {})[kind]];
@@ -655,7 +647,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     buildShape: function (id, inputs) {
         let kind = this.docKind(id);
         if (kind === 'guest') {
-            return PVE.meta.Shape.of(inputs[0], inputs[1]);
+            return PVE.meta.Shape.of(inputs[0]);
         }
         if (kind === 'prefix') {
             return PVE.meta.Shape.rooted(inputs[0]);
@@ -1220,11 +1212,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
-        // Reloading (including from the version poll) must not fold the tree up.
-        // Keyed by document *and* path, even though one panel shows one document: a
-        // window opened on a prefix file and the tab behind it are two panels with
-        // their own stores, and a key that named only the path would be the same
-        // string in both.
+        // Reloading must not fold the tree up. Keyed by document *and* path, even
+        // though one panel shows one document: a window opened on a prefix file and
+        // the tab behind it are two panels with their own stores, and a key that
+        // named only the path would be the same string in both.
         let key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
         let expanded = Object.create(null);
         let seen = false;
@@ -1249,13 +1240,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // --- editing ------------------------------------------------------------
 
-    // Opens one of this panel's modal editor windows (Edit Value, Add Key, Add Rule,
-    // Declare Key) and wires the one thing all seven call sites did by hand: `editing`
-    // goes true so a reload or the version poll cannot pull the document out from
-    // under an open window, `on`/`handler` is the window's one result event, and
-    // `editing` goes false again on `destroy` -- whether the window committed or was
-    // cancelled. A copy of this that forgot the `destroy` listener would leave
-    // `editing` stuck true and quietly stop this panel from ever reloading again.
+    // Opens one of this panel's modal editor windows (Edit Value, Add Key) and wires
+    // the one thing every call site did by hand: `editing` goes true so a reload
+    // cannot pull the document out from under an open window, `on`/`handler` is the
+    // window's one result event, and `editing` goes false again on `destroy` --
+    // whether the window committed or was cancelled. A copy of this that forgot the
+    // `destroy` listener would leave `editing` stuck true and quietly stop this
+    // panel from ever reloading again.
     openEditor: function (xtype, cfg, on, handler) {
         let me = this;
         me.editing = true;
@@ -1279,14 +1270,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         // A value with structure inside it is edited as text, wherever the request came
         // from (button, double-click, Enter). Before this, all three simply did nothing
-        // on a map row.
-        // A declaration in a prefix file is edited by the form that made it, not as
-        // text: it is the same thing Declare Key writes, so it is the same dialog
-        // prefilled. A row of YAML in a Monaco window is a worse way to change
-        // `type` than the dropdown that knows the types.
-        if (me.editDeclaration(rec)) {
-            return;
-        }
+        // on a map row. A declaration is a map like any other, so this is also how one
+        // is edited: as YAML, on `schema.properties.<key>` (DESIGN §3).
         if (PVE.meta.Utils.editorKind(rec.data) === 'text') {
             me.editAsText(rec);
             return;
@@ -1487,48 +1472,28 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         );
     },
 
-    // Declare one key of the selected prefix's schema: a view PUT into
-    // `schema.properties.<key>` of that prefix document, with its digest. The
-    // window builds the declaration; this only decides where it goes.
-    // Opens the declaration form on an existing declaration, prefilled. Returns
-    // whether it did, so `editRow` can fall through to its other editors.
-    editDeclaration: function (rec) {
-        let me = this;
-        let docId = me.docOf(rec);
-        if (me.docKind(docId) !== 'prefix') {
-            return false;
-        }
-        let key = PVE.meta.Utils.declaredKeyAt(rec.data.path);
-        if (!key) {
-            return false;
-        }
-        let current = PVE.meta.Utils.valueAt(me.plannedData(docId), rec.data.path);
-        if (current === null || typeof current !== 'object' || Array.isArray(current)) {
-            return false; // not a declaration after all; let the text editor have it
-        }
-        me.openEditor(
-            'PVE.meta.DeclareKeyWindow',
-            { prefix: me.docTitle(docId), declaration: current, keyName: key },
-            'declarekey',
-            // Laid over the declaration as it is: the form rewrites the fields it
-            // asks about and keeps the rest -- a map's nested `properties` above all.
-            (_key, schema) => me.stage(rec.data.path, 'set', PVE.meta.DeclareKeyWindow.merged(current, schema)),
-        );
-        return true;
-    },
-
+    // "Declare Key": there is no form of its own any more -- `schema.properties` is
+    // a map like any other, so this opens it as text (DESIGN §3). An empty map
+    // gets a hint instead of a blank buffer, so the first key is not typed from
+    // nothing.
     declareKey: function (rec) {
         let me = this;
-        if (!rec || !rec.data.docId || me.docKind(rec.data.docId) !== 'prefix') {
+        let docId = rec && rec.data && rec.data.docId;
+        if (!docId || me.docKind(docId) !== 'prefix') {
             return;
         }
-        let docId = rec.data.docId;
-        me.openEditor(
-            'PVE.meta.DeclareKeyWindow',
-            { prefix: me.docTitle(docId) },
-            'declarekey',
-            (key, schema) => me.stage('schema.properties.' + key, 'set', schema),
-        );
+        let props = PVE.meta.Utils.valueAt(me.plannedData(docId), 'schema.properties');
+        if (!props || !Object.keys(props).length) {
+            props = { key_name: { type: 'string' } };
+        }
+        me.textWindow = Ext.create('PVE.meta.TextWindow', {
+            view: 'schema.properties',
+            docId: docId,
+            text: PVE.meta.Codec.dump(props, 'yaml'),
+            tree: me,
+        });
+        me.textWindow.on('destroy', () => (me.textWindow = null));
+        me.textWindow.show();
     },
 
     // Staged like every other edit, so no confirm: nothing has happened yet, the row

@@ -40,12 +40,10 @@ directories:
 * `/etc/pve/meta.d/prefixes/` — cluster-wide overrides on pmxcfs. `debian/pve-meta.postinst`
   creates it (guarded on `/etc/pve/local`, i.e. only on a node that has joined a cluster);
   nothing packages files into it.
-* `/etc/pve/nodes/<node>/meta.d/prefixes/` — one node's overrides, for the guests on that
-  node. Nothing creates these ahead of time: the first write of a node's prefix file
-  creates its directory, and a node without one simply has no files of its own.
 
-A cluster prefix file overrides the packaged file of the same name, and a node file the
-cluster file for that node's guests; all of these are read per request and none is
+A cluster prefix file overrides the packaged file of the same name; a prefix file's own
+`nodes:` map overrides its `schema`/`enforce`/`hidden` for a guest on that node, inside
+the same file (`docs/DESIGN.md` §3). Both directories are read per request and neither is
 required to exist.
 
 ## Registration (handled by pve-ext, not this file)

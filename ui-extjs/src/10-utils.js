@@ -29,18 +29,6 @@ PVE.meta.Utils = {
     // The path above `path`, or '' for a top-level key (and for the root itself).
     parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
-    // The key a path declares, if it is a declaration inside a prefix file's schema
-    // -- `schema.properties.host`, or `schema.properties.spec.properties.host` --
-    // and `null` otherwise. What makes one is the segment before the last: a
-    // declaration is always a child of some `properties`.
-    declaredKeyAt: function (path) {
-        let segs = String(path || '').split('.');
-        if (segs.length < 3 || segs[0] !== 'schema' || segs[segs.length - 2] !== 'properties') {
-            return null;
-        }
-        return segs[segs.length - 1];
-    },
-
     // Two document values are the same value. Maps compare as sets: key order is
     // kept on disk as a courtesy and is not a value (DESIGN §2), so the keys are
     // sorted before the two are encoded and compared.

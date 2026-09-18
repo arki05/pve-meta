@@ -38,31 +38,12 @@ pub struct CallerAcl {
     pub node: Option<NodeName>,
 }
 
-/// `GET /meta/version`.
+/// `GET /meta/version`: one unscoped token over the whole store
+/// (`docs/DESIGN.md` §6).
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiVersion {
     /// A content hash over the store; poll it.
     pub token: String,
-    /// The newest document mtime, as a unix timestamp.
-    pub changed: u64,
-    /// With `detail`: every document's own digest, sorted by id, so a caller
-    /// that saw the token move can tell **which** documents to re-read instead
-    /// of re-listing the store. With an `id` as well, just that one document.
-    ///
-    /// Unfiltered by design. A digest is not sensitive (`docs/DESIGN.md` §1
-    /// puts digests and listings out of scope), and filtering would cost a
-    /// grant computation per document on the one endpoint whose whole purpose
-    /// is to be cheap enough to poll.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documents: Option<Vec<ApiDocumentDigest>>,
-}
-
-/// One row of `GET /meta/version?detail=1`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ApiDocumentDigest {
-    /// A vmid, `prefixes/<name>` or `nodes/<node>/prefixes/<name>`.
-    pub id: String,
-    pub digest: String,
 }
 
 /// One row of `GET /meta/guests` (`docs/DESIGN.md` §4, §8): only for a guest
@@ -161,19 +142,17 @@ pub enum PrefixEntry {
 
 /// A prefix file that did not load, keyed like a loaded [`PrefixDef`]
 /// (`prefix`, not `name`) so one array can mix both and a reader can find
-/// either by the same field. No filesystem path: `origin` (and `node`) already
-/// say which file it is, which is what a repair needs (`docs/DESIGN.md` §1).
+/// either by the same field. No filesystem path: `origin` already says which
+/// file it is, which is what a repair needs (`docs/DESIGN.md` §1).
 #[derive(Debug, Clone, Serialize)]
 pub struct FailedPrefix {
     pub prefix: String,
     pub origin: Origin,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<NodeName>,
     pub error: String,
 }
 
 impl From<RegistryFailure> for FailedPrefix {
     fn from(f: RegistryFailure) -> Self {
-        FailedPrefix { prefix: f.name, origin: f.origin, node: f.node, error: f.error }
+        FailedPrefix { prefix: f.name, origin: f.origin, error: f.error }
     }
 }

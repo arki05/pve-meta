@@ -11,8 +11,8 @@ PVE.meta.Doc = {
     // --- documents -----------------------------------------------------------
 
     // The API path of a document, from its id. Total by construction: a registry id
-    // is `prefixes/<name>` or `nodes/<node>/prefixes/<name>` -- the path it is served
-    // at -- and everything else is a vmid (`api::parse_id`).
+    // is `prefixes/<name>` -- the path it is served at -- and everything else is a
+    // vmid (`api::parse_id`).
     urlFor: function (id) {
         return id.indexOf('/') === -1 ? '/meta/guests/' + id : '/meta/' + id;
     },
@@ -26,20 +26,14 @@ PVE.meta.Doc = {
         return Ext.apply({ comments: 1 }, params);
     },
 
-    // The document id of a registry file: `<kind>/<name>`, or for a node's prefix
-    // file `nodes/<node>/prefixes/<name>` -- its own document, never the cluster file
-    // of the same name (`api::parse_id`).
-    registryId: function (kind, name, node) {
-        return node ? 'nodes/' + node + '/prefixes/' + name : kind + '/' + name;
+    // The document id of a prefix file: `prefixes/<name>` (`api::parse_id`).
+    registryId: function (name) {
+        return 'prefixes/' + name;
     },
 
-    // What kind of document an id names -- which decides what governs its rows. A
-    // node's prefix file is a prefix, described by the same meta-schema.
+    // What kind of document an id names -- which decides what governs its rows.
     docKind: function (id) {
-        if (id.indexOf('prefixes/') === 0 || /^nodes\/[^/]+\/prefixes\//.test(id)) {
-            return 'prefix';
-        }
-        return 'guest';
+        return id.indexOf('prefixes/') === 0 ? 'prefix' : 'guest';
     },
 
     // The file name, which for a prefix is the prefix: whatever follows the last
@@ -138,13 +132,12 @@ PVE.meta.Doc = {
         });
     },
 
-    // What `loadPrefixes` asks for. A guest's rows come from the set in effect for
-    // it: the packaged and cluster files with its current node's on top, one per
-    // name, resolved by the server from the guest's id (DESIGN §3), so the reload a
-    // migration's token change causes gets the new node's set. A registry
-    // document's rule picker wants every file.
+    // What `loadPrefixes` asks for. A guest's rows come from the set the server has
+    // already resolved for it -- selector and node override applied, most-specific
+    // first (DESIGN §3) -- so the reload a migration's node change causes gets the
+    // new set. A registry document's rule picker wants every file, as it is.
     prefixParams: function () {
-        return this.registryDoc ? { all: 1 } : { id: this.docId };
+        return this.registryDoc ? {} : { id: this.docId };
     },
 
     loadAccess: function (next) {
@@ -249,50 +242,6 @@ PVE.meta.Doc = {
                 Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             },
         );
-    },
-
-    poll: function () {
-        let me = this;
-        if (
-            !me.rendered ||
-            me.isDestroyed ||
-            me.editing ||
-            me.textWindow ||
-            me.mode === 'text' ||
-            // Never pull the document out from under staged edits. The token keeps
-            // moving; the next tick after Apply or Revert picks the change up.
-            me.isDirty()
-        ) {
-            return;
-        }
-        Proxmox.Utils.API2Request({
-            url: '/meta/version',
-            method: 'GET',
-            // Narrowed to the document this panel shows. Unnarrowed, every tick of
-            // every open tab read and hashed every document *and every snapshot
-            // copy* in the cluster to answer a question about one guest, and any
-            // guest changing anywhere reloaded every open editor. The token still
-            // covers the prefix directory, so a registry change reloads this panel
-            // the way it always did.
-            params: { id: me.docId },
-            failure: Ext.emptyFn, // transient; the next tick tries again
-            success: function (response) {
-                let token = (response.result.data || {}).token;
-                if (me.token === null) {
-                    me.token = token;
-                } else if (token && token !== me.token) {
-                    // Re-check: an edit (or a text editor) may have started while
-                    // this request was in flight. Do *not* advance me.token here -
-                    // leaving it stale means the next 5 s tick sees the same change
-                    // and retries, instead of the reload being lost silently.
-                    if (me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
-                        return;
-                    }
-                    me.token = token;
-                    me.reload();
-                }
-            },
-        });
     },
 
     // --- writes -------------------------------------------------------------

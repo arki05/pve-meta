@@ -1,5 +1,5 @@
 // headless-flows-check.js — the flows headless-tab-check.js does not cover: applying
-// the Monaco diff, Add, Remove, the 5 s version poll, and the datacenter document.
+// the Monaco diff, Add, Remove, and the datacenter document.
 // Usage: node headless-flows-check.js <host> <vmid>
 const puppeteer = require('puppeteer-core');
 const https = require('https');
@@ -216,7 +216,10 @@ async function main() {
             () => window.monaco.editor.getModels().length,
         );
 
-        // --- 4. The version poll: change the store from outside --------------
+        // --- 4. Manual Reload picks up a change made from outside ------------
+        // There is no background poll any more: the digest check on every write
+        // catches a concurrent change (a 409 reloads), and otherwise it is the
+        // toolbar's Reload.
         await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTextWindow').forEach((w) => w.close()));
         await sleep(1500);
         result.checks.windowsClosed = await page.evaluate(() => ({
@@ -224,54 +227,20 @@ async function main() {
             diff: Ext.ComponentQuery.query('#pveMetaDiffWindow').length,
             models: window.monaco.editor.getModels().length,
         }));
-        const before = await rows(page);
         await api(
             `/api2/json/meta/guests/${vmid}`,
             'PUT',
             tk,
             csrf,
-            'view=poll_probe&mode=replace&data=' + encodeURIComponent('"set from outside"'),
+            'view=reload_probe&mode=replace&data=' + encodeURIComponent('"set from outside"'),
         );
-        await sleep(9000);
-        const after = await rows(page);
-        result.checks.poll = {
-            appeared: after.some((r) => r.startsWith('poll_probe')),
-            beforeCount: before.length,
-            afterCount: after.length,
-        };
-        await page.screenshot({ path: `${out}/extjs-after-poll.png` });
-
-        // The poll must never fire while the row editor is open.
-        const rowCell = await page.evaluateHandle(() => {
-            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-            let n = null;
-            p.getRootNode().cascadeBy((x) => {
-                if (!n && x.data.kind !== 'map' && x.data.path && x.data.editable) n = x;
-            });
-            const row = n && p.tree.getView().getNode(n);
-            return row ? row.querySelectorAll('.x-grid-cell')[0] : null;
-        });
-        if (rowCell.asElement()) {
-            await rowCell.asElement().click({ clickCount: 2 });
-            await sleep(900);
-        }
-        result.checks.pollSuppressed = await page.evaluate(() => {
-            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-            const editing = p.editing;
-            const reloaded = [];
-            const orig = p.reload;
-            p.reload = function () {
-                reloaded.push(1);
-                return orig.apply(this, arguments);
-            };
-            p.poll();
-            Ext.ComponentQuery.query('pveMetaEditValueWindow').forEach((w) => w.close());
-            p.reload = orig;
-            return { editingFlagSet: editing, reloadCalledWhileEditing: reloaded.length };
-        });
+        await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].reload());
+        await sleep(3000);
+        result.checks.reload = { appeared: (await rows(page)).some((r) => r.startsWith('reload_probe')) };
+        await page.screenshot({ path: `${out}/extjs-after-reload.png` });
 
         await api(
-            `/api2/json/meta/guests/${vmid}?view=poll_probe`,
+            `/api2/json/meta/guests/${vmid}?view=reload_probe`,
             'DELETE',
             tk,
             csrf,

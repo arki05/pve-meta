@@ -3,7 +3,6 @@
 use pretty_assertions::assert_eq;
 use pve_meta_core::digest::digest;
 use pve_meta_core::error::Error;
-use pve_meta_core::registry::{NodeName, PrefixSet, Registry};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind, RollbackOutcome, MAX_READ_BYTES};
 use serde_json::{json, Value};
 use tempfile::tempdir;
@@ -381,33 +380,26 @@ fn write_atomic_leaves_no_temp_files_behind() {
 }
 
 #[test]
-fn version_lists_documents_with_their_digests_and_never_snapshots() {
-    let (_dir, store) = store();
-    assert!(store.version().unwrap().documents.is_empty());
+fn version_moves_for_a_snapshot_and_a_stray_file_too() {
+    // The token is one hash over every file in the store root plus the
+    // prefix directories: a snapshot copy and a stray file with no vmid in
+    // its name (a `datacenter.yaml` left by a release that had such a
+    // document, say) both move it, even though neither is addressable
+    // through the API.
+    let (dir, store) = store();
+    let v0 = store.version().unwrap();
 
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Guest(200), "b: 2\n", None).unwrap();
-    // A snapshot copy moves the token but is not a document: nothing addresses
-    // it through the API, so a caller diffing the list has nothing to do about it.
+    let v1 = store.version().unwrap();
+    assert_ne!(v0.token, v1.token);
+
     store.snapshot(100, "before").unwrap();
-    // So does a stray file with no vmid in its name -- a `datacenter.yaml` left
-    // by the release that had such a document, say.
-    std::fs::write(_dir.path().join("datacenter.yaml"), "note: x\n").unwrap();
+    let v2 = store.version().unwrap();
+    assert_ne!(v1.token, v2.token, "a snapshot moves the token");
 
-    let v = store.version().unwrap();
-    let ids: Vec<DocId> = v.documents.iter().map(|(id, _)| id.clone()).collect();
-    assert_eq!(ids, vec![DocId::Guest(100), DocId::Guest(200)]);
-
-    // Each digest is that document's own, matching what a read reports.
-    for (id, digest) in &v.documents {
-        assert_eq!(*digest, store.read(id).unwrap().digest);
-    }
-
-    let before = v.token.clone();
-    store.snapshot(100, "second").unwrap();
-    let after = store.version().unwrap();
-    assert_ne!(before, after.token, "a snapshot still moves the token");
-    assert_eq!(after.documents.len(), 2, "... but adds no document");
+    std::fs::write(dir.path().join("datacenter.yaml"), "note: x\n").unwrap();
+    let v3 = store.version().unwrap();
+    assert_ne!(v2.token, v3.token, "a stray file moves the token too");
 }
 
 #[test]
@@ -717,14 +709,14 @@ fn a_malformed_override_is_the_file_a_read_opens_and_the_loader_reports() {
     assert_eq!(read.path, cluster_file, "the read opens the override");
     assert_eq!(read.raw, "selector: {nonsense: true}\n");
 
-    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes().unwrap();
     assert!(loaded.is_empty(), "the packaged file is shadowed, not re-activated");
     assert_eq!(failures.len(), 1);
     assert_eq!(failures[0].name, "traefik");
 
     // Removing the override is the repair: the packaged file is in effect again.
     assert!(store.delete(&prefix("traefik")).unwrap());
-    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes().unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(failures.is_empty());
 }
@@ -738,33 +730,19 @@ fn a_missing_registry_document_is_not_found() {
 }
 
 #[test]
-fn version_lists_a_shadowed_registry_document_once_and_still_notices_it() {
+fn version_notices_a_shadowed_registry_document_changing_too() {
     let (dir, store) = store();
     let packaged = packaged_prefix_dir(dir.path());
     std::fs::create_dir_all(&packaged).unwrap();
     std::fs::write(packaged.join("traefik.yaml"), "description: packaged\n").unwrap();
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    let cluster = store
+    store
         .put_raw(&prefix("traefik"), "description: cluster\n", None)
-        .unwrap()
-        .document
-        .digest;
-
-    let v = store.version().unwrap();
-    let registry: Vec<_> = v
-        .documents
-        .iter()
-        .filter(|(id, _)| matches!(id, DocId::Registry(..)))
-        .collect();
-    assert_eq!(
-        registry,
-        vec![&(prefix("traefik"), cluster)],
-        "one document, with the digest of the file the loader would read",
-    );
+        .unwrap();
 
     // The shadowed file still moves the token: it is part of what the loaders
     // see, and a poll that misses a change is worse than one that reloads.
-    let before = v.token;
+    let before = store.version().unwrap().token;
     std::fs::write(packaged.join("traefik.yaml"), "description: edited\n").unwrap();
     assert_ne!(store.version().unwrap().token, before);
 }
@@ -787,49 +765,18 @@ fn a_registry_write_leaves_no_temp_files_behind_in_its_own_directory() {
 }
 
 #[test]
-fn a_nested_prefix_is_a_dotted_file_name_and_still_one_document() {
+fn a_nested_prefix_is_a_dotted_file_name_and_still_moves_the_token() {
     let (dir, store) = store();
     // `homelab.docker.yaml` declares the prefix `homelab.docker` -- the file
     // name *is* the prefix, so dots in it are ordinary.
     let nested = DocId::Registry(RegistryKind::PrefixDef, "homelab.docker".to_string());
+    let before = store.version().unwrap().token;
     let written = store.put_raw(&nested, "selector: {all: true}\n", None).unwrap();
     assert_eq!(
         written.document.path,
         cluster_prefix_dir(dir.path()).join("homelab.docker.yaml"),
     );
-
-    // And the version walk maps that file name back to the same id, which is
-    // the half of the rule a guest document's `<vmid>.<snap>.yaml` makes easy
-    // to get wrong.
-    let v = store.version().unwrap();
-    assert!(
-        v.documents.iter().any(|(id, _)| *id == nested),
-        "the nested prefix is missing from {:?}",
-        v.documents,
-    );
-}
-
-// --- node prefix documents (DocId::NodePrefix) -------------------------------
-
-#[test]
-fn a_node_prefix_document_lives_where_the_loader_reads_or_nowhere() {
-    let (dir, store) = store();
-    // With no nodes directory configured there is nowhere the loader would read
-    // a node file from, so the store has nowhere to write one either.
-    let pve1 = NodeName::new("pve1").unwrap();
-    let good = DocId::NodePrefix { node: pve1.clone(), name: "gpu".to_string() };
-    assert!(matches!(store.put_raw(&good, "selector: {all: true}\n", None), Err(Error::Registry(_))));
-    assert!(!dir.path().join("nodes").exists(), "nothing was written inside the root");
-
-    // With one, the store writes where the loader reads.
-    let registry = Registry::new(vec![cluster_prefix_dir(dir.path())])
-        .with_nodes_dir(dir.path().join("nodes"));
-    let store = MetaStore::with_registry(dir.path(), registry);
-    let written = store.put_raw(&good, "selector: {all: true}\n", None).unwrap();
-    assert_eq!(written.document.path, dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml"));
-    assert_eq!(store.registry().unwrap().load_prefixes(Some(&pve1)).unwrap().len(), 1);
-    assert_eq!(store.read(&good).unwrap().raw, "selector: {all: true}\n");
-    assert!(store.delete(&good).unwrap());
+    assert_ne!(store.version().unwrap().token, before);
 }
 
 // --- a store that is not there (docs/DESIGN.md §7) ---------------------------
@@ -861,7 +808,6 @@ fn a_store_whose_cluster_marker_is_missing_refuses_every_operation() {
     unavailable(store.delete_snapshot(100, "before").map(drop), "delete_snapshot");
     unavailable(store.purge(100).map(drop), "purge");
     unavailable(store.version().map(drop), "version");
-    unavailable(store.version_of(Some(&DocId::Guest(100)), None).map(drop), "scoped version");
     unavailable(store.registry().map(drop), "registry");
     // A marker that is there but is not what pmxcfs provides is no better.
     std::fs::create_dir(&marker).unwrap();
@@ -889,16 +835,14 @@ fn a_directory_that_cannot_be_read_is_an_error_not_an_empty_one() {
 
     let store = MetaStore::with_registry_dirs(dir.path(), vec![not_a_dir.clone()]);
     let registry = store.registry().unwrap();
-    assert!(matches!(registry.list_prefixes(PrefixSet::Cluster), Err(Error::Io(_))));
+    assert!(matches!(registry.list_prefixes(), Err(Error::Io(_))));
     assert!(matches!(store.version(), Err(Error::Io(_))));
-    let nodes = Registry::new(vec![]).with_nodes_dir(&not_a_dir);
-    assert!(matches!(nodes.nodes(), Err(Error::Io(_))));
 
     // And a missing one is still nothing at all.
     let gone = dir.path().join("gone");
     let store = MetaStore::with_registry_dirs(&gone, vec![gone.clone()]);
     assert_eq!(store.stored_vmids().unwrap(), Vec::<u32>::new());
-    assert!(store.version().unwrap().documents.is_empty());
+    assert!(store.version().is_ok());
 }
 
 #[test]
@@ -909,13 +853,7 @@ fn one_entry_that_cannot_be_looked_at_costs_that_entry_not_the_answer() {
     std::fs::create_dir_all(&prefixes).unwrap();
     std::fs::write(prefixes.join("good.yaml"), "selector: {all: true}\n").unwrap();
     std::os::unix::fs::symlink("loop.yaml", prefixes.join("loop.yaml")).unwrap();
-    let (loaded, failures) = store.registry().unwrap().list_prefixes(PrefixSet::Cluster).unwrap();
+    let (loaded, failures) = store.registry().unwrap().list_prefixes().unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(failures.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["loop"]);
-
-    let nodes = dir.path().join("nodes");
-    std::fs::create_dir_all(nodes.join("pve1")).unwrap();
-    std::os::unix::fs::symlink("pve2", nodes.join("pve2")).unwrap();
-    let names: Vec<String> = Registry::new(vec![]).with_nodes_dir(&nodes).nodes().unwrap().iter().map(|n| n.to_string()).collect();
-    assert_eq!(names, vec!["pve1"]);
 }

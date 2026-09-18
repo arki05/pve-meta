@@ -5,8 +5,6 @@ use pve_meta_core::api::{
     self, access, delete_document, get_document, list_guests, parse_id, prefixes_list,
     put_document, version, ApiError, ApiPutResult, ApiViewDocument, CallerAcl, GuestInput,
 };
-use pve_meta_core::path::Path as DocPath;
-use pve_meta_core::shape::Shape;
 use pve_meta_core::registry::{self, NodeName, Origin, PrefixDef, RegistryFailure};
 use pve_meta_core::store::{DocId, MetaStore, RegistryKind};
 use serde_json::json;
@@ -162,19 +160,12 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
     // Without `enforce`, the same schema is advisory and the same write goes through.
     put_with(&store, &enforcing(false), "100", Some("traefik.port"), "json", r#""eighty""#, "replace", None, false, false, &full()).unwrap();
 
-    // A prefix that does not reach this guest enforces nothing on it.
-    let tagged = vec![pve_meta_core::registry::parse_prefix(
-        "traefik",
-        "selector: {tag: web}\nenforce: true\nschema: {type: object, properties: {port: {type: integer}}}\n",
-    )
-    .unwrap()];
-    put_with(&store, &tagged, "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
-    let mut web = full();
-    web.tags = vec!["web".to_string()];
-    assert_eq!(
-        status(&put_with(&store, &tagged, "100", Some("traefik.port"), "json", r#""y""#, "replace", None, false, false, &web).unwrap_err()),
-        422
-    );
+    // `put_document` trusts its `prefixes` argument as already resolved for
+    // this guest (`api::effective_prefixes`/`Registry::prefixes_for_guest`,
+    // which selector-matching now lives behind): an empty set -- what a guest
+    // outside every selector resolves to -- enforces nothing, whatever the
+    // prefix directory declares elsewhere.
+    put_with(&store, &[], "100", Some("traefik.port"), "json", r#""x""#, "replace", None, false, false, &full()).unwrap();
 }
 
 fn del(
@@ -190,96 +181,13 @@ fn del(
 // -- version polling ----------------------------------------------------
 
 #[test]
-fn version_detail_names_the_documents_that_changed() {
+fn version_is_one_unscoped_token_that_moves_on_a_write() {
+    // `api::version` is a thin wrapper over `MetaStore::version` -- the token
+    // itself is `tests/store.rs`'s to pin; this only pins the wire shape.
     let (_dir, store) = store();
+    let before = version(&store).unwrap().token;
     store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Guest(200), "b: 2\n", None).unwrap();
-
-    // Without `detail` the shape is unchanged: no `documents` on the wire.
-    let plain = version(&store, false, None, None).unwrap();
-    assert!(plain.documents.is_none());
-
-    let detailed = version(&store, true, None, None).unwrap();
-    let docs = detailed.documents.expect("detail asked for");
-    let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-    assert_eq!(ids, vec!["100", "200"]);
-    assert_eq!(docs[0].digest, store.read(&DocId::Guest(100)).unwrap().digest);
-    assert_eq!(detailed.token, plain.token, "detail does not change the token");
-}
-
-#[test]
-fn a_scoped_version_ignores_other_documents_and_snapshots() {
-    let (dir, store) = store();
-    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
-
-    let mine = || version(&store, false, Some("100"), None).unwrap().token;
-    let before = mine();
-
-    // Another guest's document: the unscoped token moves, mine does not.
-    let whole_before = version(&store, false, None, None).unwrap().token;
-    store.put_raw(&DocId::Guest(101), "b: 2\n", None).unwrap();
-    assert_ne!(version(&store, false, None, None).unwrap().token, whole_before);
-    assert_eq!(mine(), before, "another guest is not my document");
-
-    // My own snapshot copy is not my document either -- it is exactly the
-    // per-guest fan-out this scoping exists to avoid.
-    std::fs::write(dir.path().join("100.snap.yaml"), "a: 9\n").unwrap();
-    assert_eq!(mine(), before, "a snapshot copy is not the document");
-
-    // My own document, and only when its content actually changed.
-    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    assert_eq!(mine(), before, "a rewrite with the same bytes is not a change");
-    store.put_raw(&DocId::Guest(100), "a: 2\n", None).unwrap();
-    assert_ne!(mine(), before);
-}
-
-#[test]
-fn a_scoped_version_still_watches_the_registry() {
-    // The registry decides what the document *looks like*, so a scoped poll
-    // that missed it would leave an open editor rendering against a schema
-    // that no longer exists.
-    let (dir, store) = store();
-    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    let prefixes = dir.path().join("registry/prefixes");
-    std::fs::create_dir_all(&prefixes).unwrap();
-
-    for (id, body) in [("100", "selector: {all: true}\n"), ("prefixes/homelab", "selector: {tag: web}\n")] {
-        let before = version(&store, false, Some(id), None).unwrap().token;
-        std::fs::write(prefixes.join("homelab.yaml"), body).unwrap();
-        assert_ne!(
-            version(&store, false, Some(id), None).unwrap().token,
-            before,
-            "a prefix appearing must move the token for {id}"
-        );
-    }
-}
-
-#[test]
-fn a_scoped_detail_lists_exactly_what_the_scoped_token_covers() {
-    // `detail` answers "which of the things this token covers changed", so
-    // it lists what the token is over and nothing else: this document, and
-    // the registry documents -- which the scoped token watches too, because
-    // they decide how the document is rendered.
-    let (dir, store) = store();
-    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    store.put_raw(&DocId::Guest(101), "b: 1\n", None).unwrap();
-    let prefixes = dir.path().join("registry/prefixes");
-    std::fs::create_dir_all(&prefixes).unwrap();
-    std::fs::write(prefixes.join("homelab.yaml"), "selector: {all: true}\n").unwrap();
-
-    let docs = version(&store, true, Some("100"), None).unwrap().documents.unwrap();
-    let ids: Vec<&str> = docs.iter().map(|d| d.id.as_str()).collect();
-    assert_eq!(ids, vec!["100", "prefixes/homelab"]);
-}
-
-#[test]
-fn a_scoped_version_refuses_a_garbage_id() {
-    // The same parser every other endpoint uses: a 400, not a 500 and not
-    // a silent fall back to the whole store.
-    let (_dir, store) = store();
-    let err = version(&store, false, Some("nope"), None).unwrap_err().to_string();
-    assert!(err.starts_with("400: "), "{err}");
+    assert_ne!(version(&store).unwrap().token, before);
 }
 
 // -- write authorization is `acl.write` alone (`docs/DESIGN.md` §4) -----
@@ -1046,7 +954,6 @@ fn prefixes_list_carries_failures_keyed_like_a_loaded_prefix() {
     let failures = vec![RegistryFailure {
         name: "brokenns".to_string(),
         origin: Origin::Packaged,
-        node: None,
         error: "missing 'selector'".to_string(),
     }];
     let ns = prefixes_list(&prefixes, &failures);
@@ -1083,8 +990,7 @@ fn a_document_that_vanishes_mid_request_is_404_or_absent_never_500() {
     assert_eq!(listed[0].digest, "");
 
     // The version poll skips it rather than failing.
-    assert!(version(&store, false, None, None).is_ok());
-    assert!(version(&store, true, None, None).is_ok());
+    assert!(version(&store).is_ok());
 
     // A DELETE of a document another caller already removed is that
     // caller's request satisfied.
@@ -1222,231 +1128,76 @@ fn a_write_that_would_leave_the_loader_nothing_to_read_is_refused() {
     assert_eq!(status(&err), 400, "{err}");
 }
 
-// -- node prefix files -------------------------------------------------------
-
-/// A store whose registry has a nodes directory as well, laid out the way
-/// `Registry::from_env` lays out `/etc/pve`: `registry/prefixes` is the cluster
-/// directory, `nodes/<node>/meta.d/prefixes` a node's.
-fn node_store() -> (tempfile::TempDir, MetaStore) {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = registry::Registry::new(vec![dir.path().join("registry/prefixes")])
-        .with_nodes_dir(dir.path().join("nodes"));
-    let store = MetaStore::with_registry(dir.path(), registry);
-    (dir, store)
-}
+// -- a node's schema override, inside the prefix file (docs/DESIGN.md §3) ----
 
 fn on_node(node: &str) -> CallerAcl {
     CallerAcl { node: Some(NodeName::new(node).unwrap()), ..full() }
 }
 
-/// `put_document` with the prefixes `api_put` hands it: the set for the
-/// caller's node.
+/// `put_document` with the prefixes `api_put` hands it: the resolved set for
+/// the caller's node and tags.
 fn put_on(store: &MetaStore, id: &str, view: &str, payload: &str, acl: &CallerAcl) -> Result<ApiPutResult, ApiError> {
     let doc_id = parse_id(id).unwrap();
     let prefixes = api::effective_prefixes(store.registry().unwrap(), &doc_id, acl).unwrap();
     put_with(store, &prefixes, id, Some(view), "json", payload, "replace", None, false, false, acl)
 }
 
-fn put_node_prefix(store: &MetaStore, id: &str, text: &str) -> ApiPutResult {
-    put(store, id, None, "yaml", text, "replace", None, false, &full()).unwrap()
-}
-
 #[test]
-fn parse_id_reads_a_node_prefix_id_and_refuses_a_node_that_is_not_one() {
-    assert_eq!(
-        parse_id("nodes/pve1/prefixes/gpu.devices").unwrap(),
-        DocId::NodePrefix { node: NodeName::new("pve1").unwrap(), name: "gpu.devices".to_string() },
-    );
-    assert_eq!(parse_id("nodes/pve1/prefixes/gpu").unwrap().to_string(), "nodes/pve1/prefixes/gpu");
-    for bad in [
-        "nodes/../prefixes/gpu",
-        "nodes/./prefixes/gpu",
-        "nodes/pve.1/prefixes/gpu",
-        "nodes//prefixes/gpu",
-        "nodes/pve1/permissions/ops",
-        "nodes/pve1/prefixes/",
-        "nodes/pve1/prefixes/a/b",
-        "nodes/pve1/prefixes/../../x",
-        "nodes/pve1",
-        "nodes/-pve1/prefixes/gpu",
-    ] {
-        let err = parse_id(bad).unwrap_err();
-        assert_eq!(status(&err), 400, "{bad} was accepted: {err}");
-    }
-
-    let (_dir, store) = node_store();
-    for bad in ["..", "pve1/../x", "a.b", ""] {
-        assert_eq!(status(&api::prefixes(store.registry().unwrap(), Some(bad), false).unwrap_err()), 400, "{bad:?}");
-        assert_eq!(status(&version(&store, false, Some("100"), Some(bad)).unwrap_err()), 400, "{bad:?}");
-    }
-}
-
-#[test]
-fn a_node_prefix_is_a_document_in_its_nodes_directory_only() {
-    let (dir, store) = node_store();
-    put_node_prefix(&store, "prefixes/gpu", "description: cluster\nselector: {all: true}\n");
-    let written = put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "description: pve1\nselector: {all: true}\n");
-    assert_eq!(written.id, "nodes/pve1/prefixes/gpu");
-    assert!(dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml").is_file());
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("registry/prefixes/gpu.yaml")).unwrap(),
-        "description: cluster\nselector:\n  all: true\n",
-        "the cluster file is untouched",
-    );
-
-    // Read back as itself, never as the cluster file it shadows -- and on
-    // another node the id names a file that is not there.
-    let got = get(&store, "nodes/pve1/prefixes/gpu", Some("description"), "json", &full()).unwrap();
-    assert_eq!(got.data.unwrap(), json!("pve1"));
-    assert_eq!(get(&store, "nodes/pve2/prefixes/gpu", None, "json", &full()).unwrap().digest, "");
-
-    // The loader's own parser gates the write, dry run included.
-    for dry_run in [false, true] {
-        let err = put(&store, "nodes/pve1/prefixes/gpu", None, "yaml", "description: no selector\n", "replace", None, dry_run, &full())
-            .unwrap_err();
-        assert_eq!(status(&err), 400, "{err}");
-        assert!(err.msg.contains("not be a valid prefix"), "{err}");
-    }
-
-    // DELETE removes the node's file; the cluster file is in effect on pve1 again.
-    del(&store, "nodes/pve1/prefixes/gpu", None, None, &full()).unwrap();
-    assert!(!dir.path().join("nodes/pve1/meta.d/prefixes/gpu.yaml").exists());
-    let set = store.registry().unwrap().load_prefixes(Some(&NodeName::new("pve1").unwrap())).unwrap();
-    assert_eq!(set.len(), 1);
-    assert_eq!((set[0].description.as_deref(), set[0].origin), (Some("cluster"), Origin::Cluster));
-}
-
-/// Layers compose only through most-specific-wins: a cluster `gpu` and a node
-/// `gpu.devices` both apply on that node, each governing its own subtree.
-#[test]
-fn a_cluster_prefix_and_a_node_child_prefix_compose_by_most_specific_wins() {
-    let (_dir, store) = node_store();
-    put_node_prefix(
+fn a_nodes_override_applies_only_to_a_guest_on_that_node() {
+    let (_dir, store) = store();
+    put(
         &store,
         "prefixes/gpu",
-        "selector: {all: true}\nschema: {type: object, properties: {vendor: {type: string}, devices: {type: integer}}}\n",
-    );
-    put_node_prefix(
-        &store,
-        "nodes/pve1/prefixes/gpu.devices",
-        "selector: {all: true}\nschema: {type: object, properties: {count: {type: integer}}}\n",
-    );
-    let p = |s: &str| DocPath::parse(s).unwrap();
-    let governs = |node: &str, path: &str| {
-        let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node(node)).unwrap();
-        Shape::of_guest(&set, &[]).governing(&p(path)).map(|d| d.prefix.to_string())
-    };
-    assert_eq!(governs("pve1", "gpu.devices.count").as_deref(), Some("gpu.devices"));
-    assert_eq!(governs("pve1", "gpu.vendor").as_deref(), Some("gpu"), "the cluster prefix still governs its own keys");
-    assert_eq!(governs("pve2", "gpu.devices.count").as_deref(), Some("gpu"), "on another node the child does not exist");
+        None,
+        "yaml",
+        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n\
+         nodes:\n  pve1: {enforce: false}\n",
+        "replace",
+        Some(""),
+        false,
+        &full(),
+    )
+    .unwrap();
 
-    let set = api::effective_prefixes(store.registry().unwrap(), &DocId::Guest(100), &on_node("pve1")).unwrap();
-    let shape = Shape::of_guest(&set, &[]);
-    assert_eq!(shape.schema_at(&p("gpu.devices.count")), Some(&json!({"type": "integer"})));
-    assert!(shape.findings(&json!({"gpu": {"devices": {"count": 2}}})).is_empty(), "the parent's `devices: integer` is shadowed");
-    // A registry document is given no prefixes to enforce.
-    assert!(api::effective_prefixes(store.registry().unwrap(), &parse_id("prefixes/gpu").unwrap(), &on_node("pve1")).unwrap().is_empty());
-}
-
-#[test]
-fn a_node_prefixs_enforce_applies_only_to_guests_on_that_node() {
-    let (_dir, store) = node_store();
-    put_node_prefix(
-        &store,
-        "nodes/pve1/prefixes/gpu",
-        "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n",
-    );
-
-    let err = put_on(&store, "100", "gpu.count", r#""two""#, &on_node("pve1")).unwrap_err();
+    // Enforced on pve2 (the top-level default) ...
+    let err = put_on(&store, "100", "gpu.count", r#""two""#, &on_node("pve2")).unwrap_err();
     assert_eq!(status(&err), 422, "{err}");
-    assert!(err.msg.contains("gpu.count"), "{err}");
-
-    // The same write for a guest on pve2, or one whose node nobody said, is
-    // not answerable to pve1's schema.
-    put_on(&store, "100", "gpu.count", r#""two""#, &on_node("pve2")).unwrap();
-    put_on(&store, "101", "gpu.count", r#""two""#, &full()).unwrap();
-
-    // Migrated to pve1, the guest meets the schema for what it now changes;
-    // what the document already holds is left alone.
-    put_on(&store, "100", "gpu.note", r#""moved""#, &on_node("pve1")).unwrap();
-    assert_eq!(status(&put_on(&store, "100", "gpu.count", r#""three""#, &on_node("pve1")).unwrap_err()), 422);
-    put_on(&store, "100", "gpu.count", "3", &on_node("pve1")).unwrap();
+    // ... and on a guest whose node nobody said.
+    let err = put_on(&store, "101", "gpu.count", r#""two""#, &full()).unwrap_err();
+    assert_eq!(status(&err), 422, "{err}");
+    // ... but pve1's override turns enforcement off, whole.
+    put_on(&store, "102", "gpu.count", r#""two""#, &on_node("pve1")).unwrap();
 }
 
 #[test]
-fn the_prefixes_listing_is_cluster_wide_by_default_a_nodes_set_with_node_and_every_file_with_all() {
-    let (_dir, store) = node_store();
-    put_node_prefix(&store, "prefixes/gpu", "selector: {all: true}\n");
-    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {all: true}\n");
-    put_node_prefix(&store, "nodes/pve2/prefixes/local", "selector: {all: true}\n");
+fn the_resolved_prefixes_listing_carries_no_nodes_map_and_the_raw_one_does() {
+    let (_dir, store) = store();
+    put(
+        &store,
+        "prefixes/gpu",
+        None,
+        "yaml",
+        "selector: {all: true}\nschema: {type: object}\nnodes:\n  pve1: {enforce: true}\n",
+        "replace",
+        Some(""),
+        false,
+        &full(),
+    )
+    .unwrap();
 
-    let rows_with = |node: Option<&str>, all: bool| -> Vec<serde_json::Value> {
-        api::prefixes(store.registry().unwrap(), node, all).unwrap().iter().map(|r| serde_json::to_value(r).unwrap()).collect()
-    };
-    let rows = |node: Option<&str>| rows_with(node, node.is_none());
+    let raw = api::prefixes(store.registry().unwrap(), None, None).unwrap();
+    let raw_row = serde_json::to_value(&raw[0]).unwrap();
+    assert!(raw_row.get("nodes").is_some(), "the unresolved listing shows the override map: {raw_row:?}");
 
-    // Neither: what the listing meant before node files -- the cluster-wide set,
-    // one row per name, no node's files.
-    let default = rows_with(None, false);
-    assert_eq!(default.len(), 1, "{default:?}");
-    assert_eq!((&default[0]["prefix"], &default[0]["origin"]), (&json!("gpu"), &json!("cluster")));
-    let err = api::prefixes(store.registry().unwrap(), Some("pve1"), true).unwrap_err();
-    assert_eq!(status(&err), 400, "node and all together: {err}");
+    let resolved = api::prefixes(store.registry().unwrap(), Some("pve1"), Some(&[])).unwrap();
+    let resolved_row = serde_json::to_value(&resolved[0]).unwrap();
+    assert!(resolved_row.get("nodes").is_none(), "a resolved row carries no nodes map: {resolved_row:?}");
+    assert_eq!(resolved_row["enforce"], json!(true), "pve1's override is already applied");
 
-    let pve1 = rows(Some("pve1"));
-    assert_eq!(pve1.len(), 1, "one row per name within a node's set: {pve1:?}");
-    assert_eq!((&pve1[0]["origin"], &pve1[0]["node"], &pve1[0]["overrides"]), (&json!("node"), &json!("pve1"), &json!(true)));
-
-    let every = rows(None);
-    let shown: Vec<(String, String, Option<String>)> = every
-        .iter()
-        .map(|r| (r["prefix"].as_str().unwrap().into(), r["origin"].as_str().unwrap().into(), r["node"].as_str().map(Into::into)))
-        .collect();
-    assert_eq!(
-        shown,
-        [
-            ("gpu".into(), "cluster".into(), None),
-            ("gpu".into(), "node".into(), Some("pve1".into())),
-            ("local".into(), "node".into(), Some("pve2".into())),
-        ]
-    );
-    assert!(every[0].get("node").is_none(), "a cluster row carries no node field");
-
-    // A failed node file is listed keyed like a loaded one, with its node.
-    let pve2 = NodeName::new("pve2").unwrap();
-    std::fs::write(store.registry().unwrap().node_prefix_dir(&pve2).unwrap().join("broken.yaml"), "selector: {x: 1}\n").unwrap();
-    let failed: Vec<serde_json::Value> = rows(None).into_iter().filter(|r| r.get("error").is_some()).collect();
-    assert_eq!(failed.len(), 1);
-    assert_eq!((&failed[0]["prefix"], &failed[0]["origin"], &failed[0]["node"]), (&json!("broken"), &json!("node"), &json!("pve2")));
-}
-
-#[test]
-fn a_node_prefix_moves_the_token_of_a_guest_on_that_node_and_migration_moves_it_too() {
-    let (dir, store) = node_store();
-    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
-    std::fs::create_dir_all(dir.path().join("nodes/pve1/meta.d/prefixes")).unwrap();
-    std::fs::create_dir_all(dir.path().join("nodes/pve2/meta.d/prefixes")).unwrap();
-    let token = |node: &str| version(&store, false, Some("100"), Some(node)).unwrap().token;
-    let whole = || version(&store, false, None, None).unwrap().token;
-
-    let (on1, on2, all) = (token("pve1"), token("pve2"), whole());
-    assert_ne!(on1, on2, "the same files on another node are another token: the guest's set moved");
-
-    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {all: true}\n");
-    assert_ne!(token("pve1"), on1, "a file on the guest's node");
-    assert_eq!(token("pve2"), on2, "another node's file is not this guest's");
-    assert_ne!(whole(), all, "the unscoped token covers every node");
-
-    // The node prefix document's own poll watches its node's directory.
-    let own = version(&store, false, Some("nodes/pve1/prefixes/gpu"), None).unwrap().token;
-    put_node_prefix(&store, "nodes/pve1/prefixes/gpu", "selector: {tag: x}\n");
-    assert_ne!(version(&store, false, Some("nodes/pve1/prefixes/gpu"), None).unwrap().token, own);
-
-    // `detail` names it by its id.
-    let ids: Vec<String> = version(&store, true, None, None).unwrap().documents.unwrap().into_iter().map(|d| d.id).collect();
-    assert_eq!(ids, ["100", "nodes/pve1/prefixes/gpu"]);
-    let ids: Vec<String> = version(&store, true, Some("100"), Some("pve2")).unwrap().documents.unwrap().into_iter().map(|d| d.id).collect();
-    assert_eq!(ids, ["100"], "a guest on pve2 covers no pve1 file");
+    // A node name that is not one is a 400, on both forms.
+    for bad in ["..", "pve1/../x", "a.b", ""] {
+        assert_eq!(status(&api::prefixes(store.registry().unwrap(), Some(bad), Some(&[])).unwrap_err()), 400, "{bad:?}");
+    }
 }
 
 // -- a store that is not there (docs/DESIGN.md §7) ------------------------------
@@ -1465,8 +1216,7 @@ fn every_call_on_an_unavailable_store_is_a_503_never_an_empty_answer() {
     unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, true, &full()).unwrap_err().status, "dry run");
     unavailable(put(&store, "100", Some("traefik.host"), "json", "\"y\"", "replace", None, false, &full()).unwrap_err().status, "put");
     unavailable(del(&store, "100", None, None, &full()).unwrap_err().status, "delete");
-    unavailable(version(&store, true, None, None).unwrap_err().status, "version");
-    unavailable(version(&store, false, Some("100"), None).unwrap_err().status, "scoped version");
+    unavailable(version(&store).unwrap_err().status, "version");
     unavailable(list_guests(&store, &rows, None).unwrap_err().status, "list");
     unavailable(access(&store, &full()).unwrap_err().status, "access");
     let err = ApiError::from(store.registry().unwrap_err());

@@ -25,8 +25,6 @@ my $root = tempdir(CLEANUP => 1);
 my $nsdir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_ROOT} = $root;
 $ENV{PVE_META_PREFIX_DIRS} = $nsdir;
-my $nodesdir = tempdir(CLEANUP => 1);
-$ENV{PVE_META_NODES_DIR} = $nodesdir;
 my $rundir = tempdir(CLEANUP => 1);
 $ENV{PVE_META_RUN_DIR} = $rundir;
 
@@ -281,41 +279,14 @@ write_file('datacenter.yaml', "note: keep me\n");
 write_file('9100.yaml', "a: 1\n");
 write_file('9100.keep.yaml', "a: 1\n");
 
-my $v = PVE::RS::Meta::api_version(0, undef);
+# One unscoped token, over every document and every prefix file
+# (docs/DESIGN.md §6): no `id`, no `detail`, no per-document digests.
+my $v = PVE::RS::Meta::api_version();
 like($v->{token}, qr/^[0-9a-f]{64}$/, 'api_version token is a sha256 hex string');
-ok($v->{changed} >= 0, 'api_version changed is a unix timestamp');
-ok(!defined($v->{documents}), 'no `documents` without detail');
+is_deeply([sort keys %$v], ['token'], 'api_version answers exactly { token }');
 
-my $vd = PVE::RS::Meta::api_version(1, undef);
-is($vd->{token}, $v->{token}, 'detail does not change the token');
-ok(ref($vd->{documents}) eq 'ARRAY', 'detail returns a documents array');
-is_deeply([sort map { $_->{id} } @{ $vd->{documents} }], ['9100', '9200'],
-    'every guest is listed by id; the snapshot copy and the stray file are not');
-
-# Scoped to one document: its own file plus the registry directories, and
-# nothing else. This is the form the editor polls, so the arity has to work
-# across the perlmod boundary as well as the semantics.
-my $scoped_v = PVE::RS::Meta::api_version(0, '9100');
-like($scoped_v->{token}, qr/^[0-9a-f]{64}$/, 'api_version takes an id');
-isnt($scoped_v->{token}, $v->{token}, 'a scoped token is its own token, not the store-wide one');
-# `detail` lists what the token covers, which for a scoped token is this
-# document plus the registry documents -- never the other guests.
-is_deeply(
-    [map { $_->{id} } @{ PVE::RS::Meta::api_version(1, '9100')->{documents} }],
-    ['9100'],
-    'detail with an id lists that document and no other guest',
-);
-write_file('9200.yaml', "moved: yes\n");
-is(PVE::RS::Meta::api_version(0, '9100')->{token}, $scoped_v->{token},
-    'another guest changing does not move a scoped token');
-isnt(PVE::RS::Meta::api_version(0, undef)->{token}, $v->{token},
-    '... though it does move the store-wide one');
 write_file('9100.yaml', "a: 2\n");
-isnt(PVE::RS::Meta::api_version(0, '9100')->{token}, $scoped_v->{token},
-    'and the document itself changing does move it');
-
-eval { PVE::RS::Meta::api_version(0, 'not-an-id') };
-like($@, api_error_status(400), 'a garbage id is a 400, not a silent whole-store poll');
+isnt(PVE::RS::Meta::api_version()->{token}, $v->{token}, 'a write moves the token');
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml");
 
@@ -738,7 +709,7 @@ my ($listed_big) = grep { $_->{vmid} == 9504 }
     @{ PVE::RS::Meta::api_list_guests([guest_row(9504, read => 1)], undef) };
 ok(defined($listed_big), 'one oversized document does not take the listing down');
 isnt($listed_big->{digest}, '', '... and it is listed with an identity of its own');
-ok(defined(PVE::RS::Meta::api_version(0, undef)->{token}), '... nor the version poll');
+ok(defined(PVE::RS::Meta::api_version()->{token}), '... nor the version poll');
 
 $res = eval { PVE::RS::Meta::api_put('9504', 'x', 'json', '{"a":1}', 'replace', undef, 0, $FULL) };
 ok(!defined($res), 'a view write against an oversized document is refused');
@@ -750,13 +721,12 @@ is_deeply(PVE::RS::Meta::api_get('9504', undef, 'json', $FULL)->{data}, { a => 1
 PVE::RS::Meta::api_delete('9504', undef, undef, $FULL);
 
 # A write that changes no path and would put back the bytes already on disk
-# is skipped: `version()`'s token does not move for it, so `changed` must not
-# either.
+# is skipped: `version()`'s token does not move for it.
 write_file('9506.yaml', "traefik:\n  spec:\n    host: x\n");
-my $noop_before = PVE::RS::Meta::api_version(0, undef);
+my $noop_before = PVE::RS::Meta::api_version();
 my $noop = PVE::RS::Meta::api_put('9506', 'traefik.spec', 'json', '{}', 'merge', undef, 0, $FULL);
 is_deeply($noop->{touched}, [], 'a no-op merge touches nothing');
-is_deeply(PVE::RS::Meta::api_version(0, undef), $noop_before, '... and moves neither token nor changed');
+is_deeply(PVE::RS::Meta::api_version(), $noop_before, '... and moves neither token');
 is(read_file('9506.yaml'), "traefik:\n  spec:\n    host: x\n", '... and rewrites nothing');
 unlink("$root/9506.yaml");
 
@@ -875,43 +845,37 @@ for my $bad ('prefixes/../../etc/passwd', 'prefixes/a/b', 'prefixes/a..b', 'oper
     like($@, api_error_status(400), "... with a 400");
 }
 
-# -- node prefix files: a third layer, per node --------------------------------
+# -- a node's schema override, inside the prefix file (docs/DESIGN.md §3) ------
 #
-# `nodes/<node>/prefixes/<name>` is a prefix file in that node's directory, a
-# registry document like the other two, and in effect only for the guests the
-# ACL hash says are on that node. The node crosses as `node` in the hash.
+# `nodes: { <node>: { schema?, enforce?, hidden? } }` inside a prefix file
+# replaces the top-level fields, whole, for a guest on that node -- never a
+# separate document, never a separate directory. The node crosses as `node`
+# in the ACL hash; a guest's tags decide whether the prefix reaches it at all.
 
-my $pve1dir = "$nodesdir/pve1/meta.d/prefixes";
-my $gpu_put = PVE::RS::Meta::api_put(
-    'nodes/pve1/prefixes/gpu', undef, 'yaml',
-    "selector: {all: true}\nenforce: true\nschema: {type: object, properties: {count: {type: integer}}}\n",
+PVE::RS::Meta::api_put(
+    'prefixes/gpu', undef, 'yaml',
+    "selector: {all: true}\nenforce: true\n" .
+    "schema: {type: object, properties: {count: {type: integer}}}\n" .
+    "nodes:\n  pve1: {enforce: false}\n",
     'replace', '', 0, $ADMIN,
 );
-is($gpu_put->{id}, 'nodes/pve1/prefixes/gpu', 'api_put creates a node prefix document');
-ok(-f "$pve1dir/gpu.yaml", '... in that node\'s directory');
-ok(!-e "$nsdir/gpu.yaml", '... and not in the cluster directory');
-is(PVE::RS::Meta::api_get('nodes/pve1/prefixes/gpu', undef, 'json', $ADMIN)->{digest},
-    $gpu_put->{digest}, 'api_get reads it back by the same id');
-is(PVE::RS::Meta::api_get('nodes/pve2/prefixes/gpu', undef, 'json', $ADMIN)->{digest}, '',
-    '... and the same name on another node is another, absent, document');
 
-ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes() }),
-    'the default listing is the cluster-wide set, as before node files existed');
-my ($gpu_row) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes(undef, 1) };
-is($gpu_row->{origin}, 'node', 'the all=1 listing says where a node file came from');
-is($gpu_row->{node}, 'pve1', '... and which node');
-ok((grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve1') }),
-    "api_prefixes('pve1') includes the node's file");
-ok(!(grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
-    "api_prefixes('pve2') does not");
-ok((grep { $_->{prefix} eq 'labtest' } @{ PVE::RS::Meta::api_prefixes('pve2') }),
-    '... though it has the cluster files');
-$res = eval { PVE::RS::Meta::api_prefixes('../pve1') };
-ok(!defined($res), 'api_prefixes refuses a node that is not a node name');
-like($@, api_error_status(400), '... with a 400');
-$res = eval { PVE::RS::Meta::api_prefixes('pve1', 1) };
-ok(!defined($res), 'api_prefixes refuses node and all together');
-like($@, api_error_status(400), '... with a 400');
+my ($gpu_raw) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes() };
+ok($gpu_raw, 'the raw listing carries the new prefix');
+is_deeply($gpu_raw->{nodes}, { pve1 => { enforce => 0 } },
+    '... with its nodes map as parsed');
+
+my ($gpu_pve1) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve1', []) };
+ok(!exists($gpu_pve1->{nodes}), 'a resolved row carries no nodes map');
+ok(!$gpu_pve1->{enforce}, "pve1's override turns enforcement off");
+my ($gpu_pve2) = grep { $_->{prefix} eq 'gpu' } @{ PVE::RS::Meta::api_prefixes('pve2', []) };
+ok($gpu_pve2->{enforce}, 'another node keeps the top-level default');
+
+for my $bad ('a b', '..', 'pve1/../x') {
+    $res = eval { PVE::RS::Meta::api_prefixes($bad, []) };
+    ok(!defined($res), "api_prefixes refuses the node '$bad'");
+    like($@, api_error_status(400), "... with a 400");
+}
 
 # The node crosses as a checked node name: the ACL hash refuses one that is not.
 $res = eval { PVE::RS::Meta::api_put('9600', 'x', 'json', '1', 'replace', undef, 0, { %$ADMIN, node => '../pve1' }) };
@@ -922,32 +886,11 @@ ok(!exists(PVE::RS::Meta::api_access('9600', { %$ADMIN, node => 'pve1' })->{node
 # enforce follows the guest's node.
 my $on_pve1 = { %$ADMIN, node => 'pve1' };
 my $on_pve2 = { %$ADMIN, node => 'pve2' };
-$res = eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve1) };
-ok(!defined($res), "a node prefix's enforce refuses a write for a guest on that node");
+ok(defined(eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve1) }),
+    "pve1's override turns enforcement off for its guests");
+$res = eval { PVE::RS::Meta::api_put('9601', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve2) };
+ok(!defined($res), 'the top-level default still enforces for a guest on another node');
 like($@, api_error_status(422), '... with a 422');
-ok(defined(eval { PVE::RS::Meta::api_put('9600', 'gpu.count', 'json', '"two"', 'replace', undef, 0, $on_pve2) }),
-    '... and does not reach a guest on another node');
-
-# The guest's token covers its node's directory and its node's name.
-my $tok1 = PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token};
-isnt(PVE::RS::Meta::api_version(0, '9600', 'pve2')->{token}, $tok1, 'a migrated guest has another token');
-is(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node is a stable input');
-PVE::RS::Meta::api_put('nodes/pve1/prefixes/gpu', 'description', 'json', '"GPUs"', 'replace', undef, 0, $ADMIN);
-isnt(PVE::RS::Meta::api_version(0, '9600', 'pve1')->{token}, $tok1, 'a node prefix change moves its guests\' token');
-ok((grep { $_->{id} eq 'nodes/pve1/prefixes/gpu' } @{ PVE::RS::Meta::api_version(1, undef)->{documents} }),
-    'the unscoped detail lists the node prefix document');
-$res = eval { PVE::RS::Meta::api_version(0, '9600', 'a/b') };
-like($@, api_error_status(400), 'a node that is not a node name is a 400 on the poll too');
-
-for my $bad ('nodes/../prefixes/gpu', 'nodes/pve.1/prefixes/gpu', 'nodes/pve1/permissions/ops') {
-    $res = eval { PVE::RS::Meta::api_get($bad, undef, 'json', $ADMIN) };
-    ok(!defined($res), "api_get refuses the id '$bad'");
-    like($@, api_error_status(400), "... with a 400");
-}
-
-is(PVE::RS::Meta::api_delete('nodes/pve1/prefixes/gpu', undef, undef, $ADMIN)->{digest}, '',
-    'api_delete removes a node prefix file');
-ok(!-e "$pve1dir/gpu.yaml", '... and the file is gone');
 
 # =========================================================================
 # A store that is not there (docs/DESIGN.md §7): every export refuses, with
@@ -961,10 +904,10 @@ write_file('9700.yaml', "a: 1\n");
         ['api_get', sub { PVE::RS::Meta::api_get('9700', undef, 'json', $FULL) }],
         ['api_put', sub { PVE::RS::Meta::api_put('9700', 'b', 'json', '1', 'replace', undef, 0, $FULL) }],
         ['api_delete', sub { PVE::RS::Meta::api_delete('9700', undef, undef, $FULL) }],
-        ['api_version', sub { PVE::RS::Meta::api_version(1, undef) }],
+        ['api_version', sub { PVE::RS::Meta::api_version() }],
         ['api_list_guests', sub { PVE::RS::Meta::api_list_guests([{ vmid => 9700, read => 1 }], undef) }],
         ['api_access', sub { PVE::RS::Meta::api_access('9700', $FULL) }],
-        ['api_prefixes', sub { PVE::RS::Meta::api_prefixes(undef) }],
+        ['api_prefixes', sub { PVE::RS::Meta::api_prefixes(undef, undef) }],
     ) {
         my ($name, $call) = @$case;
         $res = eval { $call->() };

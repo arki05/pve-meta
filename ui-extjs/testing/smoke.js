@@ -174,7 +174,7 @@ eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde �
     // (`instanceof Error` would be the vm context's own Error, not this realm's.)
     eq('... and it is a CoreError with a message', err instanceof ctx.PVE.meta.CoreError && typeof err.message === 'string', true);
     throws('an unknown function is an error', () => Core.call('no_such_function'), 'unknown function');
-    throws('a bad argument is an error', () => Core.call('shape_governing', [], [], 'a b'), 'invalid path');
+    throws('a bad argument is an error', () => Core.call('shape_governing', [], 'a b'), 'invalid path');
     eq('the instance is fine after errors', Core.call('parse', 'yaml', 'ok: 1\n'), { ok: 1 });
 }
 
@@ -183,7 +183,6 @@ eq('defined', ctx.__defined, [
     'PVE.meta.Footer',
     'PVE.meta.TreeModel',
     'PVE.meta.AddKeyWindow',
-    'PVE.meta.DeclareKeyWindow',
     'PVE.meta.EditValueWindow',
     'PVE.meta.TextWindow',
     'PVE.meta.TreePanel',
@@ -411,11 +410,11 @@ console.log('\n--- request: the destroyed-component guard around API2Request ---
 console.log('\n--- enforce: an enforcing prefix\'s findings say so ---');
 {
     const S = { type: 'object', properties: { port: { type: 'integer' } } };
-    const strict = new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 1, schema: S }], []);
-    const lax = new Shape([{ prefix: 't', selector: { all: 1 }, schema: S }], []);
+    const strict = new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 1, schema: S }]);
+    const lax = new Shape([{ prefix: 't', selector: { all: 1 }, schema: S }]);
     eq('an enforcing prefix flags its findings', strict.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer', enforced: true }]);
     eq('an ordinary one does not', lax.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer' }]);
-    eq('Perl\'s 0 is not enforce', new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 0, schema: S }], []).findings({ t: { port: 'x' } })[0].enforced, undefined);
+    eq('Perl\'s 0 is not enforce', new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 0, schema: S }]).findings({ t: { port: 'x' } })[0].enforced, undefined);
     eq('the banner line says which', U.findingText({ path: 't.port', msg: 'expected integer', enforced: true }), 'enforced: t.port: expected integer');
     eq('... and stays plain otherwise', U.findingText({ path: 't.port', msg: 'expected integer' }), 't.port: expected integer');
 }
@@ -705,8 +704,10 @@ const TRAEFIK_SCHEMA = {
 const panel = {
     registryDoc: false,
     docId: '200',
-    tags: ['traefik'],
     access: { read: 1, write: 1 },
+    // Already resolved for this guest, as `GET /meta/prefixes?id=` returns it: the
+    // selector has already been matched server-side, so a listed entry always
+    // reaches this document.
     prefixes: [
         { prefix: 'traefik', selector: { tag: 'traefik' }, schema: TRAEFIK_SCHEMA },
         { prefix: 'netbird', selector: { all: true } },
@@ -960,17 +961,6 @@ console.log('\n--- a prefix is a declaration, with or without a schema ---');
     eq('... and editable as the scalar it is', U.editorKind(scalar.children.netbird), 'inline');
 }
 
-console.log('\n--- S6: a guest that does not carry the tag ---');
-// A tag selector resolves against this guest's tags and nothing else.
-const untagged = Object.assign({}, panel);
-untagged.tags = [];
-// Same rule on the shape side: no tag, no declared rows from that prefix.
-eq(
-    'prefix applicability follows the guest\'s tags',
-    untagged.shapeFor('200').declared().map((n) => n.prefix),
-    ['netbird'],
-);
-
 console.log('\n--- schema findings for the text editor ---');
 // Prefix objects, the same shape GET /meta/prefixes returns.
 const GRAMMAR = Shape.of([
@@ -992,7 +982,7 @@ const GRAMMAR = Shape.of([
             },
         },
     },
-], []);
+]);
 
 eq('a clean document has no findings',
     GRAMMAR.findings({ traefik: { spec: { host: 'a.example', port: 80, scheme: 'https', enabled: true } } }),
@@ -1021,8 +1011,8 @@ eq('but 2 is', GRAMMAR.findings({ traefik: { spec: { enabled: 2 } } }).length, 1
 eq('keys no grammar describes are left alone',
     GRAMMAR.findings({ traefik: { extra: { anything: [1, 2] } }, mine: { x: 1 } }), []);
 eq('a prefix with nothing under it contributes nothing', GRAMMAR.findings({}), []);
-eq('a prefix with no schema has none to offer', Shape.of([{ prefix: 'netbird', selector: { all: true } }], []).hasSchema(), false);
-eq('... but is still declared', Shape.of([{ prefix: 'netbird', selector: { all: true } }], []).declared().length, 1);
+eq('a prefix with no schema has none to offer', Shape.of([{ prefix: 'netbird', selector: { all: true } }]).hasSchema(), false);
+eq('... but is still declared', Shape.of([{ prefix: 'netbird', selector: { all: true } }]).declared().length, 1);
 
 const YAML = [
     'traefik:',
@@ -1105,7 +1095,7 @@ const NESTED = Shape.of([
         selector: { all: true },
         schema: { type: 'object', properties: { compose: { type: 'string' } } },
     },
-], []);
+]);
 eq('declared sorts longest prefix first', NESTED.declared().map((n) => n.prefix), ['homelab.docker', 'homelab']);
 eq('governing picks the child for the child subtree',
     NESTED.governing('homelab.docker.compose').prefix, 'homelab.docker');
@@ -1191,10 +1181,10 @@ console.log('\n--- governing uses plain containment ---');
 // A prefix `a` does not govern the sibling comment key `a__`'s own declared
 // prefix: plain containment, no alias for a comment key.
 {
-    const two = Shape.of([{ prefix: 'a', selector: { all: true } }, { prefix: 'a__', selector: { all: true } }], []);
+    const two = Shape.of([{ prefix: 'a', selector: { all: true } }, { prefix: 'a__', selector: { all: true } }]);
     eq('a comment-key prefix governs itself, not its subject', two.governing('a__').prefix, 'a__');
     eq('... and `a` alone does not reach `a__`',
-        Shape.of([{ prefix: 'a', selector: { all: true } }], []).governing('a__'), null);
+        Shape.of([{ prefix: 'a', selector: { all: true } }]).governing('a__'), null);
 }
 
 console.log('\n--- nesting: a schema-less prefix still shadows ---');
@@ -1214,7 +1204,7 @@ console.log('\n--- nesting: a schema-less prefix still shadows ---');
                 },
             },
         },
-    ], []);
+    ]);
     const doc = { homelab: { notes: 'ok', docker: { compose: 'x' } } };
     eq('a schema-less child still shadows its parent', all.findings(doc).map((f) => f.path), []);
     eq('the parent still lints what it owns',
@@ -1268,33 +1258,24 @@ eq('originalInLang is the identity for yaml -- no reparse, so it never throws',
     Codec.originalInLang(SERVER_YAML, 'yaml'), SERVER_YAML);
 
 console.log('\n--- many documents in one panel ---');
-const D = ctx.PVE.meta.DeclareKeyWindow;
-D.FORM_KEYS = D.statics.FORM_KEYS; // the shim does not hoist statics; Ext does
 // An id is an address: the path it is served at, for every kind of document.
 eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
 eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
-// A node's prefix file is its own document at its own path, and a prefix to
-// everything that renders one.
-eq('a node prefix id', P.urlFor.call(P, 'nodes/pve1/prefixes/gpu.devices'), '/meta/nodes/pve1/prefixes/gpu.devices');
-eq('kind of a node prefix', P.docKind.call(P, 'nodes/pve1/prefixes/gpu'), 'prefix');
-eq('... and nothing else under nodes/ is one', P.docKind.call(P, 'nodes/pve1'), 'guest');
-eq('its title is the file name too', P.docTitle.call(P, 'nodes/pve1/prefixes/gpu.devices'), 'gpu.devices');
 eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 {
-    // A guest tab asks for its own set by id -- the server reads the node from the
-    // vmlist -- and a registry document for every file.
+    // A guest tab asks for its own resolved set by id, and a registry document for
+    // every file, as it is.
     const asked = (panel) => {
         let opts = null;
         P.loadPrefixes.call(Object.assign({ request: (o) => (opts = o), prefixParams: P.prefixParams }, panel), () => {});
         return opts.params;
     };
     eq('a guest tab lists its own prefix set by id', asked({ registryDoc: false, docId: '201' }), { id: '201' });
-    eq('a registry document lists every file', asked({ registryDoc: true, docId: 'prefixes/ops' }), { all: 1 });
-    eq('a node id is shaped like the others', P.registryId('prefixes', 'gpu', 'pve1'), 'nodes/pve1/prefixes/gpu');
-    eq('... and a cluster-wide one has no node', P.registryId('prefixes', 'gpu'), 'prefixes/gpu');
+    eq('a registry document lists every file', asked({ registryDoc: true, docId: 'prefixes/ops' }), {});
+    eq('a prefix id is its file name', P.registryId('gpu'), 'prefixes/gpu');
 }
 
 // Per-document digests. One shared field would have sent a prefix's digest with a
@@ -1493,26 +1474,16 @@ console.log('\n--- the registry list ---');
     // An older API returns neither field; the list must still render.
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom([{ prefix: 'x' }])[0]), 'cluster');
 
-    // Node rows: the same prefix may be listed once per file, and each row opens
-    // its own file.
-    const nodeRows = G.rowsFrom([
-        { prefix: 'gpu', selector: { all: true }, origin: 'cluster', overrides: false },
-        { prefix: 'gpu', selector: { all: true }, origin: 'node', node: 'pve1', overrides: true },
-        { prefix: 'gpu.devices', selector: { all: true }, origin: 'node', node: 'pve2', overrides: false },
-        { prefix: 'broken', origin: 'node', node: 'pve2', error: 'missing selector' },
+    // A file's per-node overrides ride along on the one row for it, as text --
+    // there is no per-node row any more (DESIGN §3).
+    const overrideRows = G.rowsFrom([
+        { prefix: 'gpu', selector: { all: true }, nodes: { pve1: { hidden: true }, pve2: { enforce: true } } },
+        { prefix: 'netbird', selector: { all: true } },
     ]);
-    eq('a node row opens the node\'s file', nodeRows.map((r) => r.id), [
-        'prefixes/gpu',
-        'nodes/pve1/prefixes/gpu',
-        'nodes/pve2/prefixes/gpu.devices',
-        'nodes/pve2/prefixes/broken',
-    ]);
-    eq('the Node column is empty for a cluster-wide row', nodeRows.map((r) => r.node), ['', 'pve1', 'pve2', 'pve2']);
-    eq('a node file over a cluster or packaged one', G.originText(nodeRows[1]), 'node (overrides cluster or packaged)');
-    eq('a node file of its own', G.originText(nodeRows[2]), 'node');
+    eq('override node names, comma-separated', overrideRows.map((r) => r.nodes), ['pve1, pve2', '']);
 
-    // The buttons: any row opens, Remove is the registry answer's for the cluster's
-    // files and the server's for a node's, and a packaged file is never removed.
+    // The buttons: any row opens, Remove is the registry answer's, and a packaged
+    // file is never removable.
     const Grid = ctx.PVE.meta.RegistryGrid;
     const buttons = (row, may) => {
         const state = {};
@@ -1524,15 +1495,9 @@ console.log('\n--- the registry list ---');
         Grid.syncButtons.call(grid);
         return [state.addBtn, state.editBtn, state.removeBtn];
     };
-    const [clusterRow, nodeRow, pkgRow] = [
-        { origin: 'cluster' },
-        nodeRows[1],
-        { origin: 'packaged' },
-    ];
+    const [clusterRow, pkgRow] = [{ origin: 'cluster' }, { origin: 'packaged' }];
     eq('with write on /: add, edit and remove a cluster file', buttons(clusterRow, true), [false, false, false]);
     eq('without it: a cluster file still opens, and is not removable', buttons(clusterRow, false), [true, false, true]);
-    eq('a node file stays removable without it: the server decides', buttons(nodeRow, false), [true, false, false]);
-    eq('... and with it', buttons(nodeRow, true), [false, false, false]);
     eq('a packaged file opens and is never removable', buttons(pkgRow, true), [false, false, true]);
     eq('no selection: nothing to edit or remove', buttons(null, true), [false, true, true]);
 
@@ -1544,11 +1509,11 @@ console.log('\n--- the registry list ---');
         cb('yes');
     };
     ctx.Proxmox.Utils.API2Request = (opts) => sent.push([opts.method, opts.url]);
-    Grid.removeOne.call({ reload() {} }, { data: nodeRow });
+    Grid.removeOne.call({ reload() {} }, { data: { id: 'prefixes/homelab', origin: 'cluster', overrides: true, name: 'homelab' } });
     ctx.Ext.Msg.confirm = confirm;
     ctx.Proxmox.Utils.API2Request = request;
-    eq('removing a node file deletes that node\'s document', sent[1], ['DELETE', '/meta/nodes/pve1/prefixes/gpu']);
-    eq('... after saying what comes back', /on node pve1.*cluster or packaged file/.test(sent[0]), true);
+    eq('removing a cluster file deletes that document', sent[1], ['DELETE', '/meta/prefixes/homelab']);
+    eq('... after saying what comes back', /packaged one takes over again/.test(sent[0]), true);
 }
 
 console.log('\n--- a key name is refused in the field, not after a round trip ---');
@@ -1778,7 +1743,6 @@ console.log('\n--- a staged value is linted like a stored one ---');
         docId: '201',
         docState: { 201: { digest: 'd', data: { docker: { port: 80 } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
-        tags: [],
         pending: EditSet.empty(),
     });
     ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach((m) => (panelS[m] = P[m]));
@@ -1962,24 +1926,7 @@ console.log('\n--- creating a registry file: the least that parses ---');
 {
     const plan = (v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(v);
     eq('a prefix with an "all" selector', plan({ name: 'x', selector: 'all' }).content, { selector: { all: true } });
-
-    // Where it lands: the cluster by default, or one node's directory.
-    const CLUSTER = ctx.PVE.meta.NewRegistryWindow.statics.CLUSTER_LOCATION;
-    const cluster = plan({ name: 'gpu', location: CLUSTER, selector: 'all' });
-    eq('the cluster is the default location', [cluster.id, cluster.node], ['prefixes/gpu', undefined]);
-    eq('... also when no location was asked', plan({ name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
-    const onNode = plan({ name: 'gpu.devices', location: 'pve1', selector: 'all' });
-    eq('a node location writes that node\'s file', [onNode.id, ctx.PVE.meta.Doc.urlFor(onNode.id), onNode.node], [
-        'nodes/pve1/prefixes/gpu.devices',
-        '/meta/nodes/pve1/prefixes/gpu.devices',
-        'pve1',
-    ]);
-    eq('the file itself does not change with where it lands', onNode.content, { selector: { all: true } });
-    eq(
-        'the locations are the cluster, then every node by name',
-        ctx.PVE.meta.NewRegistryWindow.statics.locationItems([{ node: 'pve2' }, { node: 'pve1' }]).map((i) => i[0]),
-        [CLUSTER, 'pve1', 'pve2'],
-    );
+    eq('it writes the cluster file named after the prefix', plan({ name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
     eq('a prefix with a tag selector', plan({ name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
@@ -2017,7 +1964,6 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         registryDoc: false,
         docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
-        tags: [],
     });
     ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach(
         (m) => (panelF[m] = P[m]),
@@ -2057,131 +2003,41 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         ['docker.port: expected integer']);
 }
 
-console.log('\n--- declaring one key of a prefix schema ---');
-eq('the type is always written', D.schemaFrom({ type: 'string' }), { type: 'string' });
-eq(
-    'every field the editor consumes',
-    D.schemaFrom({
-        type: 'integer',
-        description: 'How many',
-        default: '3',
-        minimum: '1',
-        maximum: '9',
-    }),
-    { type: 'integer', description: 'How many', default: 3, minimum: 1, maximum: 9 },
-);
-// There is no Optional field, and a stray one is not written: every key of a guest
-// document is optional, so `optional` would be a claim nothing reads or enforces.
-eq('optional is never declared', D.schemaFrom({ type: 'string', optional: true }), { type: 'string' });
-
-// Visibility and enforcement are three-state, because the rule is inherit unless
-// this node says otherwise. "Inherit" writes nothing; `false` is a real statement
-// -- stop inheriting and be visible, or be advisory -- so it is not the same as
-// leaving it out, and neither is a default.
-eq('inherit writes nothing', D.schemaFrom({ type: 'string', hidden: 'inherit', enforce: 'inherit' }),
-    { type: 'string' });
-
-// `valuesFrom` is `schemaFrom` backwards, and the pair has to agree about every
-// field: one the reverse forgot is a field that silently resets the moment somebody
-// edits a declaration rather than writing a new one.
-[
-    { type: 'string' },
-    { type: 'string', description: 'a host', format: 'dns-name', multiline: 1 },
-    { type: 'integer', minimum: 1, maximum: 65535, default: 80 },
-    { type: 'boolean', default: true },
-    { type: 'string', enum: ['http', 'https'], default: 'http' },
-    { type: 'object', hidden: true, enforce: false },
-    { type: 'string', hidden: false, enforce: true, description: 'x' },
-].forEach(function (decl, i) {
-    const back = D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom(decl, 'k')));
-    // Compared canonically: the form writes its fields in the order a reader wants
-    // them, which need not be the order the file had, and key order is not a value
-    // (decision 007). What has to survive is what it says.
-    eq('declaration ' + i + ' survives a trip through the form',
-        U.sameValue(back, decl), true);
-});
-
-// Editing keeps what the form does not own. A map declaration carries its nested
-// `properties`, and a keyword the form has no field for -- `optional` -- is still
-// part of what the file says; the form rewrites the fields it asks about and lays
-// them over the rest. Without this, editing a description dropped every declared
-// key inside the map.
+console.log('\n--- "Declare Key" opens schema.properties as text ---');
 {
-    const existing = {
-        type: 'object',
-        description: 'old',
-        optional: 1,
-        properties: { host: { type: 'string' }, port: { type: 'integer' } },
+    // There is no form of its own any more: the toolbar action opens the same
+    // subtree text editor everything else stages through, on `schema.properties`.
+    const created = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = (xtype, cfg) => {
+        created.push([xtype, cfg]);
+        return { on: () => {}, show: () => {} };
     };
-    const edited = D.schemaFrom(Object.assign({}, D.valuesFrom(existing, 'spec'), { description: 'new' }));
-    const merged = D.statics.merged(existing, edited);
-    eq('the edited field changed', merged.description, 'new');
-    eq('nested declarations survive an edit of their parent', merged.properties, existing.properties);
-    eq('and so does a keyword the form does not show', merged.optional, 1);
-    eq('a field the form owns and now leaves empty is gone, not kept',
-        D.statics.merged({ type: 'string', description: 'x' }, { type: 'string' }).description, undefined);
-    eq('the form keys come first, the kept ones after', Object.keys(merged), ['type', 'description', 'optional', 'properties']);
+    const withProps = Object.assign({}, panel, {
+        docId: 'prefixes/homelab',
+        pending: EditSet.empty(),
+        docState: {
+            'prefixes/homelab': { digest: 'd', data: { schema: { properties: { host: { type: 'string' } } } } },
+        },
+    });
+    ['docKind', 'plannedData', 'dataOf', 'declareKey'].forEach((m) => (withProps[m] = P[m]));
+    withProps.declareKey({ data: { docId: withProps.docId } });
+    eq('opens the text window', created[0][0], 'PVE.meta.TextWindow');
+    eq('... on schema.properties', created[0][1].view, 'schema.properties');
+    eq('... with what is already declared', Codec.parse(created[0][1].text, 'yaml'), { host: { type: 'string' } });
+
+    created.length = 0;
+    const empty = Object.assign({}, withProps, {
+        docState: { 'prefixes/homelab': { digest: 'd', data: {} } },
+    });
+    empty.declareKey({ data: { docId: empty.docId } });
+    eq('an empty map gets a hint, not a blank buffer', Object.keys(Codec.parse(created[0][1].text, 'yaml')).length > 0, true);
+
+    created.length = 0;
+    withProps.declareKey(null);
+    eq('nothing to declare on, nothing opens', created.length, 0);
+    ctx.Ext.create = origCreate;
 }
-// Members of an enum are typed like the key: an integer key's values must not come
-// back as strings after a trip through the form.
-eq('an integer enum stays integers', D.schemaFrom({ type: 'integer', enum: '80, 443' }).enum, [80, 443]);
-eq('a string enum stays strings', D.schemaFrom({ type: 'string', enum: '80, 443' }).enum, ['80', '443']);
-eq('... and an integer declaration survives the round trip',
-    U.sameValue(D.schemaFrom(Object.assign({ key: 'k' }, D.valuesFrom({ type: 'integer', enum: [80, 443] }, 'k'))),
-        { type: 'integer', enum: [80, 443] }),
-    true);
-
-// The two flags are three-state in both directions: absent means inherit, and
-// `false` is a statement that has to come back as `false` rather than as absent.
-eq('an absent flag reads as inherit',
-    [D.valuesFrom({ type: 'string' }, 'k').hidden, D.valuesFrom({ type: 'string' }, 'k').enforce],
-    ['inherit', 'inherit']);
-eq('a false flag reads as false, not inherit',
-    D.valuesFrom({ type: 'string', hidden: false }, 'k').hidden, 'false');
-eq('the key is carried so the form can show it', D.valuesFrom({ type: 'string' }, 'host').key, 'host');
-
-// Which rows are declarations, and which only look like one.
-eq('a top-level declaration', U.declaredKeyAt('schema.properties.host'), 'host');
-eq('a nested one', U.declaredKeyAt('schema.properties.spec.properties.host'), 'host');
-eq('the properties map itself is not one', U.declaredKeyAt('schema.properties'), null);
-eq('nor is the schema node', U.declaredKeyAt('schema'), null);
-eq('nor a key inside a declaration', U.declaredKeyAt('schema.properties.host.format'), null);
-eq('nor anything outside the schema', U.declaredKeyAt('selector.tag'), null);
-eq('hidden writes true', D.schemaFrom({ type: 'string', hidden: 'true' }), { type: 'string', hidden: true });
-eq('shown writes false, which is not the same as unset',
-    D.schemaFrom({ type: 'string', hidden: 'false' }), { type: 'string', hidden: false });
-eq('enforced writes true', D.schemaFrom({ type: 'string', enforce: 'true' }), { type: 'string', enforce: true });
-eq('advisory writes false', D.schemaFrom({ type: 'string', enforce: 'false' }), { type: 'string', enforce: false });
-eq('both at once', D.schemaFrom({ type: 'integer', hidden: 'true', enforce: 'false' }),
-    { type: 'integer', hidden: true, enforce: false });
-eq('an enum is a list, not a string', D.schemaFrom({ type: 'string', enum: 'always, no ,unless-stopped' }),
-    { type: 'string', enum: ['always', 'no', 'unless-stopped'] });
-// A range on a string, or a format on a number, would be a declaration nothing reads.
-eq('a range belongs to a number', D.schemaFrom({ type: 'string', minimum: '1', maximum: '9' }), { type: 'string' });
-eq('a format belongs to a string', D.schemaFrom({ type: 'integer', format: 'ip' }), { type: 'integer' });
-// "No format" is the sentinel `none`, never `''` (the `KeyValue-1` bug; see the
-// Declare Key form's format combobox in pve-meta-tree.js), so it must not land.
-eq('the none sentinel is not a format', D.schemaFrom({ type: 'string', format: 'none' }), { type: 'string' });
-eq('a real format still lands', D.schemaFrom({ type: 'string', format: 'ip' }), { type: 'string', format: 'ip' });
-eq('multiline is a string thing too', D.schemaFrom({ type: 'string', multiline: true }), { type: 'string', multiline: 1 });
-// An empty field is left out entirely: a schema full of nulls describes nothing, and
-// the server's lint refuses null values anyway.
-eq('empty fields are omitted', D.schemaFrom({ type: 'string', description: '', default: '', enum: '' }), { type: 'string' });
-// A boolean default comes from a list, not a text box: `parseValue` reads truth the
-// way the row editor's checkbox writes it, so "True" or "yes" typed into a field would
-// have been stored as `false` -- the opposite of what was meant, in a cluster-wide file.
-eq('a boolean default comes from the list', D.schemaFrom({ type: 'boolean', defaultBool: 'true' }), { type: 'boolean', default: true });
-eq('... and "false" means false', D.schemaFrom({ type: 'boolean', defaultBool: 'false' }), { type: 'boolean', default: false });
-eq('... an unset one is left out', D.schemaFrom({ type: 'boolean', defaultBool: '' }), { type: 'boolean' });
-eq(
-    'a boolean never reads the text field',
-    D.schemaFrom({ type: 'boolean', default: 'yes', defaultBool: '' }),
-    { type: 'boolean' },
-);
-// A map has no default the editor would ever read: `addShape` stops at an object and
-// walks into it. Writing one would be a declaration nothing consumes -- and a string.
-eq('a map takes no default', D.schemaFrom({ type: 'object', default: '{}' }), { type: 'object' });
-eq('an array default still parses as a list', D.schemaFrom({ type: 'array', default: 'a,b' }), { type: 'array', default: ['a', 'b'] });
 
 console.log('\n--- the editor follows the value\'s shape, not a declaration ---');
 // A map is nested YAML: Monaco, not a one-line field. This is the case that had no
@@ -2216,7 +2072,7 @@ eq('an empty value is empty', U.previewText(undefined), '');
     const ns = Shape.of([{ prefix: 'notes', selector: { all: true }, schema: {
         type: 'object',
         properties: { body: { type: 'string', multiline: 1, description: 'Free text' } },
-    } }], []);
+    } }]);
     panel.addShape.call(panel, root, ns);
     eq('multiline reaches the row', root.children.notes.children.body.multiline, true);
     eq('and so does the description', root.children.notes.children.body.grammarDescription, 'Free text');

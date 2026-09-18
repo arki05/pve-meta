@@ -31,8 +31,7 @@
 //! The store root defaults to `/etc/pve/meta` and can be overridden with the
 //! `PVE_META_ROOT` environment variable (used by tests and by
 //! `test/basic.pl`); the prefix directory likewise with
-//! `PVE_META_PREFIX_DIRS`, and the nodes directory holding each node's
-//! prefix files with `PVE_META_NODES_DIR`. A store under `/etc/pve` refuses
+//! `PVE_META_PREFIX_DIRS`. A store under `/etc/pve` refuses
 //! every call while pmxcfs is not mounted (a `503:`), and
 //! `PVE_META_CLUSTER_MARKER` names the marker it checks instead
 //! (`MetaStore::new`).
@@ -325,37 +324,27 @@ mod pve_rs_meta {
     // the guest's current node, whose prefix files join the packaged and
     // cluster ones.
 
-    /// `GET /meta/version` -> `{ token, changed }`, plus `documents`
-    /// (`[{ id, digest }]`, sorted) when `$detail` is true.
-    ///
-    /// With `$id`, the token covers that one document plus the registry
-    /// directories instead of the whole store — the cheap poll an open editor
-    /// wants, and the only form whose cost does not grow with the cluster.
-    /// `$node` (optional, trailing) is a guest's current node from the vmlist:
-    /// its prefix directory and its name join that guest's token.
+    /// `GET /meta/version` -> `{ token }`: one hash over every document and
+    /// every prefix file, unscoped (`docs/DESIGN.md` §6).
     #[export]
-    pub fn api_version(
-        detail: bool,
-        id: Option<&str>,
-        node: Option<&str>,
-    ) -> Result<api::ApiVersion, api::ApiError> {
-        api::version(&open_store(), detail, id, node)
+    pub fn api_version() -> Result<api::ApiVersion, api::ApiError> {
+        api::version(&open_store())
     }
 
-    /// `GET /meta/prefixes` -> the cluster-wide prefixes, most-specific first;
-    /// with `$node`, the prefixes in effect for a guest on that node; with `$all`
-    /// (optional, trailing), every prefix file there is, each with its `origin`
-    /// (and `node`). Each plus a row for any file that failed to load -- named,
-    /// with `error` set, and nothing else -- so a hand-edit or a bad package
-    /// upgrade that broke a file is visible here instead of just in the log
-    /// (`docs/DESIGN.md` §1). The caller has checked that `$node` is in the
-    /// cluster; Rust checks its shape, and refuses both at once.
+    /// `GET /meta/prefixes` -> without `$tags`, every prefix file as it is,
+    /// most-specific first, rows carrying `nodes` as parsed; with `$tags`
+    /// (a guest's, possibly empty) and `$node` (its current node), the
+    /// prefixes reaching that guest, resolved -- no `nodes` map, `enforce`/
+    /// `hidden`/`schema` already effective. Either way, plus a row for any
+    /// file that failed to load -- named, with `error` set, and nothing else
+    /// -- so a hand-edit or a bad package upgrade that broke a file is
+    /// visible here instead of just in the log (`docs/DESIGN.md` §1).
     #[export]
     pub fn api_prefixes(
         node: Option<&str>,
-        all: Option<bool>,
+        tags: Option<Vec<String>>,
     ) -> Result<Vec<api::PrefixEntry>, api::ApiError> {
-        api::prefixes(open_store().registry()?, node, all.unwrap_or(false))
+        api::prefixes(open_store().registry()?, node, tags.as_deref())
     }
 
     /// `GET /meta/schemas` -> `{ prefix }`, the prefix file format described
@@ -367,10 +356,9 @@ mod pve_rs_meta {
     }
 
     /// `GET /meta/access` -> `{ read, write }` for one document -- exactly
-    /// `$acl`'s own ACL answers (`docs/DESIGN.md` §4). `$id` is a vmid,
-    /// `prefixes/<name>` or `nodes/<node>/prefixes/<name>`; it is only parsed,
-    /// to give a 400 for a garbage id rather than an answer for a document
-    /// that could not exist.
+    /// `$acl`'s own ACL answers (`docs/DESIGN.md` §4). `$id` is a vmid or
+    /// `prefixes/<name>`; it is only parsed, to give a 400 for a garbage id
+    /// rather than an answer for a document that could not exist.
     #[export]
     pub fn api_access(id: &str, acl: CallerAcl) -> Result<api::ApiAccess, api::ApiError> {
         api::parse_id(id)?;
@@ -389,7 +377,7 @@ mod pve_rs_meta {
     }
 
     /// `GET /meta/guests/{vmid}` and the registry documents' `GET` (`$id` is
-    /// a vmid, `prefixes/<name>` or `nodes/<node>/prefixes/<name>`).
+    /// a vmid or `prefixes/<name>`).
     /// `$comments` (optional, trailing) keeps the comment keys, which a read
     /// otherwise leaves out.
     #[export]

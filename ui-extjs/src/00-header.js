@@ -39,10 +39,9 @@
  *   PUT /meta/guests/{vmid}?view=<narrowest covering path>&mode=replace&data=<json>&digest=<d>&comments=1
  * Every read and write of a document carries `comments=1`: the comment keys are the
  * description column, and without it the server would leave them out.
- * 409 (digest mismatch) reloads and reports the API's message verbatim. A 5 s poll of
- * `GET /meta/version?id=<docid>` — this document plus the registry, never the whole
- * store — refreshes the tree when the content token changed, and never while a row
- * editor, the text window or the Text card is open, or anything is staged.
+ * 409 (digest mismatch) reloads and reports the API's message verbatim -- the digest
+ * check on every write is what catches a concurrent change; there is no background
+ * poll, only the toolbar's manual Reload.
  *
  * Monaco has three jobs: "Edit selection as text" on the selected subtree, the Text
  * card on the whole document, and the diff that confirms either one's Apply. Its AMD
@@ -54,8 +53,8 @@
  * makes of a value, what staged edits do to a document -- are not implemented here.
  * They are pve-meta-core, the server's own crate, built for the browser
  * (crates/pve-meta-wasm, loaded lazily as `PVE.meta.Core`). Two of them are objects the
- * panel holds -- a `PVE.meta.Shape` per document, which owns the prefix listing and the
- * tags and caches what the core derives from them, and the `PVE.meta.EditSet` that is
+ * panel holds -- a `PVE.meta.Shape` per document, which owns the prefix listing and
+ * caches what the core derives from it, and the `PVE.meta.EditSet` that is
  * the staged edits -- and the rest are stateless faces: `Codec`, and the key-name checks
  * on `Utils`. The server stays the authority: an Apply sends the buffer or the planned
  * subtree to the API, which runs the same code again on the real write.

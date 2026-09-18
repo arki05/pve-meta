@@ -12,7 +12,7 @@ panel, each row of which opens in that same editor.
 The editor implements no rules. The YAML codec, the key-name charset, which prefix
 governs a path, what a schema makes of a value and what staged edits do to a document
 are all `pve-meta-core` -- the server's own crate -- compiled for the browser. The panel holds two objects over it -- a `PVE.meta.Shape` per document, which
-owns the prefix listing and the tags and caches what the core derives from them, and a
+owns the prefix listing and caches what the core derives from it, and a
 `PVE.meta.EditSet`, the staged edits -- and calls a stateless face, `PVE.meta.Codec`,
 plus the key-name checks on `Utils`. See `docs/WASM-CORE.md` for how and why.
 
@@ -75,14 +75,12 @@ behind it. What follows is what is specific to *this* file.
 
 ### Everywhere
 
-* **The version poll** runs every 5 s (`Ext.TaskManager`) against
-  `GET /meta/version?id=<docId>` — this document plus the registry directories, never
-  the whole store — and reloads when the token changed: never while a row editor, the
-  selection text window or the Text card is open, and never while anything is staged.
-  A reload preserves which nodes were expanded.
+* **No background poll.** The toolbar's Reload is manual; a reload preserves which
+  rows were expanded.
 * **Conflicts.** Every write carries the digest. On 409 the panel reloads (or re-reads
   the text buffer) and shows the API's message verbatim under a *Conflict* title. Every
-  other error is the API's message verbatim too.
+  other error is the API's message verbatim too. This is what catches a concurrent
+  change without a poll: the next write finds out.
 * **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window),
   the Text card (the whole document, in the panel body), and the diff behind the Diff
   button and the "Save anyway" banner. Its AMD loader is fetched lazily on first use from
@@ -107,8 +105,7 @@ it does not — the same way Monaco is.
 a buffer the module hands out, call, decode the response, and turn an `err` into a
 `PVE.meta.CoreError` carrying the parser's `line`/`column` when it has one. Nothing
 holds state inside the module between calls; a Shape is rebuilt from the prefix
-listing and the guest's tags on every question, which costs microseconds and no
-lifetime to manage.
+listing on every question, which costs microseconds and no lifetime to manage.
 
 The YAML the editor shows is therefore the YAML the store writes, by construction: one
 emitter, not two kept in step by settings. The server stays the authority all the same --
