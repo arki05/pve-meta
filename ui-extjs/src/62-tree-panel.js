@@ -17,8 +17,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // vmid/node/type/dc arrive as config properties from pve-ext's page loader;
     // pveSelNode is the fallback for anything that adds this panel the PVE way.
     pveSelNode: undefined,
-    // Set when this panel is inside a window: its footer then carries the way out,
-    // which is also the way to abandon staged edits.
+    // Set when this panel is inside a window: its footer then carries the way out.
     onClose: undefined,
 
     initComponent: function () {
@@ -45,10 +44,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // `loadDocument` awaits the same promise and reports its failure.
         PVE.meta.Core.load().catch(Ext.emptyFn);
         me.docState = Object.create(null); // id -> { digest, data }
-        // What is staged: the difference between the stored document and the one
-        // shown, as `{ path, op: 'set' | 'delete', value }` each. `setPlanned`
-        // derives it whenever the shown document changes; a write clears it.
-        me.pending = PVE.meta.EditSet.empty();
         me.schemas = {}; // GET /meta/schemas, the shape of a registry document
         me.access = { read: 1, write: 0 };
         me.prefixes = [];
@@ -93,9 +88,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return {
             xtype: 'treepanel',
             itemId: 'metaTree',
-            // A staged row renders on two lines (stored above, pending below), the
-            // way proxmoxlib's PendingObjectGrid does.
-            variableRowHeight: true,
             store: me.store,
             rootVisible: false,
             scrollable: true,
@@ -107,12 +99,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             columns: me.buildColumns(),
             listeners: {
                 selectionchange: () => me.syncButtons(),
-                cellclick: function (view, td, cellIndex, rec, tr, rowIndex, e) {
-                    if (e.getTarget('.pve-meta-undo')) {
-                        me.discardRow(rec);
-                        e.stopEvent();
-                    }
-                },
                 itemdblclick: (view, rec) => me.editRow(rec),
                 itemkeydown: function (view, rec, item, index, e) {
                     if (e.getKey() === e.ENTER && rec) {
@@ -229,31 +215,23 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             }),
         ].concat(
             PVE.meta.Footer.actions({
-                applyDisabled: true, // nothing staged yet; `syncFooter` decides after
+                applyDisabled: true, // there is no buffer yet; `syncFooter` decides after
                 diff: () => me.showDiff(),
                 format: () => me.formatText(),
-                apply: () => (me.mode === 'text' ? me.applyText() : me.applyPending()),
+                apply: () => me.applyText(),
                 secondary: () => me.footerSecondary(),
-                // In a window the exit *is* the discard, so there is one button for
-                // both; in a tab there is nothing to close, so it is Revert.
                 secondaryText: me.onClose ? gettext('Close') : gettext('Revert'),
             }),
         );
     },
 
-    // Close, or Discard-and-close, or Revert — one button, because in a window the
-    // way out and the way to abandon the edits are the same gesture.
+    // Revert in Text, and in a window the way out. In the tree there is nothing
+    // unwritten to revert: an edit is a write (DESIGN §8).
     footerSecondary: function () {
         let me = this;
         if (me.mode === 'text') {
             me.discardText();
             return;
-        }
-        if (me.isDirty()) {
-            me.revertPending();
-            if (!me.onClose) {
-                return;
-            }
         }
         if (me.onClose) {
             me.onClose();
@@ -294,18 +272,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         (d.belowCount > 3 ? '<br>...' : ''),
                 );
             }
-            if (d.stagedBelow) {
-                parts.push(
-                    Ext.htmlEncode(
-                        Ext.String.format(
-                            d.stagedBelow === 1
-                                ? gettext('{0} unapplied change below')
-                                : gettext('{0} unapplied changes below'),
-                            d.stagedBelow,
-                        ),
-                    ),
-                );
-            }
             if (d.grammarDescription) {
                 parts.push(Ext.htmlEncode(d.grammarDescription));
             }
@@ -330,14 +296,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     rowTip(rec, meta);
                     let d = rec.data;
                     let out = fade(rec, Ext.htmlEncode(value));
-                    // Collapsing a branch must not hide what is inside it. These are
-                    // the *branch's* markers -- something beneath this row -- so they
-                    // sit in the Key column, next to the thing you would collapse,
-                    // rather than in the Value column, which is empty for a map. The
-                    // row's own trouble is still shown on its own value.
-                    if (d.stagedBelow) {
-                        out += ' <i class="fa fa-circle" style="color:darkorange"></i>';
-                    }
+                    // Collapsing a branch must not hide what is inside it. This is the
+                    // *branch's* marker -- something beneath this row -- so it sits in
+                    // the Key column, next to the thing you would collapse, rather than
+                    // in the Value column, which is empty for a map. The row's own
+                    // trouble is still shown on its own value.
                     if (d.belowCount) {
                         out += ' <i class="fa fa-exclamation-triangle warning"></i>';
                     }
@@ -351,15 +314,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 renderer: function (value, meta, rec) {
                     rowTip(rec, meta);
                     let d = rec.data;
+                    if (d.kind === 'map') {
+                        return '';
+                    }
                     // A block of text collapses into one unreadable line in a grid
                     // cell. Show its first line and how much more there is; the row's
                     // `valueText` is untouched, so the editor still opens on all of it.
                     let shown = d.present
                         ? Ext.htmlEncode(PVE.meta.Utils.previewText(value))
                         : '<span class="faded">' + unsetText(rec) + '</span>';
-                    if (d.kind === 'map' && !d.pending) {
-                        return '';
-                    }
                     if (d.finding) {
                         // Advisory, like every other schema signal: the row is still
                         // editable, the value is still there, and the message is in
@@ -368,31 +331,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                             '<i class="fa fa-exclamation-triangle warning"></i> ' +
                             '<span class="warning">' + shown + '</span>';
                     }
-                    if (!d.pending) {
-                        return shown;
-                    }
-                    // Staged, not written. Rendered the way proxmoxlib's own
-                    // `PendingObjectGrid` renders a config change that has not taken
-                    // effect yet (`proxmoxlib.js`, the Options pages): the stored
-                    // value, then the pending one beneath it in `darkorange`, and a
-                    // pending removal as the stored value struck through.
-                    let stored = Ext.htmlEncode(PVE.meta.Utils.previewText(d.storedText));
-                    let after =
-                        d.pending === 'delete'
-                            ? '<div style="text-decoration: line-through;">' +
-                              (stored || '&nbsp;') +
-                              '</div>'
-                            : shown;
-                    // The discard sits on the row it acts on, not in a toolbar, so what
-                    // it applies to is never in question -- on a list member in
-                    // particular, where an edit applies to the whole list.
-                    let undo =
-                        ' <i class="fa fa-undo pve-meta-undo" style="cursor:pointer" ' +
-                        'data-qtip="' + Ext.htmlEncode(gettext('Discard this change')) + '"></i>';
-                    return (
-                        (d.pending === 'delete' ? '' : stored) +
-                        '<div style="color:darkorange">' + after + undo + '</div>'
-                    );
+                    return shown;
                 },
             },
             {
@@ -419,35 +358,46 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // Every path in `docId` whose value does not match its schema, by path. The tree
     // shows these on the rows themselves: the text editor already squiggles them, but
     // the tree is the view people actually open, and a value the schema refuses would
-    // otherwise look exactly like one it liked. The same Shape answers here,
-    // for the text editor's squiggles and for the warning banner Apply shows: one
-    // question asked three times, through one implementation.
+    // otherwise look exactly like one it liked. The same Shape answers here and for
+    // the text editor's squiggles: one question asked twice, through one
+    // implementation. Advisory, always: an enforcing prefix is the server's 422, not
+    // a step before the write (DESIGN §5).
     findingsFor: function () {
         let out = Object.create(null);
         let shape = this.shapeFor(this.docId);
         if (!shape.hasSchema()) {
             return out;
         }
-        // Against the *planned* document: a staged value that the schema refuses is
-        // marked the moment it is staged, not after it has been written.
-        shape.findings(this.plannedData()).forEach(function (f) {
+        shape.findings(this.dataOf(this.docId)).forEach(function (f) {
             out[f.path] = f.msg;
         });
         return out;
     },
 
-    // --- staged edits --------------------------------------------------------
+    // --- writes --------------------------------------------------------------
 
-    // The list at `path`, as it currently stands (staged edits included).
+    // Sends one edit as one write, and reloads (`submit`). Every editor here goes
+    // through this: the row editor, Add Key, Set to Default, Remove, the list helpers
+    // and the subtree text editor.
+    sendEdit: function (edit, force) {
+        let me = this;
+        me.submit(
+            me.writeFor(me.docId, edit, me.digestOf(me.docId), force),
+            undefined,
+            force ? undefined : () => me.sendEdit(edit, true),
+        );
+    },
+
+    // The list at `path`, as stored.
     listAt: function (path) {
-        let v = PVE.meta.Utils.valueAt(this.plannedData(), path);
+        let v = PVE.meta.Utils.valueAt(this.dataOf(this.docId), path);
         return Array.isArray(v) ? v.slice() : [];
     },
 
-    // Stages the list at `path` with member `index` replaced, or dropped when
-    // `value` is undefined. One write of the whole list, because a view addresses
-    // through maps only -- the same reason the member rows are not addressable.
-    stageListMember: function (path, index, value) {
+    // Writes the list at `path` with member `index` replaced, or dropped when `value`
+    // is undefined. One `replace` of the whole list, because a view addresses through
+    // maps only -- the same reason the member rows are not addressable.
+    writeListMember: function (path, index, value) {
         let list = this.listAt(path);
         if (index < 0 || index >= list.length) {
             return;
@@ -457,146 +407,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         } else {
             list[index] = value;
         }
-        this.stage(path, 'set', list);
+        this.sendEdit({ path: path, op: 'set', value: list });
     },
 
-    // Makes `doc` the document you are looking at. The edit set is not a log of what
-    // was done, it is the difference between what is stored and this -- so it is
-    // derived here, from the result, and nowhere else. That is what keeps dirty
-    // meaning *the document differs from what is stored* rather than *an edit object
-    // exists*. Two ways it came to lie, both reported: opening the subtree editor and
-    // pressing OK without typing staged a set of the value already there, and editing
-    // a row from A to B and back to A left two edits describing no change. Either way
-    // Revert appeared and Apply lit up while no row was marked. Not creating a no-op
-    // edit would have been the narrower fix, and it misses the second case: A over a
-    // pending B *is* a change at that moment. Asking what the document now is catches
-    // both, and anything else that gets here by a route nobody thought of.
-    //
-    // It also makes every staged edit minimal, which the Text card already did on the
-    // way out: replacing a whole subtree marks the rows that actually differ, not the
-    // whole subtree.
-    setPlanned: function (doc) {
-        let me = this;
-        me.pending = PVE.meta.EditSet.between(me.dataOf(me.docId), doc);
-        me.buildTree();
-        me.syncButtons();
-    },
-
-    // Records one edit: a `set` is `view::replace` at `path` and a `delete` is
-    // `view::remove`, applied to the document as it stands -- so a set at `selector`
-    // says everything about `selector.tag`, whatever was staged there before. The one
-    // door every editor stages through: the row editor, Add Key, Set to Default, the
-    // list helpers and the subtree text editor.
-    stage: function (path, op, value) {
-        let me = this;
-        let U = PVE.meta.Utils;
-        let edit = { path: path, op: op };
-        if (op === 'set') {
-            edit.value = value;
-        }
-        let doc = new PVE.meta.EditSet([edit]).apply(me.plannedData());
-        if (op === 'delete') {
-            // A delete never leaves behind a container the stored document does not
-            // have. `view::remove` takes the key and keeps its parent, which is right
-            // for a map the file holds -- an empty map is a stored state -- and wrong
-            // for one an earlier edit created on the way to a key that is now gone:
-            // set a ghost `docker.compose`, discard it, and `docker: {}` would stay
-            // staged, with Apply lit to write a map the guest never asked for.
-            let stored = me.dataOf(me.docId);
-            let parent = U.parentPath(path);
-            while (parent) {
-                let now = U.valueAt(doc, parent);
-                let isEmptyMap =
-                    now && typeof now === 'object' && !Array.isArray(now) && Object.keys(now).length === 0;
-                if (!isEmptyMap || U.valueAt(stored, parent) !== undefined) {
-                    break;
-                }
-                doc = new PVE.meta.EditSet([{ path: parent, op: 'delete' }]).apply(doc);
-                parent = U.parentPath(parent);
-            }
-        }
-        me.setPlanned(doc);
-    },
-
-    isDirty: function () {
-        return this.pending.length > 0;
-    },
-
-    // Puts the stored value back on one row and leaves the rest alone. Dropping a
-    // row's edits and restoring what is stored there are the same thing once the edit
-    // set is the difference: a ghost gets its value back, a key that was added goes,
-    // and a subtree comes back whole.
-    //
-    // A list member needs more care: the edit is staged on the *list*, so putting the
-    // whole stored list back would throw away every other member's change too. That
-    // one member goes back instead, and the list's edit is gone once every member
-    // matches again -- with no step of its own, since a list that matches is not a
-    // difference.
-    discardRow: function (rec) {
-        let me = this;
-        if (!rec || !rec.data.path) {
-            return;
-        }
-        let d = rec.data;
-        if (d.arrayIndex !== undefined && d.arrayIndex !== null) {
-            me.discardListMember(d.path, d.arrayIndex);
-            return;
-        }
-        if (d.storedIndex !== undefined && d.storedIndex !== null) {
-            // A member the staged list dropped: put it back where it was, or at the
-            // end if the list is shorter than that now. Restoring the whole stored
-            // list here would throw away every other member's change.
-            me.discardListMember(d.path, d.storedIndex);
-            return;
-        }
-        let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), d.path);
-        me.stage(d.path, stored === undefined ? 'delete' : 'set', stored);
-    },
-
-    discardListMember: function (path, index) {
-        let me = this;
-        let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), path);
-        if (!Array.isArray(stored)) {
-            return;
-        }
-        let list = me.listAt(path);
-        if (index >= stored.length) {
-            // An appended member has nothing stored to go back to: it goes.
-            me.stageListMember(path, index, undefined);
-        } else if (index >= list.length) {
-            // A dropped member, on a list now shorter than where it was: back on
-            // the end. The only place a member is ever added past the end.
-            list.push(stored[index]);
-            me.stage(path, 'set', list);
-        } else {
-            me.stageListMember(path, index, stored[index]);
-        }
-    },
-
-    // The document as it would be. Everything the tree shows is computed from this,
-    // so a staged value is linted, hovered and diffed exactly like a stored one.
-    // The document as it would be if the staged edits were applied. `docId` is here
-    // for a caller holding a row's own document; a panel shows one document, so it
-    // defaults to that one.
-    plannedData: function (docId) {
-        return this.pending.apply(this.dataOf(docId || this.docId));
-    },
-
-    // Fold a whole subtree, as edited somewhere else, back into the edited document.
-    // The one way a text buffer becomes staged edits at a view -- what "Edit selection
-    // as text" ends with, and the reason that window no longer needs a write path of
-    // its own.
-    stageFromView: function (view, value) {
-        this.stage(view || '', 'set', value);
-    },
-
-    // Revert: the document you are looking at is the stored one.
-    revertPending: function () {
-        let me = this;
-        if (!me.isDirty()) {
-            return;
-        }
-        me.setPlanned(me.dataOf(me.docId));
+    // A whole subtree, as edited somewhere else: one `replace` at that view, which
+    // says everything about what is inside it. What "Edit selection as text" ends
+    // with.
+    writeSubtree: function (view, value) {
+        this.sendEdit({ path: view || '', op: 'set', value: value });
     },
 
     // The document a row belongs to; the panel's default for anything with no row.
@@ -607,9 +425,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // What describes this document's shape (`PVE.meta.Shape`). A guest document is
     // described by the prefixes that reach it, most-specific first (they shadow); a
     // prefix file by the one meta-schema for its kind, rooted at the document itself.
-    // One function, every caller that needs it -- the row builder, the row
-    // markers, the text editor's squiggles and hovers, and the warning banner Apply
-    // shows -- so they cannot disagree about what describes the document.
+    // One function, every caller that needs it -- the row builder, the row markers,
+    // and the text editor's squiggles and hovers -- so they cannot disagree about
+    // what describes the document.
     //
     // One Shape per document, kept for as long as its inputs are the panel's
     // current ones: a Shape caches what the core derives from the listing and the
@@ -716,7 +534,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let row = d;
         set('editBtn', text || !row || !row.editable);
         set('removeBtn', text || !row || !row.present || !row.editable);
-        let dirty = me.isDirty();
         set('textSelBtn', text || !row);
         set('reloadBtn', text);
         me.syncFooter();
@@ -735,9 +552,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             // not just on unset ones. A default is the answer to "what should
             // this be", and the moment you most want that answer is when the
             // value in front of you is wrong; refusing then meant the only way
-            // back to a declared default was to remember it and retype it. It
-            // stages like every other edit, so an accidental click is one
-            // Discard away and nothing is written until Apply.
+            // back to a declared default was to remember it and retype it.
             let offers =
                 !!row &&
                 row.defaultValue !== undefined &&
@@ -745,8 +560,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             dflt.setHidden(!me.hasDefaults);
             dflt.setDisabled(text || !offers || !row.editable);
         }
-        // The Text toggle's enabled state depends on staged edits too, and this is
-        // the function that runs whenever those change.
         me.syncAccessLabel();
         let declare = me.down('#declareBtn');
         if (declare) {
@@ -758,31 +571,31 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
     },
 
-    // One place decides what the footer says, in either mode.
+    // One place decides what the footer says, in either mode. Everything on it but
+    // the mode switch belongs to the Text card now: in the tree an edit is its own
+    // write, so there is nothing to apply, revert or diff.
     syncFooter: function () {
         let me = this;
         let textMode = me.mode === 'text';
-        // `metaDiff` is deliberately not in this list: it is not a text-mode button.
-        ['textLangBtn', 'metaFormat'].forEach(function (id) {
+        ['textLangBtn', 'metaFormat', 'metaDiff', 'metaApply'].forEach(function (id) {
             let c = me.down('#' + id);
             if (c) {
                 c.setHidden(!textMode);
             }
         });
-        PVE.meta.Footer.sync(me, {
-            // In text mode the buffer is the edit, and Apply is offered whenever the
-            // document is writable (DESIGN §4) -- the diff is what decides if it is
-            // worth it.
-            canApply: textMode ? !!me.access.write : me.isDirty(),
-            // The same count in both views: the buffer is rendered from the planned
-            // document, so those staged edits are in it. Showing it only in the tree
-            // made switching to Text look like it had dropped them.
-            count: me.pending.length,
-            dirty: textMode ? true : me.isDirty(),
-            dirtyText: me.onClose ? gettext('Discard') : gettext('Revert'),
-            cleanText: me.onClose ? gettext('Close') : gettext('Revert'),
-            secondaryOnlyWhenDirty: !me.onClose,
-        });
+        let apply = me.down('#metaApply');
+        if (apply) {
+            // The buffer is the edit, and Apply is offered whenever the document is
+            // writable (DESIGN §4); the diff is what decides if it is worth it.
+            apply.setDisabled(!me.access.write);
+        }
+        let second = me.down('#metaSecondary');
+        if (second) {
+            // Revert in Text; in a window, the way out. A tab's tree has neither.
+            second.setHidden(!textMode && !me.onClose);
+            second.setIconCls(textMode ? 'fa fa-undo' : 'fa fa-times');
+            second.setText(textMode ? gettext('Revert') : gettext('Close'));
+        }
     },
 
     // The label is a read-only notice, so it says nothing at all for a caller who
@@ -1037,53 +850,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     documentEntries: function () {
         let me = this;
         let root = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
-        me.addData(root, me.plannedData());
-        // A row staged for deletion is gone from the planned document, but it should
-        // not vanish off the screen before it is applied -- you would be looking at a
-        // tree that already claims the write happened. It comes back as a ghost.
-        // A staged list edit is one write of the whole list, but it is almost never a
-        // change to the whole list: show it on the members that actually differ. Any
-        // member the edit dropped comes back as a ghost, the same as a deleted key.
-        let storedDoc = me.dataOf(me.docId);
-        me.pending.edits.forEach(function (e) {
-            if (e.op !== 'set' || !Array.isArray(e.value)) {
-                return;
-            }
-            let before = PVE.meta.Utils.valueAt(storedDoc, e.path);
-            if (!Array.isArray(before) || before.length <= e.value.length) {
-                return;
-            }
-            let entry = root;
-            let path = '';
-            e.path.split('.').forEach(function (seg) {
-                path = PVE.meta.Utils.joinPath(path, seg);
-                entry = me.entry(entry, seg, path);
-            });
-            before.slice(e.value.length).forEach(function (item, i) {
-                let row = me.entry(entry, String(e.value.length + i), e.path);
-                row.present = false;
-                row.pendingDelete = true;
-                row.arrayIndex = null; // gone: there is no member to act on
-                row.storedIndex = e.value.length + i; // but there is one to put back
-                row.addressable = false;
-                row.kind = 'string';
-                row.value = PVE.meta.Utils.itemSummary(item);
-            });
-        });
-
-        me.pending.edits
-            .filter((e) => e.op === 'delete')
-            .forEach(function (e) {
-                let entry = root;
-                let path = '';
-                e.path.split('.').forEach(function (seg) {
-                    path = PVE.meta.Utils.joinPath(path, seg);
-                    entry = me.entry(entry, seg, path);
-                    entry.kind = entry.kind || 'map';
-                });
-                entry.pendingDelete = true;
-                entry.present = false;
-            });
+        me.addData(root, me.dataOf(me.docId));
         me.addShape(root, me.shapeFor(me.docId));
         return root;
     },
@@ -1092,40 +859,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let me = this;
         let I = PVE.meta.Icons;
         let findings = me.findingsFor();
-        // What is staged, by path, so a changed row can show `stored -> pending`.
-        let staged = Object.create(null);
-        me.pending.edits.forEach((e) => (staged[e.path] = e.op));
-        let storedDoc = me.dataOf(me.docId);
-
-        // Which *member* of a staged list actually differs. The edit is one write of
-        // the whole list -- members are not addressable (§2) -- but wearing the mark on
-        // the list said "all of this changed" when one entry did.
-        let memberChanged = function (listPath, index, item) {
-            let before = PVE.meta.Utils.valueAt(storedDoc, listPath);
-            if (!Array.isArray(before) || index >= before.length) {
-                return true; // appended
-            }
-            return !PVE.meta.Utils.sameValue(before[index], item);
-        };
-        let storedMember = function (listPath, index) {
-            let before = PVE.meta.Utils.valueAt(storedDoc, listPath);
-            if (!Array.isArray(before) || index >= before.length) {
-                return '';
-            }
-            let v = before[index];
-            return v !== null && typeof v === 'object'
-                ? PVE.meta.Utils.itemSummary(v)
-                : PVE.meta.Utils.displayValue(v, PVE.meta.Utils.kindOf(v));
-        };
-        // What each branch has to answer for: schema findings beneath it, and staged
-        // edits beneath it. Both are invisible once the branch is collapsed.
+        // What each branch has to answer for: the schema findings beneath it, which
+        // are invisible once the branch is collapsed.
         let below = PVE.meta.Utils.rollUp(findings);
-        let stagedBelow = PVE.meta.Utils.rollUp(
-            me.pending.edits.reduce(function (acc, e) {
-                acc[e.path] = e.op === 'delete' ? gettext('removed') : gettext('changed');
-                return acc;
-            }, Object.create(null)),
-        );
 
         let toNodes = function (entry, docId) {
             return Object.keys(entry.children)
@@ -1153,45 +889,12 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         multiline: c.multiline,
                         rawValue: c.value,
                         arrayIndex: c.arrayIndex,
-                        storedIndex: c.storedIndex,
                         addressable: c.addressable !== false,
                         rawItem: c.rawItem,
                         valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
                         finding: findings[c.path] || '',
-                        pending: (function () {
-                            if (c.pendingDelete) {
-                                return 'delete';
-                            }
-                            if (!staged[c.path]) {
-                                return '';
-                            }
-                            // A member carries the mark when it is the one that
-                            // changed; the list itself carries only the dot that says
-                            // something below it did.
-                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
-                                return memberChanged(c.path, c.arrayIndex, c.rawItem) ? 'set' : '';
-                            }
-                            return kind === 'array' ? '' : staged[c.path];
-                        })(),
                         belowCount: (below[c.path] || {}).count || 0,
                         belowText: ((below[c.path] || {}).messages || []).join('\n'),
-                        stagedBelow:
-                            (stagedBelow[c.path] || {}).count ||
-                            (kind === 'array' && staged[c.path] ? 1 : 0),
-                        // Rendered with the row's own kind, not one inferred from the
-                        // raw value: the API returns booleans as 1/0 (DESIGN §7), so
-                        // inferring would print a struck-through "1" under a row whose
-                        // stored value reads "Yes".
-                        storedText: (function () {
-                            if (c.arrayIndex !== undefined && c.arrayIndex !== null) {
-                                return storedMember(c.path, c.arrayIndex);
-                            }
-                            if (c.pendingDelete && c.value !== undefined) {
-                                return c.value; // a ghost carries what was there
-                            }
-                            let v = PVE.meta.Utils.valueAt(storedDoc, c.path);
-                            return v === undefined ? '' : PVE.meta.Utils.displayValue(v, kind);
-                        })(),
                         editable: me.editableFor(),
                         leaf: kind !== 'map' && !Object.keys(c.children).length,
                     };
@@ -1277,156 +980,26 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return;
         }
         me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.stage(rec.data.path, 'set', value),
+            me.sendEdit({ path: rec.data.path, op: 'set', value: value }),
         );
     },
 
+    // A new key is a `replace` at its own path: `view::replace` creates the maps
+    // above it, so a dotted path into a subtree nobody has written yet needs no
+    // second write to make room for it.
     addKey: function (docId, parentPath) {
         let me = this;
         me.openEditor(
             'PVE.meta.AddKeyWindow',
             { parentPath: parentPath || '' },
             'addkey',
-            (path, value) => me.stage(path, 'set', value),
+            (path, value) => me.sendEdit({ path: path, op: 'set', value: value }),
         );
     },
 
-    // Applies everything staged, as ONE write.
-    //
-    // That is the whole point: the states in between are the ones the server refuses
-    // (a selector with both `all` and `tag`, or neither), so they must never reach it.
-    // The write is a `replace` at the narrowest view covering every staged path, with
-    // the planned subtree as its content -- for a single row edit that is exactly a
-    // one-key write.
-    //
-    // Apply applies: it stops for the diff only when the planned document would not
-    // match the schema (see `confirmAndApply`, which says why there is no `dry_run`
-    // pass).
-    applyPending: function () {
-        let me = this;
-        if (!me.isDirty()) {
-            return;
-        }
-        me.confirmAndApply();
-    },
-
-    // The dry run, the diff and the write.
-    confirmAndApply: function () {
-        let me = this;
-        let view = me.pending.writeView();
-        let planned = me.plannedData();
-        let subtree = view === '' ? planned : PVE.meta.Utils.valueAt(planned, view);
-        if (subtree === undefined) {
-            subtree = {};
-        }
-        let params = {
-            view: view || undefined,
-            mode: 'replace',
-            data: Ext.encode(subtree),
-            digest: me.digestOf(me.docId),
-        };
-        let stored = view === '' ? me.dataOf(me.docId) : PVE.meta.Utils.valueAt(me.dataOf(me.docId), view);
-
-        // One staged delete is a DELETE, not a replace of its parent.
-        //
-        // `writeView` steps up a level for a delete, because you cannot remove a key by
-        // replacing it -- and for a *top-level* key that step lands on the document
-        // root. The narrower `DELETE ?view=traefik` is preferred anyway, because it is
-        // the smaller write: it names one subtree instead of the whole document, so it
-        // collides with less, and it does not require the caller to be able to send
-        // back every key it did not touch.
-        let onlyDelete =
-            me.pending.length === 1 && me.pending.edits[0].op === 'delete' && me.pending.edits[0].path;
-        // `force` is what the warned dialog's Apply sends: the "Save anyway" tick.
-        // A prefix with `enforce: true` refuses the write without it (DESIGN §7).
-        let write = function (force) {
-            if (onlyDelete) {
-                let q = Ext.Object.toQueryString({
-                    view: me.pending.edits[0].path,
-                    digest: me.digestOf(me.docId),
-                });
-                me.submit(
-                    { url: me.urlFor(me.docId) + '?' + q, method: 'DELETE' },
-                    function () {
-                        me.pending = PVE.meta.EditSet.empty();
-                    },
-                );
-                return;
-            }
-            if (force) {
-                params.force = 1;
-            }
-            me.write(me.docId, params, function () {
-                me.pending = PVE.meta.EditSet.empty();
-            });
-        };
-
-        // Apply applies. It stops to show the diff only when the document would not
-        // match the schema, which is the one case where seeing it changes what you
-        // decide -- and the tick is what makes storing it anyway a deliberate act
-        // rather than a dialog reflex. Otherwise there is nothing to decide: the diff
-        // is a button of its own now, for whenever you want to look first.
-        //
-        // There is deliberately no `dry_run` pass any more. It existed to turn a
-        // server refusal into a banner with a "Save anyway" tick -- but a refusal is
-        // not advisory: the server refuses the real write for the same reason, tick or
-        // no tick. Showing it as an error is honest; showing it as something you can
-        // override is not, and it cost every Apply a second request.
-        // Unreachable while the Tree card is disabled, and here anyway: the rule is
-        // that a document which does not parse is repaired whole, and the planned
-        // document the tree would send is built on an empty one.
-        if (me.docParseError) {
-            Ext.Msg.alert(
-                gettext('Error'),
-                Ext.htmlEncode(
-                    Ext.String.format(
-                        gettext('This document is not valid YAML; repair it as text: {0}'),
-                        me.docParseError,
-                    ),
-                ),
-            );
-            return;
-        }
-
-        let warnings = me.applyFindingsFor(planned);
-        if (!warnings.length) {
-            write();
-            return;
-        }
-        PVE.meta.Monaco.confirmDiff({
-            title: Ext.String.format(gettext('Apply: {0}'), me.docId),
-            // Documents, not text: `confirmDiff` renders them once it has the YAML
-            // codec, so this cannot run before it is loaded.
-            originalValue: stored === undefined ? {} : stored,
-            modifiedValue: subtree,
-            warnings: warnings,
-            apply: () => write(true),
-        });
-    },
-
-    // The schema findings a planned document would *introduce*, as plain messages --
-    // what Apply warns about. The same Shape the tree markers use, through the same
-    // `shapeFor`, so the banner and the amber rows can never disagree about what is
-    // wrong; they differ only in what they are for. The markers show everything
-    // wrong with the document, which is honest. The banner asks you to vouch for
-    // what this edit did, which is the only thing you can answer for.
-    applyFindingsFor: function (planned) {
-        let me = this;
-        let shape = me.shapeFor(me.docId);
-        if (!shape.hasSchema()) {
-            return [];
-        }
-        let stored = me.dataOf(me.docId);
-        return PVE.meta.Shape.introduced(
-            shape.findings(stored),
-            shape.findings(planned),
-            PVE.meta.EditSet.changedPaths(stored, planned),
-        ).map(PVE.meta.Utils.findingText);
-    },
-
-    // Stage a declared default, because someone asked for it. Never on its own: an
+    // Write a declared default, because someone asked for it. Never on its own: an
     // unset key stays unset, and a set one keeps whatever it was set to, until this
-    // click (DESIGN §12).
+    // click.
     //
     // A row already at its default is refused here as well as disabled in the
     // toolbar, so the two cannot drift apart -- the button's state is a hint, this is
@@ -1440,7 +1013,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (rec.data.present && U.sameValue(rec.data.rawValue, rec.data.defaultValue)) {
             return;
         }
-        me.stage(rec.data.path, 'set', rec.data.defaultValue);
+        me.sendEdit({ path: rec.data.path, op: 'set', value: rec.data.defaultValue });
     },
 
     // Appending to a list. A member of a list has no name to give it, so this asks
@@ -1452,7 +1025,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             _path,
             value,
         ) {
-            me.stage(path, 'set', list.concat([value]));
+            me.sendEdit({ path: path, op: 'set', value: list.concat([value]) });
         });
     },
 
@@ -1468,7 +1041,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return;
         }
         me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.stageListMember(d.path, d.arrayIndex, value),
+            me.writeListMember(d.path, d.arrayIndex, value),
         );
     },
 
@@ -1482,7 +1055,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!docId || me.docKind(docId) !== 'prefix') {
             return;
         }
-        let props = PVE.meta.Utils.valueAt(me.plannedData(docId), 'schema.properties');
+        let props = PVE.meta.Utils.valueAt(me.dataOf(docId), 'schema.properties');
         if (!props || !Object.keys(props).length) {
             props = { key_name: { type: 'string' } };
         }
@@ -1496,18 +1069,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.textWindow.show();
     },
 
-    // Staged like every other edit, so no confirm: nothing has happened yet, the row
-    // shows struck through, and Revert or Apply is the decision.
+    // `DELETE ?view=<path>`, which takes the key's note with it (`view::remove`). A
+    // member of a list has no path of its own, so removing one is a write of the list
+    // without it.
     removeKey: function (rec) {
         let me = this;
         if (!rec || !rec.data.path) {
             return;
         }
         if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
-            me.stageListMember(rec.data.path, rec.data.arrayIndex, undefined);
+            me.writeListMember(rec.data.path, rec.data.arrayIndex, undefined);
             return;
         }
-        me.stage(rec.data.path, 'delete');
+        me.sendEdit({ path: rec.data.path, op: 'delete' });
     },
 
     // "Edit selection as text": Monaco on the selected subtree, in its own window.
@@ -1529,24 +1103,18 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             PVE.meta.Utils.editorKind(rec.data) === 'text' ? rec.data.path : me.parentPath(rec);
         let docId = me.docOf(rec);
 
-        // Rendered from the *planned* document, not fetched. This window used to read
-        // its subtree back from the server, which meant it showed the stored document
-        // and silently ignored everything staged -- so you could edit a row, open its
-        // subtree as text, and be looking at the value you had just replaced.
-        //
-        // There is nothing to fetch any more: the editor dumps with the same codec the
-        // store writes with (decision 011), so the text here is the text the file would
-        // hold, without asking.
-        let planned = me.plannedData(docId);
-        let subtree = view === '' ? planned : PVE.meta.Utils.valueAt(planned, view);
+        // Rendered from the document this panel holds, not fetched: the editor dumps
+        // with the same codec the store writes with (decision 011), so the text here
+        // is the text the file holds, without asking for it again.
+        let stored = me.dataOf(docId);
+        let subtree = view === '' ? stored : PVE.meta.Utils.valueAt(stored, view);
         me.textWindow = Ext.create('PVE.meta.TextWindow', {
             view: view,
             docId: docId,
             text: PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'),
             tree: me,
         });
-        // No reload on close: nothing was written. Reloading would also have asked
-        // whether to discard the staged edits this window has just added to.
+        // No reload on close: the write, if there was one, reloads on its own.
         me.textWindow.on('destroy', () => (me.textWindow = null));
         me.textWindow.show();
     },

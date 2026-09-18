@@ -50,13 +50,6 @@ impl Path {
         Path(Vec::new())
     }
 
-    /// Builds a path from already-validated segments. Crate-private: the
-    /// callers are the ones that took the segments from a parsed `Path` or a
-    /// linted document, so the invariant holds without a second check.
-    pub(crate) fn new(segments: Vec<String>) -> Self {
-        Path(segments)
-    }
-
     /// Parses a dotted (`a.b.c`) or slash-separated (`a/b/c`, `/a/b/c`) path
     /// string. An empty string (or `/`) parses to the root path.
     ///

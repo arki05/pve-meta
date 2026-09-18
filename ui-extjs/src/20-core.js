@@ -2,13 +2,11 @@
 // The core: pve-meta-core, built for the browser (crates/pve-meta-wasm).
 //
 // The server's own code answers the questions this editor needs: how a document
-// reads and dumps, which key names are legal, which prefix governs a path, what a
-// schema makes of a value, and what a set of staged edits does to a document.
-// Below it: `Codec`, a stateless face over the core's functions; `Shape` and
-// `EditSet`, objects that own their inputs (a Shape its listing and tags, an
-// EditSet its list) and whose methods are the core's -- so a call site reads as
-// the concept and not as a string passed to `call`, and what a Shape derives is
-// computed once.
+// reads and dumps, which key names are legal, which prefix governs a path, and what
+// a schema makes of a value. Below it: `Codec`, a stateless face over the core's
+// functions, and `Shape`, an object that owns its input (the prefix listing) and
+// whose methods are the core's -- so a call site reads as the concept and not as a
+// string passed to `call`, and what a Shape derives is computed once.
 //
 // The ABI is four exports and a JSON document each way (see the crate's own
 // doc comment): `pm_alloc`/`pm_free` for the request, `pm_call` to run it, and
@@ -31,7 +29,7 @@ PVE.meta.CoreError.prototype.constructor = PVE.meta.CoreError;
 
 PVE.meta.Core = {
     SRC: '/pve2/js/pve-meta-extjs/pve-meta-core.wasm',
-    ABI: 2,
+    ABI: 3,
     exports: null,
     promise: null,
 

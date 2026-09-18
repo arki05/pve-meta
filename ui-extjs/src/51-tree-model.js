@@ -11,10 +11,8 @@ Ext.define('PVE.meta.TreeModel', {
         { name: 'finding', type: 'string' }, // this row does not match its schema
         { name: 'belowCount', type: 'int' }, // findings somewhere beneath this row
         { name: 'belowText', type: 'string' }, // the first few of them, for the tooltip
-        { name: 'stagedBelow', type: 'int' }, // staged edits somewhere beneath this row
         { name: 'multiline', type: 'boolean' }, // grammar `multiline` -> a text box
         { name: 'arrayIndex' }, // this row is member N of the list at `path`
-        { name: 'storedIndex' }, // a ghost member: the index it had in the stored list
         { name: 'addressable', type: 'boolean' }, // false: no view path names this row
         { name: 'rawItem' }, // a list member's real value, whatever it is
         { name: 'valueText', type: 'string' },

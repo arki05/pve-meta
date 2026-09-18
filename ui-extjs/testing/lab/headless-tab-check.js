@@ -409,8 +409,7 @@ async function main() {
             await sleep(1200);
             await page.screenshot({ path: `${out}/extjs-selection-text-json-${theme}.png` });
 
-            // OK stages the subtree on the panel and closes; nothing is written and
-            // no diff opens here (the panel's own Diff shows what is staged).
+            // OK is one `replace` of that subtree and closes; the panel reloads.
             await page.evaluate(() => {
                 const w = Ext.ComponentQuery.query('pveMetaTextWindow')[0];
                 const v = JSON.parse(w.editor.getValue());
@@ -419,23 +418,19 @@ async function main() {
                 w.editor.setValue(JSON.stringify(v, null, 2));
                 w.submit();
             });
-            await sleep(1500);
-            result.checks.subtreeStaged = await page.evaluate(() => {
+            await sleep(3000);
+            result.checks.subtreeWritten = await page.evaluate(() => {
                 const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                const r = [];
+                p.getRootNode().cascadeBy(
+                    (n) => n.data.path && r.push(n.data.path + '=' + n.data.valueText),
+                );
                 return {
                     windowClosed: Ext.ComponentQuery.query('pveMetaTextWindow').length === 0,
-                    staged: p.pending.edits.map((e) => e.path + ':' + e.op).sort(),
+                    rows: r.filter((x) => x.indexOf('traefik') === 0),
                 };
             });
-            await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].showDiff());
-            await sleep(4000);
-            result.checks.diffOpen = await page.evaluate(
-                () => !!document.querySelector('.monaco-diff-editor'),
-            );
-            await page.screenshot({ path: `${out}/extjs-diff-${theme}.png` });
             await page.evaluate(() => {
-                const d = Ext.ComponentQuery.query('#pveMetaDiffWindow')[0];
-                if (d) d.close();
                 Ext.ComponentQuery.query('pveMetaTextWindow').forEach((w) => w.close());
             });
             await sleep(2500);

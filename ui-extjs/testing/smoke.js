@@ -1,13 +1,13 @@
 // Offline smoke test of pve-meta-tree.js: the editor's helpers, the row builder,
-// the staging model and the text-editor markers -- through the real pve-meta core,
-// loaded from the same `.wasm` the package ships. A minimal Ext/PVE shim is enough;
-// none of this touches the DOM.
+// the write an edit produces and the text-editor markers -- through the real pve-meta
+// core, loaded from the same `.wasm` the package ships. A minimal Ext/PVE shim is
+// enough; none of this touches the DOM.
 //
-// The rules themselves (the YAML codec, key names, shadowing, the edit set, the
-// schema findings) are tested where they live, in Rust. What this suite shows is
-// that the wasm build loads and answers, that the JavaScript objects over it
-// (Codec, Shape, EditSet) hand the right things in and out, and that the editor's
-// own logic on top of them still does what it did.
+// The rules themselves (the YAML codec, key names, shadowing, the schema findings)
+// are tested where they live, in Rust. What this suite shows is that the wasm build
+// loads and answers, that the JavaScript objects over it (Codec, Shape) hand the
+// right things in and out, and that the editor's own logic on top of them still does
+// what it did.
 //
 // Build the core first: `make wasm` (or `cargo build -p pve-meta-wasm --target
 // wasm32-unknown-unknown --profile wasm`). PVE_META_WASM overrides the path.
@@ -166,7 +166,7 @@ eq('non-ASCII survives both copies', Core.call('parse', 'yaml', 'k: ünïcøde �
     const text = Core.call('dump', 'yaml', big);
     eq('a megabyte round trips through the buffer', text.length > 1000000 && JSON.stringify(Core.call('parse', 'yaml', text)) === JSON.stringify(big), true);
     // And a call after the growth still works (the output pointer moved).
-    eq('the instance is fine afterwards', Core.call('same', 1, 1), true);
+    eq('the instance is fine afterwards', Core.call('parse', 'yaml', 'ok: 1\n'), { ok: 1 });
 }
 {
     const err = throws('a parse error is a CoreError, not a trap', () => Core.call('parse', 'yaml', 'a: 1\nb: [\n'), 'failed to parse');
@@ -195,24 +195,7 @@ eq('defined', ctx.__defined, [
 const U = ctx.PVE.meta.Utils;
 const Codec = ctx.PVE.meta.Codec;
 const Shape = ctx.PVE.meta.Shape;
-const EditSet = ctx.PVE.meta.EditSet;
 const Markers = ctx.PVE.meta.Markers;
-
-// A panel reduced to its staging: one stored document, what is staged on it, and
-// the methods that change what is staged -- no tree behind them, so a test can look
-// at the edit set and the planned document directly.
-const stagingStub = (stored, edits) => {
-    const P = ctx.PVE.meta.TreePanel;
-    const stub = { docId: '1', pending: new EditSet(edits || []), docState: { 1: { digest: 'd', data: stored } } };
-    [
-        'setPlanned', 'stage', 'stageFromView', 'plannedData', 'isDirty', 'revertPending',
-        'discardRow', 'discardListMember', 'listAt', 'stageListMember',
-    ].forEach((m) => (stub[m] = P[m]));
-    stub.dataOf = (id) => (stub.docState[id] || {}).data || {};
-    stub.buildTree = () => {};
-    stub.syncButtons = () => {};
-    return stub;
-};
 
 console.log('\n--- PVE.meta.compose: how the panel is three method sets sharing one `this` ---');
 eq('merges left to right into a new object', ctx.PVE.meta.compose({ a: 1 }, { b: 2 }, { c: 3 }), { a: 1, b: 2, c: 3 });
@@ -315,75 +298,6 @@ eq('JSON in', Codec.parse('{"a": [1, {"b": true}]}', 'json'), { a: [1, { b: true
 eq('JSON out is two-space pretty', Codec.dump({ a: [1] }, 'json'), '{\n  "a": [\n    1\n  ]\n}\n');
 throws('a JSON error carries its line too', () => Codec.parse('{"a": 1,\n}', 'json'), 'parse').line === 2 || fails++;
 
-console.log('\n--- the footer keeps the word its caller chose ---');
-{
-    // `sync` rewrites the primary button's text on every keystroke. Setting the word
-    // only where the button is built left it to be overwritten by the next thing the
-    // user typed -- so a modal's OK silently became the panel's Apply.
-    const F = ctx.PVE.meta.Footer;
-    const btn = (itemId, cfg) => {
-        const b = Object.assign({ itemId: itemId, text: '', disabled: false }, cfg);
-        b.setText = (t) => (b.text = t);
-        b.setDisabled = (d) => (b.disabled = d);
-        b.setIconCls = () => {};
-        return b;
-    };
-    const owner = (b) => ({ down: (sel) => (sel === '#metaApply' ? b : null) });
-
-    const ok = btn('metaApply', {});
-    F.sync(owner(ok), { canApply: true, count: 0, applyText: 'OK' });
-    eq('a modal keeps OK through a sync', ok.text, 'OK');
-
-    const apply = btn('metaApply', {});
-    F.sync(owner(apply), { canApply: true, count: 3 });
-    eq('the panel still counts its staged edits', apply.text, 'Apply (3)');
-
-    const bare = btn('metaApply', {});
-    F.sync(owner(bare), { canApply: true, count: 0 });
-    eq('a caller that named nothing gets Apply', bare.text, 'Apply');
-}
-
-console.log('\n--- Edit selection as text stages, like every other modal ---');
-{
-    const stored = { traefik: { spec: { host: 'a', port: 80 } }, netbird: { groups: ['lan'] } };
-
-    // A subtree buffer is one edit at the view's own path, and it says everything
-    // about what is inside that view -- a buffer for `traefik` replaces `traefik.spec`
-    // whatever was staged there before. What is staged afterwards is the difference
-    // that leaves, not the buffer.
-    const stub = stagingStub(stored, [{ path: 'traefik.spec.host', op: 'set', value: 'b' }]);
-    eq('an inner edit stages', stub.pending.length, 1);
-    stub.stageFromView('traefik', { spec: { host: 'c' } });
-    eq('the planned document is what was typed', stub.plannedData().traefik, { spec: { host: 'c' } });
-    eq('... leaving everything outside the view alone', stub.plannedData().netbird, { groups: ['lan'] });
-    eq('and the set is the difference, not the buffer',
-        stub.pending.edits.map((e) => e.path + ':' + e.op).sort(),
-        ['traefik.spec.host:set', 'traefik.spec.port:delete']);
-
-    // The whole-document view: the empty path is the document, not a key named "".
-    stub.stageFromView('', { only: 1 });
-    eq('the root view stages as the document', stub.plannedData(), { only: 1 });
-}
-
-console.log('\n--- leaving Text only asks when the tree cannot carry the change ---');
-{
-    // Ordinary edits become staged rows, so switching needs no dialog and gets none.
-    // A reorder or a reindent parses to the document it started as (decision 007:
-    // order is kept, not meaning), so it stages nothing -- and switching would drop
-    // it with no row to mark. That single case asks.
-    const stored = { b: 1, a: 2 };
-    const E = ctx.PVE.meta.EditSet;
-    eq('a reordering stages nothing', E.between(stored, { a: 2, b: 1 }).isEmpty(), true);
-    eq('a real edit still stages', E.between(stored, { b: 9, a: 2 }).length, 1);
-    // The predicate the dialog fires on, as the panel asks it: the document is the
-    // stored one and the buffer still differs.
-    const P0 = ctx.PVE.meta.TreePanel;
-    const card = (textDirty) => ({ docId: '1', dataOf: () => stored, textIsDirty: () => textDirty, layoutOnlyChange: P0.layoutOnlyChange });
-    eq('reorder: nothing staged, text dirty -> ask', card(true).layoutOnlyChange({ a: 2, b: 1 }), true);
-    eq('a real edit -> no dialog', card(true).layoutOnlyChange({ b: 9, a: 2 }), false);
-    eq('untouched buffer -> no dialog', card(false).layoutOnlyChange({ b: 1, a: 2 }), false);
-}
-
 console.log('\n--- request: the destroyed-component guard around API2Request ---');
 {
     const sent = [];
@@ -436,7 +350,7 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     const langsSet = [];
     ctx.window.monaco = { editor: { setModelLanguage: (model, lang) => langsSet.push([model, lang]) } };
     const diffs = [];
-    ctx.PVE.meta.Monaco.confirmDiff = (cfg) => diffs.push(cfg);
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
     const btn = { value: null, suspended: 0, suspendEvents() { this.suspended++; }, resumeEvents() { this.suspended--; }, setValue(v) { this.value = v; } };
 
     // A file as somebody wrote it: valid YAML in a layout no emitter would choose.
@@ -756,33 +670,30 @@ eq('array stays one leaf', root.children.netbird.children.groups.kind, 'array');
 
 console.log('\n--- Set to Default answers "what should this be", not only "what if unset" ---');
 {
-    const staged = [];
-    const sd = { stage: (path, op, value) => staged.push({ path, op, value }) };
+    const wrote = [];
+    const sd = { sendEdit: (edit) => wrote.push(edit) };
     sd.setToDefault = P.setToDefault;
     const row = (data) => ({ data: Object.assign({ docId: '100', path: 'traefik.spec.port' }, data) });
 
     sd.setToDefault.call(sd, row({ present: false, defaultValue: 80 }));
-    eq('an unset row still takes the default', staged.pop(), {
+    eq('an unset row still takes the default', wrote.pop(), {
         path: 'traefik.spec.port', op: 'set', value: 80,
     });
 
     sd.setToDefault.call(sd, row({ present: true, rawValue: 8080, defaultValue: 80 }));
-    eq('a wrong value can be put back to the default', staged.pop(), {
+    eq('a wrong value can be put back to the default', wrote.pop(), {
         path: 'traefik.spec.port', op: 'set', value: 80,
     });
 
     sd.setToDefault.call(sd, row({ present: true, rawValue: 80, defaultValue: 80 }));
-    eq('a row already at its default stages nothing', staged.length, 0);
+    eq('a row already at its default writes nothing', wrote.length, 0);
 
     sd.setToDefault.call(sd, row({ present: false }));
-    eq('a row with no default stages nothing', staged.length, 0);
+    eq('a row with no default writes nothing', wrote.length, 0);
 
-    // Structural values compare by content, not identity, and a map in another key
-    // order is the same value.
+    // Structural values compare by content, not identity: the core's dump of each.
     sd.setToDefault.call(sd, row({ present: true, rawValue: ['a'], defaultValue: ['a'] }));
-    eq('an equal list is already at its default', staged.length, 0);
-    sd.setToDefault.call(sd, row({ present: true, rawValue: { b: 1, a: 1 }, defaultValue: { a: 1, b: 1 } }));
-    eq('a map in another key order is the same value', staged.length, 0);
+    eq('an equal list is already at its default', wrote.length, 0);
 }
 
 console.log('\n--- the hostile document: the editor writes exactly what the store writes ---');
@@ -815,21 +726,16 @@ console.log('\n--- the hostile document: the editor writes exactly what the stor
     eq('a JSON round trip changes nothing', Codec.parse(Codec.dump(JSON.parse(JSON.stringify(y.document)), 'yaml'), 'yaml'), y.document);
 }
 
-console.log('\n--- the document is read as YAML: the file\'s own order survives a staged edit ---');
+console.log('\n--- the document is read as YAML: the file\'s own order survives ---');
 {
     // `GET ...?format=json` renders the document as a native Perl hash, which has
-    // no order and no booleans. Order is not a value, but an Apply at the root view
-    // writes `plannedData()` back, and keeping the file's order is what stops that
-    // from churning it.
+    // no order and no booleans. Order is not a value, but a write at the root view
+    // sends the document back, and keeping the file's order is what stops that from
+    // churning it.
     const text = 'zebra: 1\nalpha: 2\nmiddle:\n  z: 1\n  a: 2\n';
     eq('parse keeps the document order', Object.keys(Codec.parse(text, 'yaml')), ['zebra', 'alpha', 'middle']);
     eq('... at every level', Object.keys(Codec.parse(text, 'yaml').middle), ['z', 'a']);
-
-    // And the order survives the trip the editor actually makes: parse, stage an
-    // edit, dump. This is the property that keeps an Apply from churning the file.
-    const planned = new EditSet([{ path: 'alpha', op: 'set', value: 9 }]).apply(Codec.parse(text, 'yaml'));
-    eq('order survives a staged edit', Object.keys(planned), ['zebra', 'alpha', 'middle']);
-    eq('... and the dump preserves it', Codec.dump(planned, 'yaml').indexOf('zebra') === 0, true);
+    eq('... and the dump preserves it', Codec.dump(Codec.parse(text, 'yaml'), 'yaml'), text);
 }
 
 console.log('\n--- a registry file that did not load is still a row ---');
@@ -871,11 +777,10 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
 {
     // A vocabulary the size of Traefik's is mostly keys nobody sets on a given
     // guest, and every one of them as a greyed row buries what the guest says.
-    // `hidden` suppresses the ghost. It must not suppress data: a hidden key that
+    // `hidden` suppresses the offered row. It must not suppress data: a hidden key that
     // IS set still gets its row, its type and its default.
     const d = Object.assign({}, panel, {
         docId: '100',
-        pending: ctx.PVE.meta.EditSet.empty(),
         docState: { 100: { digest: 'x', data: { t: { routers: { rule: 'Host(`a`)' } } } } },
         prefixes: [
             {
@@ -899,12 +804,12 @@ console.log('\n--- a hidden declaration decorates a row, it never creates one --
             },
         ],
     });
-    ['documentEntries', 'plannedData', 'dataOf', 'shapeFor', 'docKind', 'entry', 'addData',
+    ['documentEntries', 'dataOf', 'shapeFor', 'docKind', 'entry', 'addData',
      'addShape', 'applicablePrefixes', 'schemaKind'].forEach((m) => (d[m] = P[m]));
     const root = d.documentEntries.call(d);
     const routers = root.children.t.children.routers;
 
-    eq('a shown declaration still gets its ghost row', root.children.t.children.host.present, false);
+    eq('a shown declaration still gets its declared-but-unset row', root.children.t.children.host.present, false);
     eq('a hidden subtree is still a row, because the document has one', !!routers, true);
     eq('a hidden key that is set keeps its row', routers.children.rule.present, true);
     eq('... and is still typed by its schema', routers.children.rule.kind, 'string');
@@ -931,10 +836,9 @@ console.log('\n--- a prefix is a declaration, with or without a schema ---');
     const doc = (data) => {
         const d = Object.assign({}, panel, {
             docId: '100',
-            pending: EditSet.empty(),
             docState: { 100: { digest: 'x', data: data } },
         });
-        ['documentEntries', 'plannedData', 'dataOf', 'shapeFor', 'shapeInputs', 'buildShape', 'docKind',
+        ['documentEntries', 'dataOf', 'shapeFor', 'shapeInputs', 'buildShape', 'docKind',
          'entry', 'addData', 'addShape'].forEach((m) => (d[m] = P[m]));
         return d.documentEntries.call(d);
     };
@@ -1234,7 +1138,7 @@ eq('same sees through the layout difference',
     Codec.same(parsed, SERVER_YAML), true);
 eq('same says no when a value really changed',
     Codec.same({ traefik: { spec: { host: 'b.example' } } }, SERVER_YAML), false);
-eq('same says yes when only the key order changed (order is not a value)',
+eq('same ignores key order: order is not a value',
     Codec.same({ b: 1, a: 2 }, 'a: 2\nb: 1\n'), true);
 eq('same on unparseable text is not a match',
     Codec.same({}, 'a:\n  - [\n'), false);
@@ -1333,10 +1237,9 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
         docState: { 'prefixes/x': { digest: 'd', data: { selector: { tag: 'traefik' } } } },
         schemas: { prefix: META },
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind', 'documentEntries', 'addData', 'addShape', 'entry', 'schemaKind', 'dataOf', 'plannedData'].forEach(
+    ['shapeFor', 'shapeInputs', 'buildShape', 'docKind', 'documentEntries', 'addData', 'addShape', 'entry', 'schemaKind', 'dataOf'].forEach(
         (m) => (panelR[m] = P[m]),
     );
-    panelR.pending = EditSet.empty();
     panelR.docId = 'prefixes/x';
     const entries = panelR.documentEntries();
     eq('a prefix document shows its declared keys', Object.keys(entries.children).sort(), ['description', 'selector']);
@@ -1374,66 +1277,6 @@ console.log('\n--- a marker has to survive collapsing the branch it is in ---');
     const deep = U.rollUp(many);
     eq('all of them are counted', deep.a.count, 7);
     eq('but only the first few are quoted', deep.a.messages.length, 3);
-}
-
-console.log('\n--- staged edits: the change that had no legal single step ---');
-{
-    // The case that forced this: a prefix definition's selector is exactly one of
-    // `all` or `tag`, so `{all: true}` -> `{tag: web}` has NO valid intermediate.
-    // Dropping `all` first is refused by the server; adding `tag` first is refused;
-    // the row editor could only ever do one at a time.
-    const stored = { description: 'Home', selector: { all: true } };
-    const pending = new EditSet([
-        { path: 'selector.all', op: 'delete' },
-        { path: 'selector.tag', op: 'set', value: 'web' },
-    ]);
-    eq('both edits land in one planned document', pending.apply(stored), {
-        description: 'Home',
-        selector: { tag: 'web' },
-    });
-    // ... and go out as ONE write, at the narrowest view covering both.
-    eq('written as one view', pending.writeView(), 'selector');
-    eq('the stored document is untouched until then', stored, {
-        description: 'Home',
-        selector: { all: true },
-    });
-
-    const set = (edits) => new EditSet(edits);
-    // A single row edit is still exactly the one-key write it always was.
-    eq('one set writes that key', set([{ path: 'a.b.c', op: 'set', value: 1 }]).writeView(), 'a.b.c');
-    // A delete cannot be expressed by replacing the thing being deleted, so the
-    // write moves one level up and replaces the parent without the key.
-    eq('one delete writes its parent', set([{ path: 'a.b.c', op: 'delete' }]).writeView(), 'a.b');
-    eq('a top-level delete writes the document', set([{ path: 'a', op: 'delete' }]).writeView(), '');
-    eq('unrelated subtrees write the document', set([
-        { path: 'traefik.spec.host', op: 'set', value: 'x' },
-        { path: 'netbird.groups', op: 'set', value: [] },
-    ]).writeView(), '');
-    eq('nothing staged, nothing to write', EditSet.empty().writeView(), null);
-    eq('... and an empty set says so', [EditSet.empty().isEmpty(), EditSet.empty().length], [true, 0]);
-
-    // Deletes and sets applied in the order they were made.
-    eq('order is what was done', set([
-        { path: 'a', op: 'delete' },
-        { path: 'a', op: 'set', value: 2 },
-    ]).apply({ a: 1 }), { a: 2 });
-    eq('a set then a delete leaves nothing', set([
-        { path: 'x.y', op: 'set', value: 1 },
-        { path: 'x.y', op: 'delete' },
-    ]).apply({}), { x: {} });
-    // Intermediate maps are created for a new nested key.
-    eq('a new nested key builds its parents', set([
-        { path: 'schema.properties.port.type', op: 'set', value: 'integer' },
-    ]).apply({}), { schema: { properties: { port: { type: 'integer' } } } });
-
-    // Keys are document data and no key is reserved: staging one named `__proto__`
-    // must set a key, not the prototype. The document crosses as JSON text, so there
-    // is no object for a prototype setter to touch on the way -- but the answer has
-    // to come back as a key too. (`entry()` guards the same way on its side.)
-    const planned = set([{ path: '__proto__', op: 'set', value: 'oops' }]).apply({});
-    eq('a proto-named key is a key', Object.prototype.hasOwnProperty.call(planned, '__proto__'), true);
-    eq('and the prototype is untouched', {}.oops, undefined);
-    eq('and Object still is Object', Object.getPrototypeOf({}), Object.prototype);
 }
 
 console.log('\n--- the registry list ---');
@@ -1553,337 +1396,107 @@ console.log('\n--- a key name is refused in the field, not after a round trip --
     eq('nor nothing', typeof U.fileNameError(''), 'string');
 }
 
-console.log('\n--- an edit answers for what it broke, not for what was already broken ---');
+console.log('\n--- one edit, one write (DESIGN §8) ---');
 {
-    // `Shape.introduced` scopes the banner to what this edit did; the amber row
-    // markers still show everything wrong with the document.
-    const stored = {
-        homelab: { owner: 'arki', port: 'not-a-number' },
-        netbird: { groups: ['lan'] },
-    };
-    const bad = { path: 'homelab.port', msg: 'expected integer' };
-    const before = [bad];
-
-    // An unrelated edit: the same violation is still there, and it is not ours.
-    eq(
-        'a pre-existing violation on an untouched path does not warn',
-        Shape.introduced(before, [bad], EditSet.changedPaths(stored, {
-            ...stored,
-            homelab: { ...stored.homelab, owner: 'someone' },
-        })),
-        [],
-    );
-
-    // The same path, a different wrong value: ours this time, even though the message
-    // is word for word what it was.
-    eq(
-        'a new bad value on an already-bad path does warn',
-        Shape.introduced(before, [bad], EditSet.changedPaths(stored, {
-            ...stored,
-            homelab: { ...stored.homelab, port: 'still-not-a-number' },
-        })).length,
-        1,
-    );
-
-    // Replacing a parent answers for what is beneath it.
-    eq(
-        'replacing a subtree answers for a finding inside it',
-        Shape.introduced(before, [bad], ['homelab']).length,
-        1,
-    );
-
-    // A violation that was not there before always warns, wherever it is.
-    const fresh = { path: 'netbird.groups', msg: 'expected array' };
-    eq(
-        'a violation this edit created always warns',
-        Shape.introduced(before, [bad, fresh], ['netbird.groups']).map((f) => f.path),
-        ['netbird.groups'],
-    );
-
-    // A pure key reordering changes no value at any path, so it introduces nothing.
-    eq(
-        'reordering changes no path',
-        EditSet.changedPaths(stored, { netbird: stored.netbird, homelab: stored.homelab }),
-        [],
-    );
-    eq(
-        'so reordering a document that was already wrong warns about nothing',
-        Shape.introduced(before, [bad], []),
-        [],
-    );
-
-    // `changedPaths` reports the deepest path that differs, and compares lists whole.
-    eq(
-        'a changed leaf is reported at its own path',
-        EditSet.changedPaths(stored, { ...stored, homelab: { ...stored.homelab, owner: 'x' } }),
-        ['homelab.owner'],
-    );
-    eq(
-        'a changed list member is reported at the list',
-        EditSet.changedPaths(stored, { ...stored, netbird: { groups: ['lan', 'wan'] } }),
-        ['netbird.groups'],
-    );
-    eq(
-        'a removed key is a change at that key',
-        EditSet.changedPaths(stored, { homelab: stored.homelab }),
-        ['netbird'],
-    );
-}
-
-console.log('\n--- text is just another way to edit rows ---');
-{
-    // `EditSet.between` turns whatever was typed back into edits *on rows*, so
-    // both are the same model and the rules go away.
-    const stored = {
-        homelab: { owner: 'arki', notes: 'the box', docker: { port: 80, restart: 'always' } },
-        netbird: { groups: ['lan'] },
-    };
-    const d = (edited) => EditSet.between(stored, edited).edits;
-
-    eq('an unchanged document stages nothing', d(JSON.parse(JSON.stringify(stored))), []);
-
-    // A one-key change stays a one-key edit, so the tree marks that row and no other.
-    eq(
-        'a changed leaf is one edit on its own path',
-        d({ ...stored, homelab: { ...stored.homelab, owner: 'someone' } }),
-        [{ path: 'homelab.owner', op: 'set', value: 'someone' }],
-    );
-    // A key that is gone comes back as a delete, which is what draws it struck through.
-    const withoutNotes = { ...stored, homelab: { owner: 'arki', docker: stored.homelab.docker } };
-    eq('a removed key is a delete', d(withoutNotes), [{ path: 'homelab.notes', op: 'delete' }]);
-    eq(
-        'a new key is a set at its full path',
-        d({ ...stored, homelab: { ...stored.homelab, tags: 'x' } }),
-        [{ path: 'homelab.tags', op: 'set', value: 'x' }],
-    );
-    // Lists are compared whole: their members are not addressable (DESIGN §2).
-    eq(
-        'a changed list is one edit on the list',
-        d({ ...stored, netbird: { groups: ['lan', 'wan'] } }),
-        [{ path: 'netbird.groups', op: 'set', value: ['lan', 'wan'] }],
-    );
-
-    // Key order is not a value: a pure reordering is the same document and stages
-    // nothing (docs/decisions/007-key-order-is-kept-not-meaning.md).
-    const reordered = { netbird: stored.netbird, homelab: stored.homelab };
-    eq('a pure reordering stages nothing', EditSet.between(stored, reordered).length, 0);
-
-    // Whatever comes back, replaying it on the stored document must equal what was
-    // typed -- that is the property the fallback exists to guarantee.
+    // Every editor in this panel hands `writeFor` an edit and sends what comes back,
+    // so this table is the whole write path. A `set` is `view::replace` at the edit's
+    // own path -- which creates the maps above it, so a new dotted key needs no write
+    // of its own to make room -- and a delete is `DELETE ?view=`, which takes the
+    // key's note with it. Every write carries the digest and `comments=1`.
+    const shown = (r) => [
+        r.method,
+        r.url,
+        Object.keys(r.params || {}).sort().map((k) => k + '=' + r.params[k]).join(' '),
+    ];
     [
-        { ...stored, homelab: { ...stored.homelab, docker: { port: 8080, restart: 'no' } } },
-        { homelab: stored.homelab },
-        {},
-    ].forEach(function (edited, i) {
-        eq('case ' + i + ' round trips', EditSet.between(stored, edited).apply(stored), edited);
-    });
+        [
+            'a row edit writes that key',
+            { path: 'homelab.port', op: 'set', value: 8080 },
+            false,
+            ['PUT', '/meta/guests/201', 'comments=1 data=8080 digest=d0 mode=replace view=homelab.port'],
+        ],
+        [
+            'a new key writes its own path, parents and all',
+            { path: 'docker.compose.file', op: 'set', value: 'x' },
+            false,
+            ['PUT', '/meta/guests/201', 'comments=1 data="x" digest=d0 mode=replace view=docker.compose.file'],
+        ],
+        [
+            'a list member is a write of the whole list',
+            { path: 'netbird.groups', op: 'set', value: ['lan', 'wan'] },
+            false,
+            ['PUT', '/meta/guests/201', 'comments=1 data=["lan","wan"] digest=d0 mode=replace view=netbird.groups'],
+        ],
+        [
+            'Set to Default writes the default',
+            { path: 'traefik.spec.port', op: 'set', value: 80 },
+            false,
+            ['PUT', '/meta/guests/201', 'comments=1 data=80 digest=d0 mode=replace view=traefik.spec.port'],
+        ],
+        [
+            'the root view is the document, named by leaving it out',
+            { path: '', op: 'set', value: { a: 1 } },
+            false,
+            ['PUT', '/meta/guests/201', 'comments=1 data={"a":1} digest=d0 mode=replace'],
+        ],
+        [
+            'a removal is a DELETE at that view',
+            { path: 'netbird', op: 'delete' },
+            false,
+            ['DELETE', '/meta/guests/201?view=netbird&digest=d0', ''],
+        ],
+        [
+            '"Save anyway" is the same write with force=1',
+            { path: 'homelab.port', op: 'set', value: 8080 },
+            true,
+            ['PUT', '/meta/guests/201', 'comments=1 data=8080 digest=d0 force=1 mode=replace view=homelab.port'],
+        ],
+        [
+            '... and the same removal',
+            { path: 'netbird', op: 'delete' },
+            true,
+            ['DELETE', '/meta/guests/201?view=netbird&digest=d0&force=1', ''],
+        ],
+    ].forEach((c) => eq(c[0], shown(P.writeFor('201', c[1], 'd0', c[2])), c[3]));
 
-    // A root-level edit replaces the whole document, so a staged edit under a key it
-    // does not have must not be re-applied on top. The edit set is derived from the
-    // result, so what it holds is the *minimal* description of that -- the keys that
-    // went, and the one that arrived -- rather than one opaque root edit. The planned
-    // document is the assertion; the shape is how the tree gets to mark the rows that
-    // actually differ.
-    const stub = stagingStub(stored, [{ path: 'homelab.owner', op: 'set', value: 'x' }]);
-    stub.stage('', 'set', { a: 1 });
-    eq('the planned document is what was staged', stub.pending.apply(stored), { a: 1 });
+    // A prefix file is addressed the same way: it is a document like any other.
     eq(
-        'and it is described minimally',
-        stub.pending.edits.map((e) => e.path + ':' + e.op).sort(),
-        ['a:set', 'homelab:delete', 'netbird:delete'],
+        'a prefix file is written like any other document',
+        P.writeFor('prefixes/gpu', { path: 'selector', op: 'set', value: { all: true } }, '').url,
+        '/meta/prefixes/gpu',
     );
-    eq('an edit under a replaced key is not re-applied on top', stub.pending.apply(stored).homelab, undefined);
-
-    // Dirty means the document differs, not that an edit exists. Staging the value a
-    // row already has -- which is what the subtree editor's OK does when you typed
-    // nothing -- must leave nothing staged, or Revert appears with no row marked.
-    const noop = stagingStub(stored);
-    noop.stage('', 'set', JSON.parse(JSON.stringify(stored)));
-    eq('staging the document it already is stages nothing', noop.pending.edits, []);
-    noop.stage('homelab.owner', 'set', stored.homelab.owner);
-    eq('... and so does staging a value a row already has', noop.pending.edits, []);
-
-    // And the round trip: A to B and back to A cancels, rather than leaving two edits
-    // that together describe no change.
-    noop.stage('homelab.owner', 'set', 'changed');
-    eq('a real change still stages', noop.pending.length, 1);
-    noop.stage('homelab.owner', 'set', stored.homelab.owner);
-    eq('changing it back cancels the edit', noop.pending.edits, []);
-
-    // A delete is staged without a value, and is a real change.
-    noop.stage('netbird', 'delete');
-    eq('a delete is staged without a value', noop.pending.edits, [{ path: 'netbird', op: 'delete' }]);
-    eq('... and removes the key from the planned document', noop.pending.apply(stored).netbird, undefined);
-
-}
-
-console.log('\n--- a single delete has to stay a DELETE ---');
-{
-    // `writeView` steps up a level for a delete -- you cannot remove a key by replacing
-    // it -- but for a top-level key that step lands on the document root. Apply
-    // prefers the narrower `DELETE ?view=traefik` instead, which is the smaller write.
-    eq('a top-level delete would write the document', new EditSet([{ path: 'traefik', op: 'delete' }]).writeView(), '');
-    // ... so Apply sends the narrow DELETE instead, which is what this shape is for.
-    eq('a nested delete writes its parent', new EditSet([{ path: 'a.b', op: 'delete' }]).writeView(), 'a');
-    // Two edits are a replace again: only a lone delete has a narrower spelling.
-    eq(
-        'a delete beside a set is not one',
-        new EditSet([{ path: 'a', op: 'delete' }, { path: 'b', op: 'set', value: 1 }]).writeView(),
-        '',
-    );
-}
-
-console.log('\n--- a staged value is linted like a stored one ---');
-{
-    // Findings are computed against the *planned* document, so a value that breaks
-    // the schema is marked the moment it is staged -- not after it is written.
-    const SCHEMA = { type: 'object', properties: { port: { type: 'integer', maximum: 65535 } } };
-    const panelS = Object.assign({}, panel, {
-        registryDoc: false,
-        docId: '201',
-        docState: { 201: { digest: 'd', data: { docker: { port: 80 } } } },
-        prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
-        pending: EditSet.empty(),
-    });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach((m) => (panelS[m] = P[m]));
-
-    eq('a stored value that fits is not marked', panelS.findingsFor()['docker.port'], undefined);
-    panelS.pending = new EditSet([{ path: 'docker.port', op: 'set', value: 70000 }]);
-    eq('a staged value that does not fit is', panelS.findingsFor()['docker.port'], 'must be at most 65535');
-    // ... and it is still allowed to be staged and applied: the marker is advisory,
-    // the server's lint is the authority (DESIGN §7).
-    eq('the planned document keeps it', panelS.plannedData().docker.port, 70000);
-
-}
-
-console.log('\n--- discarding a row puts the stored value back there, and nothing else ---');
-{
-    // The edit set is the difference, so "drop this row's edit" and "put back what is
-    // stored here" are one operation -- and it leaves every other row's edit alone.
-    const stored = { docker: { port: 80, host: 'h' }, a: 1, ab: 2 };
-    const paths = (s) => s.pending.edits.map((e) => e.path + ':' + e.op).sort();
-    const stub = stagingStub(stored, [
-        { path: 'docker.port', op: 'set', value: 70000 },
-        { path: 'docker.host', op: 'set', value: 'x' },
-        { path: 'added', op: 'set', value: 1 },
-        { path: 'a', op: 'set', value: 9 },
-        { path: 'ab', op: 'delete' },
-    ]);
-    stub.discardRow({ data: { path: 'docker.port' } });
-    eq('discarding a row drops its edit and keeps the rest', paths(stub), ['a:set', 'ab:delete', 'added:set', 'docker.host:set']);
-    eq('... and the row shows what is stored', stub.plannedData().docker.port, 80);
-    stub.discardRow({ data: { path: 'added' } });
-    eq('a key that was added goes away', [paths(stub).includes('added:set'), stub.plannedData().added], [false, undefined]);
-    stub.discardRow({ data: { path: 'ab' } });
-    eq('a ghost gets its value back', stub.plannedData().ab, 2);
-    eq('`ab` is not under `a`: `a` is still staged', paths(stub), ['a:set', 'docker.host:set']);
-    stub.discardRow({ data: { path: 'netbird' } });
-    eq('an untouched row changes nothing', paths(stub), ['a:set', 'docker.host:set']);
-    stub.discardRow({ data: { path: 'docker' } });
-    eq('discarding a subtree restores everything under it', paths(stub), ['a:set']);
-    eq('... which is what dirty means', stub.isDirty(), true);
-    stub.discardRow({ data: { path: 'a' } });
-    eq('and the last one leaves nothing staged', [stub.isDirty(), stub.plannedData()], [false, stored]);
 }
 
 console.log('\n--- acting on one member rewrites its list ---');
 {
-    // There is no path to `groups[1]`, so every action on a member is a write of the
-    // whole list. Staging is what makes that unremarkable: it is one more staged
-    // edit, applied with everything else.
+    // There is no path to `groups[1]`, so every action on a member is one write of
+    // the whole list, at the list's own path.
+    const sent = [];
     const stub = {
         docId: '201',
-        pending: EditSet.empty(),
         docState: { 201: { digest: 'd', data: { netbird: { groups: ['lan', 'wan', 'dmz'] } } } },
+        sendEdit: (edit) => sent.push(edit),
     };
-    ['listAt', 'stageListMember', 'plannedData', 'dataOf'].forEach((m) => (stub[m] = P[m]));
-    // A recording stub, not the real `stage`: it keeps every edit so the test
-    // can read the second one, where the real thing would have replaced the first.
-    stub.stage = function (path, op, value) {
-        this.pending.edits.push({ path: path, op: op, value: value });
-    };
+    ['listAt', 'writeListMember', 'dataOf'].forEach((m) => (stub[m] = P[m]));
 
     eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
-    stub.stageListMember('netbird.groups', 1, 'wlan');
-    eq('editing a member writes the list', stub.pending.edits[0], {
+    stub.writeListMember('netbird.groups', 1, 'wlan');
+    eq('editing a member writes the list', sent.pop(), {
         path: 'netbird.groups',
         op: 'set',
         value: ['lan', 'wlan', 'dmz'],
     });
-    // ... and it reads back through the staged edit, so a second action composes.
-    eq('and the next action sees it', stub.listAt('netbird.groups'), ['lan', 'wlan', 'dmz']);
-    stub.stageListMember('netbird.groups', 0, undefined);
-    eq('removing a member drops it', stub.pending.edits[1].value, ['wlan', 'dmz']);
+    stub.writeListMember('netbird.groups', 0, undefined);
+    eq('removing a member writes the list without it', sent.pop().value, ['wan', 'dmz']);
     // An index that is not there changes nothing, rather than growing the list with
     // a hole in it.
-    stub.pending = EditSet.empty();
-    stub.stageListMember('netbird.groups', 9, 'nope');
-    eq('an index that is not there is not an edit', stub.pending.edits, []);
-    stub.stageListMember('netbird.groups', -1, 'nope');
-    eq('nor is a negative one', stub.pending.edits, []);
+    stub.writeListMember('netbird.groups', 9, 'nope');
+    stub.writeListMember('netbird.groups', -1, 'nope');
+    eq('an index that is not there is not a write', sent, []);
 }
 
-console.log('\n--- a delete leaves no container the stored document does not have ---');
-{
-    // Set a ghost `docker.compose` on a document with no `docker`, then discard it:
-    // the map the first edit created on the way must go with the key, or `docker: {}`
-    // stays staged and Apply writes a map the guest never asked for. A map the file
-    // does hold is a stored state and stays, empty or not.
-    const s = stagingStub({ keep: { a: 1 }, empty: {} });
-    s.stage('docker.compose', 'set', 'x');
-    eq('the edit created the container', s.plannedData().docker, { compose: 'x' });
-    s.discardRow({ data: { path: 'docker.compose' } });
-    eq('discarding the ghost leaves nothing staged', [s.pending.edits, s.isDirty()], [[], false]);
-    s.stage('deep.er.key', 'set', 1);
-    s.stage('deep.er.key', 'delete');
-    eq('removing the only key removes the chain it created', s.pending.edits, []);
-    s.stage('keep.a', 'delete');
-    eq('a stored map stays when its last key goes', s.plannedData().keep, {});
-    s.stage('empty.new', 'set', 1);
-    s.stage('empty.new', 'delete');
-    eq('... and a stored empty map is not touched either',
-        [s.plannedData().empty, s.pending.edits.filter((e) => e.path.indexOf('empty') === 0)], [{}, []]);
-    eq('parentPath', [U.parentPath('a.b.c'), U.parentPath('a'), U.parentPath('')], ['a.b', '', '']);
-}
-
-console.log('\n--- discarding one member puts that member back, not the list ---');
-{
-    // The edit is staged on the *list*, so dropping it would throw away every other
-    // member's change. Discard puts that one member back instead, and the list's
-    // edit is gone once every member matches again -- a list that matches is not a
-    // difference, so that needs no step of its own.
-    const stored = { netbird: { groups: ['lan', 'wan'] }, k: 1 };
-    const s = stagingStub(stored);
-    const groups = () => s.plannedData().netbird.groups;
-    s.stageListMember('netbird.groups', 0, 'LAN');
-    s.stageListMember('netbird.groups', 1, 'WAN');
-    s.stage('netbird.groups', 'set', groups().concat(['dmz']));
-    eq('three members changed, one edit', [groups(), s.pending.length], [['LAN', 'WAN', 'dmz'], 1]);
-    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: 0 } });
-    eq('discarding one member restores it and not the list', groups(), ['lan', 'WAN', 'dmz']);
-    s.discardListMember('netbird.groups', 2);
-    eq('discarding an appended member removes it', groups(), ['lan', 'WAN']);
-    s.discardListMember('netbird.groups', 1);
-    eq('once every member matches, nothing is staged', s.pending.edits, []);
-
-    // A member the staged list dropped is a ghost row that remembers its stored
-    // index; discarding it puts that member back, and only that member.
-    s.stageListMember('netbird.groups', 0, 'LAN');
-    s.stageListMember('netbird.groups', 1, undefined);
-    eq('member 0 edited, member 1 dropped', groups(), ['LAN']);
-    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: null, storedIndex: 1 } });
-    eq('the ghost goes back, the other edit stays', groups(), ['LAN', 'wan']);
-    s.discardRow({ data: { path: 'netbird.groups', arrayIndex: 0 } });
-    eq('and the list is clean again', s.pending.edits, []);
-
-    // Revert: the document you are looking at is the stored one.
-    s.stage('netbird.groups', 'set', ['x']);
-    s.stage('k', 'delete');
-    s.stage('new', 'set', true);
-    eq('three edits staged', s.pending.length, 3);
-    s.revertPending();
-    eq('Revert clears everything', [s.pending.edits, s.plannedData()], [[], stored]);
-}
+console.log('\n--- path helpers ---');
+eq('parentPath', [U.parentPath('a.b.c'), U.parentPath('a'), U.parentPath('')], ['a.b', '', '']);
 
 console.log('\n--- a list is a container, like a map ---');
 {
@@ -1965,10 +1578,9 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         docState: { 201: { digest: 'd', data: { docker: { port: 70000, host: 'ok' } } } },
         prefixes: [{ prefix: 'docker', selector: { all: true }, schema: SCHEMA }],
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach(
+    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf'].forEach(
         (m) => (panelF[m] = P[m]),
     );
-    panelF.pending = EditSet.empty();
     panelF.docId = '201';
     const found = panelF.findingsFor();
     eq('the out-of-range row is marked', found['docker.port'], 'must be at most 65535');
@@ -1980,27 +1592,15 @@ console.log('\n--- the tree marks a row its schema refuses ---');
         docState: { 'prefixes/x': { digest: 'd', data: { description: 5 } } },
         schemas: { prefix: { type: 'object', properties: { description: { type: 'string' } } } },
     });
-    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf', 'plannedData'].forEach(
+    ['shapeFor', 'shapeInputs', 'buildShape', 'findingsFor', 'docKind', 'dataOf'].forEach(
         (m) => (panelR[m] = P[m]),
     );
-    panelR.pending = EditSet.empty();
     panelR.docId = 'prefixes/x';
     eq(
         'a prefix file is marked against the meta-schema',
         panelR.findingsFor().description,
         'expected string',
     );
-    // And the banner Apply shows asks the same Shape, through `applyFindingsFor`.
-    panelF.applyFindingsFor = P.applyFindingsFor;
-    eq('the banner names what an edit introduced',
-        panelF.applyFindingsFor({ docker: { port: 70000, host: 5 } }),
-        []);
-    eq('... but not what was already wrong and untouched',
-        panelF.applyFindingsFor({ docker: { port: 70000, host: 'changed' } }),
-        []);
-    eq('... and a fresh violation, wherever it is',
-        panelF.applyFindingsFor({ docker: { port: 'eighty', host: 'ok' } }),
-        ['docker.port: expected integer']);
 }
 
 console.log('\n--- "Declare Key" opens schema.properties as text ---');
@@ -2015,12 +1615,11 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
     };
     const withProps = Object.assign({}, panel, {
         docId: 'prefixes/homelab',
-        pending: EditSet.empty(),
         docState: {
             'prefixes/homelab': { digest: 'd', data: { schema: { properties: { host: { type: 'string' } } } } },
         },
     });
-    ['docKind', 'plannedData', 'dataOf', 'declareKey'].forEach((m) => (withProps[m] = P[m]));
+    ['docKind', 'dataOf', 'declareKey'].forEach((m) => (withProps[m] = P[m]));
     withProps.declareKey({ data: { docId: withProps.docId } });
     eq('opens the text window', created[0][0], 'PVE.meta.TextWindow');
     eq('... on schema.properties', created[0][1].view, 'schema.properties');
@@ -2095,6 +1694,8 @@ console.log('\n--- the editor reads and writes the notes: every document request
             dataOf: T.dataOf,
             setDigest: T.setDigest,
             write: T.write,
+            writeFor: T.writeFor,
+            sendEdit: T.sendEdit,
             request: (opts) => sent.push(Object.assign({ method: 'GET' }, opts)),
             submit: (opts) => sent.push(opts),
         },
@@ -2106,22 +1707,16 @@ console.log('\n--- the editor reads and writes the notes: every document request
     let req = sent.pop();
     eq('the Text card reads with comments=1', [req.method, req.url, req.params], ['GET', '/meta/guests/201', { comments: 1, format: 'yaml' }]);
 
-    const planned = { a: 2, a__: 'about a, edited' };
-    T.confirmAndApply.call(fake({
-        pending: new EditSet([{ path: 'a', op: 'set', value: 2 }, { path: 'a__', op: 'set', value: 'about a, edited' }]),
-        plannedData: () => planned,
-        applyFindingsFor: () => [],
-    }));
+    T.sendEdit.call(fake({}), { path: 'a__', op: 'set', value: 'about a, edited' });
     req = sent.pop();
-    eq('the tree\'s Apply writes the subtree with its notes, comments=1',
-        [req.method, req.url, req.params.comments, JSON.parse(req.params.data), req.params.digest],
-        ['PUT', '/meta/guests/201', 1, planned, 'd0']);
+    eq('a row edit writes the note it names, comments=1',
+        [req.method, req.url, req.params],
+        ['PUT', '/meta/guests/201', { comments: 1, mode: 'replace', data: '"about a, edited"', digest: 'd0', view: 'a__' }]);
 
     T.applyText.call(fake({
         textEditor: { getValue: () => 'a: 3\na__: typed\n' },
         textBuffer: () => ({ editor: { getValue: () => 'a: 3\na__: typed\n' }, lang: 'yaml', original: 'a: 1\n' }),
         textLang: 'yaml',
-        textFindings: () => [],
     }));
     req = sent.pop();
     eq('the Text card\'s Apply sends the buffer, comments=1',

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// "Edit selection as text" — Monaco on one subtree, with a diff-confirmed Apply.
+// "Edit selection as text" — Monaco on one subtree; OK is one write of it.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.TextWindow', {
@@ -29,14 +29,8 @@ Ext.define('PVE.meta.TextWindow', {
             ].concat(
                 PVE.meta.Footer.actions({
                     // Stated, like the panel states its own: there is no buffer until
-                    // Monaco loads, and `syncFooter` turns it on when there is.
+                    // Monaco loads, and the `afterrender` handler turns it on then.
                     applyDisabled: true,
-                    // No Diff here. This window opens on the *planned* document, so a
-                    // diff against what it opened with is empty until you type, which
-                    // is what it showed. What a diff is for -- everything staged,
-                    // against what is stored -- is one document up, on the panel's own
-                    // Apply. A value editor does not have one, and this is a value
-                    // editor for a subtree.
                     format: () => me.formatBuffer(),
                     apply: () => me.submit(),
                     applyText: gettext('OK'),
@@ -60,11 +54,9 @@ Ext.define('PVE.meta.TextWindow', {
                         minimap: { enabled: false },
                         scrollBeyondLastLine: false,
                     });
-                    // Without these the footer never learns there is a buffer:
-                    // `syncFooter` was written and never called, so the secondary
-                    // button kept an undo icon over the word Close whatever you did.
-                    me.syncFooter();
-                    me.editor.onDidChangeModelContent(() => me.syncFooter());
+                    // Without this the footer never learns there is a buffer, and OK
+                    // stays the disabled button it was built as.
+                    me.down('#metaApply').setDisabled(false);
                 },
                 (err) => Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err))),
             );
@@ -80,22 +72,6 @@ Ext.define('PVE.meta.TextWindow', {
 
     buffer: function () {
         return { editor: this.editor, lang: this.lang, original: this.original };
-    },
-
-    // OK is live as soon as there is a buffer, and Cancel stays Cancel. This is a
-    // modal that yields a value, like the row editor: closing it abandons what was
-    // typed here and nothing else, so there is no Discard to distinguish -- the thing
-    // with something to lose is the panel behind it, which keeps its own staged edits
-    // either way.
-    syncFooter: function () {
-        let me = this;
-        PVE.meta.Footer.sync(me, {
-            canApply: !!me.editor,
-            count: 0,
-            applyText: gettext('OK'),
-            dirty: false,
-            cleanText: gettext('Cancel'),
-        });
     },
 
     formatBuffer: function () {
@@ -121,8 +97,7 @@ Ext.define('PVE.meta.TextWindow', {
         PVE.meta.Buffer.render(me.buffer(), value);
     },
 
-    // OK hands the subtree back and closes. An unchanged buffer is not a special
-    // case: staging the value it already had is a no-op the edit set collapses.
+    // OK writes the subtree and closes.
     submit: function () {
         let me = this;
         if (!me.editor) {
@@ -131,15 +106,8 @@ Ext.define('PVE.meta.TextWindow', {
         me.apply(me.editor.getValue(), me.lang);
     },
 
-    // Stages what was typed; it does not write. Every other modal in this editor --
-    // the row editor, Add Key, Add Rule, Declare Key -- stages, and the panel's footer
-    // Apply is the one thing that writes. This window wrote immediately and directly,
-    // which is why it could not see staged edits and they could not see it: it was not
-    // editing the same document as everything else.
-    //
-    // One edit at the view's own path, and a set there replaces the whole subtree --
-    // a buffer for `traefik` says everything about `traefik.spec`, whatever was
-    // staged inside it before.
+    // One `replace` at the view's own path, which says everything about what is
+    // inside that view -- a buffer for `traefik` replaces `traefik.spec` too.
     apply: function (text, lang) {
         let me = this;
         let value;
@@ -149,13 +117,7 @@ Ext.define('PVE.meta.TextWindow', {
             Ext.Msg.alert(gettext('Error'), Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             return;
         }
-        // Nothing to say when there is nothing to stage. An edit that changes no
-        // value -- because nothing was typed, or because what was typed was layout
-        // (decision 007) -- resolves to no staged edit, and closing on that is the
-        // honest outcome rather than something to interrupt for. The tree behind
-        // this window shows what is staged and offers the per-row undo, so a user
-        // who wants to know what happened is already looking at it.
-        me.tree.stageFromView(me.view, value);
+        me.tree.writeSubtree(me.view, value);
         me.close();
     },
 });

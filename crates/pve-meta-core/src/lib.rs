@@ -6,8 +6,7 @@
 //! hooks, `stored_vmids` and the `api_*` functions backing
 //! `perl/PVE/API2/Ext/Meta.pm` (`docs/DESIGN.md` §8); and
 //! `crates/pve-meta-wasm`, the browser build the editor asks for the codec,
-//! the path rules, [`shape::Shape`] and [`edit::EditSet`]. There is no daemon
-//! and no CLI.
+//! the path rules and [`shape::Shape`]. There is no daemon and no CLI.
 //!
 //! No networking, no async, no PVE-specific crates. Builds and passes tests
 //! on macOS and Linux, and builds for `wasm32-unknown-unknown` (the
@@ -25,9 +24,6 @@
 //! - [`shape`] — [`shape::Shape`], the prefixes that reach one document,
 //!   most-specific first: what governs a path, what its schema says
 //!   (`docs/DESIGN.md` §3). Schemas shadow.
-//! - [`edit`] — [`edit::EditSet`], the editor's staged edits: apply them to
-//!   the stored document, recover them from an edited one, and the narrowest
-//!   view one Apply writes (`docs/DESIGN.md` §12).
 //! - [`model`] — the [`model::Value`] alias (an order-preserving
 //!   `serde_json::Value`), the one document [`model::lint`], comment keys
 //!   (`foo__`), and path lookup.
@@ -175,7 +171,6 @@ macro_rules! warn_line {
 pub mod api;
 pub mod backup;
 pub mod digest;
-pub mod edit;
 pub mod error;
 pub mod format;
 pub mod metaschema;

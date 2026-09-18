@@ -36,7 +36,7 @@ PVE.meta.Buffer = {
     // The buffer against what was loaded, without committing to it.
     diff: function (buffer, title) {
         let base = PVE.meta.Buffer.baseline(buffer);
-        PVE.meta.Monaco.confirmDiff({
+        PVE.meta.Monaco.showDiff({
             title: title,
             original: base.text,
             modified: buffer.editor.getValue(),

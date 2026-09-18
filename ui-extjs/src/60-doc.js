@@ -83,23 +83,6 @@ PVE.meta.Doc = {
         if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
             return;
         }
-        // Staged edits are the reason a reload is not free any more: re-reading the
-        // document is fine, but the overlay on top of it would be describing changes
-        // against content that has moved. Ask, the same way leaving Text mode dirty
-        // does.
-        if (me.isDirty()) {
-            Ext.Msg.confirm(
-                gettext('Confirm'),
-                gettext('Discard the unapplied changes and reload?'),
-                function (btn) {
-                    if (btn === 'yes') {
-                        me.pending = PVE.meta.EditSet.empty();
-                        me.reload();
-                    }
-                },
-            );
-            return;
-        }
         Proxmox.Utils.setErrorMask(me, true);
         // Cleared here and set only by `loadDocument`: it describes the document
         // this load is about to read, not the one the panel used to hold.
@@ -179,9 +162,9 @@ PVE.meta.Doc = {
     // This panel's one document.
     // Reads the document as YAML, for two reasons. `format=json` renders it as a
     // native Perl hash, which turns booleans into 1/0 and loses the file's key
-    // order; the YAML text keeps both. Order is not a value (DESIGN §2), but an
-    // Apply at the root view writes `plannedData()` back, and keeping the order
-    // the file already has is what stops that from churning it.
+    // order; the YAML text keeps both. Order is not a value (DESIGN §2), but a write
+    // at the root view sends the document back, and keeping the order the file
+    // already has is what stops that from churning it.
     //
     // The core is loaded first rather than assumed: it is lazy, and calling into it
     // before it is there is a bug this editor has already had once (with js-yaml).
@@ -201,9 +184,9 @@ PVE.meta.Doc = {
                         let d = response.result.data || {};
                         // The server could read the bytes but they are not a
                         // document. The tree cannot show one -- there are no rows --
-                        // and it must not pretend the document is empty, because an
-                        // Apply would then replace the file with whatever was staged
-                        // on top of nothing.
+                        // and it must not pretend the document is empty, because a
+                        // write from it would then replace the file with what was
+                        // edited on top of nothing.
                         //
                         // So hand it to the text editor, which is the one place a
                         // document that is not a document can still be worked on, and
@@ -246,11 +229,44 @@ PVE.meta.Doc = {
 
     // --- writes -------------------------------------------------------------
 
-    write: function (docId, params, onSuccess) {
-        this.submit({ url: this.urlFor(docId), method: 'PUT', params: this.docParams(params) }, onSuccess);
+    // The one request an edit is (DESIGN §8), built and not sent: a pure function, so
+    // "which write does this edit produce" is a question with a tested answer rather
+    // than a shape assembled at four call sites. An edit is
+    // `{ path, op: 'set' | 'delete', value }`. A set is `view::replace` at its own
+    // path, which creates the maps above it, so a new key at `a.b.c` needs no
+    // ancestor of its own; the root view is the whole document and is named by
+    // leaving `view` out. A delete is `DELETE ?view=`, which takes the key's note
+    // with it. `force` is the "Save anyway" an enforcing prefix's 422 offers.
+    writeFor: function (docId, edit, digest, force) {
+        let url = PVE.meta.Doc.urlFor(docId);
+        if (edit.op === 'delete') {
+            let query = { view: edit.path, digest: digest };
+            if (force) {
+                query.force = 1;
+            }
+            return { url: url + '?' + Ext.Object.toQueryString(query), method: 'DELETE' };
+        }
+        let params = { mode: 'replace', data: Ext.encode(edit.value), digest: digest };
+        if (edit.path) {
+            params.view = edit.path;
+        }
+        if (force) {
+            params.force = 1;
+        }
+        return { url: url, method: 'PUT', params: PVE.meta.Doc.docParams(params) };
     },
 
-    submit: function (opts, onSuccess) {
+    write: function (docId, params, onSuccess, retry) {
+        this.submit(
+            { url: this.urlFor(docId), method: 'PUT', params: this.docParams(params) },
+            onSuccess,
+            retry,
+        );
+    },
+
+    // `retry` is what the "Save anyway" tick calls: the same write again, with
+    // `force=1`. Without one a 422 is an ordinary error.
+    submit: function (opts, onSuccess, retry) {
         let me = this;
         Proxmox.Utils.API2Request(
             Ext.apply(
@@ -265,18 +281,39 @@ PVE.meta.Doc = {
                     failure: function (response) {
                         // The API's message, verbatim. A 409 means somebody else wrote the
                         // document since we read it: reload first, then say so.
-                        let conflict = String((response.result || {}).status) === '409';
-                        if (conflict) {
+                        let status = String((response.result || {}).status);
+                        let text =
+                            response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response);
+                        if (status === '409') {
                             if (me.mode === 'text') {
                                 me.refreshText();
                             } else {
                                 me.reload();
                             }
+                            Ext.Msg.alert(gettext('Conflict'), text);
+                            return;
                         }
-                        Ext.Msg.alert(
-                            conflict ? gettext('Conflict') : gettext('Error'),
-                            response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
-                        );
+                        // An enforcing prefix refused this write, naming the paths
+                        // (DESIGN §5). The tick is what makes storing it anyway a
+                        // deliberate act: the server's lint decides what is storable,
+                        // and an operator whose schema has drifted must not be able to
+                        // lock the administrator out of editing.
+                        if (status === '422' && retry) {
+                            Ext.Msg.show({
+                                title: gettext('This does not match the schema the operators declare'),
+                                message: text,
+                                buttons: Ext.Msg.YESNO,
+                                buttonText: { yes: gettext('Save anyway'), no: gettext('Cancel') },
+                                icon: Ext.Msg.QUESTION,
+                                fn: function (btn) {
+                                    if (btn === 'yes') {
+                                        retry();
+                                    }
+                                },
+                            });
+                            return;
+                        }
+                        Ext.Msg.alert(gettext('Error'), text);
                     },
                 },
                 opts,

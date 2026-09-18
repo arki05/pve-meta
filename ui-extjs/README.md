@@ -10,13 +10,13 @@ config panel; and `pveMetaDatacenterPanel`, the Prefixes registry grid, on the D
 panel, each row of which opens in that same editor.
 
 The editor implements no rules. The YAML codec, the key-name charset, which prefix
-governs a path, what a schema makes of a value and what staged edits do to a document
-are all `pve-meta-core` -- the server's own crate -- compiled for the browser. The panel holds two objects over it -- a `PVE.meta.Shape` per document, which
-owns the prefix listing and caches what the core derives from it, and a
-`PVE.meta.EditSet`, the staged edits -- and calls a stateless face, `PVE.meta.Codec`,
-plus the key-name checks on `Utils`. See `docs/WASM-CORE.md` for how and why.
+governs a path and what a schema makes of a value are all `pve-meta-core` -- the
+server's own crate -- compiled for the browser. The panel holds one object over it --
+a `PVE.meta.Shape` per document, which owns the prefix listing and caches what the
+core derives from it -- and calls a stateless face, `PVE.meta.Codec`, plus the
+key-name checks on `Utils`. See `docs/WASM-CORE.md` for how and why.
 
-This is **the** editor (DESIGN §12). A second implementation in pwt/Yew was built to the
+This is **the** editor (DESIGN §8). A second implementation in pwt/Yew was built to the
 same specification and compared on the lab; it was removed once the choice was made (git
 tag `pwt-ui-removed`).
 
@@ -25,12 +25,11 @@ in this file re-derives any of them.
 
 ## What it does
 
-The behaviour is specified in `docs/DESIGN.md` §12 and not repeated here: one tree of
-the document the caller can see; lists as containers with one row per member; edits
-staged and written by one Apply at the narrowest covering view; Tree and Text as two
-views of the same planned document; the schema markers and the "Save anyway" banner;
-the footer that every editor shares; the datacenter tab's registry grid and the form
-behind it. What follows is what is specific to *this* file.
+The behaviour is specified in `docs/DESIGN.md` §8 and not repeated here: one tree of
+the document the caller can see; lists as containers with one row per member; **an
+edit is one write with the digest, and a 409 reloads**; Tree and Text as two views of
+the same document; the schema markers; the datacenter tab's registry grid and the
+form behind it. What follows is what is specific to *this* file.
 
 ### The Tree card
 
@@ -49,10 +48,17 @@ behind it. What follows is what is specific to *this* file.
   Description column.
 * **The toolbar** acts on the document's *contents*: Add, Edit, Set to Default, Declare
   Key (prefix files only), Remove, Edit selection as text, Reload, and at the right the
-  muted *Read-only* label that appears only when the document is not writable.
-  Committing — Apply, Revert, Diff, Format, and the Tree | Text toggle — lives in the
-  footer (`PVE.meta.Footer`), which is the same footer the Text card and the subtree
-  window use.
+  muted *Read-only* label that appears only when the document is not writable. Each of
+  those is **one write** — `PUT ?view=<the row's path>&mode=replace&digest=…`, or
+  `DELETE ?view=…` for Remove — followed by a reload; a list member has no path of its
+  own, so acting on one writes the whole list at the list's path. The footer
+  (`PVE.meta.Footer`) carries the Tree | Text toggle and, in Text, that card's own
+  Format, Diff, Apply and Revert.
+* **A new key** is written at its own dotted path: `view::replace` creates the maps
+  above it, so `added.by.ui` needs no write of its own to make room.
+* **`Doc.writeFor(docId, edit, digest, force)`** is that whole write path as a pure
+  function — every editor hands it an edit and sends what comes back, and the smoke
+  suite drives it as a table.
 * **The row editor** is a modal window opened by Edit, a double-click, or Enter on the
   selected row. Its field comes from the schema's type first and the stored value's type
   second: `enum` → combobox, `boolean` → `proxmoxcheckbox`, `integer`/`number` →
@@ -66,10 +72,13 @@ behind it. What follows is what is specific to *this* file.
 ### The Text card
 
 * The **whole document** in Monaco as YAML, with the presentation-only YAML/JSON view
-  toggle, rendered from the *planned* document so staged row edits are in it. Apply
-  sends the buffer as `text` at the root view (`PUT ?view=&mode=replace&digest=…`).
-  Leaving Text parses the buffer back into staged edits; only a buffer that does not
-  parse refuses the switch, and it says so.
+  toggle, loaded with the file's own text. Apply sends the buffer as `text` at the root
+  view (`PUT ?view=&mode=replace&digest=…`) — the one write that is text rather than a
+  subtree, and therefore the only way a `#` comment or a hand-written key order reaches
+  the file. Revert re-reads it; Diff shows the buffer against what is stored.
+* The buffer is **the only unwritten state in the editor**, so leaving Text with a
+  dirty one asks once whether to discard it. A document that does not parse opens here
+  and can only be repaired here, by a whole-document write.
 * The **Text** segment is disabled when `/meta/access` reports no read, rather than
   offering a button that can only fail.
 
@@ -81,9 +90,13 @@ behind it. What follows is what is specific to *this* file.
   the text buffer) and shows the API's message verbatim under a *Conflict* title. Every
   other error is the API's message verbatim too. This is what catches a concurrent
   change without a poll: the next write finds out.
-* **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window),
-  the Text card (the whole document, in the panel body), and the diff behind the Diff
-  button and the "Save anyway" banner. Its AMD loader is fetched lazily on first use from
+* **Enforced schemas.** A prefix with `enforce: true` makes the server refuse a write
+  that breaks it: 422, naming the paths. That message is the dialog, and *Save anyway*
+  sends the same write again with `force=1`. Every other schema finding is advisory and
+  only marks the row amber (and squiggles the line in Text).
+* **Monaco**, three jobs: *Edit selection as text* (the selected subtree, in a window,
+  whose OK is one `replace` of that subtree), the Text card (the whole document, in the
+  panel body), and the diff behind the Diff button. Its AMD loader is fetched lazily on first use from
   `/pve2/js/pve-meta-extjs/vs/loader.js` — Monaco is vendored into the package by the
   top-level `make ui` (npm), never fetched from a CDN — and every editor and model is
   disposed when its owner goes away. `PVE.meta.Monaco.load()` waits for the core first,
@@ -109,14 +122,13 @@ listing on every question, which costs microseconds and no lifetime to manage.
 
 The YAML the editor shows is therefore the YAML the store writes, by construction: one
 emitter, not two kept in step by settings. The server stays the authority all the same --
-an Apply in YAML view sends the buffer to the API untouched as `text`, an Apply from the
-tree sends the planned subtree as `data`, and the server runs the same code again on the
-real write.
+Apply in the YAML view sends the buffer to the API untouched as `text`, a row edit sends
+one subtree as `data`, and the server runs the same code again on the real write.
 
 The editor **reads every document as YAML** (`format=yaml`), never as JSON: perlmod
 renders a document as a native Perl hash on the way out, and a Perl hash has no key
-order, so `format=json` cannot carry the order the store holds (DESIGN §7, decision 007).
-That is what makes a root Apply write the file back in the order it was in.
+order, so `format=json` cannot carry the order the store holds (DESIGN §5, decision 007).
+That is what makes a root write put the file back in the order it was in.
 
 ## How it is wired
 
@@ -125,7 +137,7 @@ pve-ext's page loader (`pve-ext/js/pve-ext-loader.js`) reads page manifests from
 either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This
 editor ships **two** manifests in the second form over one script, because a manifest
 carries a single `xtype` and the guest tab and the datacenter tab are different panels
-(DESIGN §11):
+(DESIGN §8):
 
 `pages/pve-meta.json`:
 
@@ -172,14 +184,16 @@ first, which is what its `waitForXtype()` does.
   name validators fail open, `Core.call` says "not loaded" rather than trapping) are
   exercised; then the raw ABI (a megabyte through the buffer, a memory growth, non-ASCII,
   error locations); then the editor's own logic: the row-editor field choice, the
-  document+shape row merge, per-row editability, staging, and the codec — including a
+  document+shape row merge, per-row editability, the request each kind of edit produces
+  (`Doc.writeFor`, as a table), and the codec — including a
   **round-trip property test**: a fixed corpus of hostile documents plus 500 generated
   ones (keys and values with colons, quotes, hashes, unicode, numeric-looking strings,
   booleans, nested maps and arrays), asserting `parse(dump(x))` deep-equals `x` with key
   order intact. The rules themselves are tested where they live, in Rust.
 * `testing/lab/` is not a test suite: the two scripts there need a live PVE host and
   nothing in `make check` or CI runs them. `headless-tab-check.js` and
-  `headless-flows-check.js` run headless Chromium against the real pve-manager SPA:
+  `headless-flows-check.js` (open the tab, add a key, edit it, remove it, apply from the
+  Text card, provoke a 409) run headless Chromium against the real pve-manager SPA:
   `node headless-tab-check.js <host> <vmid> <light|dark> [--stub-registry] [--readonly]
   [--ro]`. `--stub-registry` stubs a `GET /meta/prefixes` payload; `--ro` stubs
   `GET /meta/access` with a read-only answer so the "Read-only" toolbar label and the
@@ -190,8 +204,7 @@ first, which is what its `waitForXtype()` does.
 ## Screenshots
 
 `docs/screenshots/` holds only what the top-level README shows, light and dark: the
-guest tree with staged edits, Text mode with the diff, the enforced-schema warning, the
-Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
+guest tree, Text mode with the diff, the Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
 (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
 Anything else -- the row editor, the JSON view, a read-only caller's tab -- is a run of
 `testing/lab/headless-tab-check.js` away, which writes a full set into the directory

@@ -36,11 +36,6 @@ PVE.meta.Shape.rooted = (schema) =>
 
 PVE.meta.Shape.empty = () => new PVE.meta.Shape([]);
 
-// Of the findings `after` has, those an edit is answerable for: not already in
-// `before`, or on a path in `changed` (in either direction). `shape::introduced`.
-PVE.meta.Shape.introduced = (before, after, changed) =>
-    PVE.meta.Core.call('findings_introduced', before || [], after || [], changed || []);
-
 Object.assign(PVE.meta.Shape.prototype, {
     ask: function (fn, ...rest) {
         return PVE.meta.Core.call(fn, this.prefixes, ...rest);

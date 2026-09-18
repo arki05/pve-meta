@@ -19,18 +19,18 @@
 //! A request is one UTF-8 JSON document, `{"fn": <name>, "args": [...]}`,
 //! and a response is `{"ok": <value>}` or `{"err": {"message": ..., "line"?,
 //! "column"?}}`. Every function in this crate takes and returns documents
-//! anyway -- a `Value`, a path, an edit set -- so JSON is the interface's
-//! natural type, and the glue on the JavaScript side is a dozen lines
+//! anyway -- a `Value`, a path -- so JSON is the interface's natural type,
+//! and the glue on the JavaScript side is a dozen lines
 //! ([`ui-extjs/pve-meta-tree.js`, `PVE.meta.Core`]).
 //!
 //! # What crosses
 //!
 //! The concepts, one group each ([`call`]): the **codec** (`format::parse`,
-//! `format::dump`), the **path** rules, **`Shape`** (which prefixes reach a
-//! document, what governs a path, what a schema says) and **`EditSet`**
-//! (staged edits). Nothing here decides anything: it deserializes the wire
-//! shape the API hands the browser -- where Perl has rendered `true` as `1`
-//! -- into the core's own types, and calls.
+//! `format::dump`), the **path** rules and **`Shape`** (which prefixes reach
+//! a document, what governs a path, what a schema says). Nothing here
+//! decides anything: it deserializes the wire shape the API hands the
+//! browser -- where Perl has rendered `true` as `1` -- into the core's own
+//! types, and calls.
 //!
 //! # Not a security boundary
 //!
@@ -41,18 +41,17 @@
 
 use std::cell::RefCell;
 
-use pve_meta_core::edit::EditSet;
 use pve_meta_core::error::Error;
 use pve_meta_core::format::{self, Format};
 use pve_meta_core::path::{self, Path};
 use pve_meta_core::registry;
-use pve_meta_core::shape::{self, Declared, Finding, Shape};
+use pve_meta_core::shape::{Declared, Shape};
 use pve_meta_core::{view, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// The ABI version; bump when the request or response shape changes.
-pub const ABI: u32 = 2;
+pub const ABI: u32 = 3;
 
 thread_local! {
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -261,36 +260,8 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value, CallError> {
             let doc = a.value()?;
             serde_json::to_value(shape.findings(&doc))?
         }
-        "findings_introduced" => {
-            let before: Vec<Finding> = a.parsed()?;
-            let after: Vec<Finding> = a.parsed()?;
-            let changed: Vec<Path> = a.parsed()?;
-            serde_json::to_value(shape::introduced(&before, &after, &changed))?
-        }
 
-        // -- edits: edit::EditSet ----------------------------------------
-        "edits_apply" => {
-            let stored = a.value()?;
-            let set: EditSet = a.parsed()?;
-            set.apply(&stored)?
-        }
-        "edits_between" => {
-            let stored = a.value()?;
-            let edited = a.value()?;
-            serde_json::to_value(EditSet::between(&stored, &edited))?
-        }
-        "edits_write_view" => {
-            let set: EditSet = a.parsed()?;
-            json!(set.write_view())
-        }
-        "changed_paths" => {
-            let was = a.value()?;
-            let now = a.value()?;
-            json!(pve_meta_core::edit::changed_paths(&was, &now))
-        }
-        // Value equality: maps compare as sets, because key order is not a
-        // value (`docs/DESIGN.md` §2). What the editor's "is this still the
-        // loaded document" asks.
+        // Equality of two values, maps as sets: order is not a value (`docs/DESIGN.md` §2).
         "same" => {
             let x = a.value()?;
             let y = a.value()?;
@@ -535,25 +506,5 @@ mod tests {
             ok("shape_findings", json!([fmt, {"t": {"host": "h", "z": "no"}}])),
             json!([{"path": "t.host", "format": "dns-name", "value": "h"}, {"path": "t.z", "msg": "expected integer"}])
         );
-    }
-
-    #[test]
-    fn edits_go_through_the_edit_set() {
-        let stored = json!({"zebra": 1, "alpha": 2});
-        let set = json!([{"path": "alpha", "op": "set", "value": 9}]);
-        let planned = ok("edits_apply", json!([stored, set]));
-        assert_eq!(serde_json::to_string(&planned).unwrap(), r#"{"zebra":1,"alpha":9}"#);
-        assert_eq!(ok("edits_write_view", json!([set])), json!("alpha"));
-        assert_eq!(ok("edits_write_view", json!([[]])), Value::Null);
-        assert_eq!(
-            ok("edits_between", json!([stored, {"zebra": 1}])),
-            json!([{"path": "alpha", "op": "delete"}])
-        );
-        assert_eq!(ok("changed_paths", json!([stored, {"alpha": 2, "zebra": 1}])), json!([]));
-        assert_eq!(ok("same", json!([stored, {"alpha": 2, "zebra": 1}])), json!(true));
-        assert_eq!(ok("same", json!([stored, {"alpha": 3, "zebra": 1}])), json!(false));
-        assert!(ok("edits_between", json!([stored, {"alpha": 2, "zebra": 1}])).as_array().unwrap().is_empty());
-        let e = err("edits_apply", json!([{"a": [1]}, [{"path": "a.b", "op": "set", "value": 1}]]));
-        assert!(e.message.contains("never through an array"), "{e:?}");
     }
 }

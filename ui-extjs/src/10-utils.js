@@ -29,14 +29,8 @@ PVE.meta.Utils = {
     // The path above `path`, or '' for a top-level key (and for the root itself).
     parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
-    // Two document values are the same value. Maps compare as sets: key order is
-    // kept on disk as a courtesy and is not a value (DESIGN §2), so the keys are
-    // sorted before the two are encoded and compared.
-    // Two documents are the same value. The core's rule (`same`), not a local
-    // one: this was a hand-rolled canonical `JSON.stringify` with sorted keys,
-    // which is the same rule spelled a second time -- and a third copy of it
-    // nearby had no sort, so a list member whose keys arrived in a different
-    // order rendered as changed when nothing about it had changed.
+    // Two document values are the same value: the core's own dump of each, compared,
+    // rather than a canonical form spelled a second time here.
     sameValue: (a, b) => PVE.meta.Core.call('same', a, b),
 
     // Why a key name is not one, or `null` if it is fine. A dotted path is

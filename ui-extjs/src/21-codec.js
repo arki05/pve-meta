@@ -20,8 +20,8 @@ PVE.meta.Codec = {
         return PVE.meta.Core.call('dump', lang === 'json' ? 'json' : 'yaml', value);
     },
 
-    // As `dump`, but for a switch *into* YAML prefers `originalYaml` when it is the
-    // same document. The store rewrites a file only when asked to write one, so what
+    // As `dump`, but for a switch *into* YAML prefers `originalYaml` when it renders
+    // the same text. The store rewrites a file only when asked to write one, so what
     // the editor is handed can be a file as somebody *wrote* it -- valid YAML in a
     // layout no emitter would choose -- and re-dumping that on a presentation toggle
     // invents changes to a document nobody edited.
@@ -32,9 +32,7 @@ PVE.meta.Codec = {
         return PVE.meta.Codec.dump(value, lang);
     },
 
-    // True if `value` is the same document as `yamlText` parses to. Key order is
-    // not a value (DESIGN §2), so a reordering is the same document -- and the
-    // loaded text, in its own order, is what a switch back to YAML shows.
+    // True if `value` equals what `yamlText` parses to; order is not a value.
     same: function (value, yamlText) {
         try {
             return PVE.meta.Core.call('same', value, PVE.meta.Codec.parse(yamlText, 'yaml'));

@@ -12,13 +12,14 @@
 // So: **which view you are looking at goes bottom-left, what you can do about it
 // goes bottom-right**, and every editor builds both halves from here. The top
 // toolbar is left for acting on the document's *contents* (Add, Edit, Remove,
-// Declare Key, Add Rule), which is a different kind of thing from committing.
+// Declare Key), which is a different kind of thing from committing.
 // ---------------------------------------------------------------------------
 
 Ext.define('PVE.meta.Footer', {
     singleton: true,
 
-    // cfg: { format: handler?, apply: handler, secondary: handler, secondaryText }
+    // cfg: { format: handler?, diff: handler?, apply: handler, applyText?,
+    //        applyDisabled, secondary: handler, secondaryText }
     actions: function (cfg) {
         let out = [];
         if (cfg.format) {
@@ -31,12 +32,9 @@ Ext.define('PVE.meta.Footer', {
             });
         }
         out.push('->');
-        // Diff belongs with Apply and Revert, not with the view switches on the left:
-        // it answers the same question they do -- what am I about to do to this
-        // document -- and it answers it without committing. It is also not a text-mode
-        // button. What is staged is a property of the document, so the tree has a diff
-        // to show as much as the buffer does, and checking before Apply is exactly when
-        // you want it.
+        // Diff belongs with Apply, not with the view switches on the left: it answers
+        // the same question Apply does -- what am I about to do to this document --
+        // and it answers it without committing.
         if (cfg.diff) {
             out.push({
                 text: gettext('Diff'),
@@ -48,56 +46,27 @@ Ext.define('PVE.meta.Footer', {
         }
         out.push({
             // Named by the caller, because the two mean different things: the panel's
-            // footer Apply *writes*, and a modal editor's button only hands its result
-            // back -- the same OK the row editor and Add Key use. One word for both was
-            // how the subtree window came to write directly and see nothing staged.
-            // `sync` rewrites this text on every keystroke, so the caller says the
-            // word there too (`state.applyText`).
+            // footer Apply *writes* the buffer, and a modal editor's button only hands
+            // its result back -- the same OK the row editor and Add Key use.
             text: cfg.applyText || gettext('Apply'),
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
             // Stated by the caller, never defaulted. Defaulting it to `disabled` meant
-            // a caller that never called `sync` got a button that looked ordinary and
+            // a caller that never enabled it got a button that looked ordinary and
             // did nothing at all -- no click, no request, no message -- which is
-            // exactly what happened to the subtree window. A shared builder whose
-            // default only one of its callers undoes is a rule with two meanings,
-            // which is the thing extracting it was meant to stop.
+            // exactly what happened to the subtree window.
             disabled: !!cfg.applyDisabled,
             handler: cfg.apply,
         });
         out.push({
-            text: cfg.secondaryText || gettext('Revert'),
+            text: cfg.secondaryText || gettext('Cancel'),
             itemId: 'metaSecondary',
-            iconCls: 'fa fa-undo',
+            // The icon has to agree with the word, and only the panel's Revert throws
+            // anything away: the panel swaps in the undo arrow when it says Revert.
+            iconCls: 'fa fa-times',
             handler: cfg.secondary,
         });
         return out;
-    },
-
-    // `count` on the button it acts on rather than in a label beside it: a label is
-    // the first thing clipped when an editor opens in a window, and a counter you
-    // cannot read is not one.
-    // state: { canApply, count, applyText?, dirty, dirtyText?, cleanText,
-    //          secondaryOnlyWhenDirty? }
-    sync: function (owner, state) {
-        let apply = owner.down('#metaApply');
-        if (apply) {
-            apply.setDisabled(!state.canApply);
-            let word = state.applyText || gettext('Apply');
-            apply.setText(
-                state.count ? Ext.String.format(gettext('{0} ({1})'), word, state.count) : word,
-            );
-        }
-        let second = owner.down('#metaSecondary');
-        if (second) {
-            // The icon has to agree with the word: an undo arrow on a button that says
-            // Close is a button that looks like it will throw your work away.
-            second.setIconCls(state.dirty ? 'fa fa-undo' : 'fa fa-times');
-            // A window's Close becomes Discard once there is something to lose, which
-            // is the one moment the difference matters.
-            second.setText(state.dirty ? state.dirtyText || state.cleanText : state.cleanText);
-            second.setDisabled(!!state.secondaryOnlyWhenDirty && !state.dirty);
-        }
     },
 
     // The YAML | JSON view switch every text editor and the diff window carry.
@@ -124,4 +93,3 @@ Ext.define('PVE.meta.Footer', {
         return out;
     },
 });
-

@@ -1,5 +1,6 @@
-// headless-flows-check.js — the flows headless-tab-check.js does not cover: applying
-// the Monaco diff, Add, Remove, and the datacenter document.
+// headless-flows-check.js — the flows headless-tab-check.js does not cover: Add, the
+// row editor, Remove, the Text card's Apply, a 409, and the datacenter document.
+// Each of the first four is one write with the digest, followed by a reload.
 // Usage: node headless-flows-check.js <host> <vmid>
 const puppeteer = require('puppeteer-core');
 const https = require('https');
@@ -143,6 +144,9 @@ async function main() {
         result.checks.rowsBefore = await rows(page);
 
         // --- 1. Add, through the Add Key window -----------------------------
+        // The window's Add is the write: `PUT ?view=added.by.ui&mode=replace`, and
+        // `view::replace` creates `added` and `added.by` on the way. The panel
+        // reloads afterwards, so the rows below are the server's answer.
         await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].addKey(''));
         await sleep(800);
         await page.evaluate(() => {
@@ -156,7 +160,27 @@ async function main() {
         await sleep(3000);
         result.checks.afterAdd = (await rows(page)).filter((r) => r.startsWith('added'));
 
-        // --- 2. Remove, through the row's trash action -----------------------
+        // --- 2. Edit that value, through the row editor ---------------------
+        await page.evaluate(() => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            let n = null;
+            p.getRootNode().cascadeBy((x) => {
+                if (x.data.path === 'added.by.ui') n = x;
+            });
+            if (n) p.editRow(n);
+        });
+        await sleep(800);
+        result.checks.rowEditor = await page.evaluate(() => {
+            const w = Ext.ComponentQuery.query('pveMetaEditValueWindow')[0];
+            if (!w) return 'no row editor';
+            w.down('#valueField').setValue(9);
+            w.submit();
+            return 'submitted';
+        });
+        await sleep(3000);
+        result.checks.afterEdit = (await rows(page)).filter((r) => r.startsWith('added'));
+
+        // --- 3. Remove: `DELETE ?view=added&digest=` ------------------------
         result.checks.remove = await page.evaluate(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
             let n = null;
@@ -165,68 +189,58 @@ async function main() {
             });
             if (!n) return 'row not found';
             p.removeKey(n);
-            return 'confirm shown';
-        });
-        await sleep(700);
-        result.checks.confirmClicked = await page.evaluate(() => {
-            const b = Ext.ComponentQuery.query('messagebox')[0];
-            if (!b) return 'no messagebox';
-            const yes = b.query('button').find((x) => /yes/i.test(x.itemId || '') || /^Yes$/i.test(x.text));
-            if (!yes) return 'no yes button: ' + b.query('button').map((x) => x.itemId + '/' + x.text).join(',');
-            yes.el.dom.click();
-            return 'clicked';
+            return 'removed';
         });
         await sleep(3000);
         result.checks.afterRemove = (await rows(page)).filter((r) => r.startsWith('added'));
 
-        // --- 3. Apply from the selection text window, through the diff -------
+        // --- 4. The Text card's Apply sends the buffer ----------------------
+        // The one write that is text rather than a subtree: a `#` comment is not part
+        // of the document model, so it survives only because this path sends what was
+        // typed.
         await page.evaluate(() => {
-            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
-            let n = null;
-            p.getRootNode().cascadeBy((x) => {
-                if (x.data.path === 'traefik') n = x;
-            });
-            p.setSelection(n);
-            p.editSelectionAsText();
+            Ext.ComponentQuery.query('pveMetaTreePanel')[0].down('#modeBtn').setValue('text');
         });
         await sleep(9000);
-        result.checks.textWindow = await page.evaluate(() => {
-            const w = Ext.ComponentQuery.query('pveMetaTextWindow')[0];
-            if (!w || !w.editor) return 'no editor';
-            w.editor.setValue(w.editor.getValue() + 'applied_from_text: yes\n');
-            w.showDiff();
-            return 'diff requested';
+        result.checks.textApply = await page.evaluate(() => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            if (!p.textEditor) return 'no editor';
+            p.textEditor.setValue('# written from the text card\n' + p.textEditor.getValue() +
+                'applied_from_text: yes\n');
+            p.applyText();
+            return 'applied';
         });
         await sleep(4000);
-        await page.screenshot({ path: `${out}/extjs-diff-apply.png` });
-        result.checks.applyClick = await page.evaluate(() => {
-            const confirm = Ext.ComponentQuery.query('#pveMetaDiffWindow')[0];
-            if (!confirm) return 'no diff window';
-            const btn = confirm.query('button').find((b) => b.text === 'Apply');
-            if (!btn) return 'buttons seen: ' + confirm.query('button').map((b) => b.text).join(',');
-            btn.el.dom.click();
-            return 'clicked';
+        await page.screenshot({ path: `${out}/extjs-text-apply.png` });
+        result.checks.afterTextApply = await page.evaluate(() => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            return {
+                comment: p.textOriginal.indexOf('# written from the text card') === 0,
+                key: p.textOriginal.indexOf('applied_from_text') !== -1,
+            };
         });
-        await sleep(4000);
-        result.checks.afterApply = (await rows(page)).filter((r) => r.startsWith('traefik'));
-        result.checks.textWindowClosed = await page.evaluate(
-            () => Ext.ComponentQuery.query('pveMetaTextWindow').length === 0,
+        // Back to the tree: the buffer is clean, so nothing is asked.
+        await page.evaluate(() => {
+            Ext.ComponentQuery.query('pveMetaTreePanel')[0].down('#modeBtn').setValue('tree');
+        });
+        await sleep(3000);
+        result.checks.backInTree = await page.evaluate(
+            () => Ext.ComponentQuery.query('pveMetaTreePanel')[0].mode,
         );
         result.checks.monacoDisposed = await page.evaluate(
             () => window.monaco.editor.getModels().length,
         );
+        await api(
+            `/api2/json/meta/guests/${vmid}?view=applied_from_text`,
+            'DELETE',
+            tk,
+            csrf,
+            '',
+        );
 
-        // --- 4. Manual Reload picks up a change made from outside ------------
-        // There is no background poll any more: the digest check on every write
-        // catches a concurrent change (a 409 reloads), and otherwise it is the
-        // toolbar's Reload.
-        await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTextWindow').forEach((w) => w.close()));
-        await sleep(1500);
-        result.checks.windowsClosed = await page.evaluate(() => ({
-            text: Ext.ComponentQuery.query('pveMetaTextWindow').length,
-            diff: Ext.ComponentQuery.query('#pveMetaDiffWindow').length,
-            models: window.monaco.editor.getModels().length,
-        }));
+        // --- 5. A concurrent write is a 409: one message, and a reload -------
+        // There is no background poll: the digest on every write is what catches a
+        // change made elsewhere, and the next write is when you find out.
         await api(
             `/api2/json/meta/guests/${vmid}`,
             'PUT',
@@ -234,9 +248,34 @@ async function main() {
             csrf,
             'view=reload_probe&mode=replace&data=' + encodeURIComponent('"set from outside"'),
         );
-        await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].reload());
+        await sleep(500);
+        // The panel still holds the digest from before that write.
+        await page.evaluate(() =>
+            Ext.ComponentQuery.query('pveMetaTreePanel')[0].sendEdit({
+                path: 'conflict_probe',
+                op: 'set',
+                value: 'from the ui',
+            }),
+        );
         await sleep(3000);
-        result.checks.reload = { appeared: (await rows(page)).some((r) => r.startsWith('reload_probe')) };
+        result.checks.conflict = await page.evaluate(() => {
+            const b = Ext.ComponentQuery.query('messagebox').find((m) => m.isVisible());
+            const title = b ? b.title : null;
+            if (b) b.close();
+            return { title: title };
+        });
+        await sleep(3000);
+        await page.screenshot({ path: `${out}/extjs-conflict.png` });
+        // The 409 reloaded, so the outside write is on screen and ours is not.
+        result.checks.afterConflict = await page.evaluate(() => {
+            const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+            const r = [];
+            p.getRootNode().cascadeBy((n) => n.data.path && r.push(n.data.path));
+            return {
+                outsideWrite: r.indexOf('reload_probe') !== -1,
+                ourWrite: r.indexOf('conflict_probe') !== -1,
+            };
+        });
         await page.screenshot({ path: `${out}/extjs-after-reload.png` });
 
         await api(
