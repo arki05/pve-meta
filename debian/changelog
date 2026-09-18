@@ -1,3 +1,45 @@
+pve-meta (0.2.0-1) UNRELEASED; urgency=medium
+
+  * Access is PVE's ACLs and nothing else: VM.Audit reads a guest's document,
+    VM.Config.Options writes it, Sys.Modify writes a prefix file. The
+    permission files under /etc/pve/meta.d/permissions, their scopes, partial
+    reads, per-path write checks, GET /meta/permissions, the permissions/<name>
+    documents and the editor's Access column, Add Rule window, Permissions
+    grid and service-token wizard are gone. A token that could read a prefix
+    through a permission file needs VM.Audit on the guests now; a leftover
+    permission file is ignored. GET /meta/access answers { read, write }.
+  * A node's schema is an override inside the prefix file: nodes.<node> with
+    any of schema, enforce and hidden, each replacing the top-level value
+    whole for guests on that node. The per-node directory
+    /etc/pve/nodes/<node>/meta.d/prefixes, the nodes/<node>/prefixes/<name>
+    ids and routes and the all=1 listing are gone; a file left in that
+    directory is ignored and should be folded into the cluster file's
+    nodes: map. GET /meta/prefixes?id=<vmid> returns the prefixes reaching
+    the guest with selector and override applied, most specific first.
+  * GET /meta/version is one token over every document and prefix file; the
+    id and detail parameters and the per-document digests are gone.
+  * Notes (keys ending in __) follow one rule: a read leaves them out unless
+    it asks with comments=1, a replace that did not ask keeps the note of
+    every map key it keeps and nothing inside a list, and deleting a key
+    deletes its note. A payload that carries a note without asking writes
+    it; a view or has= naming a note is an absent path, not a 400.
+  * The editor writes each edit at once, as every PVE panel does: a row
+    editor's OK is one PUT with the digest, Remove is a DELETE, a 409
+    reloads, a 422 names the paths and offers Save anyway. Staged edits,
+    Apply and Revert for the tree, the version poll, the Declare Key form
+    and the layout-only dialog are gone; the text card keeps Apply, Revert
+    and the diff. Declare Key opens schema.properties in the text editor.
+  * pve-ext: the manifest id, the .claimed-by marker, the manifest-id
+    subcommand, the requires gating of tabs and the iframe page form are
+    gone; a leftover marker is ignored.
+  * pve-meta-publish: a path has no length cap of its own, and the manifest's
+    entry name and hash are the daemon's own and otherwise unchecked.
+  * The design is docs/DESIGN.md, 150 lines of model, invariants and
+    non-goals; the code, its comments and its tests are about half their
+    size, with every rule tested once.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Thu, 18 Sep 2026 12:00:00 +0200
+
 pve-meta (0.1.3-1) unstable; urgency=medium
 
   * Prefix files per node: /etc/pve/nodes/<node>/meta.d/prefixes/<name>.yaml,
