@@ -491,34 +491,15 @@ for my $hack_view ('zzz_hacked', 'zzz_hacked.deep') {
 is_deeply(PVE::RS::Meta::api_get('9400', undef, 'json', $FULL)->{data}, $before_hack->{data},
     'no empty merge created any structure');
 
-# Comment keys are notes (docs/DESIGN.md §2, §7): a read leaves them out unless
-# `$comments`, and a replace without it carries none and keeps the stored ones.
+# Comment keys are notes (docs/DESIGN.md §2): a read leaves them out unless
+# `$comments`, which is how they cross the Perl/Rust boundary at all -- the
+# rule itself is proven once, in Rust.
 write_file('9403.yaml', "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n");
 is_deeply(PVE::RS::Meta::api_get('9403', undef, 'json', $FULL)->{data},
     { web => { host => 'a', port => 80 } }, 'api_get leaves comment keys out by default');
-is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL)->{text}, "web:\n  host: a\n  port: 80\n",
-    '... and format=yaml is the canonical dump of what is left');
-is(PVE::RS::Meta::api_get('9403', undef, 'yaml', $FULL, 1)->{text},
-    "__: the guest\nweb:\n  host__: public name\n  host: a\n  port: 80\n",
-    'with $comments a full reader gets the file itself');
-$res = eval { PVE::RS::Meta::api_get('9403', 'web.host__', 'json', $FULL) };
-like($@, api_error_status(400), 'a view naming a comment key without $comments is 400:');
-my $kept = PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"b"}', 'replace', undef, 0, $FULL);
-is_deeply([sort map { "$_->{op} $_->{path}" } @{ $kept->{touched} }],
-    ['delete web.port', 'set web.host'], 'a replace without $comments reports only what it changed');
-is(read_file('9403.yaml'), "__: the guest\nweb:\n  host__: public name\n  host: b\n",
-    '... and keeps the notes whose subject it kept');
-$res = eval { PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c","host__":"x"}', 'replace',
-        undef, 0, $FULL) };
-like($@, api_error_status(400), 'a replace without $comments may not carry a comment key');
-PVE::RS::Meta::api_put('9403', 'web', 'json', '{"host":"c"}', 'replace', undef, 0, $FULL, 0, 1);
-is(read_file('9403.yaml'), "__: the guest\nweb:\n  host: c\n",
-    'with $comments the payload is the subtree, notes included');
-write_file('9403.yaml', "web__: the site\nweb:\n  host: c\n");
-PVE::RS::Meta::api_delete('9403', 'web', undef, $FULL);
-is(read_file('9403.yaml'), "{}\n", 'a DELETE of a view takes its note along');
-$res = eval { PVE::RS::Meta::api_list_guests([{ vmid => 9403, read => 1 }], 'web__') };
-like($@, api_error_status(400), 'has= naming a comment key is 400:');
+is_deeply(PVE::RS::Meta::api_get('9403', undef, 'json', $FULL, 1)->{data},
+    { __ => 'the guest', web => { host__ => 'public name', host => 'a', port => 80 } },
+    'and with $comments carries them');
 unlink("$root/9403.yaml");
 
 # A registry document uses only the ACL it is given, same as a guest.

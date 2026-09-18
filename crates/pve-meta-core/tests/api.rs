@@ -421,7 +421,6 @@ backup:\n\
 \x20 retention__: days\n\
 \x20 targets:\n\
 \x20 - host: nas\n\
-\x20   host__: the only one\n\
 traefik__: about traefik\n\
 traefik:\n\
 \x20 host__: public name\n\
@@ -456,11 +455,10 @@ fn a_read_carries_no_comment_key_unless_it_asks() {
         get_bare(&store, "100", Some("backup"), "yaml", &full()).unwrap().text.as_deref(),
         Some("retention: 7\ntargets:\n- host: nas\n")
     );
-    // Naming a note is asking for it: without `comments` that is a 400.
+    // Naming a note is just a path a stripped read no longer has: not found,
+    // like any other absent key, with no rule of its own.
     for view in ["traefik__", "traefik.host__", "__"] {
-        let err = get_bare(&store, "100", Some(view), "json", &full()).unwrap_err();
-        assert_eq!(status(&err), 400, "{view}: {err}");
-        assert!(err.msg.contains("comments=1"), "{err}");
+        assert_eq!(get_bare(&store, "100", Some(view), "json", &full()).unwrap().data, Some(json!({})));
     }
 
     // With `comments`, the read is what it always was: the file's own text for the
@@ -515,14 +513,14 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
     assert_eq!(read_raw(&store, "100").unwrap(), NOTED.replace("retention: 7", "retention: 14"));
 
     // A note whose subject the write drops goes with it -- and says so; a map's
-    // own `__` stays while the map does. A view's payload is judged the same way.
+    // own `__` stays while the map does. Inside the list nothing is kept.
     let dry = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", true, false, &full()).unwrap();
     let r = put_notes(&store, &[], "100", Some("backup"), r#"{"targets": [{"host": "nas"}, {"host": "tape"}]}"#, "replace", false, false, &full()).unwrap();
     assert_eq!(touched_paths(&r), vec!["delete backup.retention", "delete backup.retention__", "set backup.targets"]);
     assert_eq!(touched_paths(&dry), touched_paths(&r), "a dry run plans the same write");
     assert_eq!(
         get(&store, "100", Some("backup"), "json", &full()).unwrap().data.unwrap(),
-        json!({"__": "the backup job's settings", "targets": [{"host": "nas", "host__": "the only one"}, {"host": "tape"}]})
+        json!({"__": "the backup job's settings", "targets": [{"host": "nas"}, {"host": "tape"}]})
     );
     // Replacing a scalar keeps the note beside it, which is outside the view anyway.
     put_notes(&store, &[], "100", Some("traefik.host"), r#""www""#, "replace", false, false, &full()).unwrap();
@@ -530,22 +528,6 @@ fn a_replace_without_comments_keeps_the_notes_of_what_it_keeps() {
         get(&store, "100", Some("traefik"), "json", &full()).unwrap().data.unwrap(),
         json!({"host__": "public name", "host": "www"})
     );
-}
-
-#[test]
-fn a_replace_without_comments_may_not_carry_or_name_a_note() {
-    let (_dir, store) = store();
-    seed(&store, "100", NOTED);
-    for (view, payload, path) in [
-        (None, r#"{"traefik": {"host": "web", "host__": "new"}}"#, "traefik.host__"),
-        (Some("backup"), r#"{"targets": [{"host": "nas", "host__": "x"}]}"#, "backup.targets.0.host__"),
-        (Some("traefik.host__"), r#""new""#, "traefik.host__"),
-    ] {
-        let err = put_notes(&store, &[], "100", view, payload, "replace", false, false, &full()).unwrap_err();
-        assert_eq!(status(&err), 400, "{view:?} {payload}: {err}");
-        assert!(err.msg.starts_with(path), "{err}");
-    }
-    assert_eq!(read_raw(&store, "100").as_deref(), Some(NOTED));
 }
 
 #[test]
@@ -576,12 +558,13 @@ fn a_merge_is_the_same_with_or_without_comments() {
 }
 
 #[test]
-fn a_note_is_named_only_by_a_caller_that_asks_and_a_broken_one_says_so() {
+fn a_broken_note_says_so() {
     let (dir, store) = store();
     seed(&store, "100", NOTED);
+    // `has=` is checked against the same notes-left-out view a read returns:
+    // naming one finds nothing, no special case.
     let rows = vec![GuestInput { vmid: 100, read: true, ..Default::default() }];
-    let err = list_guests(&store, &rows, Some("traefik__")).unwrap_err();
-    assert_eq!(status(&err), 400, "{err}");
+    assert!(list_guests(&store, &rows, Some("traefik__")).unwrap().is_empty());
 
     // A stored note that is not a string, from out of band: a replace that did
     // not ask for notes kept it, and the lint says what it is.

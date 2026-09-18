@@ -398,8 +398,9 @@ mod pve_rs_meta {
     /// trailing) stores the result even where a prefix declares
     /// `enforce: true` and it would not match that prefix's schema. `$comments`
     /// (optional, trailing) makes a replace's payload the subtree notes included;
-    /// without it the payload carries none and the stored ones are kept. The
-    /// prefixes enforced for a guest are those in effect on `$acl`'s `node`.
+    /// without it, a key the payload keeps keeps its stored note unless the
+    /// payload gives its own. The prefixes enforced for a guest are those in
+    /// effect on `$acl`'s `node`.
     ///
     /// The caller (`PVE::API2::Ext::Meta`) must already hold the document's
     /// `cfs_lock_domain` lock: the digest precondition is re-checked inside

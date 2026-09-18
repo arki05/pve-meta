@@ -381,22 +381,18 @@ pub fn prefixes_list(prefixes: &[PrefixDef], failures: &[RegistryFailure]) -> Ve
 ///
 /// A guest the caller cannot read is omitted entirely.
 ///
-/// A `has` that names a comment key is a `400`, as a view naming one is without
-/// `comments`: a note is not something a guest has.
+/// `has` is checked against the same notes-left-out view a read returns
+/// (`docs/DESIGN.md` §2): naming a note finds nothing, like any other path a
+/// stripped document does not have.
 ///
 /// # Errors
-/// `400:` if `has` is not a valid path, or names a comment key.
+/// `400:` if `has` is not a valid path.
 pub fn list_guests(
     store: &MetaStore,
     guests: &[GuestInput],
     has: Option<&str>,
 ) -> Result<Vec<GuestListEntry>, ApiError> {
     let has_path = has.map(DocPath::parse).transpose()?;
-    if let Some(path) = has_path.as_ref().filter(|p| view::names_comment(p)) {
-        return Err(bad_request(format!(
-            "{path}: a comment key is a note, not something a guest has"
-        )));
-    }
 
     let mut out = Vec::with_capacity(guests.len());
     for guest in guests {
@@ -407,7 +403,7 @@ pub fn list_guests(
         let stored = read_stored(store, &DocId::Guest(guest.vmid))?;
 
         if let Some(path) = &has_path {
-            if model::get_path(&stored.value, path).is_none() {
+            if model::get_path(&view::strip_comments(&stored.value), path).is_none() {
                 continue;
             }
         }
@@ -442,15 +438,15 @@ pub fn list_guests(
 /// writing over it.
 ///
 /// **Comment keys are notes** (`docs/DESIGN.md` §2): without `comments` the
-/// answer carries none, at any depth, and `format=yaml` is the canonical dump of
-/// what is left; a `view` naming one is a `400`. With `comments` the answer is
-/// the stored content, and the root view in YAML the file's own text. `digest`
-/// is the file's either way.
+/// answer carries none, at any depth, and `format=yaml` is the canonical dump
+/// of what is left. A `view` naming one finds nothing there any more, like
+/// any other path a stripped document does not have -- no special case. With
+/// `comments` the answer is the stored content, and the root view in YAML the
+/// file's own text. `digest` is the file's either way.
 ///
 /// # Errors
-/// `400:` invalid id/view/format, or a view naming a comment key without
-/// `comments`. `403:` no read access. `422:` the stored document's content
-/// could not be recovered.
+/// `400:` invalid id/view/format. `403:` no read access. `422:` the stored
+/// document's content could not be recovered.
 pub fn get_document(
     store: &MetaStore,
     id: &str,
@@ -462,9 +458,6 @@ pub fn get_document(
     let doc_id = parse_id(id)?;
     let fmt = parse_view_format(format_name)?;
     let view_path = parse_view(view)?;
-    if !comments {
-        refuse_comment(&Value::Null, &view_path)?;
-    }
 
     if !acl.read {
         return Err(forbidden(&view_path));
@@ -495,12 +488,15 @@ pub fn get_document(
         });
     }
 
+    // Notes are stripped from the *whole* document before the view is taken,
+    // not after: a view naming a note key then finds nothing there, the same
+    // as any other absent path, with no rule of its own (`docs/DESIGN.md` §2).
+    let base = if comments { stored.value.clone() } else { view::strip_comments(&stored.value) };
     let result_value = if view.is_some() {
-        view::extract(&stored.value, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
+        view::extract(&base, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
     } else {
-        stored.value.clone()
+        base
     };
-    let result_value = if comments { result_value } else { view::strip_comments(&result_value) };
 
     let (data, text) = match fmt {
         Format::Json => (Some(result_value), None),
@@ -525,18 +521,6 @@ pub fn get_document(
         text,
         parse_error: None,
     })
-}
-
-/// A `400` naming the first comment key in `value` placed at `view_path` (the
-/// view itself, when it names one): what a read or a `replace` that did not ask
-/// for `comments` may not name or carry (`docs/DESIGN.md` §7).
-fn refuse_comment(value: &Value, view_path: &DocPath) -> Result<(), ApiError> {
-    match view::first_comment(value, view_path) {
-        Some(path) => Err(bad_request(format!(
-            "{path}: a comment key is read and written only with comments=1"
-        ))),
-        None => Ok(()),
-    }
 }
 
 /// Refuses every write against a document whose content could not be
@@ -659,19 +643,19 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
 /// write: enforcement makes a mismatch a deliberate act, not an impossible
 /// one, so a drifted schema can never lock an administrator out (§7).
 ///
-/// **A `replace` without `comments` keeps the notes it could not see**
-/// (`docs/DESIGN.md` §7): its payload may carry no comment key, and every
-/// stored note under the view whose subject the payload keeps is put back
-/// ([`view::keep_comments`]) before the write is planned, so it is neither lost
-/// nor a touched path. A note whose subject the payload drops goes with it.
-/// With `comments` the payload is the subtree, notes included. A `merge`
-/// names what it changes and is the same either way.
+/// **A `replace` without `comments` keeps the stored note of every key it
+/// keeps** (`docs/DESIGN.md` §2), and a map's own `__` while it stays a map
+/// ([`view::keep_comments`]), before the write is planned, so a kept note is
+/// neither lost nor a touched path; a note whose subject the payload drops
+/// goes with it, and a note the payload gives its own value for is written as
+/// given. Inside a list nothing is kept. With `comments` the payload is the
+/// subtree, notes included. A `merge` names what it changes and is the same
+/// either way.
 ///
 /// # Errors
-/// `400:` invalid id/view/format/mode/payload, a comment key in a `replace`
-/// without `comments`, or the planned document fails the lint. `409:` digest
-/// mismatch. `403:` no write access. `422:` the write introduces a finding
-/// under an enforcing prefix and `force` is not set.
+/// `400:` invalid id/view/format/mode/payload, or the planned document fails
+/// the lint. `409:` digest mismatch. `403:` no write access. `422:` the write
+/// introduces a finding under an enforcing prefix and `force` is not set.
 #[allow(clippy::too_many_arguments)] // matches the PUT endpoint's parameter set 1:1 (docs/DESIGN.md §8)
 pub fn put_document(
     store: &MetaStore,
@@ -711,9 +695,6 @@ pub fn put_document(
         view::parse(payload, fmt)?
     };
     let keep_notes = !is_merge && !comments;
-    if keep_notes {
-        refuse_comment(&payload_value, &view_path)?;
-    }
 
     store.check_precondition(&doc_id, digest)?;
     let stored = read_stored(store, &doc_id)?;

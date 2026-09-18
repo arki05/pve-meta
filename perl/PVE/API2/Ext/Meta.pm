@@ -243,9 +243,9 @@ my $COMMENTS_SCHEMA = {
     default => 0,
     description => "Include comment keys (a key ending in '__', a note about its sibling; "
         . "docs/DESIGN.md §2). Without it a read leaves them out at any depth, 'text' is "
-        . "the canonical YAML of what is left, and a 'view' naming one is a 400; a "
-        . "'replace' may carry none and keeps every stored note whose subject it keeps "
-        . "(in a list, the notes of an unchanged member). "
+        . "the canonical YAML of what is left, and a 'view' naming one finds nothing there "
+        . "any more; a 'replace' keeps the stored note of every key it keeps (a map's own "
+        . "note while it stays a map; none of a list's). "
         . "With it a read returns them and a 'replace' payload is the subtree, notes "
         . "included. 'merge' is the same either way.",
 };
@@ -713,7 +713,7 @@ __PACKAGE__->register_method({
                 type => 'string',
                 optional => 1,
                 description => "Only list guests whose data has something at this "
-                    . "dotted path. Naming a comment key is a 400: a note is not data.",
+                    . "dotted path, notes left out as everywhere a read does (docs/DESIGN.md §2).",
             },
         },
     },
