@@ -1,3 +1,12 @@
+pve-meta (0.3.1-1) unstable; urgency=medium
+
+  * Managed files: reservation and deletion agree on operator identity
+    (same-operator renames converge, cross-writer claims refuse by name),
+    and each plane collects only its own manifest records. v0.3.0 lacked
+    the deletion half; no consumer existed yet, nothing broke.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Mon, 21 Sep 2026 19:30:00 +0200
+
 pve-meta (0.3.0-1) unstable; urgency=medium
 
   * Guest files grow a managed plane for operators: manifest records carry
