@@ -32,7 +32,8 @@ guest-files:
   file, as if the entry were removed.
 * **Entries are judged one by one.** An entry that fails to validate — an unknown or
   invalid field, `raw` on a non-string, content over the cap — is refused and holds what
-  it wrote before. Two entries resolving to one path, or one to a directory the
+  it wrote before. A document with a pre-0.2 `publish:` key and no `guest-files:` key
+  is held with a warning naming the rename. Two entries resolving to one path, or one to a directory the
   other's path runs through, are both refused. A document that does not parse, or a
   `guest-files` that is not a map, holds everything.
 * **Paths.** A relative path resolves under `/etc/pve-meta`, an absolute one is used as

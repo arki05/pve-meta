@@ -98,7 +98,7 @@ them in the same editor.
 
 | Text mode with the diff | Save anyway, when a schema objects |
 |---|---|
-| <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-text-diff-dark.png"><img alt="Text mode with the diff" src="ui-extjs/docs/screenshots/readme-text-diff-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-save-anyway-dark.png"><img alt="The enforced-schema warning with the Save anyway tick" src="ui-extjs/docs/screenshots/readme-save-anyway-light.png"></picture> |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-text-diff-dark.png"><img alt="Text mode with the diff" src="ui-extjs/docs/screenshots/readme-text-diff-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-save-anyway-dark.png"><img alt="The enforced-schema warning with its Save anyway button" src="ui-extjs/docs/screenshots/readme-save-anyway-light.png"></picture> |
 
 | Prefixes on the Datacenter panel |
 |---|

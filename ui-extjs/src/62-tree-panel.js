@@ -178,7 +178,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
             // Only shown when the caller is restricted (DESIGN §8).
-            { xtype: 'tbtext', itemId: 'accessText', cls: 'faded', hidden: true },
+            { xtype: 'tbtext', itemId: 'accessText', cls: 'pve-meta-faded', hidden: true },
         ];
     },
 
@@ -231,7 +231,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     buildColumns: function () {
         let me = this;
         let U = PVE.meta.Utils;
-        let fade = (rec, html) => (rec.data.present ? html : '<span class="faded">' + html + '</span>');
+        let fade = (rec, html) => (rec.data.present ? html : '<span class="pve-meta-faded">' + html + '</span>');
         // `html` is already content-encoded; this only escapes it for the attribute.
         let tip = function (meta, html) {
             if (html) {
@@ -307,7 +307,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     // `valueText` is untouched, so the editor still opens on all of it.
                     let shown = d.present
                         ? Ext.htmlEncode(PVE.meta.Utils.previewText(value))
-                        : '<span class="faded">' + unsetText(rec) + '</span>';
+                        : '<span class="pve-meta-faded">' + unsetText(rec) + '</span>';
                     if (d.finding) {
                         // Advisory: the row stays editable, the message is in the
                         // tooltip. `warning` is proxmoxlib's own class.

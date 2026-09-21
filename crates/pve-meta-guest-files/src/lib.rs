@@ -14,6 +14,9 @@ pub mod plan;
 /// The top-level key of a document this crate reads.
 pub const PREFIX: &str = "guest-files";
 
+/// The pre-0.2 spelling of [`PREFIX`]: warned about, never read.
+pub(crate) const LEGACY_PREFIX: &str = "publish";
+
 /// The directory inside a guest relative paths resolve under; it also holds
 /// the manifest.
 pub const GUEST_ROOT: &str = "/etc/pve-meta";
