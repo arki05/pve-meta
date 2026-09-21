@@ -100,9 +100,9 @@ them in the same editor.
 |---|---|
 | <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-text-diff-dark.png"><img alt="Text mode with the diff" src="ui-extjs/docs/screenshots/readme-text-diff-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-save-anyway-dark.png"><img alt="The enforced-schema warning with the Save anyway tick" src="ui-extjs/docs/screenshots/readme-save-anyway-light.png"></picture> |
 
-| Prefixes on the Datacenter panel | Editing a declaration |
-|---|---|
-| <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-prefixes-dark.png"><img alt="The Prefixes grid" src="ui-extjs/docs/screenshots/readme-prefixes-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-declare-key-dark.png"><img alt="The declaration form" src="ui-extjs/docs/screenshots/readme-declare-key-light.png"></picture> |
+| Prefixes on the Datacenter panel |
+|---|
+| <picture><source media="(prefers-color-scheme: dark)" srcset="ui-extjs/docs/screenshots/readme-prefixes-dark.png"><img alt="The Prefixes grid" src="ui-extjs/docs/screenshots/readme-prefixes-light.png"></picture> |
 
 **From a script on the node**, no token, no pveproxy, works during boot:
 

@@ -68,11 +68,10 @@ That is what makes a root write put the file back in the order it was in.
 ## How it is wired
 
 pve-ext's page loader (`pve-ext/js/pve-ext-loader.js`) reads page manifests from
-`/usr/share/pve-ext/pages/*.json` through `GET /api2/json/ext/pages`. A manifest declares
-either `url` (a same-origin iframe) or `script` + `xtype` (a native panel class). This
-editor ships **two** manifests in the second form over one script, because a manifest
-carries a single `xtype` and the guest tab and the datacenter tab are different panels
-(DESIGN §8):
+`/usr/share/pve-ext/pages/*.json` through `GET /api2/json/ext/pages`. A manifest names a
+`script` and the `xtype` of the panel it defines. This editor ships **two** manifests
+over one script, because a manifest carries a single `xtype` and the guest tab and the
+datacenter tab are different panels (DESIGN §8):
 
 `pages/pve-meta.json`:
 
@@ -89,7 +88,7 @@ carries a single `xtype` and the guest tab and the datacenter tab are different 
 ```
 
 `pages/pve-meta-dc.json` is the same with `"id": "pve-meta-dc"`, `"targets": ["dc"]`,
-`"xtype": "pveMetaDatacenterPanel"` and `"requires": { "dc": ["Sys.Audit"] }`. The
+`"xtype": "pveMetaDatacenterPanel"`. The
 loader fetches a `script` once per URL, so the second manifest costs no second download.
 
 The file installs to `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-tree.js` with
