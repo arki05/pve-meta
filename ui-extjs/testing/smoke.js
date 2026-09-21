@@ -80,6 +80,9 @@ const ctx = {
             ctx.__defined.push(name);
         },
         data: { TreeModel: {} },
+        // The header installs one stylesheet rule for unset rows; record it
+        // so the suite can see the rule without a DOM.
+        util: { CSS: { createStyleSheet: (css, id) => ctx.__styles.push([id, css]) } },
         Msg: { alert: (title, msg) => ctx.__alerts.push([title, msg]) },
         window: { Window: {} },
         panel: { Panel: {} },
@@ -88,6 +91,7 @@ const ctx = {
     Proxmox: { Utils: { format_boolean: (v) => (v ? 'Yes' : 'No') } },
     __defined: [],
     __alerts: [],
+    __styles: [],
 };
 ctx.PVE = {};
 vm.createContext(ctx);
@@ -120,6 +124,9 @@ const throws = (name, fn, contains) => {
 };
 
 console.log('--- before the core has loaded: everything that asks it fails closed ---');
+eq('unset rows dim through one recorded stylesheet rule, not a fixed grey', ctx.__styles, [
+    ['pve-meta-faded', '.pve-meta-faded { opacity: 0.55; }'],
+]);
 // The core is lazy, and `syncButtons` runs on render ahead of the first document
 // read; the registry grid's dialogs can open before it too. This editor has
 // shipped two lazy-load ordering bugs already (js-yaml's). Nothing below may throw.

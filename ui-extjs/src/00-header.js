@@ -13,6 +13,9 @@ Ext.ns('PVE.meta');
 
 // Unset rows dim relative to the theme instead of taking a fixed grey: PVE
 // ships no theme-aware faded class, and a fixed rgb is pale-on-light and
-// near-invisible-on-dark (lab report 1, finding 4).
-Ext.util.CSS.createStyleSheet('.pve-meta-faded { opacity: 0.55; }', 'pve-meta-faded');
+// near-invisible-on-dark (lab report 1, finding 4). Guarded, not assumed:
+// the node smoke harness has no Ext.util.CSS (it records the rule instead).
+if (Ext.util && Ext.util.CSS && Ext.util.CSS.createStyleSheet) {
+    Ext.util.CSS.createStyleSheet('.pve-meta-faded { opacity: 0.55; }', 'pve-meta-faded');
+}
 
