@@ -1,4 +1,4 @@
-//! The manifest: `/etc/pve-meta/.published` inside the guest, one record per
+//! The manifest: `/etc/pve-meta/.guest-files` inside the guest, one record per
 //! file the daemon wrote.
 //!
 //! ```json
@@ -37,7 +37,7 @@ pub const MODE: u32 = 0o600;
 
 /// The manifest's name under [`GUEST_ROOT`]. No entry path may be it or run
 /// through it.
-pub const NAME: &str = ".published";
+pub const NAME: &str = ".guest-files";
 
 /// The largest manifest read back from a guest, in bytes.
 pub const MAX_BYTES: usize = 1024 * 1024;

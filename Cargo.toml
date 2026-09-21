@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/pve-meta-core",
     "crates/pve-meta-perl",
-    "crates/pve-meta-publish",
+    "crates/pve-meta-guest-files",
     "crates/pve-meta-wasm",
 ]
 # pve-meta-perl (PVE::RS::Meta perlmod bindings) needs `libperl-dev` headers
@@ -14,7 +14,7 @@ members = [
 # `cargo build --workspace` still targets every member, pve-meta-rs included.
 default-members = [
     "crates/pve-meta-core",
-    "crates/pve-meta-publish",
+    "crates/pve-meta-guest-files",
     "crates/pve-meta-wasm",
 ]
 

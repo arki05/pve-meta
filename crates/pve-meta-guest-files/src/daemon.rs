@@ -13,7 +13,7 @@
 //!   file edited or removed inside the guest; [`Timing::retry`] after a
 //!   failed one.
 //!
-//! A container is watched while its document has a `publish` key, and after
+//! A container is watched while its document has a `guest-files` key, and after
 //! that for as long as its manifest had records at its last sync, so removing
 //! the key cleans up. A stopped container is skipped until it starts, a locked
 //! one (a backup, a snapshot, a migration) until the lock is gone.
@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use pve_meta_core::store::{DocId, MetaStore};
 
-use crate::entry::{self, Publication};
+use crate::entry::{self, GuestFiles};
 use crate::guest::{self, Outcome};
 use crate::lock::GuestLock;
 use crate::node::{self, Kind};
@@ -95,11 +95,11 @@ pub fn due(
     memo: Option<&Memo>,
     inode: Option<u64>,
     digest: Option<&str>,
-    has_publish_key: bool,
+    has_guest_files_key: bool,
     now: Instant,
 ) -> Option<Reason> {
     inode?;
-    if !has_publish_key && !memo.is_some_and(|m| m.watched) {
+    if !has_guest_files_key && !memo.is_some_and(|m| m.watched) {
         return None;
     }
     let Some(m) = memo else {
@@ -151,7 +151,7 @@ impl Log {
 #[derive(Default)]
 pub struct Daemon {
     pub memos: HashMap<u32, Memo>,
-    publications: HashMap<u32, (Option<String>, Publication)>,
+    wanted: HashMap<u32, (Option<String>, GuestFiles)>,
     pub log: Log,
 }
 
@@ -161,7 +161,7 @@ impl Daemon {
         let node = node::nodename()?;
         let store = entry::open_store();
         eprintln!(
-            "pve-meta-publish on {node}: polling every {}s, drift check every {}s",
+            "pve-meta-guest-files on {node}: polling every {}s, drift check every {}s",
             timing.poll.as_secs(),
             timing.drift.as_secs()
         );
@@ -189,32 +189,32 @@ impl Daemon {
             .filter(|(_, g)| g.node == node && g.kind == Kind::Lxc)
             .map(|(vmid, _)| *vmid)
             .collect();
-        let mut publications = HashMap::new();
+        let mut next = HashMap::new();
         for &vmid in &local {
             let digest = match store.digest_of(&DocId::Guest(vmid)) {
                 Ok(d) => d,
                 Err(e) => return self.unavailable(format!("the document of {vmid}: {e}")),
             };
-            let publication = match self.publications.remove(&vmid) {
+            let wanted = match self.wanted.remove(&vmid) {
                 Some((d, p)) if d == digest => p,
-                _ => match entry::read_publication(store, vmid) {
+                _ => match entry::read_guest_files(store, vmid) {
                     Ok(p) => p,
                     Err(e) => return self.unavailable(format!("{e:#}")),
                 },
             };
-            publications.insert(vmid, (digest, publication));
+            next.insert(vmid, (digest, wanted));
         }
         if self.log.once(0, "unavailable", None) {
             eprintln!("available again");
         }
-        self.publications = publications;
+        self.wanted = next;
         self.memos.retain(|vmid, _| local.contains(vmid));
 
         let mut queue = Vec::new();
-        for (&vmid, (digest, publication)) in &self.publications {
+        for (&vmid, (digest, wanted)) in &self.wanted {
             let inode = active.get(&vmid).copied();
             let memo = self.memos.get(&vmid);
-            match due(memo, inode, digest.as_deref(), publication.has_publish_key(), now) {
+            match due(memo, inode, digest.as_deref(), wanted.has_guest_files_key(), now) {
                 Some(reason) => queue.push((reason, vmid)),
                 None => {
                     if let Some(m) = self.memos.get_mut(&vmid) {
@@ -262,14 +262,14 @@ impl Daemon {
                 return false;
             }
         };
-        let (digest, publication) = self.publications[&vmid].clone();
-        let result = guest::sync(&mut Pct { vmid }, &publication, false);
+        let (digest, wanted) = self.wanted[&vmid].clone();
+        let result = guest::sync(&mut Pct { vmid }, &wanted, false);
         let memo = self.memos.entry(vmid).or_default();
         memo.digest = digest;
         let report = match result {
             Ok(r) => r,
             Err(e) => {
-                memo.watched |= publication.has_publish_key();
+                memo.watched |= wanted.has_guest_files_key();
                 memo.next_due = Some(now + timing.retry);
                 self.log.once(vmid, "sync", Some(format!("sync failed: {e:#}")));
                 return true;

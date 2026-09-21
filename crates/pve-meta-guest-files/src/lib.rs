@@ -1,5 +1,5 @@
-//! `pve-meta-publish`: writes views of a container's pve-meta document into
-//! that container as files, one way, host to guest (`docs/PUBLISH.md`).
+//! `pve-meta-guest-files`: writes views of a container's pve-meta document into
+//! that container as files, one way, host to guest (`docs/GUEST-FILES.md`).
 //! Reads documents with [`pve_meta_core`]; acts inside a guest via `pct exec`.
 
 pub mod daemon;
@@ -12,13 +12,13 @@ pub mod pct;
 pub mod plan;
 
 /// The top-level key of a document this crate reads.
-pub const PREFIX: &str = "publish";
+pub const PREFIX: &str = "guest-files";
 
 /// The directory inside a guest relative paths resolve under; it also holds
 /// the manifest.
 pub const GUEST_ROOT: &str = "/etc/pve-meta";
 
-/// The largest content one entry may publish, in bytes: the store's own write
+/// The largest content one entry may write, in bytes: the store's own write
 /// cap ([`pve_meta_core::store::MAX_BYTES`]), which is the source of truth.
 ///
 /// A view is a part of a document, so a document written through the API can
@@ -35,8 +35,8 @@ mod tests {
     #[test]
     fn packaged_prefix_loads() {
         use pve_meta_core::registry::{self, Selector};
-        let def = registry::parse_prefix(crate::PREFIX, include_str!("../prefixes/publish.yaml"))
-            .expect("prefixes/publish.yaml loads");
+        let def = registry::parse_prefix(crate::PREFIX, include_str!("../prefixes/guest-files.yaml"))
+            .expect("prefixes/guest-files.yaml loads");
         assert_eq!(def.selector, Selector::All);
         assert!(def.enforce);
         assert!(def.schema.is_some());

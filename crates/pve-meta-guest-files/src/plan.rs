@@ -1,4 +1,4 @@
-//! The decision table of `docs/PUBLISH.md`: what a guest's document asks
+//! The decision table of `docs/GUEST-FILES.md`: what a guest's document asks
 //! for, what the manifest says was written, and what is in the guest now, in;
 //! the file operations and the manifest they leave, out. Pure: nothing here
 //! touches a guest.
@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::entry::{GuestPath, LocalEdits, Owner, Publication, Resolved};
+use crate::entry::{GuestPath, LocalEdits, Owner, GuestFiles, Resolved};
 use crate::manifest::{self, Manifest, Record};
 use crate::GUEST_ROOT;
 
@@ -151,15 +151,15 @@ impl Plan {
 
 /// Every path whose node a plan needs: each file wanted or recorded, every
 /// directory above it, and the manifest's directories.
-pub fn probe_paths(publication: &Publication, manifest: &Manifest) -> BTreeSet<String> {
+pub fn probe_paths(files: &GuestFiles, manifest: &Manifest) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = manifest::directories().into_iter().collect();
     let mut add = |p: &GuestPath| {
         out.extend(p.directories());
         out.insert(p.to_string());
     };
-    if let Publication::Entries(entries) = publication {
+    if let GuestFiles::Entries(entries) = files {
         for r in entries {
-            if let Resolved::Publish(d) = r {
+            if let Resolved::File(d) = r {
                 add(&d.entry.path);
             }
         }
@@ -205,7 +205,7 @@ pub fn assess(path: &GuestPath, nodes: &BTreeMap<String, Node>) -> FileState {
 /// Decides one sync. `force` overwrites local edits of wanted files; it never
 /// deletes one.
 pub fn plan(
-    publication: &Publication,
+    files: &GuestFiles,
     old: &Manifest,
     nodes: &BTreeMap<String, Node>,
     force: bool,
@@ -221,8 +221,8 @@ pub fn plan(
     let root_problem = manifest::directories()
         .iter()
         .find_map(|d| dir_problem(d, nodes.get(d).unwrap_or(&Node::Missing)));
-    let hold = match publication {
-        Publication::Held(why) => Some(why.clone()),
+    let hold = match files {
+        GuestFiles::Held(why) => Some(why.clone()),
         _ => root_problem,
     };
     if let Some(why) = hold {
@@ -233,8 +233,8 @@ pub fn plan(
         p.manifest = old.clone();
         return p;
     }
-    let entries = match publication {
-        Publication::Entries(entries) => entries.as_slice(),
+    let entries = match files {
+        GuestFiles::Entries(entries) => entries.as_slice(),
         _ => &[][..],
     };
 
@@ -248,7 +248,7 @@ pub fn plan(
 
     for r in entries {
         let d = match r {
-            Resolved::Publish(d) => d,
+            Resolved::File(d) => d,
             Resolved::Absent { .. } => continue,
             Resolved::Refused { name, reason } => {
                 let action = Action::Refused(reason.clone());
@@ -348,8 +348,8 @@ mod tests {
             .collect()
     }
 
-    fn wants(path: &str, content: &str, edits: LocalEdits) -> Publication {
-        Publication::Entries(vec![Resolved::Publish(Desired {
+    fn wants(path: &str, content: &str, edits: LocalEdits) -> GuestFiles {
+        GuestFiles::Entries(vec![Resolved::File(Desired {
             entry: Entry {
                 name: "t".into(),
                 view: Path::parse("a").unwrap(),
@@ -430,8 +430,8 @@ mod tests {
         }
         // Only the manifest has it: the entry was removed, or its view is gone.
         for pubn in [
-            Publication::Nothing,
-            Publication::Entries(vec![Resolved::Absent { name: "t".into() }]),
+            GuestFiles::Nothing,
+            GuestFiles::Entries(vec![Resolved::Absent { name: "t".into() }]),
         ] {
             for force in [false, true] {
                 let run = |node: Option<Node>| {
@@ -482,11 +482,11 @@ mod tests {
         let mut nodes = root_dirs();
         nodes.insert(T.into(), file("written", 0o444));
         // A refused entry holds its record; so does a document that cannot be read.
-        let refused = Publication::Entries(vec![Resolved::Refused {
+        let refused = GuestFiles::Entries(vec![Resolved::Refused {
             name: "t".into(),
             reason: "bad".into(),
         }]);
-        for pubn in [refused, Publication::Held("unreadable".into())] {
+        for pubn in [refused, GuestFiles::Held("unreadable".into())] {
             let p = plan(&pubn, &old, &nodes, true);
             assert!(matches!(only(&p), Action::Refused(_)));
             assert!(p.ops.is_empty() && !p.changes(&old));
@@ -498,7 +498,7 @@ mod tests {
             p.ops.is_empty() && matches!(only(&p), Action::Refused(r) if r.contains("symlink"))
         );
         // Nothing without a record is ever deleted.
-        let p = plan(&Publication::Nothing, &Manifest::default(), &root_dirs(), true);
+        let p = plan(&GuestFiles::Nothing, &Manifest::default(), &root_dirs(), true);
         assert!(p.items.is_empty() && p.ops.is_empty() && p.dirs.is_empty());
     }
 

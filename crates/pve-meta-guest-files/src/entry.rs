@@ -1,8 +1,8 @@
-//! The `publish` key of a guest's document: what should be a file inside the
+//! The `guest-files` key of a guest's document: what should be a file inside the
 //! guest, and what that file holds.
 //!
 //! Every entry is judged on its own. An entry that does not validate is
-//! **refused** and holds whatever it published before: a typo in `mode` must
+//! **refused** and holds whatever it wrote before: a typo in `mode` must
 //! not delete a service's configuration. An entry whose view is not in the
 //! document is **absent**, which is the same as the entry having been
 //! removed. Comment keys (`swap__`, `path__`) are the document's own notes and
@@ -24,8 +24,8 @@ use crate::{GUEST_ROOT, MAX_CONTENT_BYTES, PREFIX};
 pub const FORBIDDEN_ROOTS: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 /// Reserved inside every path segment: the daemon's temp files are named
-/// with it, so no published file can be one.
-pub const TEMP_MARK: &str = ".pve-meta-publish";
+/// with it, so no written file can be one.
+pub const TEMP_MARK: &str = ".pve-meta-guest-files";
 
 /// How a view becomes file content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,12 +49,12 @@ impl FileFormat {
     }
 }
 
-/// What happens to a file that no longer holds what was published.
+/// What happens to a file that no longer holds what was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalEdits {
     /// Leave it, and do not delete it either.
     Keep,
-    /// Replace it with the published content.
+    /// Replace it with the written content.
     Overwrite,
 }
 
@@ -150,7 +150,7 @@ impl GuestPath {
             }
         }
         if let Some(root) = FORBIDDEN_ROOTS.iter().find(|r| is_at_or_under(r, p)) {
-            return Err(format!("{root} is not a filesystem files are published to"));
+            return Err(format!("{root} is not a filesystem files are written to"));
         }
         let manifest = crate::manifest::path();
         if is_at_or_under(p, &manifest) || is_under(&manifest, p) {
@@ -233,42 +233,42 @@ pub struct Desired {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {
     /// A file with this content.
-    Publish(Desired),
+    File(Desired),
     /// No file: the view is not in the document.
     Absent { name: String },
-    /// Not valid; holds what the entry published before.
+    /// Not valid; holds what the entry wrote before.
     Refused { name: String, reason: String },
 }
 
 impl Resolved {
     pub fn name(&self) -> &str {
         match self {
-            Resolved::Publish(d) => &d.entry.name,
+            Resolved::File(d) => &d.entry.name,
             Resolved::Absent { name } | Resolved::Refused { name, .. } => name,
         }
     }
 }
 
-/// A guest's publication, as its document states it.
+/// A guest's files, as its document states it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Publication {
-    /// No document, or no `publish` key: nothing should be published.
+pub enum GuestFiles {
+    /// No document, or no `guest-files` key: nothing should be written.
     Nothing,
-    /// The document cannot be read, or `publish` is not a map. Everything
-    /// published before is held.
+    /// The document cannot be read, or `guest-files` is not a map. Everything
+    /// written before is held.
     Held(String),
     /// The entries, in document order.
     Entries(Vec<Resolved>),
 }
 
-impl Publication {
-    /// Reads the `publish` key of a parsed document.
-    pub fn of_document(doc: &Value) -> Publication {
+impl GuestFiles {
+    /// Reads the `guest-files` key of a parsed document.
+    pub fn of_document(doc: &Value) -> GuestFiles {
         let Some(tree) = doc.get(PREFIX) else {
-            return Publication::Nothing;
+            return GuestFiles::Nothing;
         };
         let Some(map) = tree.as_object() else {
-            return Publication::Held(format!("'{PREFIX}' is not a map"));
+            return GuestFiles::Held(format!("'{PREFIX}' is not a map"));
         };
         let mut entries: Vec<Resolved> = map
             .iter()
@@ -276,18 +276,18 @@ impl Publication {
             .map(|(name, spec)| resolve(doc, name, spec))
             .collect();
         refuse_collisions(&mut entries);
-        Publication::Entries(entries)
+        GuestFiles::Entries(entries)
     }
 
-    /// `true` when the document has a `publish` key, whatever it holds: the
+    /// `true` when the document has a `guest-files` key, whatever it holds: the
     /// guest is one the daemon watches.
-    pub fn has_publish_key(&self) -> bool {
-        !matches!(self, Publication::Nothing)
+    pub fn has_guest_files_key(&self) -> bool {
+        !matches!(self, GuestFiles::Nothing)
     }
 
     /// `true` when some entry wants a file.
     pub fn wants_files(&self) -> bool {
-        matches!(self, Publication::Entries(e) if e.iter().any(|r| matches!(r, Resolved::Publish(_))))
+        matches!(self, GuestFiles::Entries(e) if e.iter().any(|r| matches!(r, Resolved::File(_))))
     }
 }
 
@@ -302,16 +302,16 @@ pub fn open_store() -> MetaStore {
     MetaStore::new(store_root())
 }
 
-/// A guest's publication as its stored document says it. A document that
+/// A guest's files as its stored document says it. A document that
 /// does not parse, or is above the read cap, holds everything.
-pub fn read_publication(store: &MetaStore, vmid: u32) -> anyhow::Result<Publication> {
+pub fn read_guest_files(store: &MetaStore, vmid: u32) -> anyhow::Result<GuestFiles> {
     match store.read(&DocId::Guest(vmid)) {
         Ok(doc) => Ok(match &doc.parse_error {
-            Some(e) => Publication::Held(format!("the document does not parse: {e}")),
-            None => Publication::of_document(&doc.value),
+            Some(e) => GuestFiles::Held(format!("the document does not parse: {e}")),
+            None => GuestFiles::of_document(&doc.value),
         }),
-        Err(StoreError::NotFound(_)) => Ok(Publication::Nothing),
-        Err(e @ StoreError::TooLarge { .. }) => Ok(Publication::Held(e.to_string())),
+        Err(StoreError::NotFound(_)) => Ok(GuestFiles::Nothing),
+        Err(e @ StoreError::TooLarge { .. }) => Ok(GuestFiles::Held(e.to_string())),
         Err(e) => Err(anyhow::Error::new(e).context(format!("reading the document of {vmid}"))),
     }
 }
@@ -322,7 +322,7 @@ fn refuse_collisions(entries: &mut [Resolved]) {
     let paths: Vec<Option<GuestPath>> = entries
         .iter()
         .map(|r| match r {
-            Resolved::Publish(d) => Some(d.entry.path.clone()),
+            Resolved::File(d) => Some(d.entry.path.clone()),
             _ => None,
         })
         .collect();
@@ -354,14 +354,14 @@ fn resolve(doc: &Value, name: &str, spec: &Value) -> Resolved {
     };
     match render(&value, entry.format) {
         Ok(content) => {
-            Resolved::Publish(Desired { sha256: digest::digest(&content), content, entry })
+            Resolved::File(Desired { sha256: digest::digest(&content), content, entry })
         }
         Err(reason) => Resolved::Refused { name: name.to_string(), reason },
     }
 }
 
 /// The content of a view in `format`, or why it has none. Comment keys are
-/// the document's notes, not configuration, and are never published.
+/// the document's notes, not configuration, and are never written.
 pub fn render(value: &Value, format: FileFormat) -> Result<Vec<u8>, String> {
     let content = match format {
         FileFormat::Yaml => view::render(&view::strip_comments(value), Format::Yaml).into_bytes(),
@@ -439,8 +439,8 @@ mod tests {
     }
 
     fn entries(yaml: &str) -> Vec<Resolved> {
-        match Publication::of_document(&doc(yaml)) {
-            Publication::Entries(entries) => entries,
+        match GuestFiles::of_document(&doc(yaml)) {
+            GuestFiles::Entries(entries) => entries,
             other => panic!("{other:?}"),
         }
     }
@@ -456,7 +456,7 @@ mod tests {
             ("/root/somefile.yaml", "/root/somefile.yaml"),
             ("/run/app/conf", "/run/app/conf"),
             ("/devices", "/devices"),
-            ("a/.published", "/etc/pve-meta/a/.published"),
+            ("a/.guest-files", "/etc/pve-meta/a/.guest-files"),
         ] {
             assert_eq!(GuestPath::parse(given).unwrap().as_str(), resolved, "{given}");
         }
@@ -475,12 +475,12 @@ mod tests {
             "a\\b",
             "a*",
             "é",
-            ".published",
-            ".published/x",
-            "/etc/pve-meta/.published",
+            ".guest-files",
+            ".guest-files/x",
+            "/etc/pve-meta/.guest-files",
             "/etc/pve-meta",
             "/etc",
-            "a/.x.pve-meta-publish.tmp",
+            "a/.x.pve-meta-guest-files.tmp",
             "/proc/sys/x",
             "/sys",
             "/dev/null",
@@ -497,10 +497,10 @@ mod tests {
             p.directories(),
             ["/etc", "/etc/pve-meta", "/etc/pve-meta/llm", "/etc/pve-meta/llm/conf"]
         );
-        assert_eq!(p.temp(), "/etc/pve-meta/llm/conf/.swap.yaml.pve-meta-publish.tmp");
+        assert_eq!(p.temp(), "/etc/pve-meta/llm/conf/.swap.yaml.pve-meta-guest-files.tmp");
         assert_eq!(GuestPath::parse("/root/x").unwrap().directories(), ["/root"]);
         assert!(GuestPath::parse("/x").unwrap().directories().is_empty());
-        assert_eq!(GuestPath::parse("/x").unwrap().temp(), "/.x.pve-meta-publish.tmp");
+        assert_eq!(GuestPath::parse("/x").unwrap().temp(), "/.x.pve-meta-guest-files.tmp");
         let a = GuestPath::parse("/a").unwrap();
         assert!(a.nests_with(&GuestPath::parse("/a/b").unwrap()));
         assert!(!a.nests_with(&GuestPath::parse("/ab/c").unwrap()));
@@ -554,9 +554,9 @@ mod tests {
     #[test]
     fn defaults_and_rendered_content() {
         let e = entries(
-            "llm:\n  swap: {port: 8080}\npublish:\n  swap:\n    view: llm.swap\n    path: llm/swap.yaml\n",
+            "llm:\n  swap: {port: 8080}\nguest-files:\n  swap:\n    view: llm.swap\n    path: llm/swap.yaml\n",
         );
-        let Resolved::Publish(d) = &e[0] else { panic!("{e:?}") };
+        let Resolved::File(d) = &e[0] else { panic!("{e:?}") };
         assert_eq!(d.entry.mode, 0o444);
         assert_eq!(d.entry.owner, Owner::ROOT);
         assert_eq!(d.entry.format, FileFormat::Yaml);
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn missing_view_is_absent_and_bad_fields_are_refused() {
         let e = entries(
-            "a: {x: 1}\npublish:\n  gone: {view: a.y, path: g}\n  typo: {view: a, path: t, local_edit: keep}\n  \
+            "a: {x: 1}\nguest-files:\n  gone: {view: a.y, path: g}\n  typo: {view: a, path: t, local_edit: keep}\n  \
              mode: {view: a, path: m, mode: \"4755\"}\n  raw: {view: a, path: r, format: raw}\n  \
              dev: {view: a, path: /dev/sda}\n  noview: {path: n}\n  gone__: a comment key\n",
         );
@@ -582,25 +582,25 @@ mod tests {
     #[test]
     fn comment_keys_inside_an_entry_are_not_fields() {
         let e =
-            entries("a: 1\npublish:\n  x: {view: a, path: x, path__: where the service reads}\n");
-        assert!(matches!(e[0], Resolved::Publish(_)), "{e:?}");
+            entries("a: 1\nguest-files:\n  x: {view: a, path: x, path__: where the service reads}\n");
+        assert!(matches!(e[0], Resolved::File(_)), "{e:?}");
     }
 
     #[test]
     fn colliding_paths_refuse_both() {
         let e = entries(
-            "a: 1\npublish:\n  one: {view: a, path: x}\n  two: {view: a, path: x}\n  \
+            "a: 1\nguest-files:\n  one: {view: a, path: x}\n  two: {view: a, path: x}\n  \
              dir: {view: a, path: d}\n  under: {view: a, path: d/e}\n  \
              rel: {view: a, path: s}\n  abs: {view: a, path: /etc/pve-meta/s}\n  fine: {view: a, path: f}\n",
         );
         assert!(e[..6].iter().all(|r| matches!(r, Resolved::Refused { .. })), "{e:?}");
-        assert!(matches!(e[6], Resolved::Publish(_)));
+        assert!(matches!(e[6], Resolved::File(_)));
     }
 
     #[test]
     fn document_shapes() {
-        assert_eq!(Publication::of_document(&doc("a: 1\n")), Publication::Nothing);
-        assert!(matches!(Publication::of_document(&doc("publish: 3\n")), Publication::Held(_)));
-        assert!(Publication::of_document(&doc("publish: {}\n")).has_publish_key());
+        assert_eq!(GuestFiles::of_document(&doc("a: 1\n")), GuestFiles::Nothing);
+        assert!(matches!(GuestFiles::of_document(&doc("guest-files: 3\n")), GuestFiles::Held(_)));
+        assert!(GuestFiles::of_document(&doc("guest-files: {}\n")).has_guest_files_key());
     }
 }

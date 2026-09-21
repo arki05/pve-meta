@@ -197,7 +197,7 @@ rmf() {
 ";
 
 /// Ends every heredoc of content; not in the base64 alphabet.
-const EOF_MARK: &str = "PVE_META_PUBLISH_EOF";
+const EOF_MARK: &str = "PVE_META_GUEST_FILES_EOF";
 
 fn quote(s: &str) -> String {
     debug_assert!(!s.contains('\''));
@@ -432,7 +432,7 @@ mod tests {
             eprintln!("skipped: needs root, stat -c, sha256sum and base64");
             return;
         }
-        let root = format!("/run/pve-meta-publish-test-{}", std::process::id());
+        let root = format!("/run/pve-meta-guest-files-test-{}", std::process::id());
         let sh = |script: &str| {
             let out = run("sh", &["-s"], Some(script.as_bytes()), TIMEOUT).unwrap();
             assert_eq!(out.status, 0, "{}", out.stderr);

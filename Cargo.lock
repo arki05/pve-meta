@@ -255,7 +255,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pve-meta-publish"
+name = "pve-meta-guest-files"
 version = "0.1.3"
 dependencies = [
  "anyhow",

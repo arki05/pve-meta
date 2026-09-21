@@ -1,29 +1,29 @@
-//! `pve-meta-publish`: the daemon and the operator's commands, one binary.
+//! `pve-meta-guest-files`: the daemon and the operator's commands, one binary.
 
 use std::process::ExitCode;
 
 use anyhow::{bail, Context, Result};
 
-use pve_meta_publish::daemon::{Daemon, Timing};
-use pve_meta_publish::entry;
-use pve_meta_publish::guest::{self, Outcome};
-use pve_meta_publish::lock::GuestLock;
-use pve_meta_publish::node::{self, Kind};
-use pve_meta_publish::pct::Pct;
-use pve_meta_publish::plan::Action;
+use pve_meta_guest_files::daemon::{Daemon, Timing};
+use pve_meta_guest_files::entry;
+use pve_meta_guest_files::guest::{self, Outcome};
+use pve_meta_guest_files::lock::GuestLock;
+use pve_meta_guest_files::node::{self, Kind};
+use pve_meta_guest_files::pct::Pct;
+use pve_meta_guest_files::plan::Action;
 
-const USAGE: &str = "usage: pve-meta-publish daemon
-       pve-meta-publish sync <vmid> [--force]
-       pve-meta-publish status [<vmid>]
+const USAGE: &str = "usage: pve-meta-guest-files daemon
+       pve-meta-guest-files sync <vmid> [--force]
+       pve-meta-guest-files status [<vmid>]
 
   daemon  the loop the systemd unit runs: sync this node's containers when their
           document changes, when they start, and every ten minutes
   sync    sync one running container now; --force overwrites its local edits once
   status  per entry what a sync would do, checked in the guest now; every
-          container on this node with a 'publish' key by default
+          container on this node with a 'guest-files' key by default
 
 Writes go to /etc/pve-meta inside the container for a relative path, to the path
-itself for an absolute one. Only files recorded in /etc/pve-meta/.published are
+itself for an absolute one. Only files recorded in /etc/pve-meta/.guest-files are
 ever replaced or deleted without local_edits: overwrite or --force.
 ";
 
@@ -51,7 +51,7 @@ fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(e) => {
-            eprintln!("pve-meta-publish: {e:#}");
+            eprintln!("pve-meta-guest-files: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -67,7 +67,7 @@ fn not_syncable(vmid: u32) -> Result<Option<String>> {
     let here = node::nodename()?;
     let Some(g) = node::vmlist()?.remove(&vmid) else { bail!("{vmid} is not a guest") };
     if g.kind != Kind::Lxc {
-        bail!("{vmid} is not a container; 'publish' is for containers only");
+        bail!("{vmid} is not a container; 'guest-files' is for containers only");
     }
     if g.node != here {
         bail!("{vmid} is on node {}; run this there", g.node);
@@ -79,9 +79,9 @@ fn sync(vmid: u32, force: bool) -> Result<bool> {
     if let Some(why) = not_syncable(vmid)? {
         bail!("{vmid} is {why}");
     }
-    let publication = entry::read_publication(&entry::open_store(), vmid)?;
+    let files = entry::read_guest_files(&entry::open_store(), vmid)?;
     let _lock = GuestLock::take(vmid, true)?;
-    let report = guest::sync(&mut Pct { vmid }, &publication, force)?;
+    let report = guest::sync(&mut Pct { vmid }, &files, force)?;
     if let Some(w) = &report.warning {
         println!("warning: {w}");
     }
@@ -121,21 +121,21 @@ fn status(only: Option<u32>) -> Result<bool> {
     println!("{:<8} {:<20} {:<44} STATE", "VMID", "ENTRY", "PATH");
     let mut ok = true;
     for vmid in vmids {
-        let publication = entry::read_publication(&store, vmid)?;
-        if only.is_none() && !publication.has_publish_key() {
+        let files = entry::read_guest_files(&store, vmid)?;
+        if only.is_none() && !files.has_guest_files_key() {
             continue;
         }
         if let Some(why) = not_syncable(vmid)? {
             row(vmid, "-", "-", &why);
             continue;
         }
-        match guest::inspect(&mut Pct { vmid }, &publication, false) {
+        match guest::inspect(&mut Pct { vmid }, &files, false) {
             Ok(ins) => {
                 if let Some(w) = &ins.warning {
                     row(vmid, "-", "-", &format!("warning: {w}"));
                 }
                 if ins.plan.items.is_empty() {
-                    row(vmid, "-", "-", "nothing published");
+                    row(vmid, "-", "-", "no files");
                 }
                 for item in &ins.plan.items {
                     let path = item.path.as_ref().map(|p| p.as_str()).unwrap_or("-");

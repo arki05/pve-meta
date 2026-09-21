@@ -23,11 +23,11 @@ MONACO := $(UI_DIR)/monaco/vs
 WASM_TARGET := wasm32-unknown-unknown
 WASM := target/$(WASM_TARGET)/wasm/pve_meta_wasm.wasm
 
-.PHONY: build ui js wasm deb install install-publish clean check check-perl test doc
+.PHONY: build ui js wasm deb install install-guest-files clean check check-perl test doc
 
 build: wasm js
 	$(MAKE) -C crates/pve-meta-perl BUILD_MODE=release
-	$(CARGO) build --release -p pve-meta-publish
+	$(CARGO) build --release -p pve-meta-guest-files
 
 wasm:
 	$(CARGO) build -p pve-meta-wasm --target $(WASM_TARGET) --profile wasm
@@ -56,8 +56,8 @@ ui:
 # pve-ext/README.md): the API module (auto-discovered), the UI pages
 # (pages/*.json), and the managed lifecycle patch. Three binary packages come
 # from this source (debian/control): `pve-meta` (below), `libpve-meta-rs-perl`
-# (crates/pve-meta-perl's own `install`, PACKAGING.md), and `pve-meta-publish`
-# (install-publish, below).
+# (crates/pve-meta-perl's own `install`, PACKAGING.md), and `pve-meta-guest-files`
+# (install-guest-files, below).
 install: js
 	if [ -f perl/PVE/API2/Ext/Meta.pm ]; then \
 		install -D -m 0644 perl/PVE/API2/Ext/Meta.pm $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext/Meta.pm; \
@@ -94,13 +94,13 @@ install: js
 		cp -a $(MONACO)/. $(DESTDIR)$(PREFIX)/share/pve-manager/js/pve-meta-extjs/vs/; \
 	fi
 
-# The pve-meta-publish package (docs/PUBLISH.md): the daemon, in sbin since it
-# writes into containers as root, and the `publish` prefix it reads. The
-# systemd unit (debian/pve-meta-publish.service) is installed by dh_installsystemd.
-install-publish:
-	install -D -m 0755 target/release/pve-meta-publish $(DESTDIR)$(PREFIX)/sbin/pve-meta-publish
-	install -D -m 0644 crates/pve-meta-publish/prefixes/publish.yaml \
-		$(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/publish.yaml
+# The pve-meta-guest-files package (docs/GUEST-FILES.md): the daemon, in sbin since it
+# writes into containers as root, and the `guest-files` prefix it reads. The
+# systemd unit (debian/pve-meta-guest-files.service) is installed by dh_installsystemd.
+install-guest-files:
+	install -D -m 0755 target/release/pve-meta-guest-files $(DESTDIR)$(PREFIX)/sbin/pve-meta-guest-files
+	install -D -m 0644 crates/pve-meta-guest-files/prefixes/guest-files.yaml \
+		$(DESTDIR)$(PREFIX)/share/pve-meta/prefixes/guest-files.yaml
 
 # Builds every package this repo ships: pve-ext's own source package (moving its
 # artifacts up from pve-ext/'s parent to sit next to this package's own), then
@@ -112,15 +112,15 @@ deb:
 	for f in pve-ext_*.deb pve-ext_*.buildinfo pve-ext_*.changes; do [ -e "$$f" ] && mv -f "$$f" ..; done
 	dpkg-buildpackage -b -us -uc -d
 	if [ -n "$$CI" ]; then \
-		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-publish_*.deb ../pve-ext_*.deb; \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-guest-files_*.deb ../pve-ext_*.deb; \
 	else \
-		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-publish_*.deb ../pve-ext_*.deb || true; \
+		lintian ../pve-meta_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta-guest-files_*.deb ../pve-ext_*.deb || true; \
 	fi
 
 # A broken intra-doc link is caught here but not by clippy; needs no libperl,
 # so it also runs on a workstation.
 doc:
-	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps -p pve-meta-core -p pve-meta-publish
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps -p pve-meta-core -p pve-meta-guest-files
 
 check: doc wasm js
 	$(CARGO) clippy --workspace -- -D warnings
@@ -143,7 +143,7 @@ check-perl:
 	done
 
 test:
-	$(CARGO) test -p pve-meta-core -p pve-meta-wasm -p pve-meta-publish
+	$(CARGO) test -p pve-meta-core -p pve-meta-wasm -p pve-meta-guest-files
 
 clean:
 	$(CARGO) clean

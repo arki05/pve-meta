@@ -26,12 +26,12 @@ endif
 #   - `libpve-meta-rs-perl`: crates/pve-meta-perl's own Makefile, its own DESTDIR
 #     (see crates/pve-meta-perl/PACKAGING.md, option 1) so its files never land in
 #     the other package's tree.
-#   - `pve-meta-publish`:    top-level Makefile's `install-publish` target, its own
-#     DESTDIR likewise; its unit is debian/pve-meta-publish.service.
+#   - `pve-meta-guest-files`:    top-level Makefile's `install-guest-files` target, its own
+#     DESTDIR likewise; its unit is debian/pve-meta-guest-files.service.
 override_dh_auto_install:
 	$(MAKE) install DESTDIR=$(CURDIR)/debian/pve-meta PREFIX=/usr
 	$(MAKE) -C crates/pve-meta-perl install DESTDIR=$(CURDIR)/debian/libpve-meta-rs-perl
-	$(MAKE) install-publish DESTDIR=$(CURDIR)/debian/pve-meta-publish PREFIX=/usr
+	$(MAKE) install-guest-files DESTDIR=$(CURDIR)/debian/pve-meta-guest-files PREFIX=/usr
 
 override_dh_auto_test:
 	# Rust tests run separately on the build host (make test);

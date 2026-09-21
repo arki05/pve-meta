@@ -128,19 +128,19 @@ pvesh get /meta/version                                  # a token; moves when a
 
 Every write leaves one syslog line tagged `pve-meta audit:`.
 
-**Into a container**, with the optional `pve-meta-publish` package: a `publish` entry
+**Into a container**, with the optional `pve-meta-guest-files` package: a `guest-files` entry
 names a view of the container's own document and a path inside it, and a daemon on each
 node writes it there, as YAML or JSON without its comment keys or as verbatim text, on
 change, on container start and against drift. One way; a file edited inside the container is left alone unless the
-entry says `overwrite`. Writing `publish` is root in that container.
+entry says `overwrite`. Writing `guest-files` is root in that container.
 
 ```yaml
-publish:
+guest-files:
   swap: { view: llm.swap, path: /etc/llama-swap/config.yaml }
 ```
 
 > [!WARNING]
-> **With `pve-meta-publish` installed, write access to `publish` means root inside that
+> **With `pve-meta-guest-files` installed, write access to `guest-files` means root inside that
 > container.** It writes any file, with any owner and mode, as root. Gate it like root:
 > grant `VM.Config.Options` on a container only to those you'd trust with root inside
 > it. It guards against accidents, not against users inside the container.

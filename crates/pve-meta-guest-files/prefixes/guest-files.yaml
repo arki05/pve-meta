@@ -1,31 +1,31 @@
-# The `publish` prefix (docs/PUBLISH.md), shipped by the pve-meta-publish
-# package to /usr/share/pve-meta/prefixes/publish.yaml; a cluster file of the
-# same name at /etc/pve/meta.d/prefixes/publish.yaml overrides it, and a
-# node's /etc/pve/nodes/<node>/meta.d/prefixes/publish.yaml does for the
-# containers on that node.
+# The `guest-files` prefix (docs/GUEST-FILES.md), shipped by the
+# pve-meta-guest-files package to /usr/share/pve-meta/prefixes/guest-files.yaml;
+# a cluster file of the same name at /etc/pve/meta.d/prefixes/guest-files.yaml
+# overrides it. Per-node differences are a `nodes:` map inside that file, never
+# a second file (docs/DESIGN.md §3).
 #
 # Every guest, because a container opts in by having the key, not by a tag.
-# Enforced, so a write that makes `publish` something other than a map is
-# refused (force=1 stores it, and the daemon then holds what it published).
+# Enforced, so a write that makes `guest-files` something other than a map is
+# refused (force=1 stores it, and the daemon then holds what it wrote).
 #
 # The entry names are the document's own, and the schema dialect has no way
 # to describe the members of a map whose keys it does not know, so each
 # entry's fields are described here and checked by the daemon: an entry that
 # does not validate is refused, logged, and shown by
-# `pve-meta-publish status`.
-description: Files pve-meta-publish writes into this container
+# `pve-meta-guest-files status`.
+description: Files pve-meta-guest-files writes into this container
 selector: { all: true }
 enforce: true
 schema:
   type: object
   description: >-
     One map per file, keyed by an entry name of your choice. view (required):
-    a dotted view into this document, published as the file's content.
+    a dotted view into this document, written as the file's content.
     path (required): a path inside the container; relative paths are under
     /etc/pve-meta, absolute ones are used as they are (not under /proc, /sys
     or /dev; no symlink and nothing but directories on the way). format: yaml (default), json, or raw (the view is a string,
     written verbatim). mode: octal, default "0444". owner: uid:gid inside the
     container, default "0:0". local_edits: keep (default) leaves a file that
-    was changed in the container, or that pve-meta-publish did not write, and
+    was changed in the container, or that pve-meta-guest-files did not write, and
     never deletes it; overwrite replaces it. Writing this key is root inside
     the container.

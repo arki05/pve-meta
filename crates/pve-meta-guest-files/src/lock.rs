@@ -8,7 +8,7 @@ use std::os::unix::io::AsRawFd;
 
 use anyhow::{bail, Context, Result};
 
-pub const DIR: &str = "/run/lock/pve-meta-publish";
+pub const DIR: &str = "/run/lock/pve-meta-guest-files";
 
 pub struct GuestLock {
     _file: File,

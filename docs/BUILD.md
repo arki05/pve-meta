@@ -62,7 +62,7 @@ no guaranteed network for crates.io), so these run by hand and in CI, before the
 packages are built:
 
 ```sh
-make test                                        # every pve-meta-core, pve-meta-wasm and pve-meta-publish test; runs on macOS
+make test                                        # every pve-meta-core, pve-meta-wasm and pve-meta-guest-files test; runs on macOS
 cargo test -p pve-meta-core                      # the core crate alone
 make check                                       # rustdoc -D warnings, clippy, make wasm, the smoke suite
 node ui-extjs/testing/smoke.js                   # the editor's offline suite against the built .wasm (after make wasm)
@@ -104,7 +104,7 @@ make deb   # builds pve-ext (make -C pve-ext deb) and this source's own three
 
 This produces four binary packages: `../pve-ext_<version>_all.deb`,
 `../pve-meta_<version>_all.deb`, `../libpve-meta-rs-perl_<version>_<arch>.deb` and
-`../pve-meta-publish_<version>_<arch>.deb` (plus `-dbgsym` packages for the two compiled
+`../pve-meta-guest-files_<version>_<arch>.deb` (plus `-dbgsym` packages for the two compiled
 ones; dpkg-buildpackage places artifacts in the
 parent directory, and the root `deb` target moves pve-ext's own output there too, since
 a plain `dpkg-buildpackage` run from `pve-ext/` would otherwise drop them one level
@@ -114,7 +114,7 @@ upgrade) it first — apt resolves the order for you either way:
 ```sh
 apt install ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb
 # or: dpkg -i ../pve-ext_*.deb ../libpve-meta-rs-perl_*.deb ../pve-meta_*.deb && apt-get -f install
-apt install ../pve-meta-publish_*.deb    # optional: the publish daemon (docs/DESIGN.md §8)
+apt install ../pve-meta-guest-files_*.deb    # optional: the guest-files daemon (docs/DESIGN.md §8)
 ```
 
 `libpve-meta-rs-perl` ships `activate-noawait pve-api-updates`

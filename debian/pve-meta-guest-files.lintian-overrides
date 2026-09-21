@@ -3,4 +3,4 @@
 # heuristic fires on libyaml's message text and symbol names, not on copied C
 # object code. The same override, and the same reasoning at more length, is in
 # debian/libpve-meta-rs-perl.lintian-overrides.
-pve-meta-publish: embedded-library libyaml [usr/sbin/pve-meta-publish]
+pve-meta-guest-files: embedded-library libyaml [usr/sbin/pve-meta-guest-files]

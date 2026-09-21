@@ -8,7 +8,7 @@ if a patched upstream package no longer matches our patch.
 `.github/workflows/build.yml` builds and tests every push on **amd64 and arm64** --
 native builds in a `debian:trixie` container on each architecture, because
 `libpve-meta-rs-perl` is a compiled Perl module and each architecture builds its own;
-`pve-meta-publish` is a compiled binary too. The two `Architecture: all` packages
+`pve-meta-guest-files` is a compiled binary too. The two `Architecture: all` packages
 (`pve-meta`, `pve-ext`) are taken from the amd64 job alone, so one file name never means
 two different files.
 
@@ -65,7 +65,7 @@ apt update && apt install pve-meta
 ```
 
 `pve-meta` depends on `pve-ext` and `libpve-meta-rs-perl`, so apt installs all three.
-`pve-meta-publish` is not pulled in; `apt install pve-meta-publish` adds it.
+`pve-meta-guest-files` is not pulled in; `apt install pve-meta-guest-files` adds it.
 
 ## 3. Upgrade safety
 

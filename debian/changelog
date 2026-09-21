@@ -32,7 +32,10 @@ pve-meta (0.2.0-1) UNRELEASED; urgency=medium
   * pve-ext: the manifest id, the .claimed-by marker, the manifest-id
     subcommand, the requires gating of tabs and the iframe page form are
     gone; a leftover marker is ignored.
-  * pve-meta-publish: a path has no length cap of its own, and the manifest's
+  * pve-meta-guest-files (renamed since 0.1.x, when it was pve-meta-publish):
+    the document key is `guest-files`, not `publish`; the daemon, package,
+    prefix file and manifest (now `/etc/pve-meta/.guest-files`) follow the
+    new name. A path has no length cap of its own, and the manifest's
     entry name and hash are the daemon's own and otherwise unchecked.
   * The design is docs/DESIGN.md, 150 lines of model, invariants and
     non-goals; the code, its comments and its tests are about half their

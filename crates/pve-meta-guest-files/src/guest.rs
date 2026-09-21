@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 
-use crate::entry::{Owner, Publication};
+use crate::entry::{Owner, GuestFiles};
 use crate::manifest::{self, Manifest};
 use crate::plan::{self, Action, Expect, Item, Node, Op, Plan};
 
@@ -51,7 +51,7 @@ pub struct Inspection {
 }
 
 /// Reads the manifest and probes the guest, and decides. Changes nothing.
-pub fn inspect(g: &mut dyn Guest, publication: &Publication, force: bool) -> Result<Inspection> {
+pub fn inspect(g: &mut dyn Guest, files: &GuestFiles, force: bool) -> Result<Inspection> {
     let (manifest, warning) = match g.read(&manifest::path(), manifest::MAX_BYTES)? {
         None => (Manifest::default(), None),
         Some(bytes) => match Manifest::parse(&bytes) {
@@ -63,13 +63,13 @@ pub fn inspect(g: &mut dyn Guest, publication: &Publication, force: bool) -> Res
         },
     };
     // Nothing wanted and nothing recorded: there is no path to look at.
-    let nodes = if publication.wants_files() || !manifest.is_empty() {
-        let paths: Vec<String> = plan::probe_paths(publication, &manifest).into_iter().collect();
+    let nodes = if files.wants_files() || !manifest.is_empty() {
+        let paths: Vec<String> = plan::probe_paths(files, &manifest).into_iter().collect();
         g.probe(&paths)?
     } else {
         BTreeMap::new()
     };
-    let plan = plan::plan(publication, &manifest, &nodes, force);
+    let plan = plan::plan(files, &manifest, &nodes, force);
     Ok(Inspection { plan, manifest, warning })
 }
 
@@ -91,8 +91,8 @@ pub struct Report {
 }
 
 /// Runs one sync.
-pub fn sync(g: &mut dyn Guest, publication: &Publication, force: bool) -> Result<Report> {
-    let ins = inspect(g, publication, force)?;
+pub fn sync(g: &mut dyn Guest, files: &GuestFiles, force: bool) -> Result<Report> {
+    let ins = inspect(g, files, force)?;
     let plan = &ins.plan;
     let mut outcomes = Vec::new();
     let mut manifest = ins.manifest.clone();
@@ -268,11 +268,11 @@ mod tests {
     use super::*;
     use pve_meta_core::format::{self, Format};
 
-    fn publication(yaml: &str) -> Publication {
-        Publication::of_document(&format::parse(Format::Yaml, yaml).unwrap())
+    fn guest_files(yaml: &str) -> GuestFiles {
+        GuestFiles::of_document(&format::parse(Format::Yaml, yaml).unwrap())
     }
 
-    const DOC: &str = "llm:\n  swap: {port: 8080}\nproxy: {host: web}\npublish:\n  \
+    const DOC: &str = "llm:\n  swap: {port: 8080}\nproxy: {host: web}\nguest-files:\n  \
                        swap: {view: llm.swap, path: llm/swap.yaml}\n  \
                        proxy: {view: proxy, path: /etc/traefik/dynamic.json, format: json, mode: \"0640\", owner: \"0:33\"}\n";
     const SWAP: &str = "/etc/pve-meta/llm/swap.yaml";
@@ -286,9 +286,9 @@ mod tests {
     }
 
     #[test]
-    fn publish_update_and_remove() {
+    fn guest_files_update_and_remove() {
         let mut g = Fake::new();
-        let r = sync(&mut g, &publication(DOC), false).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), false).unwrap();
         let created = (Action::Create, Some(Outcome::Done));
         assert_eq!(actions(&r), [created.clone(), created]);
         assert_eq!(g.text(SWAP).unwrap(), "port: 8080\n");
@@ -299,16 +299,16 @@ mod tests {
         ));
         assert!(matches!(g.fs.get("/etc/traefik"), Some(F::Dir { uid: 0, mode: 0o755 })));
         assert!(matches!(
-            g.fs.get("/etc/pve-meta/.published"),
+            g.fs.get("/etc/pve-meta/.guest-files"),
             Some(F::File { mode: 0o600, uid: 0, .. })
         ));
-        assert!(all_in_sync(&sync(&mut g, &publication(DOC), false).unwrap()));
+        assert!(all_in_sync(&sync(&mut g, &guest_files(DOC), false).unwrap()));
 
-        let r = sync(&mut g, &publication(&DOC.replace("8080", "9090")), false).unwrap();
+        let r = sync(&mut g, &guest_files(&DOC.replace("8080", "9090")), false).unwrap();
         assert_eq!(actions(&r)[0], (Action::Update, Some(Outcome::Done)));
         assert!(describe(&r.items[0]).unwrap().ends_with("update: done"));
 
-        let r = sync(&mut g, &publication("llm: {}\n"), false).unwrap();
+        let r = sync(&mut g, &guest_files("llm: {}\n"), false).unwrap();
         assert!(actions(&r).iter().all(|a| *a == (Action::Delete, Some(Outcome::Done))));
         assert!(g.text(SWAP).is_none() && !r.has_records);
         assert!(g.fs.contains_key("/etc/traefik"));
@@ -319,21 +319,21 @@ mod tests {
         let mut g = Fake::new();
         g.fs.insert("/etc/traefik".into(), F::Dir { uid: 0, mode: 0o755 });
         g.put("/etc/traefik/dynamic.json", "the distribution's own\n");
-        let r = sync(&mut g, &publication(DOC), false).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), false).unwrap();
         assert_eq!(actions(&r)[1].0, Action::KeptLocalEdit);
         assert!(describe(&r.items[1]).unwrap().ends_with("local edit kept"));
         // Removing the entry never deletes a file that was not ours.
-        sync(&mut g, &publication("a: 1\n"), false).unwrap();
+        sync(&mut g, &guest_files("a: 1\n"), false).unwrap();
         assert_eq!(g.text("/etc/traefik/dynamic.json").unwrap(), "the distribution's own\n");
 
         g.put(SWAP, "port: 1\n");
-        let r = sync(&mut g, &publication(DOC), false).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), false).unwrap();
         assert_eq!(actions(&r)[0].0, Action::KeptLocalEdit);
-        let r = sync(&mut g, &publication(DOC), true).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), true).unwrap();
         assert!(actions(&r).iter().all(|a| *a == (Action::Overwrite, Some(Outcome::Done))));
         assert_eq!(g.text(SWAP).unwrap(), "port: 8080\n");
         // Adopted: the entry's removal now deletes it.
-        let r = sync(&mut g, &publication("a: 1\n"), false).unwrap();
+        let r = sync(&mut g, &guest_files("a: 1\n"), false).unwrap();
         assert!(actions(&r).iter().all(|a| a.0 == Action::Delete));
         assert!(g.text("/etc/traefik/dynamic.json").is_none());
     }
@@ -341,48 +341,48 @@ mod tests {
     #[test]
     fn a_failed_or_raced_item_does_not_block_the_others() {
         let mut g = Fake::new();
-        sync(&mut g, &publication(DOC), false).unwrap();
+        sync(&mut g, &guest_files(DOC), false).unwrap();
         let changed = DOC.replace("8080", "9090").replace("web", "proxy");
         g.fails.insert(SWAP.into());
-        let r = sync(&mut g, &publication(&changed), false).unwrap();
+        let r = sync(&mut g, &guest_files(&changed), false).unwrap();
         assert!(matches!(actions(&r)[0].1, Some(Outcome::Failed(_))));
         assert_eq!(actions(&r)[1], (Action::Update, Some(Outcome::Done)));
         assert_eq!(g.text(SWAP).unwrap(), "port: 8080\n");
         g.fails.clear();
-        let r = sync(&mut g, &publication(&changed), false).unwrap();
+        let r = sync(&mut g, &guest_files(&changed), false).unwrap();
         assert_eq!(actions(&r)[0], (Action::Update, Some(Outcome::Done)));
-        assert!(all_in_sync(&sync(&mut g, &publication(&changed), false).unwrap()));
+        assert!(all_in_sync(&sync(&mut g, &guest_files(&changed), false).unwrap()));
 
         // An edit between the probe and the commit wins, and is then a local edit.
         g.race = Some((SWAP.into(), "raced\n".into()));
-        let r = sync(&mut g, &publication(DOC), false).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), false).unwrap();
         assert_eq!(actions(&r)[0], (Action::Update, Some(Outcome::Changed)));
         assert_eq!(g.text(SWAP).unwrap(), "raced\n");
-        let r = sync(&mut g, &publication(DOC), false).unwrap();
+        let r = sync(&mut g, &guest_files(DOC), false).unwrap();
         assert_eq!(actions(&r)[0].0, Action::KeptLocalEdit);
     }
 
     #[test]
     fn an_untrusted_manifest_deletes_nothing_and_matching_files_are_adopted() {
         let mut g = Fake::new();
-        sync(&mut g, &publication(DOC), false).unwrap();
-        g.put("/etc/pve-meta/.published", "garbage");
-        let r = sync(&mut g, &publication("llm: {}\n"), false).unwrap();
+        sync(&mut g, &guest_files(DOC), false).unwrap();
+        g.put("/etc/pve-meta/.guest-files", "garbage");
+        let r = sync(&mut g, &guest_files("llm: {}\n"), false).unwrap();
         assert!(r.items.is_empty() && r.warning.is_some());
         assert!(g.text(SWAP).is_some());
-        assert!(all_in_sync(&sync(&mut g, &publication(DOC), false).unwrap()));
-        assert!(g.text("/etc/pve-meta/.published").unwrap().contains("swap.yaml"));
+        assert!(all_in_sync(&sync(&mut g, &guest_files(DOC), false).unwrap()));
+        assert!(g.text("/etc/pve-meta/.guest-files").unwrap().contains("swap.yaml"));
 
-        g.put("/etc/pve-meta/.published", &"x".repeat(manifest::MAX_BYTES + 1));
-        assert!(sync(&mut g, &publication(DOC), false).is_err());
+        g.put("/etc/pve-meta/.guest-files", &"x".repeat(manifest::MAX_BYTES + 1));
+        assert!(sync(&mut g, &guest_files(DOC), false).is_err());
     }
 
     #[test]
-    fn a_guest_that_never_published_is_not_written_to() {
+    fn a_guest_without_guest_files_is_not_written_to() {
         let mut g = Fake::new();
-        let r = sync(&mut g, &Publication::Nothing, false).unwrap();
+        let r = sync(&mut g, &GuestFiles::Nothing, false).unwrap();
         assert!(r.items.is_empty() && !r.has_records);
-        let r = sync(&mut g, &publication("publish:\n  t: {view: a}\n"), false).unwrap();
+        let r = sync(&mut g, &guest_files("guest-files:\n  t: {view: a}\n"), false).unwrap();
         assert!(matches!(r.items[0].item.action, Action::Refused(_)));
         assert!(!g.fs.contains_key("/etc/pve-meta"));
     }

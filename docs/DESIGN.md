@@ -139,8 +139,8 @@ nothing. Clone is not carried. There is no sweeper: `pve-meta ls --orphans` and
   view, and a datacenter tab listing prefix files. An edit is one write with the digest,
   as everywhere in PVE; a 409 reloads.
 * **pve-ext** (own package): mounts the API module, adds the tabs, applies the patches.
-* **pve-meta-publish** (own package): writes views of a container's document into it as
-  files. `PUBLISH.md`.
+* **pve-meta-guest-files** (own package): writes views of a container's document into it as
+  files. `GUEST-FILES.md`.
 
 ## 9. Planned, not in 0.2.0
 
