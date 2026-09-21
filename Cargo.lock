@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "pve-meta-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "pve-meta-guest-files"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "pve-meta-rs"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "perlmod",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "pve-meta-wasm"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "pretty_assertions",
  "pve-meta-core",
