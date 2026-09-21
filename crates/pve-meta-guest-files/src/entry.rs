@@ -210,23 +210,90 @@ pub fn temp_for(absolute: &str) -> String {
 }
 
 /// One entry, validated.
+///
+/// `view` is `Some` for entries read from a document and `None` for managed
+/// entries built by an operator through [`Entry::managed`]: the content of a
+/// managed entry is given, never rendered from a document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
-    pub view: Path,
+    pub view: Option<Path>,
     pub path: GuestPath,
     pub format: FileFormat,
     pub mode: u32,
     pub owner: Owner,
     pub local_edits: LocalEdits,
+    /// Who owns this entry: `user/<name>` for document entries,
+    /// `managed/<operator>/<name>` for operator-built ones. Recorded in the
+    /// manifest, so two writers claiming one path refuse each other by name.
+    pub source: String,
 }
 
-/// An entry with its content rendered from the document.
+/// The source of a document entry: its own name under `user/`.
+pub fn user_source(name: &str) -> String {
+    format!("user/{name}")
+}
+
+/// The source of an operator-built entry.
+pub fn managed_source(operator: &str, name: &str) -> String {
+    format!("managed/{operator}/{name}")
+}
+
+/// `true` for a `managed/` source.
+pub fn is_managed_source(source: &str) -> bool {
+    source.starts_with("managed/")
+}
+
+/// Two sources claiming one path refuse each other, except two `user/`
+/// entries: renaming an entry keeps its path working as before. A managed
+/// source meeting anything but itself is always a fight between two writers.
+pub(crate) fn sources_conflict(a: &str, b: &str) -> bool {
+    a != b && (is_managed_source(a) || is_managed_source(b))
+}
+
+impl Entry {
+    /// An operator-built entry: content given through [`Desired::direct`],
+    /// never rendered from a document. The same path, mode and owner rules
+    /// as a document entry; `format` is accepted and ignored.
+    pub fn managed(
+        operator: &str,
+        name: &str,
+        path: &str,
+        format: FileFormat,
+        mode: &str,
+        owner: &str,
+        local_edits: LocalEdits,
+    ) -> Result<Entry, String> {
+        Ok(Entry {
+            name: name.to_string(),
+            view: None,
+            path: GuestPath::parse(path)?,
+            format,
+            mode: parse_mode(mode)
+                .ok_or(format!("mode '{mode}' is not an octal mode such as \"0444\""))?,
+            owner: Owner::parse(owner).ok_or(format!("owner '{owner}' is not uid:gid"))?,
+            local_edits,
+            source: managed_source(operator, name),
+        })
+    }
+}
+
+/// An entry with its content rendered from the document, or handed over
+/// by an operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Desired {
     pub entry: Entry,
     pub content: Vec<u8>,
     pub sha256: String,
+}
+
+impl Desired {
+    /// Content handed over by an operator for a managed entry: the same size
+    /// cap as rendered content, nothing else checked.
+    pub fn direct(entry: Entry, content: Vec<u8>) -> Result<Desired, String> {
+        check_content_len(&content)?;
+        Ok(Desired { sha256: digest::digest(&content), content, entry })
+    }
 }
 
 /// What one entry of the document asks for.
@@ -249,7 +316,8 @@ impl Resolved {
     }
 }
 
-/// A guest's files, as its document states it.
+/// A guest's files, as its document states it — or as an operator hands
+/// them over. The daemon only ever sees the document side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuestFiles {
     /// No document, or no `guest-files` key: nothing should be written.
@@ -259,6 +327,10 @@ pub enum GuestFiles {
     Held(String),
     /// The entries, in document order.
     Entries(Vec<Resolved>),
+    /// Operator-handed files with content already rendered: every member is
+    /// a file, never absent or refused. Built by [`GuestFiles::managed`],
+    /// which refuses colliding paths up front.
+    Managed(Vec<Desired>),
 }
 
 impl GuestFiles {
@@ -280,14 +352,36 @@ impl GuestFiles {
     }
 
     /// `true` when the document has a `guest-files` key, whatever it holds: the
-    /// guest is one the daemon watches.
+    /// guest is one the daemon watches. Managed files count as keyed: there
+    /// is described work either way.
     pub fn has_guest_files_key(&self) -> bool {
         !matches!(self, GuestFiles::Nothing)
     }
 
+    /// Operator-handed files: every path must resolve to exactly one file,
+    /// so two entries on one path (or one through the other's directory)
+    /// are an error naming both, not a silent pick of a winner.
+    pub fn managed(items: Vec<Desired>) -> Result<GuestFiles, String> {
+        for (i, a) in items.iter().enumerate() {
+            for b in &items[i + 1..] {
+                if a.entry.path == b.entry.path || a.entry.path.nests_with(&b.entry.path) {
+                    return Err(format!(
+                        "path '{}' collides with entry '{}'",
+                        a.entry.path, b.entry.name
+                    ));
+                }
+            }
+        }
+        Ok(GuestFiles::Managed(items))
+    }
+
     /// `true` when some entry wants a file.
     pub fn wants_files(&self) -> bool {
-        matches!(self, GuestFiles::Entries(e) if e.iter().any(|r| matches!(r, Resolved::File(_))))
+        match self {
+            GuestFiles::Entries(e) => e.iter().any(|r| matches!(r, Resolved::File(_))),
+            GuestFiles::Managed(items) => !items.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -349,7 +443,13 @@ fn resolve(doc: &Value, name: &str, spec: &Value) -> Resolved {
         Ok(e) => e,
         Err(reason) => return Resolved::Refused { name: name.to_string(), reason },
     };
-    let Some(value) = view::extract(doc, &entry.view) else {
+    let Some(view) = &entry.view else {
+        return Resolved::Refused {
+            name: name.to_string(),
+            reason: "a document entry always has a view".into(),
+        };
+    };
+    let Some(value) = view::extract(doc, view) else {
         return Resolved::Absent { name: name.to_string() };
     };
     match render(&value, entry.format) {
@@ -358,6 +458,19 @@ fn resolve(doc: &Value, name: &str, spec: &Value) -> Resolved {
         }
         Err(reason) => Resolved::Refused { name: name.to_string(), reason },
     }
+}
+
+/// The size rule for any content, rendered or handed over: at most the
+/// store's own write cap, so a view of a document written out of band and
+/// an operator's blob meet the same limit.
+pub fn check_content_len(content: &[u8]) -> Result<(), String> {
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err(format!(
+            "content is {} bytes, above the {MAX_CONTENT_BYTES}-byte cap",
+            content.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The content of a view in `format`, or why it has none. Comment keys are
@@ -371,12 +484,7 @@ pub fn render(value: &Value, format: FileFormat) -> Result<Vec<u8>, String> {
             _ => return Err("format raw needs the view to be a string".into()),
         },
     };
-    if content.len() > MAX_CONTENT_BYTES {
-        return Err(format!(
-            "content is {} bytes, above the {MAX_CONTENT_BYTES}-byte cap",
-            content.len()
-        ));
-    }
+    check_content_len(&content)?;
     Ok(content)
 }
 
@@ -400,6 +508,8 @@ pub fn parse_entry(name: &str, spec: &Value) -> Result<Entry, String> {
             return Err(format!("unknown field '{key}'"));
         }
     }
+    // `source` is deliberately absent above: provenance is assigned by the
+    // reader, and a document claiming one is refused as an unknown field.
     let view_text = text("view")?.ok_or("'view' is required")?;
     if view_text.is_empty() || view_text.contains('/') {
         return Err(format!("view '{view_text}' is not a dotted key path"));
@@ -426,7 +536,16 @@ pub fn parse_entry(name: &str, spec: &Value) -> Result<Entry, String> {
         Some("overwrite") => LocalEdits::Overwrite,
         Some(o) => return Err(format!("local_edits '{o}' is not keep or overwrite")),
     };
-    Ok(Entry { name: name.to_string(), view, path, format, mode, owner, local_edits })
+    Ok(Entry {
+        name: name.to_string(),
+        view: Some(view),
+        path,
+        format,
+        mode,
+        owner,
+        local_edits,
+        source: user_source(name),
+    })
 }
 
 #[cfg(test)]
@@ -602,5 +721,52 @@ mod tests {
         assert_eq!(GuestFiles::of_document(&doc("a: 1\n")), GuestFiles::Nothing);
         assert!(matches!(GuestFiles::of_document(&doc("guest-files: 3\n")), GuestFiles::Held(_)));
         assert!(GuestFiles::of_document(&doc("guest-files: {}\n")).has_guest_files_key());
+    }
+
+    fn managed_entry(operator: &str, name: &str, path: &str) -> Desired {
+        let entry =
+            Entry::managed(operator, name, path, FileFormat::Yaml, "0444", "0:0", LocalEdits::Keep)
+                .unwrap();
+        Desired::direct(entry, b"content\n".to_vec()).unwrap()
+    }
+
+    #[test]
+    fn managed_entries_validate_like_document_ones() {
+        assert!(Entry::managed("compose", "s", "/opt/stack/compose.yaml", FileFormat::Yaml, "0444", "0:0", LocalEdits::Keep).is_ok());
+        for bad in [
+            Entry::managed("compose", "s", "/dev/null", FileFormat::Yaml, "0444", "0:0", LocalEdits::Keep),
+            Entry::managed("compose", "s", "/x", FileFormat::Yaml, "4755", "0:0", LocalEdits::Keep),
+            Entry::managed("compose", "s", "/x", FileFormat::Yaml, "0444", "root", LocalEdits::Keep),
+        ] {
+            assert!(bad.is_err(), "{bad:?}");
+        }
+        let entry = Entry::managed("compose", "stack", "/opt/stack/compose.yaml", FileFormat::Yaml, "0644", "0:0", LocalEdits::Overwrite).unwrap();
+        assert_eq!(entry.source, "managed/compose/stack");
+        assert_eq!(entry.view, None);
+        assert!(Desired::direct(entry, vec![b'x'; MAX_CONTENT_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn managed_lists_refuse_colliding_paths() {
+        let a = managed_entry("compose", "one", "/opt/stack/a.yaml");
+        let b = managed_entry("compose", "two", "/opt/stack/a.yaml");
+        let err = GuestFiles::managed(vec![a, b]).unwrap_err();
+        assert!(err.contains("/opt/stack/a.yaml") && err.contains("two"), "{err}");
+        let ok = GuestFiles::managed(vec![
+            managed_entry("compose", "one", "/opt/stack/a.yaml"),
+            managed_entry("compose", "two", "/opt/stack/b.yaml"),
+        ])
+        .unwrap();
+        assert!(ok.wants_files() && ok.has_guest_files_key());
+    }
+
+    #[test]
+    fn sources_conflict_only_across_writers() {
+        assert!(!sources_conflict("user/a", "user/a"));
+        assert!(!sources_conflict("user/a", "user/b"));
+        assert!(sources_conflict("user/a", "managed/compose/stack"));
+        assert!(sources_conflict("managed/compose/stack", "user/a"));
+        assert!(sources_conflict("managed/a/x", "managed/b/y"));
+        assert!(!sources_conflict("managed/compose/stack", "managed/compose/stack"));
     }
 }

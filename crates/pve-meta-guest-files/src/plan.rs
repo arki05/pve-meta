@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::entry::{GuestPath, LocalEdits, Owner, GuestFiles, Resolved};
+use crate::entry::{sources_conflict, GuestPath, LocalEdits, Owner, GuestFiles, Resolved};
 use crate::manifest::{self, Manifest, Record};
 use crate::GUEST_ROOT;
 
@@ -164,6 +164,11 @@ pub fn probe_paths(files: &GuestFiles, manifest: &Manifest) -> BTreeSet<String> 
             }
         }
     }
+    if let GuestFiles::Managed(items) = files {
+        for d in items {
+            add(&d.entry.path);
+        }
+    }
     manifest.records.keys().for_each(add);
     out
 }
@@ -233,8 +238,15 @@ pub fn plan(
         p.manifest = old.clone();
         return p;
     }
-    let entries = match files {
+    let owned: Vec<Resolved>;
+    let entries: &[Resolved] = match files {
         GuestFiles::Entries(entries) => entries.as_slice(),
+        // Managed files arrive resolved; map them to the same shape. The
+        // clone is per sync call, never the daemon's hot poll.
+        GuestFiles::Managed(items) => {
+            owned = items.iter().cloned().map(Resolved::File).collect();
+            &owned
+        }
         _ => &[][..],
     };
 
@@ -259,6 +271,24 @@ pub fn plan(
         let e = &d.entry;
         wanted.insert(&e.path);
         let record = old.records.get(&e.path);
+        // Two writers, one path: the manifest's source wins and the claimant
+        // is refused by name. `user/` entries among themselves keep the old
+        // behaviour (a rename keeps its path).
+        if let Some(r) = record {
+            if sources_conflict(&e.source, &r.source) {
+                let reason = format!(
+                    "path '{}' is recorded for source '{}', not '{}'",
+                    e.path, r.source, e.source
+                );
+                p.items.push(Item {
+                    entry: e.name.clone(),
+                    path: Some(e.path.clone()),
+                    action: Action::Refused(reason),
+                });
+                p.manifest.records.insert(e.path.clone(), r.clone());
+                continue;
+            }
+        }
         let (action, expect) = match assess(&e.path, nodes) {
             FileState::Unsafe(why) => (Action::Refused(why), None),
             FileState::Missing => (Action::Create, Some(Expect::Missing)),
@@ -280,6 +310,7 @@ pub fn plan(
                     entry: e.name.clone(),
                     path: e.path.clone(),
                     sha256: d.sha256.clone(),
+                    source: e.source.clone(),
                 };
                 p.manifest.records.insert(e.path.clone(), r);
             }
@@ -336,7 +367,7 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::{Desired, Entry, FileFormat};
+    use crate::entry::{user_source, Desired, Entry, FileFormat};
     use pve_meta_core::digest::digest;
     use pve_meta_core::path::Path;
 
@@ -352,12 +383,13 @@ mod tests {
         GuestFiles::Entries(vec![Resolved::File(Desired {
             entry: Entry {
                 name: "t".into(),
-                view: Path::parse("a").unwrap(),
+                view: Some(Path::parse("a").unwrap()),
                 path: GuestPath::parse(path).unwrap(),
                 format: FileFormat::Raw,
                 mode: 0o444,
                 owner: Owner::ROOT,
                 local_edits: edits,
+                source: user_source("t"),
             },
             content: content.as_bytes().to_vec(),
             sha256: digest(content.as_bytes()),
@@ -370,14 +402,73 @@ mod tests {
 
     fn recorded(path: &str, content: &str) -> Manifest {
         let path = GuestPath::parse(path).unwrap();
-        let r =
-            Record { entry: "t".into(), path: path.clone(), sha256: digest(content.as_bytes()) };
+        let r = Record {
+            entry: "t".into(),
+            path: path.clone(),
+            sha256: digest(content.as_bytes()),
+            source: user_source("t"),
+        };
         Manifest { records: [(path, r)].into_iter().collect() }
     }
 
     fn only(p: &Plan) -> &Action {
         assert_eq!(p.items.len(), 1, "{:?}", p.items);
         &p.items[0].action
+    }
+
+    fn managed_wants(content: &str) -> GuestFiles {
+        GuestFiles::managed(vec![Desired::direct(
+            Entry::managed(
+                "compose",
+                "stack",
+                "/opt/stack/compose.yaml",
+                FileFormat::Yaml,
+                "0644",
+                "0:0",
+                OVER,
+            )
+            .unwrap(),
+            content.as_bytes().to_vec(),
+        )
+        .unwrap()])
+        .unwrap()
+    }
+
+    #[test]
+    fn paths_recorded_for_another_source_are_refused_by_name() {
+        use crate::entry::managed_source;
+
+        let path = GuestPath::parse("/opt/stack/compose.yaml").unwrap();
+        let mut managed_record = Manifest::default();
+        managed_record.records.insert(path.clone(), Record {
+            entry: "stack".into(),
+            path: path.clone(),
+            sha256: digest(b"old"),
+            source: managed_source("compose", "stack"),
+        });
+        let mut nodes = root_dirs();
+        nodes.insert(path.to_string(), file("old", 0o444));
+
+        // A user entry on a managed path is refused, and the manifest keeps
+        // the managed record.
+        let p = plan(&wants("/opt/stack/compose.yaml", "new", OVER), &managed_record, &nodes, false);
+        match only(&p) {
+            Action::Refused(why) => assert!(why.contains("managed/compose/stack"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(p.manifest.records[&path].source, "managed/compose/stack");
+
+        // The reverse: a managed claim on a user-recorded path is refused too.
+        let p = plan(&managed_wants("new\n"), &recorded("/opt/stack/compose.yaml", "old"), &nodes, false);
+        match only(&p) {
+            Action::Refused(why) => assert!(why.contains("user/t"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+
+        // Same source converges and records its source.
+        let p = plan(&managed_wants("new\n"), &Manifest::default(), &root_dirs(), false);
+        assert_eq!(only(&p), &Action::Create, "{p:?}");
+        assert_eq!(p.manifest.records[&path].source, "managed/compose/stack");
     }
 
     const T: &str = "/etc/app/t";

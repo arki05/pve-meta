@@ -93,6 +93,24 @@ guest-files:
 * **No hooks.** Nothing runs in the guest after a write; a service picks up the change
   itself.
 
+## Managed files (for operators)
+
+The same writer, without a document: an operator (pve-compose today) hands
+content over through the crate (`Entry::managed`, `Desired::direct`,
+`GuestFiles::managed`) and syncs it with the same `inspect`/`sync`, the
+same `GuestLock`, and the same manifest. What differs:
+
+* `view` is none and `format` ignored: the content is given, never rendered.
+* `source` is `managed/<operator>/<name>` instead of `user/<entry>`, and is
+  recorded in the manifest. A path the manifest attributes to another source
+  is refused to the claimant by name (`user/` entries among themselves keep
+  the old behaviour, so renaming an entry keeps its path).
+* `GuestFiles::managed` refuses colliding paths up front, like entries do.
+* Tag lists go through `node::split_tags`, the API's rule, not a private copy.
+
+There is no API endpoint for managed files: effects stay out of pveproxy,
+and each operator keeps its own loop and calls the library synchronously.
+
 | Command | Does |
 |---|---|
 | `daemon` | the loop above |

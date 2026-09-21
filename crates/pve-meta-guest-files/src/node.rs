@@ -103,6 +103,17 @@ pub fn container_lock(node: &str, vmid: u32) -> Result<Option<String>> {
     Ok(parse_lock(&text))
 }
 
+/// A guest's PVE tags, split the way `PVE::API2::Ext::Meta::parse_tags`
+/// does: the cluster stores them `;`-separated, and `,` and whitespace
+/// separate too, so a hand-written list still parses. Empty runs drop out.
+/// Operators share this instead of each splitting tags their own way.
+pub fn split_tags(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ';' || c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Why `vmid` cannot be synced right now: not in `active`, or locked (a
 /// backup, snapshot or migration); `None` when it can be.
 pub fn stopped_or_locked(
@@ -155,5 +166,13 @@ mod tests {
         let text = "arch: amd64\nlock: backup\n\n[snap]\nlock: snapshot\n";
         assert_eq!(parse_lock(text).as_deref(), Some("backup"));
         assert_eq!(parse_lock("hostname: x\n\n[snap]\nlock: snapshot\n"), None);
+    }
+
+    #[test]
+    fn tags_split_like_the_api() {
+        assert!(split_tags("").is_empty());
+        assert_eq!(split_tags("traefik"), ["traefik"]);
+        assert_eq!(split_tags("a;b;;c"), ["a", "b", "c"]);
+        assert_eq!(split_tags("a, b c\ttraefik\n"), ["a", "b", "c", "traefik"]);
     }
 }

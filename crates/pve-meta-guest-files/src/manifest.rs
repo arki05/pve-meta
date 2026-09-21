@@ -1,14 +1,20 @@
 //! The manifest: `/etc/pve-meta/.guest-files` inside the guest, one record per
-//! file the daemon wrote.
+//! file written.
 //!
 //! ```json
 //! {
 //!   "version": 1,
 //!   "files": [
-//!     { "entry": "swap", "path": "/etc/pve-meta/llm/swap.yaml", "sha256": "…" }
+//!     { "entry": "swap", "path": "/etc/pve-meta/llm/swap.yaml", "sha256": "…", "source": "user/swap" }
 //!   ]
 //! }
 //! ```
+//!
+//! `source` is who asked for the file: `user/<entry>` for document entries,
+//! `managed/<operator>/<name>` for operator-handed ones. A file the manifest
+//! attributes to another source is refused to the claimant, by name, so two
+//! writers sharing one guest refuse each other instead of overwriting. Files
+//! recorded before sources existed read back as `user/<entry>`.
 //!
 //! It is how a file the daemon wrote is told apart from a file someone else
 //! wrote or edited: a file is replaced or removed only while its content
@@ -53,13 +59,16 @@ pub fn directories() -> Vec<String> {
     vec!["/etc".to_string(), GUEST_ROOT.to_string()]
 }
 
-/// One file the daemon wrote.
+/// One file written: by the daemon for a document entry, or by an operator
+/// through [`crate::entry::Desired::direct`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub entry: String,
     pub path: GuestPath,
     /// Of the content as written.
     pub sha256: String,
+    /// `user/<entry>` or `managed/<operator>/<name>`.
+    pub source: String,
 }
 
 /// Every record, by path.
@@ -79,6 +88,8 @@ struct RawRecord {
     entry: String,
     path: String,
     sha256: String,
+    #[serde(default)]
+    source: String,
 }
 
 impl Manifest {
@@ -93,10 +104,16 @@ impl Manifest {
             return Err(format!("manifest version {} is not {VERSION}", raw.version));
         }
         let mut out = Manifest::default();
-        for r in raw.files {
+        for mut r in raw.files {
+            // Records written before sources existed carry no source: they
+            // came from document entries, so they read back as their own.
+            if r.source.is_empty() {
+                r.source = crate::entry::user_source(&r.entry);
+            }
             let path = GuestPath::absolute(&r.path)
                 .map_err(|why| format!("record {:?}: {why}", r.path))?;
-            let record = Record { entry: r.entry, path: path.clone(), sha256: r.sha256 };
+            let record =
+                Record { entry: r.entry, path: path.clone(), sha256: r.sha256, source: r.source };
             if out.records.insert(path.clone(), record).is_some() {
                 return Err(format!("'{path}' is recorded twice"));
             }
@@ -115,6 +132,7 @@ impl Manifest {
                     entry: r.entry.clone(),
                     path: r.path.to_string(),
                     sha256: r.sha256.clone(),
+                    source: r.source.clone(),
                 })
                 .collect(),
         };
@@ -135,11 +153,14 @@ mod tests {
     #[test]
     fn round_trip() {
         let mut m = Manifest::default();
-        for (path, entry) in [("/etc/traefik/dynamic.yaml", "traefik"), ("llm/swap.yaml", "swap")] {
+        for (path, entry, source) in [
+            ("/etc/traefik/dynamic.yaml", "traefik", "managed/traefik/dyn"),
+            ("llm/swap.yaml", "swap", "user/swap"),
+        ] {
             let path = GuestPath::parse(path).unwrap();
             m.records.insert(
                 path.clone(),
-                Record { entry: entry.into(), path, sha256: "ab".repeat(32) },
+                Record { entry: entry.into(), path, sha256: "ab".repeat(32), source: source.into() },
             );
         }
         let text = m.render();
@@ -148,6 +169,14 @@ mod tests {
         assert!(s.ends_with("}\n") && s.contains("\"files\": ["));
         assert!(s.find("/etc/pve-meta/llm").unwrap() < s.find("/etc/traefik").unwrap());
         assert!(Manifest::parse(&Manifest::default().render()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn records_without_a_source_read_back_as_their_own_entry() {
+        let sha = "ab".repeat(32);
+        let text = format!(r#"{{"version": 1, "files": [{{"entry": "e", "path": "/etc/e", "sha256": "{sha}"}}]}}"#);
+        let m = Manifest::parse(text.as_bytes()).unwrap();
+        assert_eq!(m.records[&GuestPath::parse("/etc/e").unwrap()].source, "user/e");
     }
 
     #[test]
