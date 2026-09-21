@@ -1,3 +1,12 @@
+pve-meta (0.3.2-1) unstable; urgency=medium
+
+  * Managed syncs never collect: a present file the call did not ask for
+    stays with its record, since callers sync partial sets. Missing files
+    are forgotten by whoever notices. (v0.3.1's same-operator collection
+    ate a caller's own files between two syncs; no consumer shipped it.)
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Mon, 21 Sep 2026 20:15:00 +0200
+
 pve-meta (0.3.1-1) unstable; urgency=medium
 
   * Managed files: reservation and deletion agree on operator identity
