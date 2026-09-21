@@ -908,6 +908,19 @@ eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
     eq('a prefix id is its file name', P.registryId('gpu'), 'prefixes/gpu');
 }
 
+// A mask over the panel's own element covers the docked footer too, and the
+// Tree|Text switch under it drops the click: the first one after a fresh render
+// did nothing at all.
+{
+    let got = null;
+    ctx.Proxmox.Utils.setErrorMask = (comp, msg) => (got = [comp.el, msg]);
+    P.setMask.call({ el: 'panel', body: 'body' }, true);
+    eq('the load mask covers the view', got, ['body', true]);
+    P.setMask.call({ el: 'panel' }, 'boom');
+    eq('... and the panel itself before there is one', got, ['panel', 'boom']);
+    delete ctx.Proxmox.Utils.setErrorMask;
+}
+
 // Per-document digests. One shared field would have sent a prefix's digest with a
 // write to another document, which is a 409 at best and the wrong document at worst.
 {
@@ -1314,6 +1327,9 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
     eq('opens the text window', created[0][0], 'PVE.meta.TextWindow');
     eq('... on schema.properties', created[0][1].view, 'schema.properties');
     eq('... with what is already declared', Codec.parse(created[0][1].text, 'yaml'), { host: { type: 'string' } });
+    // OK writes through the panel, so a document id on the window would be one the
+    // write ignores -- a registry file edited from another document's panel.
+    eq('... and no document of its own', created[0][1].docId, undefined);
 
     created.length = 0;
     const empty = Object.assign({}, withProps, {

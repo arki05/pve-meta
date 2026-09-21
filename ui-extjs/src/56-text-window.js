@@ -12,7 +12,9 @@ Ext.define('PVE.meta.TextWindow', {
     layout: 'fit',
     referenceHolder: true, // lookupReference('mount'/'langbtn') needs this
     lang: 'yaml',
-    // configs: view (dotted path), text (YAML), tree (the owning panel)
+    // configs: view (dotted path), text (YAML), tree (the owning panel). OK writes
+    // through `tree`, so the window names a view of *its* document and never a
+    // document of its own -- an id here would only be one the write could ignore.
 
     initComponent: function () {
         let me = this;

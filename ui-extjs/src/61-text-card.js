@@ -79,7 +79,7 @@ PVE.meta.TextCard = {
         me.mode = 'text';
         me.syncButtons();
         me.getLayout().setActiveItem(me.down('#metaText'));
-        Proxmox.Utils.setErrorMask(me, true);
+        me.setMask(true);
         me.request({
             url: me.urlFor(me.docId),
             params: me.docParams({ format: 'yaml' }),
@@ -91,7 +91,7 @@ PVE.meta.TextCard = {
                 me.showTextEditor();
             },
             failure: function (response) {
-                Proxmox.Utils.setErrorMask(me, false);
+                me.setMask(false);
                 Ext.Msg.alert(gettext('Error'), response.htmlStatus || gettext('Error'));
                 me.abortTextMode();
             },
@@ -105,7 +105,7 @@ PVE.meta.TextCard = {
                 if (me.isDestroyed || me.mode !== 'text') {
                     return;
                 }
-                Proxmox.Utils.setErrorMask(me, false);
+                me.setMask(false);
                 if (me.textEditor) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
                     me.annotateText();
@@ -123,7 +123,7 @@ PVE.meta.TextCard = {
                 me.annotateText();
             },
             function (err) {
-                Proxmox.Utils.setErrorMask(me, false);
+                me.setMask(false);
                 PVE.meta.Utils.alertError(err);
                 me.abortTextMode();
             },

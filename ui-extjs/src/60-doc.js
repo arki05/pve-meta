@@ -53,6 +53,13 @@ PVE.meta.Doc = {
 
     // --- loading -----------------------------------------------------------
 
+    // The load mask goes over the body, never `me.el`: the panel's element includes
+    // its docked footer, and the Tree|Text switch under a mask swallows the click --
+    // which is why the switch needed a second one after every fresh render.
+    setMask: function (msg) {
+        Proxmox.Utils.setErrorMask({ el: this.body || this.el }, msg);
+    },
+
     // Every load is a chain of these. A failure the caller did not handle masks
     // the panel with it.
     request: function (opts) {
@@ -62,7 +69,7 @@ PVE.meta.Doc = {
             Ext.apply(
                 {
                     failure: (response) =>
-                        Proxmox.Utils.setErrorMask(me, response.htmlStatus || gettext('Error')),
+                        me.setMask(response.htmlStatus || gettext('Error')),
                 },
                 opts,
             ),
@@ -74,14 +81,12 @@ PVE.meta.Doc = {
         if (!me.rendered || me.isDestroyed || me.editing || me.textWindow || me.mode === 'text') {
             return;
         }
-        Proxmox.Utils.setErrorMask(me, true);
+        me.setMask(true);
         // Cleared here and set only by `loadDocument`: describes the load in
         // progress, not the document the panel used to hold.
         me.docParseError = '';
         me.loadPrefixes(() =>
-            me.loadAccess(() =>
-                me.loadSchemas(() => me.loadDocument(() => Proxmox.Utils.setErrorMask(me, false))),
-            ),
+            me.loadAccess(() => me.loadSchemas(() => me.loadDocument(() => me.setMask(false)))),
         );
     },
 
@@ -174,7 +179,7 @@ PVE.meta.Doc = {
                         try {
                             data = PVE.meta.Codec.parse(d.text || '', 'yaml');
                         } catch (err) {
-                            Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                            me.setMask(Ext.htmlEncode(PVE.meta.Utils.errText(err)));
                             return;
                         }
                         me.docState[me.docId] = { digest: d.digest || '', data: data };
@@ -186,7 +191,7 @@ PVE.meta.Doc = {
             },
             function (err) {
                 // Without the core this panel cannot read a document faithfully.
-                Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err)));
+                me.setMask(Ext.htmlEncode(PVE.meta.Utils.errText(err)));
             },
         );
     },

@@ -952,17 +952,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // nothing.
     declareKey: function (rec) {
         let me = this;
-        let docId = rec && rec.data && rec.data.docId;
-        if (!docId || me.docKind(docId) !== 'prefix') {
+        if (!rec || me.docKind(me.docId) !== 'prefix') {
             return;
         }
-        let props = PVE.meta.Utils.valueAt(me.dataOf(docId), 'schema.properties');
+        let props = PVE.meta.Utils.valueAt(me.dataOf(me.docId), 'schema.properties');
         if (!props || !Object.keys(props).length) {
             props = { key_name: { type: 'string' } };
         }
         me.textWindow = Ext.create('PVE.meta.TextWindow', {
             view: 'schema.properties',
-            docId: docId,
             text: PVE.meta.Codec.dump(props, 'yaml'),
             tree: me,
         });
@@ -1002,16 +1000,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         let view =
             PVE.meta.Utils.editorKind(rec.data) === 'text' ? rec.data.path : me.parentPath(rec);
-        let docId = me.docOf(rec);
 
         // Rendered from the document this panel holds, not fetched: the editor dumps
         // with the same codec the store writes with (decision 011), so the text here
-        // is the text the file holds, without asking for it again.
-        let stored = me.dataOf(docId);
+        // is the text the file holds, without asking for it again. `me.docId`, since
+        // that is the document OK writes back to.
+        let stored = me.dataOf(me.docId);
         let subtree = view === '' ? stored : PVE.meta.Utils.valueAt(stored, view);
         me.textWindow = Ext.create('PVE.meta.TextWindow', {
             view: view,
-            docId: docId,
             text: PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'),
             tree: me,
         });
