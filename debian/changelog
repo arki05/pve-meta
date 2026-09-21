@@ -1,3 +1,11 @@
+pve-meta (0.2.1-1) unstable; urgency=medium
+
+  * The editor smoke suite covers the unset-rows stylesheet rule, and the
+    rule installs only where Ext.util.CSS exists. No behaviour change;
+    CI was red on v0.2.0 without it.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Mon, 21 Sep 2026 17:40:00 +0200
+
 pve-meta (0.2.0-1) unstable; urgency=medium
 
   * Access is PVE's ACLs and nothing else: VM.Audit reads a guest's document,
