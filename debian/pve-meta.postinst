@@ -35,20 +35,6 @@ scan_notes() {
     fi
 }
 
-# Files 0.2 no longer reads: say so on upgrade, so a rule the operator thinks holds is not silently gone.
-warn_ignored_legacy() {
-    if [ -d /etc/pve/local ]; then
-        if [ -d /etc/pve/meta.d/permissions ] && [ -n "$(ls -A /etc/pve/meta.d/permissions 2>/dev/null)" ]; then
-            echo "pve-meta: warning: /etc/pve/meta.d/permissions/ still holds files, ignored since 0.2.0 (access is PVE ACLs now); remove the directory." >&2
-        fi
-        for d in /etc/pve/nodes/*/meta.d/prefixes; do
-            if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then
-                echo "pve-meta: warning: $d still holds files, ignored since 0.2.0; fold them into /etc/pve/meta.d/prefixes/<name>.yaml as a nodes: override." >&2
-            fi
-        done
-    fi
-}
-
 # Restarts pvedaemon/pveproxy to pick up the lifecycle patch; a no-op off a
 # systemd host and never fails the install.
 restart_pve_services() {
@@ -62,7 +48,6 @@ restart_pve_services() {
 case "$1" in
     configure)
         ensure_dropdirs
-        warn_ignored_legacy
         apply_lifecycle_patch
         restart_pve_services
         scan_notes

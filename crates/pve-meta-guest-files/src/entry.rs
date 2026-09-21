@@ -17,7 +17,7 @@ use pve_meta_core::path::{self, Path};
 use pve_meta_core::store::{DocId, MetaStore};
 use pve_meta_core::{digest, view, Error as StoreError};
 
-use crate::{GUEST_ROOT, LEGACY_PREFIX, MAX_CONTENT_BYTES, PREFIX};
+use crate::{GUEST_ROOT, MAX_CONTENT_BYTES, PREFIX};
 
 /// Directories no entry may write under: kernel and device filesystems, where
 /// a file is not configuration. `/run` is allowed.
@@ -262,17 +262,9 @@ pub enum GuestFiles {
 }
 
 impl GuestFiles {
-    /// Reads the `guest-files` key of a parsed document. A document with no
-    /// `guest-files` key but a pre-0.2 `publish:` key is held with a warning
-    /// naming the rename, so a forgotten migration is visible in `status`
-    /// instead of silently writing nothing.
+    /// Reads the `guest-files` key of a parsed document.
     pub fn of_document(doc: &Value) -> GuestFiles {
         let Some(tree) = doc.get(PREFIX) else {
-            if doc.get(LEGACY_PREFIX).is_some() {
-                return GuestFiles::Held(format!(
-                    "has a legacy '{LEGACY_PREFIX}:' key, ignored since 0.2.0; rename it to '{PREFIX}:'"
-                ));
-            }
             return GuestFiles::Nothing;
         };
         let Some(map) = tree.as_object() else {
@@ -610,11 +602,5 @@ mod tests {
         assert_eq!(GuestFiles::of_document(&doc("a: 1\n")), GuestFiles::Nothing);
         assert!(matches!(GuestFiles::of_document(&doc("guest-files: 3\n")), GuestFiles::Held(_)));
         assert!(GuestFiles::of_document(&doc("guest-files: {}\n")).has_guest_files_key());
-        // A pre-0.2 `publish:` key is held with the rename spelled out, never read.
-        match GuestFiles::of_document(&doc("publish:\n  x: {view: a, path: x}\n")) {
-            GuestFiles::Held(why) => assert!(why.contains("'guest-files:'"), "{why}"),
-            other => panic!("{other:?}"),
-        }
-        assert!(GuestFiles::of_document(&doc("publish:\n  x: {view: a, path: x}\n")).has_guest_files_key());
     }
 }
