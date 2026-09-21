@@ -970,17 +970,27 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // `DELETE ?view=<path>`, which takes the key's note with it (`view::remove`). A
     // member of a list has no path of its own, so removing one is a write of the list
-    // without it.
+    // without it. Always behind a confirm: this is an immediate write, as everywhere
+    // in PVE, and fat-fingering a row must not drop data.
     removeKey: function (rec) {
         let me = this;
         if (!rec || !rec.data.path) {
             return;
         }
-        if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
-            me.writeListMember(rec.data.path, rec.data.arrayIndex, undefined);
-            return;
-        }
-        me.sendEdit({ path: rec.data.path, op: 'delete' });
+        Ext.Msg.confirm(
+            gettext('Confirm'),
+            Ext.String.format(gettext('Remove "{0}"?'), rec.data.path),
+            function (btn) {
+                if (btn !== 'yes') {
+                    return;
+                }
+                if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
+                    me.writeListMember(rec.data.path, rec.data.arrayIndex, undefined);
+                    return;
+                }
+                me.sendEdit({ path: rec.data.path, op: 'delete' });
+            },
+        );
     },
 
     // "Edit selection as text": Monaco on the selected subtree, in its own window.
