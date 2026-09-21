@@ -34,6 +34,8 @@ Description: pve-meta store bindings for PVE (Rust, perlmod)
 
 Package: pve-meta-guest-files
 Architecture: any
+Conflicts: pve-meta-publish
+Replaces: pve-meta-publish
 Depends: pve-meta (= ${source:Version}),
          pve-container,
          ${shlibs:Depends}, ${misc:Depends}

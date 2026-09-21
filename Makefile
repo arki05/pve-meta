@@ -41,10 +41,22 @@ $(UI_JS): $(UI_SRC)
 # Fetches Monaco's minified AMD tree into ui-extjs/monaco/vs, to ship in the
 # package (never loaded from a CDN). Tolerant of `npm` being absent: the editor
 # then degrades (no Text card, no diff) instead of failing the build.
+# A stale vendored tree is worse than none: the editor would ship whatever
+# version happened to be there instead of package.json's pin. So refresh
+# whenever the vendored copy disagrees with the pin, not just when absent.
 ui:
-	@if [ -d $(MONACO) ]; then \
-		echo "monaco already vendored in $(MONACO)"; \
+	@pinned=$$(grep '"monaco-editor"' $(UI_DIR)/package.json | sed 's/[^0-9.]//g'); \
+	have=""; \
+	if [ -f $(UI_DIR)/node_modules/monaco-editor/package.json ]; then \
+		have=$$(grep -m1 '"version"' $(UI_DIR)/node_modules/monaco-editor/package.json | sed 's/[^0-9.]//g'); \
+	fi; \
+	if [ -d $(MONACO) ] && [ -n "$$have" ] && [ "$$have" = "$$pinned" ]; then \
+		echo "monaco $$have already vendored in $(MONACO)"; \
 	elif command -v npm >/dev/null 2>&1; then \
+		if [ -d $(MONACO) ] && [ "$$have" != "$$pinned" ]; then \
+			echo "monaco vendored is $$have, pin is $$pinned: re-vendoring"; \
+		fi; \
+		rm -rf $(MONACO) $(UI_DIR)/node_modules; \
 		(cd $(UI_DIR) && npm install --no-audit --no-fund); \
 		mkdir -p $(MONACO); \
 		cp -a $(UI_DIR)/node_modules/monaco-editor/min/vs/. $(MONACO)/; \

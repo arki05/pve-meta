@@ -24,7 +24,7 @@ new record; the old one is deleted, since git remembers it.
 | [019](019-backup-carries-the-document-in-the-notes.md) | A backup carries the document in the archive's copy of the guest's notes | accepted |
 | [021](021-comment-keys-hidden-unless-asked.md) | Comment keys are notes: a read leaves them out unless it asks | accepted |
 | [022](022-unavailable-store-is-an-error.md) | A store that is not there is an error, not an empty store | accepted |
-| [023](023-publish-is-a-separate-package.md) | Publishing into containers is a separate package that pushes files one way | accepted |
+| [023](023-publish-is-a-separate-package.md) | Publishing into containers is a separate package that pushes files one way (now guest-files) | accepted |
 | [024](024-access-is-pves-acls.md) | Access is PVE's ACLs | accepted, supersedes 001, 002, 004 |
 | [025](025-a-nodes-schema-is-an-override-inside-the-prefix-file.md) | A node's schema is an override inside the prefix file | accepted, supersedes 020 |
 | [026](026-the-editor-writes-each-edit.md) | The editor writes each edit | accepted, supersedes 010 |

@@ -35,9 +35,7 @@ scan_notes() {
     fi
 }
 
-# Since 0.2.0 permission files and per-node prefix directories are ignored
-# (docs/DESIGN.md, decisions 024/025). Say so loudly on upgrade instead of
-# silently dropping what an operator thought was enforced.
+# Files 0.2 no longer reads: say so on upgrade, so a rule the operator thinks holds is not silently gone.
 warn_ignored_legacy() {
     if [ -d /etc/pve/local ]; then
         if [ -d /etc/pve/meta.d/permissions ] && [ -n "$(ls -A /etc/pve/meta.d/permissions 2>/dev/null)" ]; then
