@@ -106,9 +106,11 @@ same `GuestLock`, and the same manifest. What differs:
   is refused to the claimant by name (`user/` entries among themselves keep
   the old behaviour, so renaming an entry keeps its path).
 * `GuestFiles::managed` refuses colliding paths up front, like entries do.
-* Each plane collects only its own records: a user document never deletes
-  a `managed/` file it no longer sees (or vice versa); a rename within one
-  operator converges like a user rename.
+* Each plane forgets missing files, whoever recorded them; present files
+  are collected only by their owner plane, and the managed plane never
+  collects (its calls carry partial sets, so "unwanted here" must not mean
+  "abandoned"). Retiring a managed file is explicit: delete it in the
+guest and its record is forgotten on the next poll.
 * Tag lists go through `node::split_tags`, the API's rule, not a private copy.
 
 There is no API endpoint for managed files: effects stay out of pveproxy,

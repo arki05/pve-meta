@@ -12,8 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::entry::{
-    is_managed_source, managed_operator, sources_conflict, GuestPath, LocalEdits, Owner,
-    GuestFiles, Resolved,
+    is_managed_source, sources_conflict, GuestPath, LocalEdits, Owner, GuestFiles, Resolved,
 };
 use crate::manifest::{self, Manifest, Record};
 use crate::GUEST_ROOT;
@@ -210,25 +209,18 @@ pub fn assess(path: &GuestPath, nodes: &BTreeMap<String, Node>) -> FileState {
     }
 }
 
-/// Whether this plane deletes a path it no longer wants: each plane only
-/// collects its own records. The user plane (a document, or none) owns
-/// `user/` records; a managed list owns its operator's records, so a rename
-/// within one operator still cleans up. Anything else is left in place with
-/// its record kept: the other writer is alive and will decide itself.
+/// Whether this plane deletes a path it no longer wants. Only the user
+/// plane (a document, or none) collects, and only `user/` records: the
+/// document is a complete declaration, so "unwanted" means "abandoned".
+/// A managed list never deletes: its wanted-set is a partial statement
+/// ("ensure these"), and one sync call cannot know what the operator's
+/// other calls still want. Anything a plane does not own is left in place
+/// with its record kept; missing files are forgotten by whoever notices
+/// (see the deletion loop), whatever plane recorded them.
 fn deletion_owner(files: &GuestFiles, source: &str) -> bool {
     match files {
-        GuestFiles::Managed(items) => items
-            .iter()
-            .any(|d| d.entry.source == source || same_operator(&d.entry.source, source)),
+        GuestFiles::Managed(_) => false,
         _ => !is_managed_source(source),
-    }
-}
-
-/// `true` when both sources are `managed/` of the same operator.
-fn same_operator(a: &str, b: &str) -> bool {
-    match (managed_operator(a), managed_operator(b)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
     }
 }
 
@@ -366,6 +358,12 @@ pub fn plan(
         if wanted.contains(path) {
             continue;
         }
+        // A missing file is forgotten by whoever notices it: there is
+        // nothing to protect, so ownership does not matter.
+        if matches!(assess(path, nodes), FileState::Missing) {
+            p.items.push(Item { entry: r.entry.clone(), path: Some(path.clone()), action: Action::Forget });
+            continue;
+        }
         if !deletion_owner(files, &r.source) {
             p.manifest.records.insert(path.clone(), r.clone());
             continue;
@@ -375,6 +373,7 @@ pub fn plan(
             continue;
         }
         let action = match assess(path, nodes) {
+            // Checked above; kept for the guest changing between the two reads.
             FileState::Missing => Action::Forget,
             FileState::Present { sha256, .. } if sha256 == r.sha256 => {
                 p.ops.push(Op::Remove { path: path.to_string(), sha256 });
@@ -486,10 +485,30 @@ mod tests {
         assert!(p.items.is_empty(), "{p:?}");
         assert_eq!(p.manifest, managed_old);
 
-        // A managed list leaves a user-recorded file alone the same way.
+        // A managed list forgets a user-recorded file that is already gone,
+        // whoever recorded it.
         let p = plan(&managed_wants("new\n"), &recorded("/other/t", "old"), &nodes, false);
-        assert!(p.items.iter().all(|i| i.path.as_ref().map(|p| p.as_str()) != Some("/other/t")), "{p:?}");
-        assert!(p.manifest.records.contains_key(&GuestPath::parse("/other/t").unwrap()));
+        assert!(p.items.iter().any(|i| matches!(i.action, Action::Forget)), "{p:?}");
+        assert!(!p.manifest.records.contains_key(&GuestPath::parse("/other/t").unwrap()));
+
+        // A managed sync never collects: a present same-operator file it was
+        // not asked for stays, with its record. Callers sync partial sets,
+        // so "unwanted here" must not mean "abandoned".
+        let other = GuestPath::parse("/opt/stack/other.yaml").unwrap();
+        let mut sibling_old = Manifest::default();
+        sibling_old.records.insert(other.clone(), Record {
+            entry: "other".into(),
+            path: other.clone(),
+            sha256: digest(b"other"),
+            source: managed_source("compose", "other"),
+        });
+        nodes.insert(other.to_string(), file("other", 0o444));
+        let p = plan(&managed_wants("new\n"), &sibling_old, &nodes, false);
+        assert!(
+            p.items.iter().all(|i| i.path.as_ref() != Some(&other)),
+            "{p:?}"
+        );
+        assert_eq!(p.manifest.records.get(&other).map(|r| r.source.as_str()), Some("managed/compose/other"));
 
         // Same operator, renamed entry: the path converges onto the new
         // entry, like a user rename, and the record takes its source.
