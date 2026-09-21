@@ -11,7 +11,8 @@
 # A definition names no principal. Declaring that a prefix exists and has a
 # shape is useful with no operator, no token and no automation anywhere near
 # it -- a structured notes field with a schema is a complete use of this
-# system. Who may *write* it is a separate file (docs/DESIGN.md §4).
+# system. Who may *read and write* it is PVE's own ACLs (docs/DESIGN.md §4):
+# `VM.Audit` reads a guest's document, `VM.Config.Options` writes it.
 #
 # Files are parsed strictly and independently. A malformed file is skipped
 # with a warning and contributes nothing; it never affects another one.
