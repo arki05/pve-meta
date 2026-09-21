@@ -11,7 +11,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::entry::{sources_conflict, GuestPath, LocalEdits, Owner, GuestFiles, Resolved};
+use crate::entry::{
+    is_managed_source, managed_operator, sources_conflict, GuestPath, LocalEdits, Owner,
+    GuestFiles, Resolved,
+};
 use crate::manifest::{self, Manifest, Record};
 use crate::GUEST_ROOT;
 
@@ -207,6 +210,28 @@ pub fn assess(path: &GuestPath, nodes: &BTreeMap<String, Node>) -> FileState {
     }
 }
 
+/// Whether this plane deletes a path it no longer wants: each plane only
+/// collects its own records. The user plane (a document, or none) owns
+/// `user/` records; a managed list owns its operator's records, so a rename
+/// within one operator still cleans up. Anything else is left in place with
+/// its record kept: the other writer is alive and will decide itself.
+fn deletion_owner(files: &GuestFiles, source: &str) -> bool {
+    match files {
+        GuestFiles::Managed(items) => items
+            .iter()
+            .any(|d| d.entry.source == source || same_operator(&d.entry.source, source)),
+        _ => !is_managed_source(source),
+    }
+}
+
+/// `true` when both sources are `managed/` of the same operator.
+fn same_operator(a: &str, b: &str) -> bool {
+    match (managed_operator(a), managed_operator(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Decides one sync. `force` overwrites local edits of wanted files; it never
 /// deletes one.
 pub fn plan(
@@ -341,6 +366,10 @@ pub fn plan(
         if wanted.contains(path) {
             continue;
         }
+        if !deletion_owner(files, &r.source) {
+            p.manifest.records.insert(path.clone(), r.clone());
+            continue;
+        }
         if held.contains(r.entry.as_str()) {
             p.manifest.records.insert(path.clone(), r.clone());
             continue;
@@ -435,6 +464,48 @@ mod tests {
     }
 
     #[test]
+    fn each_plane_collects_only_its_own_records() {
+        use crate::entry::managed_source;
+
+        let path = GuestPath::parse("/opt/stack/compose.yaml").unwrap();
+        let mut managed_old = Manifest::default();
+        managed_old.records.insert(path.clone(), Record {
+            entry: "stack".into(),
+            path: path.clone(),
+            sha256: digest(b"old"),
+            source: managed_source("compose", "stack"),
+        });
+        let mut nodes = root_dirs();
+        nodes.insert("/opt".into(), Node::Dir);
+        nodes.insert("/opt/stack".into(), Node::Dir);
+        nodes.insert(path.to_string(), file("old", 0o444));
+
+        // A user document that wants nothing leaves a managed file and its
+        // record alone: the operator is alive and decides itself.
+        let p = plan(&GuestFiles::Nothing, &managed_old, &nodes, false);
+        assert!(p.items.is_empty(), "{p:?}");
+        assert_eq!(p.manifest, managed_old);
+
+        // A managed list leaves a user-recorded file alone the same way.
+        let p = plan(&managed_wants("new\n"), &recorded("/other/t", "old"), &nodes, false);
+        assert!(p.items.iter().all(|i| i.path.as_ref().map(|p| p.as_str()) != Some("/other/t")), "{p:?}");
+        assert!(p.manifest.records.contains_key(&GuestPath::parse("/other/t").unwrap()));
+
+        // Same operator, renamed entry: the path converges onto the new
+        // entry, like a user rename, and the record takes its source.
+        let mut renamed_old = Manifest::default();
+        renamed_old.records.insert(path.clone(), Record {
+            entry: "oldname".into(),
+            path: path.clone(),
+            sha256: digest(b"old"),
+            source: managed_source("compose", "oldname"),
+        });
+        let p = plan(&managed_wants("new\n"), &renamed_old, &nodes, false);
+        assert!(p.items.iter().any(|i| matches!(i.action, Action::Update)), "{p:?}");
+        assert_eq!(p.manifest.records[&path].source, "managed/compose/stack");
+    }
+
+    #[test]
     fn paths_recorded_for_another_source_are_refused_by_name() {
         use crate::entry::managed_source;
 
@@ -447,6 +518,8 @@ mod tests {
             source: managed_source("compose", "stack"),
         });
         let mut nodes = root_dirs();
+        nodes.insert("/opt".into(), Node::Dir);
+        nodes.insert("/opt/stack".into(), Node::Dir);
         nodes.insert(path.to_string(), file("old", 0o444));
 
         // A user entry on a managed path is refused, and the manifest keeps

@@ -244,11 +244,24 @@ pub fn is_managed_source(source: &str) -> bool {
     source.starts_with("managed/")
 }
 
-/// Two sources claiming one path refuse each other, except two `user/`
-/// entries: renaming an entry keeps its path working as before. A managed
-/// source meeting anything but itself is always a fight between two writers.
+/// Two sources claiming one path refuse each other, except renames: two
+/// `user/` entries, or two `managed/` entries of one operator, keep the old
+/// behaviour (a rename keeps its path). Anything else is a fight between
+/// two writers.
 pub(crate) fn sources_conflict(a: &str, b: &str) -> bool {
-    a != b && (is_managed_source(a) || is_managed_source(b))
+    if a == b {
+        return false;
+    }
+    match (managed_operator(a), managed_operator(b)) {
+        (Some(x), Some(y)) => x != y,
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    }
+}
+
+/// The operator of a `managed/<operator>/<name>` source, if it is one.
+pub(crate) fn managed_operator(source: &str) -> Option<&str> {
+    source.strip_prefix("managed/")?.split('/').next()
 }
 
 impl Entry {
@@ -764,6 +777,7 @@ mod tests {
     fn sources_conflict_only_across_writers() {
         assert!(!sources_conflict("user/a", "user/a"));
         assert!(!sources_conflict("user/a", "user/b"));
+        assert!(!sources_conflict("managed/compose/a", "managed/compose/b"));
         assert!(sources_conflict("user/a", "managed/compose/stack"));
         assert!(sources_conflict("managed/compose/stack", "user/a"));
         assert!(sources_conflict("managed/a/x", "managed/b/y"));
