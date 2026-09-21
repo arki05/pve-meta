@@ -132,7 +132,7 @@ first, which is what its `waitForXtype()` does.
 ## Screenshots
 
 `docs/screenshots/` holds only what the top-level README shows, light and dark: the
-guest tree, Text mode with the diff, the Prefixes grid, and the declaration form. They were taken on `pvemeta-node1`
+guest tree, Text mode with the diff, the Save-anyway dialog, and the Prefixes grid. They were taken on `pvemeta-node1`
 (pve-manager 9.2.11, ExtJS 7.0.0, proxmox-widget-toolkit 5.2.8) inside the real UI.
 Anything else -- the row editor, the JSON view, a read-only caller's tab -- is a run of
 `testing/lab/headless-check.js` away, which writes a full set into the directory you
