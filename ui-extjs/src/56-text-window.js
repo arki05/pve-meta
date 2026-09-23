@@ -102,7 +102,9 @@ Ext.define('PVE.meta.TextWindow', {
     },
 
     // One `replace` at the view's own path, which says everything about what is
-    // inside that view -- a buffer for `traefik` replaces `traefik.spec` too.
+    // inside that view -- a buffer for `traefik` replaces `traefik.spec` too. The
+    // window closes only once the server has it: a page of YAML refused by a lint
+    // rule or a 403 is a page of YAML this window is still the only copy of.
     apply: function (text, lang) {
         let me = this;
         let value;
@@ -112,8 +114,7 @@ Ext.define('PVE.meta.TextWindow', {
             PVE.meta.Utils.alertError(err);
             return;
         }
-        me.tree.writeSubtree(me.view, value);
-        me.close();
+        PVE.meta.writeFromWindow(me, (done) => me.tree.writeSubtree(me.view, value, done));
     },
 });
 

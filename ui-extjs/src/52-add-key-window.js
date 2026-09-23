@@ -67,8 +67,10 @@ Ext.define('PVE.meta.AddKeyWindow', {
                 throw new Error(gettext('Key must not be empty'));
             }
             let value = v.kind === 'map' ? {} : PVE.meta.Utils.parseValue(v.value || '', v.kind);
-            me.fireEvent('addkey', PVE.meta.Utils.joinPath(me.parentPath, key), value);
-            me.close();
+            let path = PVE.meta.Utils.joinPath(me.parentPath, key);
+            // Closed by the write, not by the click: a key refused by the server is
+            // one the window still holds, ready to be corrected.
+            PVE.meta.writeFromWindow(me, (done) => me.fireEvent('addkey', path, value, done));
         } catch (err) {
             PVE.meta.Utils.alertError(err);
         }

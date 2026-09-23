@@ -87,7 +87,8 @@ Ext.define('PVE.meta.EditValueWindow', {
             me.close(); // nothing actually changed
             return;
         }
-        me.fireEvent('setvalue', value);
-        me.close();
+        // The write is one round trip away and may fail -- a lint error, a 403, a
+        // dropped connection -- so the window closes in the callback, not here.
+        PVE.meta.writeFromWindow(me, (done) => me.fireEvent('setvalue', value, done));
     },
 });

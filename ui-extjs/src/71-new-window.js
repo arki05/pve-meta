@@ -80,7 +80,9 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             Ext.Msg.alert(gettext('Error'), gettext('A tag selector needs a tag'));
             return;
         }
-        me.fireEvent('create', PVE.meta.NewRegistryWindow.planFrom(v));
-        me.close();
+        let plan = PVE.meta.NewRegistryWindow.planFrom(v);
+        // A name the server refuses, or one somebody else just took (a 409 on the
+        // empty digest), leaves the form open with the two fields still filled in.
+        PVE.meta.writeFromWindow(me, (done) => me.fireEvent('create', plan, done));
     },
 });

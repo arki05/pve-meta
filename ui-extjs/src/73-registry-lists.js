@@ -215,7 +215,7 @@ Ext.define('PVE.meta.RegistryGrid', {
     createOne: function () {
         let me = this;
         let win = Ext.create('PVE.meta.NewRegistryWindow', {});
-        win.on('create', function (plan) {
+        win.on('create', function (plan, done) {
             Proxmox.Utils.API2Request({
                 url: PVE.meta.Doc.urlFor(plan.id),
                 method: 'PUT',
@@ -225,12 +225,15 @@ Ext.define('PVE.meta.RegistryGrid', {
                     mode: 'replace',
                     digest: '',
                 }),
-                failure: (response) =>
+                failure: function (response) {
+                    done(false);
                     Ext.Msg.alert(
                         gettext('Error'),
                         response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
-                    ),
+                    );
+                },
                 success: function () {
+                    done(true);
                     me.reload();
                     me.editOne({ data: { id: plan.id } });
                 },

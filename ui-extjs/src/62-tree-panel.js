@@ -356,12 +356,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // --- writes --------------------------------------------------------------
 
     // Sends one edit as one write, and reloads. Every editor here goes through this.
-    sendEdit: function (edit, force) {
+    // `onDone(ok)` is the window that asked for it waiting to hear whether it may
+    // close; "Save anyway" carries the same one, so one retry answers once.
+    sendEdit: function (edit, force, onDone) {
         let me = this;
         me.submit(
             me.writeFor(me.docId, edit, me.digestOf(me.docId), force),
-            undefined,
-            force ? undefined : () => me.sendEdit(edit, true),
+            onDone,
+            force ? undefined : () => me.sendEdit(edit, true, onDone),
         );
     },
 
@@ -373,9 +375,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // Writes the list at `path` with member `index` replaced, or dropped when `value`
     // is undefined. One `replace` of the whole list: a view addresses through maps only.
-    writeListMember: function (path, index, value) {
+    writeListMember: function (path, index, value, onDone) {
         let list = this.listAt(path);
         if (index < 0 || index >= list.length) {
+            // Nothing written, so nothing to wait for: the editor that asked is
+            // told, rather than left masked over a write that never happened.
+            if (onDone) {
+                onDone(false);
+            }
             return;
         }
         if (value === undefined) {
@@ -383,14 +390,14 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         } else {
             list[index] = value;
         }
-        this.sendEdit({ path: path, op: 'set', value: list });
+        this.sendEdit({ path: path, op: 'set', value: list }, false, onDone);
     },
 
     // A whole subtree, as edited somewhere else: one `replace` at that view, which
     // says everything about what is inside it. What "Edit selection as text" ends
     // with.
-    writeSubtree: function (view, value) {
-        this.sendEdit({ path: view || '', op: 'set', value: value });
+    writeSubtree: function (view, value, onDone) {
+        this.sendEdit({ path: view || '', op: 'set', value: value }, false, onDone);
     },
 
     // The document a row belongs to; the panel's default for anything with no row.
@@ -885,8 +892,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.editAsText(rec);
             return;
         }
-        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.sendEdit({ path: rec.data.path, op: 'set', value: value }),
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value, done) =>
+            me.sendEdit({ path: rec.data.path, op: 'set', value: value }, false, done),
         );
     },
 
@@ -899,7 +906,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             'PVE.meta.AddKeyWindow',
             { parentPath: parentPath || '' },
             'addkey',
-            (path, value) => me.sendEdit({ path: path, op: 'set', value: value }),
+            (path, value, done) => me.sendEdit({ path: path, op: 'set', value: value }, false, done),
         );
     },
 
@@ -925,8 +932,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
             _path,
             value,
+            done,
         ) {
-            me.sendEdit({ path: path, op: 'set', value: list.concat([value]) });
+            me.sendEdit({ path: path, op: 'set', value: list.concat([value]) }, false, done);
         });
     },
 
@@ -941,8 +949,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.editAsText(rec);
             return;
         }
-        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.writeListMember(d.path, d.arrayIndex, value),
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value, done) =>
+            me.writeListMember(d.path, d.arrayIndex, value, done),
         );
     },
 

@@ -218,7 +218,9 @@ PVE.meta.TextCard = {
         me.write(
             me.docId,
             params,
-            () => me.refreshText(),
+            // Only a write that landed re-reads: a failed one leaves the buffer
+            // alone, since it is still the only copy of what was typed.
+            (ok) => (ok ? me.refreshText() : undefined),
             force ? undefined : () => me.applyText(true),
         );
     },

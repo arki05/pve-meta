@@ -222,26 +222,34 @@ PVE.meta.Doc = {
         return { url: url, method: 'PUT', params: PVE.meta.Doc.docParams(params) };
     },
 
-    write: function (docId, params, onSuccess, retry) {
+    write: function (docId, params, onDone, retry) {
         this.submit(
             { url: this.urlFor(docId), method: 'PUT', params: this.docParams(params) },
-            onSuccess,
+            onDone,
             retry,
         );
     },
 
-    // `retry` is what the "Save anyway" tick calls: the same write again, with
-    // `force=1`. Without one a 422 is an ordinary error.
-    submit: function (opts, onSuccess, retry) {
+    // `onDone(ok)` is how a write answers the editor that started it: true once the
+    // server has it, false on every failure it is left to deal with -- which is what
+    // keeps a window open with what was typed instead of closing over a 400. A 422
+    // that offers "Save anyway" answers nothing until that question is settled: the
+    // retry carries the same `onDone`, so the editor stays masked and open across it.
+    // `retry` is what the tick calls: the same write again, with `force=1`. Without
+    // one a 422 is an ordinary error.
+    submit: function (opts, onDone, retry) {
         let me = this;
+        let done = function (ok) {
+            if (onDone) {
+                onDone(ok);
+            }
+        };
         Proxmox.Utils.API2Request(
             Ext.apply(
                 {
                     waitMsgTarget: me,
                     success: function () {
-                        if (onSuccess) {
-                            onSuccess();
-                        }
+                        done(true);
                         me.reload();
                     },
                     failure: function (response) {
@@ -260,6 +268,7 @@ PVE.meta.Doc = {
                                 me.reload();
                                 Ext.Msg.alert(gettext('Conflict'), text);
                             }
+                            done(false);
                             return;
                         }
                         // An enforcing prefix refused this write, naming the paths
@@ -274,12 +283,15 @@ PVE.meta.Doc = {
                                 fn: function (btn) {
                                     if (btn === 'yes') {
                                         retry();
+                                    } else {
+                                        done(false);
                                     }
                                 },
                             });
                             return;
                         }
                         Ext.Msg.alert(gettext('Error'), text);
+                        done(false);
                     },
                 },
                 opts,

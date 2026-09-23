@@ -1185,6 +1185,152 @@ console.log('\n--- one edit, one write (DESIGN §8) ---');
     );
 }
 
+console.log('\n--- a popup closes when the write lands, not when the button is clicked ---');
+{
+    // Every one of these fired its event and closed in the same breath, so a 400
+    // from the lint, a 403 or a dropped connection threw away what was typed --
+    // for the subtree window, a page of YAML. The window now waits for the write.
+    const win = function () {
+        const w = { masks: [], closed: 0, isDestroyed: false, close() { this.closed++; } };
+        w.body = { mask: () => w.masks.push('on'), unmask: () => w.masks.push('off') };
+        return w;
+    };
+
+    const kept = win();
+    ctx.PVE.meta.writeFromWindow(kept, (done) => (kept.done = done));
+    eq('the body is masked while the write is in flight', kept.masks, ['on']);
+    eq('... the window is not closed on the click', kept.closed, 0);
+    kept.done(false);
+    eq('a failed write unmasks and leaves it open', [kept.masks, kept.closed], [['on', 'off'], 0]);
+    const gone = win();
+    ctx.PVE.meta.writeFromWindow(gone, (done) => done(true));
+    eq('a write that landed closes it', [gone.masks, gone.closed], [['on', 'off'], 1]);
+
+    // Add Key: the edit it fires, and the callback it closes on.
+    const add = Object.assign(win(), {
+        parentPath: 'traefik',
+        list: false,
+        validForm: () => ({ getValues: () => ({ key: 'port', kind: 'number', value: '8080' }) }),
+        fireEvent(name, path, value, done) {
+            this.fired = [name, path, value];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.AddKeyWindow.submit.call(add);
+    eq('Add Key fires the edit at its own path', add.fired, ['addkey', 'traefik.port', 8080]);
+    add.done(false);
+    eq('... and a refused key leaves the form open to be corrected', add.closed, 0);
+    add.done(true);
+    eq('... closing once the key is stored', add.closed, 1);
+
+    // The row editor.
+    const edit = Object.assign(win(), {
+        rec: { data: { path: 'traefik.spec.port', kind: 'number', present: true, rawValue: 80 } },
+        validForm: () => ({}),
+        down: () => ({ getValue: () => '8080' }),
+        fireEvent(name, value, done) {
+            this.fired = [name, value];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.EditValueWindow.submit.call(edit);
+    eq('the row editor fires the value', edit.fired, ['setvalue', 8080]);
+    edit.done(false);
+    eq('... and stays open on a failure', [edit.masks, edit.closed], [['on', 'off'], 0]);
+
+    // "Edit selection as text": the one with a page of YAML to lose.
+    const text = Object.assign(win(), {
+        view: 'traefik',
+        tree: {
+            writeSubtree(view, value, done) {
+                text.wrote = [view, value];
+                text.done = done;
+            },
+        },
+    });
+    ctx.PVE.meta.TextWindow.apply.call(text, 'spec:\n  host: a.example\n', 'yaml');
+    eq('the subtree window writes its view', text.wrote, ['traefik', { spec: { host: 'a.example' } }]);
+    text.done(false);
+    eq('... and keeps the buffer when the write is refused', [text.masks, text.closed], [['on', 'off'], 0]);
+    text.done(true);
+    eq('... closing when it is not', text.closed, 1);
+
+    // New Prefix. (`statics:` is a plain object in the shim; Ext hoists it onto
+    // the class, which is how `submit` reaches `planFrom`.)
+    const New = ctx.PVE.meta.NewRegistryWindow;
+    New.planFrom = New.statics.planFrom;
+    const create = Object.assign(win(), {
+        validForm: () => ({ getValues: () => ({ name: 'gpu', selector: 'all' }) }),
+        fireEvent(name, plan, done) {
+            this.fired = [name, plan.id];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.NewRegistryWindow.submit.call(create);
+    eq('New Prefix fires the plan', create.fired, ['create', 'prefixes/gpu']);
+    create.done(false);
+    eq('... and a name the server refuses leaves the form filled in', create.closed, 0);
+    delete New.planFrom;
+}
+
+console.log('\n--- what a write answers the editor that started it ---');
+{
+    // `onDone(ok)` is the whole contract: true once the server has it, false on
+    // every failure the editor is left holding. A 422 answers nothing until the
+    // "Save anyway" question is settled, so the window stays masked across it.
+    const answers = [];
+    const shown = [];
+    const panelD = panelWith({ docId: '201', docState: { 201: { digest: 'd0', data: {} } }, reload() {} });
+    const request = ctx.Proxmox.Utils.API2Request;
+    const msgShow = ctx.Ext.Msg.show;
+    let reply = 'no';
+    ctx.Ext.Msg.show = function (cfg) {
+        shown.push(cfg.title);
+        cfg.fn(reply);
+    };
+    const edit = { path: 'a', op: 'set', value: 1 };
+
+    ctx.Proxmox.Utils.API2Request = (opts) => opts.success({});
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('a write that landed says so', answers.splice(0), [true]);
+
+    ctx.__alerts.splice(0);
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 400 }, htmlStatus: 'not a key name' });
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('an error says so, once, and is shown', [answers.splice(0), ctx.__alerts.splice(0).length], [[false], 1]);
+
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 422 }, htmlStatus: 'traefik.spec.port: expected integer' });
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('a 422 asks before it answers', shown.splice(0).length, 1);
+    eq('... and Cancel is a failed write', answers.splice(0), [false]);
+
+    // "Save anyway": the retry carries the same callback, so the window is
+    // answered once, after the forced write -- not unmasked mid-question.
+    reply = 'yes';
+    let forced = null;
+    let first = true;
+    ctx.Proxmox.Utils.API2Request = function (opts) {
+        if (first) {
+            first = false;
+            opts.failure({ result: { status: 422 }, htmlStatus: 'expected integer' });
+            return;
+        }
+        forced = opts.params.force;
+        opts.success({});
+    };
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('Save anyway retries with force=1', forced, 1);
+    eq('... and answers once, when that write lands', answers.splice(0), [true]);
+
+    ctx.Ext.Msg.show = msgShow;
+    ctx.Proxmox.Utils.API2Request = request;
+    if (!request) {
+        delete ctx.Proxmox.Utils.API2Request;
+    }
+}
+
 console.log('\n--- acting on one member rewrites its list ---');
 {
     // There is no path to `groups[1]`, so every action on a member is one write of
