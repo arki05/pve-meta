@@ -579,6 +579,26 @@ fn stored_vmids_covers_documents_and_snapshot_copies() {
 }
 
 #[test]
+fn a_file_the_store_cannot_name_is_listed_rather_than_skipped() {
+    // A typo'd or leftover file name is otherwise invisible: `stored_vmids`
+    // passes it over while `version` hashes it, so `pve-meta ls` shows it.
+    let (dir, store) = store();
+    store.put_raw(&DocId::Guest(100), "a: 1\n", None).unwrap();
+    store.snapshot(100, "before").unwrap();
+    for stray in ["datacenter.yaml", "100.bad name.yaml", "notes.txt", "100"] {
+        std::fs::write(dir.path().join(stray), "a: 1\n").unwrap();
+    }
+    // Our own write-in-progress temp file is not a stray.
+    std::fs::write(dir.path().join(".100.yaml.tmp.node1.42.0"), "junk").unwrap();
+
+    assert_eq!(store.stored_vmids().unwrap(), vec![100]);
+    assert_eq!(
+        store.unknown_files().unwrap(),
+        vec!["100", "100.bad name.yaml", "datacenter.yaml", "notes.txt"],
+    );
+}
+
+#[test]
 fn too_large_document_is_rejected() {
     let (_dir, store) = store();
     let big = "x".repeat(600 * 1024);
@@ -763,6 +783,7 @@ fn a_store_whose_cluster_marker_is_missing_refuses_every_operation() {
         ("put_raw", Box::new(|s| s.put_raw(&DocId::Guest(101), "b: 1\n", None).map(drop))),
         ("delete", Box::new(|s| s.delete(&DocId::Guest(100)).map(drop))),
         ("stored_vmids", Box::new(|s| s.stored_vmids().map(drop))),
+        ("unknown_files", Box::new(|s| s.unknown_files().map(drop))),
         ("list_snapshots", Box::new(|s| s.list_snapshots(100).map(drop))),
         ("snapshot", Box::new(|s| s.snapshot(100, "again").map(drop))),
         ("rollback", Box::new(|s| s.rollback(100, "before").map(drop))),

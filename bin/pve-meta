@@ -42,6 +42,9 @@ usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
   --file  read the payload from a file, or '-' for stdin; .json is JSON, anything else YAML
   --force store the result even where a prefix's schema is enforced and it does not match
 
+  ls            every document, plus every file under /etc/pve/meta that is neither a
+                document nor a snapshot copy, as 'unknown/<file>': never touched, never
+                an orphan, but a typo'd name is only visible here
   ls --orphans  only vmids the store holds files for that are not in the vmlist
   rm <vmid>     remove an orphan's document and snapshot copies; refuses a live guest
   scan-notes    read every backup notes block in the cluster's guest configs into the
@@ -287,9 +290,14 @@ sub cmd_ls {
     # not, plus every prefix file, unscoped.
     my $vmids = call(sub { PVE::RS::Meta::stored_vmids() });
     my $prefixes = call(sub { PVE::RS::Meta::api_prefixes(undef, undef) });
+    # A file the store cannot classify is listed too, flagged: it is nobody's
+    # document, `rm` will not take it and `--orphans` will not name it, so this
+    # is the only place a typo'd file name shows up.
+    my $unknown = call(sub { PVE::RS::Meta::unknown_files() });
     my @docs = (
         (map { { id => "$_" } } sort { $a <=> $b } @$vmids),
         (map { { id => "prefixes/$_->{prefix}" } } @$prefixes),
+        (map { { id => "unknown/$_", unknown => JSON::PP::true } } @$unknown),
     );
     if ($format eq 'json') {
         print JSON::PP->new->canonical->encode(\@docs), "\n";

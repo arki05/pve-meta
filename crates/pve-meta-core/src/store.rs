@@ -434,38 +434,54 @@ impl MetaStore {
 
     /// Every vmid with any file, sorted; what `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §7).
     pub fn stored_vmids(&self) -> Result<Vec<u32>> {
-        self.check_available()?;
         let mut out = std::collections::BTreeSet::new();
+        for (_, vmid) in self.classified_root()? {
+            if let Some(vmid) = vmid {
+                out.insert(vmid);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Every file in the root this store cannot name -- neither `<vmid>.yaml`
+    /// nor `<vmid>.<snapname>.yaml` -- by file name, sorted. [`MetaStore::stored_vmids`]
+    /// passes them over and [`MetaStore::version`] hashes them, so without
+    /// this a typo'd file name is invisible; `pve-meta ls` lists them, and
+    /// nothing removes them or counts them as an orphan.
+    pub fn unknown_files(&self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .classified_root()?
+            .into_iter()
+            .filter(|(_, vmid)| vmid.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every regular, non-hidden file in the root with the vmid its name
+    /// carries, or `None` for a name this store does not give out: the one
+    /// classification both listings read.
+    fn classified_root(&self) -> Result<Vec<(String, Option<u32>)>> {
+        self.check_available()?;
+        let mut out = Vec::new();
         let Some(entries) = gone_is_none(fs::read_dir(&self.root))? else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
-        let suffix = format!(".{}", DISK_FORMAT.ext());
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(file_type) = gone_is_none(entry.file_type())? else {
                 continue;
             };
+            // A dot file is this store's own write-in-progress temp name.
             if name.starts_with('.') || !file_type.is_file() {
                 continue;
             }
-            // `<vmid>.yaml` or `<vmid>.<snapname>.yaml`: the vmid is the
-            // first dot-separated component either way.
-            let Some(stem) = name.strip_suffix(&suffix) else {
-                continue;
-            };
-            let (head, snap) = match stem.split_once('.') {
-                Some((head, snap)) => (head, Some(snap)),
-                None => (stem, None),
-            };
-            if snap.is_some_and(|s| !is_valid_snapshot_name(s)) {
-                continue;
-            }
-            if let Ok(vmid) = head.parse::<u32>() {
-                out.insert(vmid);
-            }
+            let vmid = vmid_of_file(&name);
+            out.push((name, vmid));
         }
-        Ok(out.into_iter().collect())
+        Ok(out)
     }
 
     /// Lists a guest's snapshot names, sorted.
@@ -601,6 +617,21 @@ impl MetaStore {
         }
         Ok(())
     }
+}
+
+/// The vmid `name` names: `<vmid>.yaml` or `<vmid>.<snapname>.yaml`, the vmid
+/// being the first dot-separated component either way. `None` for anything
+/// else under the store's root.
+fn vmid_of_file(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
+    let (head, snap) = match stem.split_once('.') {
+        Some((head, snap)) => (head, Some(snap)),
+        None => (stem, None),
+    };
+    if snap.is_some_and(|s| !is_valid_snapshot_name(s)) {
+        return None;
+    }
+    head.parse::<u32>().ok()
 }
 
 /// A filesystem-safe node tag for temp file names; falls back to `"node"`.

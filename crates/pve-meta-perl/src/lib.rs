@@ -170,6 +170,15 @@ mod pve_rs_meta {
         Ok(open_store().stored_vmids()?)
     }
 
+    /// Every file in the store's root that is neither a document nor a
+    /// snapshot copy, by file name, sorted. `pve-meta ls` lists them as
+    /// `unknown/<file>`; nothing removes them or calls them orphans
+    /// (`docs/DESIGN.md` §8).
+    #[export]
+    pub fn unknown_files() -> Result<Vec<String>, Error> {
+        Ok(open_store().unknown_files()?)
+    }
+
     /// The notes block for `$vmid`'s current document, or `undef` if none.
     /// Called from the patched vzdump `assemble` of both guest types
     /// (`docs/LIFECYCLE.md`). Dies for a document too large or unparsable to

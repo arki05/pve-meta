@@ -158,6 +158,8 @@ is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200, 999500],
 is(PVE::RS::Meta::on_destroy(999500), 2, 'on_destroy removes a stale document and its snapshot copy');
 is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200], '... and the vmid leaves the list');
 ok(file_exists('datacenter.yaml'), 'a stray file with no vmid in its name is never a guest');
+is_deeply(PVE::RS::Meta::unknown_files(), ['datacenter.yaml'],
+    '... and unknown_files names it, the row `pve-meta ls` prints as unknown/<file>');
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$root/9200.old.yaml");
 
