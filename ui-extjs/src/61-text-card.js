@@ -32,7 +32,16 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return;
         }
+        me.flushAnnotate();
         PVE.meta.Buffer.diff(me.textBuffer(), me.docId);
+    },
+
+    // Is there anything in the buffer that the file does not have? One predicate,
+    // `Buffer.unchanged`, which the subtree window asks too -- this used to be a
+    // second copy of it that compared against `textOriginal` by hand.
+    textIsDirty: function () {
+        let me = this;
+        return !!me.textEditor && !PVE.meta.Buffer.unchanged(me.textBuffer());
     },
 
     setModeButton: function (value) {
@@ -56,21 +65,6 @@ PVE.meta.TextCard = {
             me.enterTextMode();
         } else {
             me.leaveTextMode();
-        }
-    },
-
-    textIsDirty: function () {
-        let me = this;
-        if (!me.textEditor) {
-            return false;
-        }
-        try {
-            return (
-                me.textEditor.getValue() !==
-                PVE.meta.Codec.originalInLang(me.textOriginal, me.textLang)
-            );
-        } catch (_err) {
-            return true; // cannot tell: assume there is something to lose
         }
     },
 
@@ -124,7 +118,7 @@ PVE.meta.TextCard = {
                 // Squiggles describe the text the server sent; typing moves the lines,
                 // so they are dropped on the first edit and come back on the next load.
                 me.textEditor.onDidChangeModelContent(function () {
-                    me.annotateText();
+                    me.scheduleAnnotate();
                 });
                 me.annotateText();
             },
@@ -139,6 +133,7 @@ PVE.meta.TextCard = {
     // The buffer goes, and what the hover provider knows about its model with it.
     disposeTextEditor: function () {
         let me = this;
+        me.cancelAnnotate();
         let model = me.textEditor && me.textEditor.getModel();
         if (model) {
             PVE.meta.TextHovers.delete(model);
@@ -223,6 +218,7 @@ PVE.meta.TextCard = {
         if (!me.textEditor) {
             return;
         }
+        me.flushAnnotate();
         if (PVE.meta.Buffer.unchanged(me.textBuffer())) {
             return;
         }
@@ -260,9 +256,44 @@ PVE.meta.TextCard = {
     },
 
     // Underline what is wrong with the buffer *as it is now* and describe the key on
-    // hover. Advisory only, on every keystroke: a YAML syntax error as an Error
-    // marker (Monaco validates JSON itself but not YAML), every schema finding
-    // (the Shape) as a Warning -- YAML-only, since the line index is a YAML scan.
+    // hover. Advisory only, and after a pause in the typing: a YAML syntax error as
+    // an Error marker (Monaco validates JSON itself but not YAML), every schema
+    // finding (the Shape) as a Warning -- YAML-only, since the line index is a YAML
+    // scan.
+    // Every keystroke moves every line, so the answer is only worth having once
+    // typing pauses: the parser runs over the whole buffer and the findings come
+    // from the core. Anything that acts on the buffer flushes first.
+    ANNOTATE_DELAY: 150,
+
+    scheduleAnnotate: function () {
+        let me = this;
+        me.cancelAnnotate();
+        me.annotateTimer = setTimeout(function () {
+            me.annotateTimer = null;
+            if (!me.isDestroyed) {
+                me.annotateText();
+            }
+        }, me.ANNOTATE_DELAY);
+    },
+
+    cancelAnnotate: function () {
+        let me = this;
+        if (me.annotateTimer) {
+            clearTimeout(me.annotateTimer);
+            me.annotateTimer = null;
+        }
+    },
+
+    // What a pending annotation owes the buffer, now: Apply and Diff both ask what
+    // is wrong with the text as it stands, not as it stood 150 ms ago.
+    flushAnnotate: function () {
+        let me = this;
+        if (me.annotateTimer) {
+            me.cancelAnnotate();
+            me.annotateText();
+        }
+    },
+
     annotateText: function () {
         let me = this;
         if (!me.textEditor || !window.monaco) {

@@ -1907,6 +1907,135 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
     ctx.Ext.create = origCreate;
 }
 
+console.log('\n--- the panel takes its editors with it, and asks one question once ---');
+{
+    // A modal that outlives its panel edits a document nothing will write: its OK
+    // goes through the panel, and PVE.meta.request drops the answer once the panel
+    // is destroyed. They are tracked the way the text window already was.
+    const opened = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = function (xtype, cfg) {
+        const win = {
+            xtype: xtype,
+            closed: 0,
+            handlers: {},
+            on(name, fn) { this.handlers[name] = fn; },
+            show() {},
+            close() {
+                this.closed++;
+                this.handlers.destroy();
+            },
+        };
+        opened.push(win);
+        return win;
+    };
+    const host = panelWith({ docId: '201', docState: { 201: { digest: 'd', data: {} } } });
+    host.addKey('201', '');
+    host.addKey('201', 'traefik');
+    eq('every editor it opens is tracked', host.editors.length, 2);
+    opened[0].close();
+    eq('... and one that closes on its own is forgotten', host.editors.length, 1);
+    host.textWindow = { closed: 0, close() { this.closed++; } };
+    const textWindow = host.textWindow;
+    host.closeEditors();
+    eq('destroying the panel closes what is left', [opened[1].closed, textWindow.closed], [1, 1]);
+    eq('... and the editing flag is down again', host.editing, false);
+    ctx.Ext.create = origCreate;
+
+    // One question, one answer: syncAccessLabel calls syncFooter, and syncButtons
+    // called it a second time on its own.
+    let footers = 0;
+    const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
+    const stub = { setDisabled() {}, setHidden() {}, setText() {}, setVisible() {} };
+    const counted = panelWith({
+        docId: '201',
+        docState: { 201: { digest: 'd', data: {} } },
+        access: { read: 1, write: 1 },
+        mode: 'tree',
+        tree: { getSelection: () => [] },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : stub),
+        syncFooter: () => footers++,
+    });
+    counted.syncButtons();
+    eq('the footer is synced once per button sync', footers, 1);
+}
+
+console.log('\n--- one rule for "did this change" ---');
+{
+    // The row editor compared `Ext.encode` of each value and `setToDefault` asked
+    // the core's `same`: two rules for one question, and the string one made key
+    // order part of the answer, which it is not (DESIGN §2).
+    let fired = 0;
+    const unchanged = Object.assign({}, ctx.PVE.meta.EditValueWindow, {
+        rec: { data: { path: 'netbird.groups', kind: 'array', present: true, rawValue: ['lan', 'wan'] } },
+        closed: 0,
+        validForm: () => ({}),
+        down: () => ({ getValue: () => 'lan, wan' }),
+        fireEvent: () => fired++,
+        close() { this.closed++; },
+    });
+    unchanged.submit();
+    eq('a value that is the value already there is not a write', [fired, unchanged.closed], [0, 1]);
+    const changed = Object.assign({}, unchanged, { closed: 0, down: () => ({ getValue: () => 'lan, dmz' }) });
+    changed.submit();
+    eq('... and one that differs is', fired, 1);
+
+    // And the Text card's own dirty check is `Buffer.unchanged`, which knows the
+    // buffer's language: the same document shown as JSON is not an edit.
+    const card = panelWith({
+        textLang: 'json',
+        textOriginal: 'b:   1\na: [x, y]\n',
+        textEditor: { getValue: () => Codec.dump({ b: 1, a: ['x', 'y'] }, 'json') },
+    });
+    eq('the loaded document, shown as JSON, is nothing to discard', card.textIsDirty(), false);
+    card.textEditor = { getValue: () => '{"b": 2}' };
+    eq('... an edit is', card.textIsDirty(), true);
+    eq('no buffer at all, nothing to lose', panelWith({}).textIsDirty(), false);
+}
+
+console.log('\n--- the squiggles wait for a pause in the typing ---');
+{
+    // annotateText parses the whole buffer and asks the core for every finding;
+    // running that on every keystroke is work nobody asked for, and the answer is
+    // stale before it is drawn. Anything that acts on the buffer flushes it first.
+    const timers = [];
+    const [realSet, realClear] = [ctx.setTimeout, ctx.clearTimeout];
+    ctx.setTimeout = (fn, ms) => timers.push([fn, ms]);
+    ctx.clearTimeout = (id) => (timers[id - 1] = null);
+    const diffs = [];
+    const shownDiff = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    let annotated = 0;
+    const typing = panelWith({
+        docId: '201',
+        docState: { 201: { digest: 'd', data: { a: 1 } } },
+        textLang: 'yaml',
+        textOriginal: 'a: 1\n',
+        textEditor: { getValue: () => 'a: 1\n' },
+        annotateText: () => annotated++,
+    });
+
+    typing.scheduleAnnotate();
+    eq('a keystroke does not run the parser', annotated, 0);
+    eq('... it asks again in 150 ms', timers[0][1], typing.ANNOTATE_DELAY);
+    typing.scheduleAnnotate();
+    eq('... and the next keystroke replaces that timer', [timers[0], timers.length], [null, 2]);
+    timers[1][0]();
+    eq('... one run when the typing stops', annotated, 1);
+
+    typing.scheduleAnnotate();
+    typing.showDiff();
+    eq('Diff sees the buffer as it is now', annotated, 2);
+    eq('... and is still a diff', diffs.length, 1);
+    typing.scheduleAnnotate();
+    typing.applyText();
+    eq('and so does Apply', annotated, 3);
+
+    ctx.PVE.meta.Monaco.showDiff = shownDiff;
+    ctx.setTimeout = realSet;
+    ctx.clearTimeout = realClear;
+}
+
 console.log('\n--- the editor follows the value\'s shape, not a declaration ---');
 // A map is nested YAML: Monaco, not a one-line field. This is the case that had no
 // editor at all -- Edit was disabled, and double-click and Enter both bailed out.
@@ -1965,6 +2094,9 @@ console.log('\n--- the editor reads and writes the notes: every document request
             write: T.write,
             writeFor: T.writeFor,
             sendEdit: T.sendEdit,
+            flushAnnotate: T.flushAnnotate,
+            cancelAnnotate: T.cancelAnnotate,
+            clearParseErrorIfSound: T.clearParseErrorIfSound,
             request: (opts) => sent.push(Object.assign({ method: 'GET' }, opts)),
             submit: (opts) => sent.push(opts),
         },

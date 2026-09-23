@@ -63,11 +63,20 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.syncButtons();
         });
         me.on('destroy', function () {
-            if (me.textWindow) {
-                me.textWindow.close();
-            }
+            me.closeEditors();
             me.disposeTextEditor();
         });
+    },
+
+    // Everything this panel has open goes with it: a modal that outlives its panel
+    // edits a document nothing will write, since its OK goes through `me` and
+    // `PVE.meta.request` drops the answer once `me` is destroyed.
+    closeEditors: function () {
+        let me = this;
+        if (me.textWindow) {
+            me.textWindow.close();
+        }
+        (me.editors || []).slice().forEach((win) => win.close());
     },
 
     // --- chrome --------------------------------------------------------------
@@ -555,7 +564,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         set('removeBtn', text || !row || !row.present || !row.editable);
         set('textSelBtn', text || !row);
         set('reloadBtn', text);
-        me.syncFooter();
         let dflt = me.down('#defaultBtn');
         if (dflt) {
             // Hidden when nothing in the document declares a default (a per-document
@@ -918,8 +926,13 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.editing = true;
         let win = Ext.create(xtype, cfg);
         win.on(on, handler);
+        // Tracked the way `textWindow` is: a modal outliving its panel is a write
+        // with nowhere to land.
+        me.editors = me.editors || [];
+        me.editors.push(win);
         win.on('destroy', function () {
             me.editing = false;
+            me.editors = me.editors.filter((open) => open !== win);
         });
         win.show();
         return win;

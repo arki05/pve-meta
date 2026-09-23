@@ -83,7 +83,9 @@ Ext.define('PVE.meta.EditValueWindow', {
             PVE.meta.Utils.alertError(err);
             return;
         }
-        if (d.present && Ext.encode(value) === Ext.encode(d.rawValue)) {
+        // The core's own comparison, the one `setToDefault` asks: `Ext.encode` of
+        // each made key order part of the answer, which it is not (DESIGN §2).
+        if (d.present && PVE.meta.Utils.sameValue(value, d.rawValue)) {
             me.close(); // nothing actually changed
             return;
         }
