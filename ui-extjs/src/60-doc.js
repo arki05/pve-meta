@@ -252,11 +252,14 @@ PVE.meta.Doc = {
                             response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response);
                         if (status === '409') {
                             if (me.mode === 'text') {
-                                me.refreshText();
+                                // The buffer is unwritten text and the only copy of
+                                // it: the Text card re-reads around it rather than
+                                // over it, and says so itself once it has.
+                                me.conflictInText(text);
                             } else {
                                 me.reload();
+                                Ext.Msg.alert(gettext('Conflict'), text);
                             }
-                            Ext.Msg.alert(gettext('Conflict'), text);
                             return;
                         }
                         // An enforcing prefix refused this write, naming the paths

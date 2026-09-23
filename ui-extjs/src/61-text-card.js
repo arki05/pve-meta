@@ -338,8 +338,12 @@ PVE.meta.TextCard = {
     },
 
     // Re-read the document and put it back in the buffer (after Apply, or Revert).
-    refreshText: function () {
+    // `cfg.keepBuffer` re-reads around the buffer instead: the digest and the text
+    // the buffer is compared against are updated, what was typed is left alone.
+    // `cfg.then` runs once the read has landed.
+    refreshText: function (cfg) {
         let me = this;
+        let opts = cfg || {};
         me.request({
             url: me.urlFor(me.docId),
             params: me.docParams({ format: 'yaml' }),
@@ -347,10 +351,29 @@ PVE.meta.TextCard = {
                 let d = response.result.data || {};
                 me.setDigest(me.docId, d.digest);
                 me.textOriginal = d.text || '';
-                if (me.textEditor) {
+                if (me.textEditor && !opts.keepBuffer) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
                     me.annotateText();
                 }
+                if (opts.then) {
+                    opts.then();
+                }
+            },
+        });
+    },
+
+    // A 409 while the Text card holds a buffer: somebody else wrote the document
+    // since it was read. The buffer is unwritten work, so the re-read takes the
+    // fresh digest and original only -- the next Apply carries that digest -- and
+    // the diff is the buffer against what is in the file *now*, which is the
+    // question a conflict actually raises.
+    conflictInText: function (message) {
+        let me = this;
+        me.refreshText({
+            keepBuffer: true,
+            then: function () {
+                Ext.Msg.alert(gettext('Conflict'), message);
+                me.showDiff();
             },
         });
     },

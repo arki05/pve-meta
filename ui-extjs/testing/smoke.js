@@ -1438,6 +1438,47 @@ console.log('\n--- the editor reads and writes the notes: every document request
     eq('nothing else was sent', sent.length, 0);
 }
 
+console.log('\n--- a 409 in Text mode keeps the buffer ---');
+{
+    // The buffer is unwritten work and the only copy of it. A 409 says the file
+    // moved under it, which is a reason to show the difference, not to drop what
+    // was typed on the floor and put the server's text there instead.
+    const typed = '# mine\nb: 2\na: 1\n';
+    const stored = 'a: 1\nc: 3\n';
+    const editor = { value: typed, getValue() { return this.value; }, setValue(v) { this.value = v; } };
+    const diffs = [];
+    const shown = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    ctx.__alerts.splice(0);
+    const panelT = panelWith({
+        docId: '201',
+        mode: 'text',
+        textLang: 'yaml',
+        textOriginal: 'a: 1\n',
+        textEditor: editor,
+        docState: { 201: { digest: 'd0', data: { a: 1 } } },
+        // The re-read a conflict triggers: the document as somebody else left it.
+        request: (opts) => opts.success({ result: { data: { digest: 'd9', text: stored } } }),
+        annotateText: () => {},
+    });
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    panelT.applyText();
+    delete ctx.Proxmox.Utils.API2Request;
+    ctx.PVE.meta.Monaco.showDiff = shown;
+
+    eq('the buffer is still what was typed', editor.value, typed);
+    eq('the digest is the one the next Apply needs', panelT.digestOf('201'), 'd9');
+    eq('and the buffer is now compared against the new file', panelT.textOriginal, stored);
+    eq('the conflict is reported', ctx.__alerts.splice(0), [['Conflict', 'digest mismatch']]);
+    eq('... with the diff against what is in the file now', diffs.pop(), {
+        title: '201',
+        original: stored,
+        modified: typed,
+        lang: 'yaml',
+    });
+}
+
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
 // keys (DESIGN §7) that must become ordinary rows, not resolve through the
