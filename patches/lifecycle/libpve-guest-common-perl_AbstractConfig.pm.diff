@@ -132,33 +132,66 @@
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -876,6 +980,9 @@
+@@ -876,6 +980,24 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
 +
-+    eval { PVE::RS::Meta::on_snapshot($vmid, $snapname) };
-+    warn "pve-meta: on_snapshot($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: under the document's own lock -- the one every other writer
++    # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`), so the copy, a
++    # rollback and an in-flight API write can never interleave on the file.
++    #
++    # `cfs_lock_domain` reports the callback's die through `$@` rather than
++    # raising, so `$@` is read inside the eval, before leaving it clears it.
++    # The eval is for `cfs_lock_domain` itself: metadata must never be able to
++    # fail a guest operation.
++    my $meta_err;
++    eval {
++        PVE::Cluster::cfs_lock_domain(
++            "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_snapshot($vmid, $snapname) },
++        );
++        $meta_err = $@;
++    };
++    $meta_err = $@ if !$meta_err;
++    warn "pve-meta: on_snapshot($vmid, $snapname) failed: $meta_err" if $meta_err;
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1159,9 @@
+@@ -1052,6 +1174,17 @@
              $class->write_config($vmid, $conf);
          },
      );
 +
-+    eval { PVE::RS::Meta::on_delsnap($vmid, $snapname) };
-+    warn "pve-meta: on_delsnap($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: under the document's own lock, like `snapshot_create`'s copy.
++    my $meta_err;
++    eval {
++        PVE::Cluster::cfs_lock_domain(
++            "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_delsnap($vmid, $snapname) },
++        );
++        $meta_err = $@;
++    };
++    $meta_err = $@ if !$meta_err;
++    warn "pve-meta: on_delsnap($vmid, $snapname) failed: $meta_err" if $meta_err;
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1324,9 @@
+@@ -1214,6 +1347,19 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);
 +
-+    eval { PVE::RS::Meta::on_rollback($vmid, $snapname) };
-+    warn "pve-meta: on_rollback($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: under the document's own lock, like `snapshot_create`'s copy --
++    # this one writes the document without a digest, so it must not land on top
++    # of an API write that read it a moment earlier.
++    my $meta_err;
++    eval {
++        PVE::Cluster::cfs_lock_domain(
++            "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_rollback($vmid, $snapname) },
++        );
++        $meta_err = $@;
++    };
++    $meta_err = $@ if !$meta_err;
++    warn "pve-meta: on_rollback($vmid, $snapname) failed: $meta_err" if $meta_err;
  }
  
  # Calculate a derived property from a configuration. Derived properties are:

@@ -25,6 +25,12 @@ three functions it touches). The diff:
   copy over the current document (or removes the current document if the guest had none
   at snapshot time).
 
+Every call runs under the document's own `cfs_lock_domain("pve-meta-<vmid>")`, the lock
+every other writer takes, so a copy, a rollback and an in-flight API or CLI write never
+interleave on the file — `rollback` in particular writes the document without a digest,
+which nothing else would catch. The lock is taken inside the guest lock the caller
+already holds, the order create and destroy use.
+
 Every call is `eval { ... }; warn ... if $@;` — soft-fail, never blocks the actual
 snapshot/rollback/delete-snapshot operation. A metadata read/write hiccup (disk full, a
 corrupt document, the library not yet installed mid-upgrade) must never take down a
