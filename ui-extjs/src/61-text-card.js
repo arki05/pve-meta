@@ -353,6 +353,7 @@ PVE.meta.TextCard = {
                 let d = response.result.data || {};
                 me.setDigest(me.docId, d.digest);
                 me.textOriginal = d.text || '';
+                me.clearParseErrorIfSound();
                 if (me.textEditor && !opts.keepBuffer) {
                     me.textEditor.setValue(me.textRendered(me.textLang));
                     me.annotateText();
@@ -362,6 +363,25 @@ PVE.meta.TextCard = {
                 }
             },
         });
+    },
+
+    // Text is where a document that does not parse gets repaired, and this is the
+    // only read that sees the repair: `reload` clears `docParseError` but returns
+    // early while the mode is text, so without this the Tree segment stayed disabled
+    // until the page was reloaded. The document's own text is the answer -- if it
+    // parses now, there are rows to show again.
+    clearParseErrorIfSound: function () {
+        let me = this;
+        if (!me.docParseError) {
+            return;
+        }
+        try {
+            PVE.meta.Codec.parse(me.textOriginal, 'yaml');
+        } catch (_err) {
+            return;
+        }
+        me.docParseError = '';
+        me.syncAccessLabel();
     },
 
     // A 409 while the Text card holds a buffer: somebody else wrote the document

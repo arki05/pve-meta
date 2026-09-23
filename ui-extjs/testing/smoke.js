@@ -1584,6 +1584,43 @@ console.log('\n--- the editor reads and writes the notes: every document request
     eq('nothing else was sent', sent.length, 0);
 }
 
+console.log('\n--- a repaired document can go back to the tree ---');
+{
+    // A document that does not parse has no rows, so Text is the only view of it
+    // and the only place it gets repaired. `docParseError` is what disables the
+    // Tree segment, and only `reload` cleared it -- which returns early while the
+    // mode is text, so a repaired document stayed text-only until the page was
+    // reloaded. The read after an Apply is what knows better.
+    const tree = {
+        disabled: true,
+        tooltip: null,
+        setDisabled(d) { this.disabled = d; },
+        setTooltip(t) { this.tooltip = t; },
+    };
+    const modeBtn = { items: { getAt: (i) => (i === 0 ? tree : { setDisabled() {} }) } };
+    const reading = (text) => (opts) => opts.success({ result: { data: { digest: 'd', text: text } } });
+    const panelP = panelWith({
+        docId: '201',
+        mode: 'text',
+        textLang: 'yaml',
+        docParseError: 'mapping values are not allowed here',
+        docState: { 201: { digest: 'd0', data: {} } },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : null),
+        syncFooter() {},
+        request: reading('a: 1\nb: [\n'),
+    });
+
+    panelP.refreshText();
+    eq('text that still does not parse keeps the tree out of reach',
+        [panelP.docParseError, tree.tooltip], ['mapping values are not allowed here', null]);
+
+    panelP.request = reading('a: 1\n');
+    panelP.refreshText();
+    eq('a document that parses again clears the error', panelP.docParseError, '');
+    eq('... and the Tree segment is live, with no tooltip to explain itself',
+        [tree.disabled, tree.tooltip], [false, undefined]);
+}
+
 console.log('\n--- a 409 in Text mode keeps the buffer ---');
 {
     // The buffer is unwritten work and the only copy of it. A 409 says the file
