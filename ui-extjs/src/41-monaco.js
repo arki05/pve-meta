@@ -3,7 +3,9 @@
 // ---------------------------------------------------------------------------
 
 PVE.meta.Monaco = {
-    VS: '/pve2/js/pve-meta-extjs/vs',
+    // Under Monaco's version (`make js` writes it in), so an upgrade is a new tree
+    // and never half-cached.
+    VS: '/pve2/js/pve-meta-extjs/@MONACO_DIR@/vs',
     promise: null,
 
     // ExtJS marks every function with an *enumerable* `Function.prototype.$isFunction`,

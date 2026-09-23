@@ -411,6 +411,20 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     delete ctx.window.monaco;
 }
 
+console.log('\n--- the core and Monaco are fetched under names that change with them ---');
+{
+    // pve-ext fingerprints the script, not what the script fetches for itself, so
+    // `make js` writes in the core's content hash and Monaco's version: a browser
+    // never pairs an upgraded script with a core or a tree it cached before.
+    const M = ctx.PVE.meta;
+    const hash = require('crypto').createHash('sha256').update(fs.readFileSync(WASM)).digest('hex');
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    eq('the core is named by the hash of the .wasm it was built with',
+        M.Core.SRC, '/pve2/js/pve-meta-extjs/pve-meta-core-' + hash.slice(0, 8) + '.wasm');
+    eq('Monaco\'s tree is named by its pinned version',
+        M.Monaco.VS, '/pve2/js/pve-meta-extjs/monaco-' + pkg.dependencies['monaco-editor'] + '/vs');
+}
+
 console.log('\n--- Monaco loads next to ExtJS ---');
 // Ext's enumerable `$isFunction` made Monaco's ESM-to-AMD interop throw inside its
 // own chunk, where the loader's errback never sees it: the Text view masked itself

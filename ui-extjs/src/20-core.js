@@ -15,7 +15,9 @@ PVE.meta.CoreError.prototype = Object.create(Error.prototype);
 PVE.meta.CoreError.prototype.constructor = PVE.meta.CoreError;
 
 PVE.meta.Core = {
-    SRC: '/pve2/js/pve-meta-extjs/pve-meta-core.wasm',
+    // `make js` writes in the name the core is installed under: its content hash,
+    // so a browser never pairs this script with a core it cached before an upgrade.
+    SRC: '/pve2/js/pve-meta-extjs/@WASM_NAME@',
     ABI: 3,
     exports: null,
     promise: null,

@@ -50,7 +50,8 @@ make install DESTDIR=/some/root PREFIX=/usr
 ```
 
 `make install` ships the `.wasm` as
-`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm`, next to the editor that
+`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core-<hash>.wasm` (the first eight hex
+digits of its SHA-256, which `make js` writes into the editor script), next to the editor that
 loads it, and fails if it is missing — unlike Monaco, it is not optional: an editor without
 its core cannot read a document. `make check` runs clippy, rustdoc and, when `node` is
 present, `ui-extjs/testing/smoke.js`, which instantiates that same built `.wasm`.
