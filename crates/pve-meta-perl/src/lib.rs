@@ -118,10 +118,11 @@ mod pve_rs_meta {
         Ok(open_store().delete_snapshot(vmid.0, snapname)?)
     }
 
-    /// Clears any metadata at `$vmid`. Called from
-    /// `create_and_lock_config` only when it just asserted the vmid unused,
-    /// so a restore over an existing guest keeps its document instead
-    /// (`docs/decisions/009-no-sweeper.md`). Returns the files removed.
+    /// Clears any metadata at `$vmid`: the document and its snapshot copies.
+    /// Called from `create_and_lock_config` when it just asserted the vmid
+    /// unused (`docs/decisions/009-no-sweeper.md`), and from the patched
+    /// `write_config` for a restore over an existing guest whose backup
+    /// carried no document (`docs/LIFECYCLE.md`). Returns the files removed.
     #[export]
     pub fn on_create(vmid: Vmid) -> Result<usize, Error> {
         Ok(open_store().purge(vmid.0)?)

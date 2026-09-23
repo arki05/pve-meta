@@ -8,7 +8,7 @@
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -65,6 +66,49 @@
+@@ -65,6 +66,70 @@
  sub write_config {
      my ($class, $vmid, $conf) = @_;
  
@@ -26,12 +26,17 @@
 +    # The import runs under the document's own lock, the one every other writer takes,
 +    # inside the guest lock the caller holds, the same order create and destroy use.
 +    # An error leaves the notes as they are, block included, and never fails the write.
++    # The companion marker, <vmid>.existing, says the create was a restore *over* an
++    # existing guest; it is taken in the same moment as the marker itself, so the two
++    # never drift apart across the several writes one restore makes.
 +    my $meta_block = defined($conf->{description})
 +        && index($conf->{description}, '[pve-meta v') != -1;
 +    my $meta_created;
++    my $meta_existing;
 +    if ($meta_block || !$conf->{lock}) {
 +        $meta_created = eval { PVE::RS::Meta::take_created($vmid) };
 +        warn "pve-meta: take_created($vmid) failed: $@" if $@;
++        $meta_existing = $meta_created && unlink("/run/pve-meta/$vmid.existing");
 +    }
 +    if ($meta_created && $meta_block) {
 +        my $meta_err;
@@ -53,12 +58,28 @@
 +        };
 +        $meta_err = $@ if !$meta_err;
 +        warn "pve-meta: notes_import($vmid) failed: $meta_err" if $meta_err;
++    } elsif ($meta_created && $meta_existing) {
++        # pve-meta: a restore *over* an existing guest of a backup that carries no
++        # document. After the restore the guest is the backup, so the document of the
++        # incarnation it replaced goes with it, snapshot copies included -- keeping it
++        # would hand a stale ingress route or compose stack to a guest that no longer
++        # runs them. Same lock and same soft-fail as the import above.
++        my $meta_err;
++        eval {
++            PVE::Cluster::cfs_lock_domain(
++                "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_create($vmid) },
++            );
++            $meta_err = $@;
++        };
++        $meta_err = $@ if !$meta_err;
++        warn "pve-meta: clearing $vmid after a restore that carried no document failed: $meta_err"
++            if $meta_err;
 +    }
 +
      my $cfspath = $class->cfs_config_path($vmid);
  
      PVE::Cluster::cfs_write_file($cfspath, $conf);
-@@ -267,6 +311,41 @@
+@@ -267,6 +332,58 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -97,10 +118,27 @@
 +    # imported by an ordinary config write; `pve-meta scan-notes` is the way in.
 +    eval { PVE::RS::Meta::mark_created($vmid) };
 +    warn "pve-meta: mark_created($vmid) failed: $@" if $@;
++
++    # pve-meta: and the one fact only this call knows -- whether the vmid was already
++    # taken, which happens on a restore over an existing guest and nowhere else. A
++    # restore whose backup carries no document must clear the one the guest had
++    # (write_config above); a plain create clears the mark so a create that follows a
++    # half-finished restore cannot inherit it. Node-local, beside the marker, written
++    # from here rather than through the store: it is about this node's next write.
++    eval {
++        my $existing = "/run/pve-meta/$vmid.existing";
++        if ($allow_existing) {
++            open(my $fh, '>', $existing) or die "$existing: $!\n";
++            close($fh);
++        } else {
++            unlink($existing);
++        }
++    };
++    warn "pve-meta: marking $vmid as a restore over an existing guest failed: $@" if $@;
  }
  
  # destroys configuration, only applicable for configs owned by the callers node.
-@@ -276,6 +355,31 @@
+@@ -276,6 +393,31 @@
  
      my $config_fn = $class->config_file($vmid, $nodename);
      unlink $config_fn or die "failed to remove config file: $!\n";
@@ -132,7 +170,7 @@
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -876,6 +980,24 @@
+@@ -876,6 +1018,24 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
@@ -157,7 +195,7 @@
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1174,17 @@
+@@ -1052,6 +1212,17 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -175,7 +213,7 @@
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1347,19 @@
+@@ -1214,6 +1385,19 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);

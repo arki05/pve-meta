@@ -129,7 +129,8 @@ plugins. Create clears leftovers for the vmid; destroy removes the document and 
 snapshot copies; snapshot, rollback and delsnapshot copy, restore and remove
 `<vmid>.<snapname>.yaml`. A backup carries the document as one marked block in the
 archive's copy of the guest's notes; the restore's first config write imports it and
-strips it; `pve-meta scan-notes` picks up a block a restore left behind. Migration needs
+strips it, and a restore *over* an existing guest whose backup carried no block removes
+the document it replaced — after a restore the guest is the backup; `pve-meta scan-notes` picks up a block a restore left behind. Migration needs
 nothing. Clone is not carried. There is no sweeper: `pve-meta ls --orphans` and
 `pve-meta rm <vmid>`. Details: `LIFECYCLE.md`.
 

@@ -69,8 +69,11 @@ target, `qm`/`pct` CLI, both remote-migration inbound paths). It opens with
 `PVE::Cluster::check_vmid_unused($vmid, $allow_existing)`, which is what makes the hook
 precise rather than a guess: when `$allow_existing` is false, PVE has just asserted this
 vmid was free, so anything still under `/etc/pve/meta/<vmid>.*` is a leftover and is
-cleared. When it is true — a restore *over* an existing guest — the document is kept,
-because a backup does not carry one and clearing would be data loss.
+cleared. When it is true — a restore *over* an existing guest, the only case that reaches
+it — nothing is cleared here; the hook records the fact in a second node-local marker,
+`/run/pve-meta/<vmid>.existing`, beside the restore marker, and the restore's own
+`write_config` decides from the notes (below). A plain create removes that marker instead,
+so a half-finished restore can never hand its mark to the next guest at that vmid.
 
 This replaces the hourly GC, and it is not merely faster. A sweep nominates vmids that are
 missing from the vmlist; a guest destroyed and recreated at the same vmid between two
@@ -118,7 +121,12 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decisio
   backup being restored. Enforced schemas are not applied, since a restore is not an
   edit. An error (a block someone mangled, YAML the store refuses) warns and leaves the
   notes as they are, block included, for `pve-meta scan-notes`; nothing here can fail a
-  restore. Until that scan, a clone of such a guest copies the block and imports it on
+  restore. When the marked write carries **no** block and the `.existing` marker says the
+  restore went over an existing guest, that guest's document and its snapshot copies are
+  removed under the same lock: after a restore the guest is the backup, and a document the
+  backup did not carry is the previous incarnation's — a stale ingress route or compose
+  stack for something that no longer runs. A plain create takes this path too and finds
+  nothing: `create_and_lock_config` cleared the vmid a moment earlier. Until that scan, a clone of such a guest copies the block and imports it on
   its own first write, since a clone begins with a create too.
 * **Restore on a host without pve-meta.** The block stays in the notes. It renders on
   the Summary panel as a marked YAML code block, so the operator can see what the guest
