@@ -78,6 +78,9 @@ nodes:                                # optional: per-node overrides
   the editor marks mismatches. `hidden: true` offers no declared-but-unset row.
 * A prefix file is itself a document, id `prefixes/<name>`, through the same read/write
   machinery. Writes land in the cluster directory, and the result must load as a prefix.
+  The packaged file is never written or removed: a `DELETE` of a prefix that has no
+  cluster file is a 404, and deleting a view of one writes the cluster file that shadows
+  it, packaged content minus the view.
   `GET /meta/schemas` describes the file format to the editor.
 
 ## 4. Access

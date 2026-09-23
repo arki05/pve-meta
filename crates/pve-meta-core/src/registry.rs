@@ -43,6 +43,14 @@ impl RegistryKind {
             RegistryKind::PrefixDef => "prefixes",
         }
     }
+
+    /// The singular noun for one file of this kind, as an error message about
+    /// that file spells it: `prefix`.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            RegistryKind::PrefixDef => "prefix",
+        }
+    }
 }
 
 impl fmt::Display for RegistryKind {

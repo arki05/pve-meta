@@ -1024,6 +1024,55 @@ fn a_prefix_is_read_and_written_like_any_other_document() {
     assert_eq!(ns.schema.unwrap()["type"], json!("object"));
 }
 
+/// A store whose registry is the two directories production has: a packaged
+/// one below the cluster one a write lands in (`docs/DESIGN.md` §3).
+fn store_with_packaged() -> (tempfile::TempDir, MetaStore, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let packaged = dir.path().join("registry/packaged");
+    let store = MetaStore::with_registry_dirs(
+        dir.path(),
+        vec![packaged.clone(), dir.path().join("registry/prefixes")],
+    );
+    std::fs::create_dir_all(&packaged).unwrap();
+    (dir, store, packaged)
+}
+
+#[test]
+fn a_delete_of_a_packaged_only_prefix_removes_nothing_and_says_so() {
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+
+    // The whole document: the delete would unlink a cluster file that is not
+    // there, so answering 200 with the packaged file's content as `touched`
+    // reports a removal that did not happen.
+    let err = del(&store, PutReq { id: "prefixes/compose", ..Default::default() }).unwrap_err();
+    assert_eq!(status(&err), 404, "{err}");
+    assert!(err.msg.contains("compose"), "{err}");
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+    assert!(!cluster.exists());
+
+    // A view delete does land: it writes the cluster file that shadows the
+    // packaged one, and the result is that file's digest and what it dropped.
+    let r = del(&store, PutReq { id: "prefixes/compose", view: Some("description"), ..Default::default() })
+        .unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete description"]);
+    assert_eq!(std::fs::read_to_string(&cluster).unwrap(), "selector:\n  all: true\nschema:\n  type: object\n");
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+    assert_eq!(get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest, r.digest);
+
+    // With a cluster file there, the whole-document delete removes it and the
+    // packaged file is what a read falls back to.
+    let r = del(&store, PutReq { id: "prefixes/compose", ..Default::default() }).unwrap();
+    assert_eq!(r.digest, "");
+    assert!(!cluster.exists());
+    assert_eq!(
+        get(&store, "prefixes/compose", None, "yaml", &full()).unwrap().text.as_deref(),
+        Some(text),
+    );
+}
+
 #[test]
 fn a_registry_document_uses_only_the_acl_it_is_given() {
     let (_dir, store) = store();

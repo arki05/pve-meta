@@ -509,12 +509,10 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
     };
     parsed.map_err(|e| {
-        let kind = match kind {
-            RegistryKind::PrefixDef => "prefix",
-        };
         bad_request(format!(
-            "the result would not be a valid {kind}: {e} \
-             (the loader would skip the file, so the write is refused instead)"
+            "the result would not be a valid {}: {e} \
+             (the loader would skip the file, so the write is refused instead)",
+            kind.noun(),
         ))
     })
 }
@@ -677,8 +675,13 @@ fn check_enforced(
 /// snapshot hooks and are never touched from the REST API
 /// (`docs/DESIGN.md` §7).
 ///
+/// A prefix that only exists as a packaged file has nothing to remove: a
+/// whole-document delete is a 404, a view delete writes the cluster file that
+/// shadows it (`docs/DESIGN.md` §3), and says so in the audit line.
+///
 /// # Errors
-/// `400:` invalid id/view. `409:` digest mismatch. `403:` no write access.
+/// `400:` invalid id/view. `404:` only a packaged prefix file is there.
+/// `409:` digest mismatch. `403:` no write access.
 pub fn delete_document(
     store: &MetaStore,
     id: &str,
@@ -696,6 +699,26 @@ pub fn delete_document(
     // A root DELETE removes the file whole, so it repairs an unrecoverable
     // document exactly like a root replace does.
     check_repairable(&stored, &view_path, false)?;
+
+    // What the read saw and what a write could touch are two files for a
+    // registry document (`docs/DESIGN.md` §3). A whole-document delete of a
+    // prefix that only exists packaged would otherwise diff the packaged
+    // content, unlink nothing and answer 200 for a file still on disk.
+    let own_file = store.has_own_file(&doc_id)?;
+    let packaged_only = match &doc_id {
+        DocId::Registry(kind, name) => (!own_file).then(|| (kind.noun(), name.clone())),
+        DocId::Guest(_) => None,
+    };
+    if let Some((noun, name)) = &packaged_only {
+        if view_path.is_root() && !stored.digest.is_empty() {
+            return Err(ApiError {
+                status: 404,
+                msg: format!(
+                    "no cluster file for {noun} '{name}' (the packaged file cannot be removed)"
+                ),
+            });
+        }
+    }
 
     let mut planned = stored.value.clone();
     let touched = plan_write(&mut planned, false, |v| {
@@ -719,8 +742,16 @@ pub fn delete_document(
         // hold on this path as on `put_document`'s.
         check_registry_shape(&doc_id, &text)?;
         let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        // Removing a view of a packaged-only prefix edits no packaged file: it
+        // writes the cluster file that shadows it, the packaged content minus
+        // the view. The audit line names which of the two happened.
+        let shadowing = if packaged_only.is_some() {
+            " as a new cluster file shadowing the packaged one"
+        } else {
+            ""
+        };
         crate::audit(&format!(
-            "{} removed view '{}' of {doc_id}: {} path(s) touched, digest {}",
+            "{} removed view '{}' of {doc_id}{shadowing}: {} path(s) touched, digest {}",
             acl.authid,
             view_out(view),
             touched.len(),

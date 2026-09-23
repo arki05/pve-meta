@@ -339,6 +339,14 @@ impl MetaStore {
         self.read_document(id, &self.read_path_for(id)?)
     }
 
+    /// `true` if `id` has a file at the path a write lands in: for a registry
+    /// document its cluster file, never the packaged file a read falls back to
+    /// ([`MetaStore::read_path_for`]) and no write can touch (`docs/DESIGN.md` §3).
+    pub fn has_own_file(&self, id: &DocId) -> Result<bool> {
+        self.check_available()?;
+        Ok(gone_is_none(fs::metadata(self.path_for(id)?))?.is_some())
+    }
+
     /// `id`'s current content identity without reading the whole document; see [`identify`].
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
         self.check_available()?;
