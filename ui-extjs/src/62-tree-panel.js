@@ -463,6 +463,55 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
     },
 
+    // A row's identity across a rebuild. Keyed by document and path *and* key,
+    // since two group rows can share the empty path and a list member shares the
+    // path of the list it is in; this is what the expansion bookkeeping uses too.
+    rowKey: (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || ''),
+
+    // The selected row, and the row above it for when the write removed it.
+    selectionKey: function () {
+        let me = this;
+        let rec = me.getSelection()[0];
+        if (!rec) {
+            return null;
+        }
+        let up = rec.parentNode;
+        return {
+            row: me.rowKey(rec),
+            parent: up && up.data && up.data.text ? me.rowKey(up) : null,
+        };
+    },
+
+    // Puts the selection back on the tree `buildTree` just replaced: the same row
+    // where it is still there, its parent where a Remove took it. Without this
+    // every write left nothing selected and the toolbar disabled under the pointer
+    // that had just used it.
+    reselect: function (want) {
+        let me = this;
+        if (!want) {
+            return;
+        }
+        let row = null;
+        let parent = null;
+        me.store.getRoot().cascadeBy(function (n) {
+            if (!n.data.text) {
+                return;
+            }
+            let key = me.rowKey(n);
+            if (!row && key === want.row) {
+                row = n;
+            }
+            if (!parent && want.parent && key === want.parent) {
+                parent = n;
+            }
+        });
+        let found = row || parent;
+        if (found) {
+            me.setSelection(found);
+        }
+        me.syncButtons();
+    },
+
     parentPath: (rec) => (rec.parentNode && rec.parentNode.data.path) || '',
 
     // Where a new key goes: into the selected map, beside a selected leaf, or --
@@ -835,28 +884,29 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         me.hasDefaults = false;
         let children = toNodes(me.documentEntries(), me.docId);
 
-        // Reloading must not fold the tree up. Keyed by document and path, since two
-        // panels (a window and the tab behind it) can each hold a different document.
-        let key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
+        // Reloading must not fold the tree up, and must not lose the selection
+        // either: both are read off the old tree before the root is replaced.
         let expanded = Object.create(null);
         let seen = false;
+        let selected = me.selectionKey();
         me.store.getRoot().cascadeBy(function (n) {
             if (n.data.text && !n.isLeaf()) {
                 seen = true;
                 if (n.isExpanded()) {
-                    expanded[key(n)] = true;
+                    expanded[me.rowKey(n)] = true;
                 }
             }
         });
         me.store.setRoot({ expanded: true, children: children });
         if (seen) {
             me.store.getRoot().cascadeBy(function (n) {
-                if (n.data.text && !n.isLeaf() && !expanded[key(n)]) {
+                if (n.data.text && !n.isLeaf() && !expanded[me.rowKey(n)]) {
                     n.collapse();
                     n.set('iconCls', PVE.meta.Icons.map);
                 }
             });
         }
+        me.reselect(selected);
     },
 
     // --- editing ------------------------------------------------------------

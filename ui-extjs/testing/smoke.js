@@ -1442,6 +1442,87 @@ console.log('\n--- reloading must not fold the tree up ---');
     eq('every row has a key of its own', new Set(keys).size, keys.length);
 }
 
+console.log('\n--- a write must not lose the selected row ---');
+{
+    // Every write rebuilds the tree, and the rebuilt tree had no selection at all:
+    // after Edit, Add or Set to Default the toolbar went dead and the row had to be
+    // hunted down again. A store standing in for Ext's, just enough of a node for
+    // what buildTree does to one.
+    const asNodes = function (children, parent) {
+        return (children || []).map(function (cfg) {
+            const n = { data: cfg, parentNode: parent, open: cfg.expanded !== false };
+            n.childNodes = asNodes(cfg.children, n);
+            n.isLeaf = () => !n.childNodes.length;
+            n.isExpanded = () => n.open;
+            n.collapse = () => (n.open = false);
+            n.set = (k, v) => (n.data[k] = v);
+            return n;
+        });
+    };
+    const store = {
+        root: null,
+        getRoot() { return this.root; },
+        setRoot(cfg) {
+            const r = {
+                data: {},
+                cascadeBy(fn) {
+                    const walk = (n) => {
+                        fn(n);
+                        n.childNodes.forEach(walk);
+                    };
+                    walk(this);
+                },
+            };
+            r.childNodes = asNodes(cfg.children, r);
+            this.root = r;
+        },
+    };
+    store.setRoot({ children: [] });
+    let sel = [];
+    const panelS = panelWith({
+        docId: '201',
+        prefixes: [],
+        docState: { 201: { digest: 'd', data: { traefik: { spec: { host: 'a.example', port: 80 } } } } },
+        store: store,
+        tree: { getSelection: () => sel, setSelection: (rec) => (sel = [rec]) },
+        syncButtons() {},
+    });
+    const find = (path) => {
+        let hit = null;
+        store.getRoot().cascadeBy((n) => {
+            if (n.data.path === path) {
+                hit = hit || n;
+            }
+        });
+        return hit;
+    };
+
+    panelS.buildTree();
+    eq('nothing selected, nothing to put back', panelS.getSelection(), []);
+
+    sel = [find('traefik.spec.host')];
+    panelS.buildTree();
+    eq('the row a write touched is selected again, on the new node',
+        [panelS.getSelection()[0].data.path, panelS.getSelection()[0] === sel[0]],
+        ['traefik.spec.host', true]);
+
+    // A Remove: the row is gone, so its parent takes the selection rather than
+    // leaving the toolbar pointing at nothing.
+    panelS.docState['201'].data = { traefik: { spec: { port: 80 } } };
+    panelS.buildTree();
+    eq('a removed row leaves its parent selected', panelS.getSelection()[0].data.path, 'traefik.spec');
+
+    // And a selection in another document is not answered by a row of this one.
+    eq('the key is the document, the path and the key',
+        panelS.rowKey({ data: { docId: '201', path: 'a', key: 'a' } }) ===
+            panelS.rowKey({ data: { docId: 'prefixes/x', path: 'a', key: 'a' } }),
+        false);
+    sel = [{ data: { docId: 'prefixes/x', path: 'traefik.spec.host', key: 'host' }, parentNode: null }];
+    panelS.buildTree();
+    eq('... so a row of another document matches nothing here',
+        panelS.getSelection()[0].data.docId, 'prefixes/x');
+}
+
 console.log('\n--- the tree marks a row its schema refuses ---');
 {
     // Same rule, same function -- `shapeFor` is shared by both callers so they
