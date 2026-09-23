@@ -323,13 +323,20 @@ pub fn list_guests(
             continue;
         }
 
-        let stored = read_stored(store, &DocId::Guest(guest.vmid))?;
-
-        if let Some(path) = &has_path {
-            if model::get_path(&view::strip_comments(&stored.value), path).is_none() {
-                continue;
+        let id = DocId::Guest(guest.vmid);
+        let digest = match &has_path {
+            // The filter is the only thing a listing needs the content for.
+            Some(path) => {
+                let stored = read_stored(store, &id)?;
+                if model::get_path(&view::strip_comments(&stored.value), path).is_none() {
+                    continue;
+                }
+                stored.digest
             }
-        }
+            // Without it, the row carries the digest and nothing else, and
+            // that is a `stat` and a hash rather than a YAML parse per guest.
+            None => store.digest_of(&id)?.unwrap_or_default(),
+        };
 
         out.push(GuestListEntry {
             vmid: guest.vmid,
@@ -337,7 +344,7 @@ pub fn list_guests(
             kind: guest.kind.clone(),
             name: guest.name.clone(),
             tags: guest.tags.clone(),
-            digest: stored.digest,
+            digest,
         });
     }
     Ok(out)

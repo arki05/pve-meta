@@ -900,6 +900,30 @@ fn list_guests_uses_the_rows_perl_passes_and_gates_on_read_access() {
 }
 
 #[test]
+fn a_listing_reports_the_same_digest_whether_or_not_it_filters() {
+    let (dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    // A document a read could not recover is still a row with its digest:
+    // a listing without `has` never parses one.
+    std::fs::write(dir.path().join("101.yaml"), "a: [\n").unwrap();
+    let rows = vec![
+        GuestInput { vmid: 100, read: true, ..Default::default() },
+        GuestInput { vmid: 101, read: true, ..Default::default() },
+    ];
+
+    let listed = list_guests(&store, &rows, None).unwrap();
+    assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
+    for row in &listed {
+        let id = row.vmid.to_string();
+        assert_eq!(row.digest, store.digest_of(&parse_id(&id).unwrap()).unwrap().unwrap(), "{id}");
+    }
+    // ... the same digest the filtering listing reports for the one it keeps.
+    let filtered = list_guests(&store, &rows, Some("traefik")).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].digest, listed[0].digest);
+}
+
+#[test]
 fn access_reflects_the_acl_it_is_given() {
     let (_dir, store) = store();
     let a = access(&store, &full()).unwrap();
