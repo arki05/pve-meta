@@ -425,7 +425,7 @@ cmd_apply() {
     [ "$count" -gt 0 ] || die "no [[file]] entries found in the selected manifest(s)"
 
     echo
-    cmd_status_quiet
+    cmd_status
     if [ "$rc" -eq 0 ]; then
         log "apply: success (${count} file(s), ${#MANIFESTS[@]} manifest(s))."
     else
@@ -485,7 +485,7 @@ cmd_remove() {
     done
 
     echo
-    cmd_status_quiet || true
+    cmd_status || true
     if [ "$rc" -eq 0 ]; then
         log "remove: success (${count} file(s), ${#MANIFESTS[@]} manifest(s))."
     else
@@ -639,8 +639,6 @@ status_one() {
         return 1
     fi
 }
-
-cmd_status_quiet() { cmd_status; }
 
 cmd_status() {
     require_cmd dpkg-divert
