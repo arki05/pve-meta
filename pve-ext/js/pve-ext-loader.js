@@ -13,11 +13,15 @@
  * capturing the original prototype method in a closure and invoking it
  * with a plain Function.prototype.apply(), no Ext class-system machinery
  * involved at all. The obvious alternative - Ext.override(cls, {...})
- * with this.callParent(arguments) inside the replacement - throws in real
- * ExtJS 7 classic (as shipped by PVE), silently killing the *whole*
- * config panel for every guest. The capture-and-apply fix is proven in a
- * real browser against real pve-manager and must not be changed without
- * re-doing that verification.
+ * with this.callParent(arguments) inside the replacement - cannot work
+ * from this file: ExtJS resolves what callParent() is to call through
+ * Function.prototype.caller, and reading .caller from inside a
+ * strict-mode function throws a TypeError. Everything below is
+ * 'use strict', so the override would throw and silently kill the
+ * *whole* config panel for every guest. (Dropping 'use strict' is not
+ * the fix.) The capture-and-apply technique is proven in a real browser
+ * against real pve-manager and must not be changed without re-doing that
+ * verification.
  *
  * Plain ES2017, no build step, no external dependencies.
  */
@@ -80,7 +84,7 @@
         return;
     }
 
-    // --- Theme detection (same logic as pve-meta-loader.js) -------------
+    // --- Theme detection -------------------------------------------------
     // Mirrors PVE's PVEThemeCookie ('crisp' -> light, 'proxmox-dark' ->
     // dark, anything else -> follow the OS/browser preference).
     function getPveTheme() {
