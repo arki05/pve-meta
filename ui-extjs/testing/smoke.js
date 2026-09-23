@@ -413,6 +413,32 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     eq('... names the target language', alerts().map((a) => a[1].indexOf('Cannot convert to JSON') === 0), [true]);
     eq('... and the buffer is untouched', ed.sets, 0);
 
+    // The toggle must give back what it took. `Codec.render` only knows the text
+    // the document was *loaded* as, and `same` ignores key order, so a reorder or a
+    // `#` comment typed into the buffer compared equal to the loaded document and
+    // was quietly replaced by it -- the concrete way "switching to JSON and back
+    // loses my edits" happened. The switch out of YAML now stashes the exact text.
+    const edited = '# mine\nb:   1\na: [y, x]\n';
+    ed = editor(edited);
+    const round = { editor: ed, lang: 'yaml', original: handWritten };
+    round.lang = 'json';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    eq('the JSON side is the value, which is all JSON can hold', ed.value, Codec.dump({ b: 1, a: ['y', 'x'] }, 'json'));
+    round.lang = 'yaml';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('coming back gives the comment and the order back, exactly', ed.value, edited);
+
+    // ... unless the JSON side was edited, in which case the value is what carries
+    // over and the YAML layout it used to have is not that value's.
+    round.lang = 'json';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    ed.value = Codec.dump({ b: 7, a: ['y', 'x'] }, 'json');
+    round.lang = 'yaml';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('an edited JSON buffer comes back as a dump of what it now says',
+        ed.value, Codec.dump({ b: 7, a: ['y', 'x'] }, 'yaml'));
+    eq('no alerts through any of that', alerts(), []);
+
     // diff
     Buffer.diff({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }, 'the title');
     eq('diff shows the buffer against the baseline', diffs.pop(), { title: 'the title', original: handWritten, modified: 'b: 2\n', lang: 'yaml' });

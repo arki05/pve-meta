@@ -5,6 +5,13 @@
 // ---------------------------------------------------------------------------
 
 PVE.meta.Buffer = {
+    // What the YAML side held when the JSON side was entered. A switch to JSON and
+    // back is a presentation toggle and has to give back exactly the text it took:
+    // key order and `#` comments are not values, so nothing that went through JSON
+    // can carry them back. Keyed by the Monaco editor, since a `buffer` is built
+    // fresh for every call; a WeakMap, so a disposed editor needs no bookkeeping.
+    stashed: new WeakMap(),
+
     // The loaded text as the buffer's language shows it, for a diff or a "did
     // anything change"; falls back to YAML if it cannot be rendered as JSON.
     // Returns `{ lang, text }`.
@@ -73,11 +80,32 @@ PVE.meta.Buffer = {
         }
     },
 
-    // The second half: show `value` in `buffer.lang`, via `Codec.render` so a
-    // no-op toggle back to YAML never becomes a whitespace diff.
+    // The second half: show `value` in `buffer.lang`. The text being left goes with
+    // it, since leaving YAML is the only chance to remember how it looked.
     render: function (buffer, value) {
+        let leaving = buffer.editor.getValue();
         window.monaco.editor.setModelLanguage(buffer.editor.getModel(), buffer.lang);
-        buffer.editor.setValue(PVE.meta.Codec.render(value, buffer.lang, buffer.original));
+        buffer.editor.setValue(PVE.meta.Buffer.rendered(buffer, value, leaving));
+    },
+
+    // What that shows. Into JSON: the dump, with the YAML it replaced stashed.
+    // Back into YAML: that exact text, if the JSON side was never touched -- once
+    // it was, the value is all that carries over, and the layout it used to have is
+    // not that value's. Then it is `Codec.render`, which still prefers the text the
+    // document was loaded as when the value is the one it was loaded with.
+    rendered: function (buffer, value, leaving) {
+        let me = PVE.meta.Buffer;
+        if (buffer.lang === 'json') {
+            let json = PVE.meta.Codec.dump(value, 'json');
+            me.stashed.set(buffer.editor, { yaml: leaving, json: json });
+            return json;
+        }
+        let held = me.stashed.get(buffer.editor);
+        me.stashed.delete(buffer.editor);
+        if (held && held.json === leaving) {
+            return held.yaml;
+        }
+        return PVE.meta.Codec.render(value, 'yaml', buffer.original);
     },
 };
 
