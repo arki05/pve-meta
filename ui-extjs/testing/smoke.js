@@ -1409,6 +1409,49 @@ console.log('\n--- one edit, one write (DESIGN §8) ---');
     );
 }
 
+console.log('\n--- Add does not overwrite a key that is there ---');
+{
+    // Add sends a `replace` at the typed path, so it used to replace whatever was
+    // already there without a word -- while Remove asks before it drops a key. The
+    // field says so instead, live, against the document the panel holds.
+    const doc = { traefik: { spec: { host: 'a.example', port: 80 } }, netbird: { groups: ['lan'] } };
+    const owner = { docId: '201', docState: { 201: { digest: 'd', data: doc } }, dataOf: P.dataOf };
+    const keyField = function (cfg) {
+        const w = Object.assign({}, ctx.PVE.meta.AddKeyWindow, { list: false, tree: owner }, cfg);
+        return w.formItems().filter((f) => f.name === 'key')[0];
+    };
+
+    const inSpec = keyField({ parentPath: 'traefik.spec' });
+    eq('a key that is not there is fine', inSpec.validator('scheme'), true);
+    eq('one that is gets a field error, not a silent replace',
+        inSpec.validator('host'), 'This key exists; use Edit to change it');
+    eq('... a bad name is still refused first', typeof inSpec.validator('bad key'), 'string');
+
+    const atRoot = keyField({ parentPath: '' });
+    eq('the check follows the path that would be written', atRoot.validator('host'), true);
+    eq('... including a dotted one', atRoot.validator('traefik.spec.port'),
+        'This key exists; use Edit to change it');
+    eq('... and a key holding a map counts as there', atRoot.validator('netbird'),
+        'This key exists; use Edit to change it');
+
+    // A list member has no name of its own, so there is nothing to collide with.
+    const member = keyField({ parentPath: 'netbird.groups', list: true });
+    eq('appending to a list is never a collision', member.validator(''), true);
+
+    // And the window is given the document to check against.
+    const created = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = (xtype, cfg) => {
+        created.push([xtype, cfg]);
+        return { on: () => {}, show: () => {} };
+    };
+    const adder = panelWith({ docId: '201', docState: owner.docState });
+    adder.addKey('201', 'traefik.spec');
+    eq('Add Key opens against the panel\'s own document',
+        [created[0][1].parentPath, created[0][1].tree === adder], ['traefik.spec', true]);
+    ctx.Ext.create = origCreate;
+}
+
 console.log('\n--- a popup closes when the write lands, not when the button is clicked ---');
 {
     // Every one of these fired its event and closed in the same breath, so a 400

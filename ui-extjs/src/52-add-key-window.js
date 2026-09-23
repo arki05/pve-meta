@@ -11,6 +11,19 @@ Ext.define('PVE.meta.AddKeyWindow', {
     primaryText: gettext('Add'),
     parentPath: '', // dotted path of the map the key goes into ('' = the document root)
     list: false, // appending to a list instead: a member has no name to give it
+    // configs: tree (the owning panel), whose document says which keys are taken
+
+    // Whether the panel's document already holds something at `path`. Add sends a
+    // `replace`, so without this it silently overwrote whatever was there -- while
+    // Remove asks before it drops a key. Losing a value is the same loss either
+    // way; Edit is how you change one. A list append has no name to collide with.
+    exists: function (path) {
+        let me = this;
+        if (me.list || !me.tree || !path) {
+            return false;
+        }
+        return PVE.meta.Utils.valueAt(me.tree.dataOf(me.tree.docId), path) !== undefined;
+    },
 
     formItems: function () {
         let me = this;
@@ -29,10 +42,19 @@ Ext.define('PVE.meta.AddKeyWindow', {
                 emptyText: gettext('key, or a dotted path'),
                 // Leading and trailing dots are stripped on submit, so
                 // do not fail the field for them while it is being typed.
-                validator: (v) =>
-                    me.list && !v
-                        ? true
-                        : PVE.meta.Utils.keyPathError(String(v || '').replace(/^\.+|\.+$/g, '')) || true,
+                validator: function (v) {
+                    let key = String(v || '').replace(/^\.+|\.+$/g, '');
+                    if (me.list && !key) {
+                        return true;
+                    }
+                    let why = PVE.meta.Utils.keyPathError(key);
+                    if (why) {
+                        return why;
+                    }
+                    return me.exists(PVE.meta.Utils.joinPath(me.parentPath, key))
+                        ? gettext('This key exists; use Edit to change it')
+                        : true;
+                },
             },
             {
                 xtype: 'proxmoxKVComboBox',

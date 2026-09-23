@@ -953,7 +953,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let me = this;
         me.openEditor(
             'PVE.meta.AddKeyWindow',
-            { parentPath: parentPath || '' },
+            // The window checks the key against this panel's document: Add never
+            // overwrites what is already at that path.
+            { parentPath: parentPath || '', tree: me },
             'addkey',
             (path, value, done) => me.sendEdit({ path: path, op: 'set', value: value }, false, done),
         );
@@ -978,7 +980,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     addListMember: function (path) {
         let me = this;
         let list = me.listAt(path);
-        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
+        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true, tree: me }, 'addkey', function (
             _path,
             value,
             done,
