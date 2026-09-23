@@ -72,11 +72,19 @@ endpoint for the others. A duplicate `id` (first one wins, by sorted
 filename) is likewise skipped with a `warn`.
 
 `pve-ext-loader.js` (loaded via a `<script>` tag dpkg-diverted into stock
-`index.html.tpl`, right after `pvemanagerlib.js`) fetches that endpoint once
-and, for every manifest whose `targets` includes the panel being built, adds
-a `layout: 'fit'` tab that inserts a `<script>` for `script` (once per URL,
+`index.html.tpl`, right after `pvemanagerlib.js`) prefetches that endpoint
+once, asynchronously, at script load — before the app starts, so the list is
+normally there long before the first config panel is built. For every
+manifest whose `targets` includes the panel being built it adds a
+`layout: 'fit'` tab that inserts a `<script>` for `script` (once per URL,
 cached), waits for `xtype` to resolve to a defined class, and replaces its
-own content with `{ xtype, vmid, type, node, dc }`. Adding a tab works by
+own content with `{ xtype, vmid, type, node, dc }`. A panel built while the
+prefetch is still in flight gets its tabs afterwards, through that panel's
+own `insertNodes()` (the seam its `initComponent` hands `items` to), in the
+same manifest order. `index.html.tpl` is also rendered pre-login, so
+a prefetch that fails (a 401, most likely) is warned about and never cached
+as an empty list for the session: the next config panel asks again. Adding
+a tab works by
 patching `PVE.panel.Config.prototype.initComponent` directly (capture the
 original, call it, then add tabs) — see the file's header comment for why
 this, and not `Ext.override`, is required on ExtJS 7 classic. Every seam
