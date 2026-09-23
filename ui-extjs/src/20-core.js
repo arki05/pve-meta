@@ -35,12 +35,19 @@ PVE.meta.Core = {
                 typeof WebAssembly.instantiateStreaming === 'function'
                     ? WebAssembly.instantiateStreaming(fetch(me.SRC), {}).catch(buffered)
                     : buffered();
-            me.promise = me.exports
+            me.promise = (me.exports
                 ? Promise.resolve(me)
                 : streaming().then(function (result) {
                       me.attach(result.instance);
                       return me;
-                  });
+                  })
+            ).catch(function (err) {
+                // Not the answer for the rest of the session: one lost request
+                // would leave the panel without a core until the page is reloaded.
+                // The next caller asks again.
+                me.promise = null;
+                throw err;
+            });
         }
         return me.promise;
     },

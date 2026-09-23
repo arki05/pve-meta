@@ -31,6 +31,10 @@ const ctx = {
     WebAssembly,
     TextEncoder,
     TextDecoder,
+    // The browser's, which the editor uses for the Monaco load timeout and the
+    // annotation debounce; a fresh vm context has neither.
+    setTimeout,
+    clearTimeout,
     gettext: (s) => s,
     Ext: {
         // Just enough of the VTypes singleton for PVE.meta.Utils.checkFormat: the real
@@ -112,6 +116,12 @@ const eq = (name, got, want) => {
         console.log(`ok   ${name}`);
     }
 };
+// A section that has to wait for something -- a load promise, a debounced timer --
+// pushes a thunk here. They run in order after everything synchronous, before the
+// summary, so the output stays readable.
+const asyncSections = [];
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 const throws = (name, fn, contains) => {
     let err = null;
     try {
@@ -440,6 +450,67 @@ console.log('\n--- Monaco loads next to ExtJS ---');
     eq('... and which Ext still reads', inCtx('(function () {}).$isFunction'), true);
     inCtx('delete Function.prototype.$isFunction');
 }
+
+// A failed load used to be the answer for the rest of the session: `me.promise`
+// was never reset, so one dropped request took Text mode with it until the page
+// was reloaded. And a script that neither loads nor errors left the caller's mask
+// up with nothing to say, which is what the timeout is for.
+asyncSections.push(async function () {
+    console.log('\n--- a failed load is this attempt\'s answer, not the session\'s ---');
+    const M = ctx.PVE.meta;
+
+    // The core, with itself detached for the length of the check.
+    const attached = M.Core.exports;
+    M.Core.exports = null;
+    M.Core.promise = null;
+    ctx.fetch = () => Promise.reject(new Error('offline'));
+    let err = null;
+    await M.Core.load().catch((e) => (err = e));
+    eq('a core that did not load is an error', String(err), 'Error: offline');
+    eq('... and the next caller gets to try again', M.Core.promise, null);
+    delete ctx.fetch;
+    M.Core.exports = attached;
+    M.Core.promise = null;
+
+    // Monaco, with just enough of a page for the loader to run against.
+    delete ctx.window.monaco;
+    let script = null;
+    const listeners = [];
+    ctx.window.location = { origin: 'https://pve.example:8006' };
+    ctx.window.addEventListener = (name, fn) => listeners.push([name, fn]);
+    ctx.window.removeEventListener = (name, fn) => listeners.splice(listeners.findIndex((l) => l[1] === fn), 1);
+    ctx.document.createElement = () => (script = {});
+
+    let failed = null;
+    const first = M.Monaco.load().catch((e) => (failed = e));
+    await tick();
+    eq('the loader script is fetched from the tree the package ships',
+        script.src, 'https://pve.example:8006' + M.Monaco.VS + '/loader.js');
+    script.onerror();
+    await first;
+    eq('a Monaco that did not load is an error', String(failed).indexOf('failed to load') !== -1, true);
+    eq('... and it is not cached either', M.Monaco.promise, null);
+    eq('... with nothing left listening for its chunks', listeners.length, 0);
+
+    // Nothing at all: no load event, no error event. The timer is the only way out.
+    const timers = [];
+    const realSetTimeout = ctx.setTimeout;
+    ctx.setTimeout = (fn, ms) => timers.push([fn, ms]);
+    let timedOut = null;
+    const second = M.Monaco.load().catch((e) => (timedOut = e));
+    await tick();
+    eq('the load is given 30 seconds', timers[0][1], M.Monaco.TIMEOUT);
+    timers[0][0]();
+    await second;
+    eq('... and says so when they pass', String(timedOut), 'Error: Timed out loading the text editor');
+    eq('... without disabling Text mode for good', M.Monaco.promise, null);
+
+    ctx.setTimeout = realSetTimeout;
+    delete ctx.window.location;
+    delete ctx.window.addEventListener;
+    delete ctx.window.removeEventListener;
+    ctx.document.createElement = () => ({});
+});
 
 console.log('\n--- row merge: document + shape ---');
 const P = ctx.PVE.meta.TreePanel;
@@ -1779,5 +1850,10 @@ eq('global Object untouched', typeof Object.create, 'function');
 // And they cross the ABI as keys, both ways.
 eq('proto-named keys survive the core', Codec.parse(Codec.dump(protoDoc, 'yaml'), 'yaml'), protoDoc);
 
-console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
-process.exit(fails ? 1 : 0);
+(async function () {
+    for (const section of asyncSections) {
+        await section();
+    }
+    console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
+    process.exit(fails ? 1 : 0);
+})();
