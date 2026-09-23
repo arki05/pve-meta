@@ -358,8 +358,9 @@ pub fn list_guests(
 /// other absent path. `digest` is the file's either way.
 ///
 /// # Errors
-/// `400:` invalid id/view/format. `403:` no read access. `422:` the stored
-/// document's content could not be recovered.
+/// `400:` invalid id/view/format, including a view through an array or a
+/// scalar. `403:` no read access. `422:` the stored document's content could
+/// not be recovered.
 pub fn get_document(
     store: &MetaStore,
     id: &str,
@@ -406,7 +407,10 @@ pub fn get_document(
     // as any other absent path, with no rule of its own (`docs/DESIGN.md` §2).
     let base = if comments { stored.value.clone() } else { view::strip_comments(&stored.value) };
     let result_value = if view.is_some() {
-        view::extract(&base, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
+        // A view that runs through an array or a scalar is refused here as it
+        // is on a write (400); only a *missing* path reads as the empty
+        // document.
+        view::extract(&base, &view_path)?.unwrap_or_else(|| Value::Object(Map::new()))
     } else {
         base
     };
@@ -582,7 +586,7 @@ pub fn put_document(
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(ApiError::from)
         } else {
-            let subtree = match view::extract(v, &view_path) {
+            let subtree = match view::extract(v, &view_path)? {
                 Some(old) if keep_notes => view::keep_comments(&old, payload_value.clone()),
                 _ => payload_value.clone(),
             };

@@ -384,6 +384,29 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
     );
 }
 
+#[test]
+fn a_read_through_an_array_or_a_scalar_is_refused_like_the_write() {
+    // `docs/DESIGN.md` §2: array members are not addressable. A read used to
+    // answer the empty document here, which a caller cannot tell from "unset".
+    let (_dir, store) = store();
+    seed(&store, "100", "traefik:\n  routers:\n  - name: web\n  host: x\n");
+    for view in ["traefik.routers.0", "traefik.routers.0.name", "traefik.host.deeper"] {
+        for fmt in ["json", "yaml"] {
+            let err = get(&store, "100", Some(view), fmt, &full())
+                .map(|ok| panic!("{view} as {fmt} was answered: {ok:?}"))
+                .unwrap_err();
+            assert_eq!(status(&err), 400, "{view} as {fmt}: {err}");
+            assert!(err.msg.contains(view), "{view} as {fmt}: {err}");
+        }
+        let err = put(&store, PutReq { view: Some(view), data: "{}", ..Default::default() })
+            .map(|ok| panic!("{view} was written: {ok:?}"))
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{view}: {err}");
+    }
+    // A path the document simply does not have is still the empty document.
+    assert_eq!(get(&store, "100", Some("nothing.here"), "json", &full()).unwrap().data, Some(json!({})));
+}
+
 // -- comment keys are notes (docs/DESIGN.md §2, §5) ---------------------
 
 /// A read that did not ask for the notes.

@@ -462,7 +462,9 @@ fn resolve(doc: &Value, name: &str, spec: &Value) -> Resolved {
             reason: "a document entry always has a view".into(),
         };
     };
-    let Some(value) = view::extract(doc, view) else {
+    // A view that addresses into an array or a scalar has no content to write,
+    // like one the document does not have at all.
+    let Some(value) = view::extract(doc, view).ok().flatten() else {
         return Resolved::Absent { name: name.to_string() };
     };
     match render(&value, entry.format) {
