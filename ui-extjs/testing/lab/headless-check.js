@@ -115,15 +115,20 @@ async function openPage(browser, tk, csrf, result) {
 // (`kind === 'dc'`), then opens the Metadata nav item pve-ext's loader added.
 async function openTab(page, kind, id) {
     if (kind === 'dc') {
-        const h = await page.evaluateHandle(() => {
+        // Selected through the tree's own API, not a DOM click: the resource tree
+        // re-renders its rows on every status update, so a row handle taken a
+        // moment ago is detached by the time puppeteer clicks it.
+        const ok = await page.evaluate(() => {
             const tree = Ext.ComponentQuery.query('treepanel')[0];
             const rec = tree.getStore().getNodeById('root');
-            return rec ? tree.getView().getNode(rec) : null;
+            if (!rec) return false;
+            tree.getSelectionModel().select(rec);
+            return true;
         });
-        if (!h.asElement()) {
+        if (!ok) {
             throw new Error('no datacenter node in the resource tree');
         }
-        await h.asElement().click();
+        await sleep(500);
     } else {
         const h = await page.evaluateHandle((v) => {
             return new Promise((resolve, reject) => {
@@ -245,6 +250,14 @@ async function main() {
             if (!n) return 'row not found';
             p.removeKey(n);
             return 'removed';
+        });
+        // Remove asks first (9cff6b1), like every other PVE panel: answer it.
+        await sleep(500);
+        result.checks.removeConfirm = await page.evaluate(() => {
+            const box = Ext.Msg.isVisible() ? Ext.Msg : null;
+            if (!box) return 'no confirm';
+            box.down('button#yes').click();
+            return 'confirmed';
         });
         await sleep(3000);
         result.checks.afterRemove = (await rows(page)).filter((r) => r.startsWith('added'));
