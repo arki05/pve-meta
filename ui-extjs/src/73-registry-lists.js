@@ -191,6 +191,9 @@ Ext.define('PVE.meta.RegistryGrid', {
             // Every file, as it is, rather than a guest's resolved set.
             params: {},
             success: function (response) {
+                // The failure below masks the grid with its message; nothing else
+                // ever took it off, so one failed Reload hid every later one.
+                Proxmox.Utils.setErrorMask(me, false);
                 me.store.setData(PVE.meta.RegistryGrid.rowsFrom(response.result.data || []));
                 me.syncButtons();
             },

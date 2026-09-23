@@ -1245,6 +1245,44 @@ console.log('\n--- the registry list ---');
     eq('a packaged file opens and is never removable', buttons(pkgRow, true), [false, false, true]);
     eq('no selection: nothing to edit or remove', buttons(null, true), [false, true, true]);
 
+    // A listing that failed masks the grid with the reason; the next one that
+    // works has to take it off again, or the grid stays behind the old message
+    // with the rows it just loaded invisible underneath.
+    {
+        const masks = [];
+        const setErrorMask = ctx.Proxmox.Utils.setErrorMask;
+        ctx.Proxmox.Utils.setErrorMask = (comp, msg) => masks.push(msg);
+        // As Ext does with `statics:`, for the one call `reload` makes.
+        ctx.PVE.meta.RegistryGrid.rowsFrom = G.rowsFrom;
+        const listing = { result: { data: [{ prefix: 'gpu', selector: { all: true } }] } };
+        const grid = {
+            access: { write: 1 },
+            store: { setData: (rows) => (grid.rows = rows) },
+            syncButtons() {},
+            request(opts) {
+                if (opts.url === '/meta/prefixes') {
+                    if (grid.broken) {
+                        opts.failure({ htmlStatus: 'connection error' });
+                    } else {
+                        opts.success(listing);
+                    }
+                }
+            },
+        };
+        grid.broken = true;
+        Grid.reload.call(grid);
+        eq('a failed listing says so on the grid', masks, ['connection error']);
+        grid.broken = false;
+        Grid.reload.call(grid);
+        eq('... and the next one that works clears it', masks, ['connection error', false]);
+        eq('... showing what it loaded', grid.rows.map((r) => r.name), ['gpu']);
+        ctx.Proxmox.Utils.setErrorMask = setErrorMask;
+        if (!setErrorMask) {
+            delete ctx.Proxmox.Utils.setErrorMask;
+        }
+        delete ctx.PVE.meta.RegistryGrid.rowsFrom;
+    }
+
     // Remove asks, then deletes the row's own document.
     const sent = [];
     const [confirm, request] = [ctx.Ext.Msg.confirm, ctx.Proxmox.Utils.API2Request];
