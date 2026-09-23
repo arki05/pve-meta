@@ -16,11 +16,26 @@ Ext.define('PVE.meta.TextWindow', {
     // through `tree`, so the window names a view of *its* document and never a
     // document of its own -- an id here would only be one the write could ignore.
 
+    // Whether the document behind this view can be written at all (DESIGN §4). A
+    // read-only caller gets the same window as a look at the YAML, with no OK to
+    // press and nothing to type into: the 403 was the only thing telling them so.
+    mayWrite: function () {
+        let me = this;
+        return !!(me.tree && me.tree.access && me.tree.access.write);
+    },
+
+    // The body, not the window: Cancel has to stay clickable under a Monaco that
+    // did not load, exactly as 60-doc.js `setMask` says of the panel's own footer.
+    setMask: function (msg) {
+        Proxmox.Utils.setErrorMask({ el: this.body || this.el }, msg);
+    },
+
     initComponent: function () {
         let me = this;
+        let write = me.mayWrite();
         me.original = me.text || '';
         me.title = Ext.String.format(
-            gettext('Edit selection as text: {0}'),
+            write ? gettext('Edit selection as text: {0}') : gettext('View selection as text: {0}'),
             Ext.htmlEncode(me.view || gettext('(whole document)')),
         );
 
@@ -33,6 +48,7 @@ Ext.define('PVE.meta.TextWindow', {
                     // Stated, like the panel states its own: there is no buffer until
                     // Monaco loads, and the `afterrender` handler turns it on then.
                     applyDisabled: true,
+                    applyHidden: !write,
                     format: () => me.formatBuffer(),
                     apply: () => me.submit(),
                     applyText: gettext('OK'),
@@ -44,16 +60,22 @@ Ext.define('PVE.meta.TextWindow', {
         me.callParent();
 
         me.on('afterrender', function () {
-            Proxmox.Utils.setErrorMask(me, true);
+            me.setMask(true);
             PVE.meta.Monaco.load().then(
                 function () {
-                    Proxmox.Utils.setErrorMask(me, false);
-                    me.editor = PVE.meta.Monaco.create(me.lookupReference('mount').getEl().dom, me.original);
-                    // Without this the footer never learns there is a buffer, and OK
-                    // stays the disabled button it was built as.
-                    me.down('#metaApply').setDisabled(false);
+                    me.setMask(false);
+                    me.editor = PVE.meta.Monaco.create(
+                        me.lookupReference('mount').getEl().dom,
+                        me.original,
+                        { readOnly: !write },
+                    );
+                    if (write) {
+                        // Without this the footer never learns there is a buffer, and
+                        // OK stays the disabled button it was built as.
+                        me.down('#metaApply').setDisabled(false);
+                    }
                 },
-                (err) => Proxmox.Utils.setErrorMask(me, Ext.htmlEncode(PVE.meta.Utils.errText(err))),
+                (err) => me.setMask(Ext.htmlEncode(PVE.meta.Utils.errText(err))),
             );
         });
 
@@ -95,7 +117,7 @@ Ext.define('PVE.meta.TextWindow', {
     // OK writes the subtree and closes.
     submit: function () {
         let me = this;
-        if (!me.editor) {
+        if (!me.editor || !me.mayWrite()) {
             return;
         }
         me.apply(me.editor.getValue(), me.lang);

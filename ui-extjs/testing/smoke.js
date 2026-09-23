@@ -1471,6 +1471,68 @@ console.log('\n--- a popup closes when the write lands, not when the button is c
     delete New.planFrom;
 }
 
+// A read-only caller could type into "Edit selection as text", press OK and get a
+// 403 for their trouble; and a Monaco that failed to load masked the whole window,
+// Cancel included, with no way out but Escape.
+asyncSections.push(async function () {
+    console.log('\n--- "Edit selection as text" says whether it can be written ---');
+    const M = ctx.PVE.meta;
+    const [realLoad, realCreate] = [M.Monaco.load, M.Monaco.create];
+    const masks = [];
+    ctx.Proxmox.Utils.setErrorMask = (comp, msg) => masks.push([comp.el, msg]);
+    let created = null;
+    M.Monaco.load = () => Promise.resolve();
+    M.Monaco.create = (mount, value, options) => {
+        created = { value: value, options: options };
+        return { getValue: () => value, getModel: () => null, dispose() {} };
+    };
+
+    const open = async function (write) {
+        const handlers = {};
+        const ok = {
+            disabled: true,
+            setDisabled(d) { this.disabled = d; },
+        };
+        const win = Object.assign({}, M.TextWindow, {
+            view: 'traefik',
+            text: 'spec:\n  host: a.example\n',
+            tree: { access: { read: 1, write: write ? 1 : 0 }, writeSubtree: () => (win.wrote = true) },
+            body: 'the-body',
+            el: 'the-window',
+            callParent() {},
+            on(name, fn) { handlers[name] = fn; },
+            lookupReference: () => ({ getEl: () => ({ dom: 'the-mount' }) }),
+            down: () => ok,
+        });
+        win.initComponent();
+        handlers.afterrender();
+        await tick();
+        win.ok = ok;
+        win.applyButton = win.bbar.filter((b) => b && b.itemId === 'metaApply')[0];
+        return win;
+    };
+
+    const editing = await open(true);
+    eq('a writable document is edited', editing.title, 'Edit selection as text: traefik');
+    eq('... with OK offered, and live once there is a buffer',
+        [editing.applyButton.hidden, editing.ok.disabled], [false, false]);
+    eq('... and a buffer that can be typed into', created.options, { readOnly: false });
+
+    const viewing = await open(false);
+    eq('a document that may not be written is viewed', viewing.title, 'View selection as text: traefik');
+    eq('... with no OK to press', viewing.applyButton.hidden, true);
+    eq('... and a read-only buffer', created.options, { readOnly: true });
+    eq('... which OK would not write even if it were pressed',
+        (viewing.submit(), viewing.wrote), undefined);
+
+    eq('the mask goes over the body, so Cancel stays clickable',
+        masks.map((m) => m[0]), ['the-body', 'the-body', 'the-body', 'the-body']);
+
+    M.Monaco.load = realLoad;
+    M.Monaco.create = realCreate;
+    delete ctx.Proxmox.Utils.setErrorMask;
+});
+
 console.log('\n--- what a write answers the editor that started it ---');
 {
     // `onDone(ok)` is the whole contract: true once the server has it, false on

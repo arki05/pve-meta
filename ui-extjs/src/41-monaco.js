@@ -112,16 +112,23 @@ PVE.meta.Monaco = {
             : 'vs';
     },
 
-    // A standalone editor with the options every text buffer in this editor shares.
-    create: function (mount, value) {
-        return window.monaco.editor.create(mount, {
-            value: value,
-            language: 'yaml',
-            theme: PVE.meta.Monaco.theme(),
-            automaticLayout: true,
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-        });
+    // A standalone editor with the options every text buffer in this editor shares;
+    // `options` is what one of them differs on (a read-only caller's `readOnly`).
+    create: function (mount, value, options) {
+        return window.monaco.editor.create(
+            mount,
+            Ext.apply(
+                {
+                    value: value,
+                    language: 'yaml',
+                    theme: PVE.meta.Monaco.theme(),
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                },
+                options,
+            ),
+        );
     },
 
     dispose: function (editor) {
