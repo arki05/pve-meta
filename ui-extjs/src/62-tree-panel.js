@@ -66,8 +66,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             if (me.textWindow) {
                 me.textWindow.close();
             }
-            PVE.meta.Monaco.dispose(me.textEditor);
-            me.textEditor = null;
+            me.disposeTextEditor();
         });
     },
 

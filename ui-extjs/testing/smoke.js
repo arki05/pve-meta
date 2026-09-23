@@ -886,6 +886,81 @@ eq('hover: an enum', Markers.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null);
 
+console.log('\n--- a hover belongs to the model, not to the first panel that asked ---');
+{
+    // Monaco registers a hover provider per *language*, so the one this editor
+    // installs is shared by every buffer on the page. It used to close over the
+    // panel that happened to open Text first: a second panel got no hovers at all,
+    // and once the first was destroyed, neither did anything else.
+    const registered = [];
+    const model = (lines) => ({
+        getLineCount: () => lines,
+        getLineMaxColumn: () => 20,
+    });
+    const editorOn = (text, m) => ({
+        getValue: () => text,
+        getModel: () => m,
+        dispose() {},
+    });
+    const fakeMonaco = {
+        MarkerSeverity: { Error: 8, Warning: 4 },
+        Range: function (line, from, endLine, to) {
+            this.line = line;
+            this.to = to;
+        },
+        editor: { setModelMarkers() {} },
+        languages: { registerHoverProvider: (lang, provider) => registered.push([lang, provider]) },
+    };
+    ctx.monaco = fakeMonaco;
+    ctx.window.monaco = fakeMonaco;
+    ctx.PVE.meta.textHoverRegistered = false;
+
+    const guestYaml = 'traefik:\n  spec:\n    host: a.example\n';
+    const guestModel = model(3);
+    const guest = panelWith({
+        docId: '201',
+        textLang: 'yaml',
+        prefixes: [{ prefix: 'traefik', selector: { all: true }, schema: TRAEFIK_SCHEMA }],
+        textEditor: editorOn(guestYaml, guestModel),
+    });
+
+    const otherYaml = 'netbird:\n  groups:\n  - lan\n';
+    const otherModel = model(3);
+    const other = panelWith({
+        docId: '202',
+        textLang: 'yaml',
+        prefixes: [
+            {
+                prefix: 'netbird',
+                selector: { all: true },
+                schema: { type: 'object', properties: { groups: { type: 'array', description: 'Netbird groups' } } },
+            },
+        ],
+        textEditor: editorOn(otherYaml, otherModel),
+    });
+
+    guest.annotateText();
+    other.annotateText();
+    eq('one provider for the page, however many panels', registered.length, 1);
+    const hover = (m, line) => {
+        const out = registered[0][1].provideHover(m, { lineNumber: line });
+        return out && out.contents[0].value;
+    };
+    eq('the first panel\'s model is described by its own schema',
+        hover(guestModel, 3), 'string \u00b7 Public host name');
+    eq('and the second\'s by its own', hover(otherModel, 2), 'array \u00b7 Netbird groups');
+    eq('a line nothing declares says nothing', hover(guestModel, 9), null);
+
+    // And the map does not outlive the buffer.
+    guest.disposeTextEditor();
+    eq('a disposed buffer takes its hovers with it', hover(guestModel, 3), null);
+    eq('... and leaves the other panel\'s alone', hover(otherModel, 2), 'array \u00b7 Netbird groups');
+    other.disposeTextEditor();
+
+    delete ctx.monaco;
+    delete ctx.window.monaco;
+}
+
 console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
 {
     const nsPanel = panelWith({});

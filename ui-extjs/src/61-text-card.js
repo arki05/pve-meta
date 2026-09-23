@@ -4,6 +4,12 @@
 // comment or key order (outside the document model, DESIGN §2) survives.
 // ---------------------------------------------------------------------------
 
+// What each Monaco model's lines mean, by model: the hover provider is registered
+// once per *language*, so it cannot belong to one panel. A guest tab and a prefix
+// file's window each have a buffer, and the panel the provider happened to be built
+// with may be long destroyed. Written by `annotateText`, dropped with the editor.
+PVE.meta.TextHovers = new Map();
+
 PVE.meta.TextCard = {
     buildTextCard: function () {
         return {
@@ -130,6 +136,17 @@ PVE.meta.TextCard = {
         );
     },
 
+    // The buffer goes, and what the hover provider knows about its model with it.
+    disposeTextEditor: function () {
+        let me = this;
+        let model = me.textEditor && me.textEditor.getModel();
+        if (model) {
+            PVE.meta.TextHovers.delete(model);
+        }
+        PVE.meta.Monaco.dispose(me.textEditor);
+        me.textEditor = null;
+    },
+
     // Text mode could not be entered: fall back to the tree without asking.
     abortTextMode: function () {
         let me = this;
@@ -163,8 +180,7 @@ PVE.meta.TextCard = {
     // to run while the mode still says text.
     finishLeavingTextMode: function () {
         let me = this;
-        PVE.meta.Monaco.dispose(me.textEditor);
-        me.textEditor = null;
+        me.disposeTextEditor();
         me.mode = 'tree';
         me.setModeButton('tree');
         me.getLayout().setActiveItem(me.down('#metaTree'));
@@ -307,22 +323,22 @@ PVE.meta.TextCard = {
         }
 
         monaco.editor.setModelMarkers(model, 'pve-meta', markers);
-        me.textHovers = hovers;
+        PVE.meta.TextHovers.set(model, hovers);
         me.registerTextHover();
     },
 
-    // One hover provider for the language, reading whichever panel owns the model that
-    // is asking. Monaco registers providers per-language, not per-editor.
+    // One hover provider for the language, answering for whichever model is asking.
+    // Monaco registers providers per-language, not per-editor, so this one is
+    // registered once per page and closes over nothing.
     registerTextHover: function () {
-        let me = this;
         if (PVE.meta.textHoverRegistered || !window.monaco || !monaco.languages) {
             return;
         }
         PVE.meta.textHoverRegistered = true;
         monaco.languages.registerHoverProvider('yaml', {
             provideHover: function (model, position) {
-                let owner = me.textEditor && me.textEditor.getModel() === model ? me : null;
-                let text = owner && owner.textHovers && owner.textHovers[position.lineNumber];
+                let hovers = PVE.meta.TextHovers.get(model);
+                let text = hovers && hovers[position.lineNumber];
                 if (!text) {
                     return null;
                 }
