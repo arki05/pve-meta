@@ -140,10 +140,22 @@ guest-files:
 ```
 
 > [!WARNING]
-> **With `pve-meta-guest-files` installed, write access to `guest-files` means root inside that
-> container.** It writes any file, with any owner and mode, as root. Gate it like root:
-> grant `VM.Config.Options` on a container only to those you'd trust with root inside
-> it. It guards against accidents, not against users inside the container.
+> **An integration decides what a document write can do, and today they decide a lot.**
+> A document is inert; the thing reading it is not. `VM.Config.Options` on a guest is the
+> single privilege behind all of it, and per installed integration it currently means:
+>
+> | integration | what a write to its prefix can do |
+> |---|---|
+> | `pve-meta-guest-files` | root inside that container: any file, any path, any owner and mode, `/etc/shadow` included |
+> | `pve-compose` (`x-pve.path`, `x-pve.storage`) | host bind mounts and disk allocation, things PVE keeps to `root@pam` |
+> | `pve-meta-traefik` | administrative control of the cluster's Traefik |
+> | `pve-meta-nvidia` | every GPU on the node |
+>
+> So grant `VM.Config.Options` on a guest accordingly: only to those you would trust with
+> whatever the integrations you installed turn it into. It guards against accidents, not
+> against a deliberate writer, and not against users inside a container. A privilege gate
+> per prefix — a schema flag that makes a write to that part of a document need
+> `Sys.Modify` — is planned; until it lands, the whole document is one grant.
 
 ## Where things are
 

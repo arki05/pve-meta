@@ -6,8 +6,8 @@ service inside reads configuration kept in pve-meta; nothing of this runs in pve
 pvedaemon or the write path. **Writing a guest's `guest-files` key is root inside that
 guest**: it chooses the content, mode and owner of a file at any admitted path, and with
 `local_edits: overwrite` that includes a file the guest already had, `/etc/shadow` among
-them. So `VM.Config.Options` on a container is root inside it, the trust `pct enter`
-already carries.
+them. No PVE API role grants root inside a container; this package is what turns
+`VM.Config.Options` on a guest — a routine per-guest privilege — into exactly that.
 
 ```yaml
 guest-files:
@@ -32,7 +32,7 @@ guest-files:
   file, as if the entry were removed.
 * **Entries are judged one by one.** An entry that fails to validate — an unknown or
   invalid field, `raw` on a non-string, content over the cap — is refused and holds what
-  it wrote before. Two entries resolving to one path, or one to a directory the to a directory the
+  it wrote before. Two entries resolving to one path, or one to a directory the
   other's path runs through, are both refused. A document that does not parse, or a
   `guest-files` that is not a map, holds everything.
 * **Paths.** A relative path resolves under `/etc/pve-meta`, an absolute one is used as
@@ -47,8 +47,10 @@ guest-files:
   `/etc/pve-meta` must pass too, since the manifest lives there; when it does not,
   everything is held. Missing directories are created root `0755`, never removed.
 * **The manifest**, `/etc/pve-meta/.guest-files`, root `0600`, JSON, `{ version: 1, files:
-  [...] }`: one record per file written, with the entry name, the absolute path and the
-  sha256 of the content as written. A file is **ours** while it hashes to its record,
+  [...] }`: one record per file written, with the entry name, the absolute path, the
+  sha256 of the content as written, and the `source` that wrote it — `user/<entry>` for
+  an entry of this document's `guest-files`, `managed/<operator>/<name>` for an
+  operator's (below). A file is **ours** while it hashes to its record,
   and moves with the guest through backup, restore and migration. Above 1 MiB, not
   parsing, or holding a record whose path does not validate, distrusts the whole
   manifest: nothing in it is deleted, and files exactly as wanted are adopted again. The

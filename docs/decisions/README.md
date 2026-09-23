@@ -28,6 +28,17 @@ new record; the old one is deleted, since git remembers it.
 | [024](024-access-is-pves-acls.md) | Access is PVE's ACLs | accepted, supersedes 001, 002, 004 |
 | [025](025-a-nodes-schema-is-an-override-inside-the-prefix-file.md) | A node's schema is an override inside the prefix file | accepted, supersedes 020 |
 | [026](026-the-editor-writes-each-edit.md) | The editor writes each edit | accepted, supersedes 010 |
+| [027](027-the-loader-gates-nothing.md) | The page loader gates nothing and every page is a script | accepted |
+
+Numbers missing from the table are records deleted when their decision was reversed;
+the successor in the table is what replaced them. **001** (a prefix and a permission
+are two files), **002** (a write is authorized by what it changes) and **004**
+(permissions are pve-meta's own files, not PVE ACL paths) by
+[024](024-access-is-pves-acls.md); **010** (edits are staged, the tree and the text
+editor two views of one edit set) by [026](026-the-editor-writes-each-edit.md); **020**
+(a node's own prefix files reach the guests on that node) by
+[025](025-a-nodes-schema-is-an-override-inside-the-prefix-file.md). Git has the deleted
+text.
 
 Related records kept in their own files: [`../WASM-CORE.md`](../WASM-CORE.md) (how the
 core reaches the browser) and [`../LIFECYCLE.md`](../LIFECYCLE.md) (the
