@@ -103,15 +103,11 @@ pub fn container_lock(node: &str, vmid: u32) -> Result<Option<String>> {
     Ok(parse_lock(&text))
 }
 
-/// A guest's PVE tags, split the way `PVE::API2::Ext::Meta::parse_tags`
-/// does: the cluster stores them `;`-separated, and `,` and whitespace
-/// separate too, so a hand-written list still parses. Empty runs drop out.
-/// Operators share this instead of each splitting tags their own way.
+/// A guest's PVE tags, split by the core's one rule
+/// ([`pve_meta_core::tags::split_tags`]). Operators share this instead of
+/// each splitting tags their own way.
 pub fn split_tags(raw: &str) -> Vec<String> {
-    raw.split(|c: char| c == ';' || c == ',' || c.is_whitespace())
-        .filter(|t| !t.is_empty())
-        .map(str::to_string)
-        .collect()
+    pve_meta_core::tags::split_tags(raw)
 }
 
 /// Why `vmid` cannot be synced right now: not in `active`, or locked (a

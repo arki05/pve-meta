@@ -28,7 +28,10 @@ sub ext_path { return 'meta' }
 # The CLI is a local reader with no ticket and no pveproxy; it authorizes
 # nothing, so it needs only the lookups below, never `_guest_acl` itself.
 
-# A guest's PVE tags, split from the `;`-separated config string.
+# A guest's PVE tags, split from the `;`-separated config string. The same
+# rule in Rust is `pve_meta_core::tags::split_tags`, which is what every
+# consumer of a document splits with (pve-meta-guest-files and the operators);
+# both split on `;`, `,` and whitespace and drop empty runs.
 sub parse_tags {
     my ($raw) = @_;
     return [] if !defined($raw) || $raw eq '';
