@@ -283,9 +283,10 @@ impl MetaStore {
         let Some(bytes) = gone_is_none(fs::read(path))? else {
             return Err(Error::NotFound(id.clone()));
         };
+        let dig = digest::digest(&bytes);
         // Not UTF-8 is the one read failure that is not a parse_error: there
         // is no `raw` to report.
-        let raw = String::from_utf8(bytes.clone()).map_err(|e| Error::Parse {
+        let raw = String::from_utf8(bytes).map_err(|e| Error::Parse {
             format: DISK_FORMAT,
             msg: format!("invalid utf-8: {e}"),
             at: None,
@@ -299,7 +300,6 @@ impl MetaStore {
                 (Value::Object(serde_json::Map::new()), Some(e.to_string()))
             }
         };
-        let dig = digest::digest(&bytes);
         Ok(Document {
             id: id.clone(),
             path: path.to_path_buf(),
