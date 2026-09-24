@@ -372,6 +372,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.writeFor(me.docId, edit, me.digestOf(me.docId), force),
             onDone,
             force ? undefined : () => me.sendEdit(edit, true, onDone),
+            edit,
         );
     },
 
@@ -933,9 +934,24 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         win.on('destroy', function () {
             me.editing = false;
             me.editors = me.editors.filter((open) => open !== win);
+            me.editorClosed();
         });
         win.show();
         return win;
+    },
+
+    // Monaco on one view of this document, in its own modal window, which
+    // `reload` waits for like it waits for the row editors. A write reloads on
+    // its own once the window has closed over it, so closing reloads nothing
+    // that is not already owed.
+    openTextWindow: function (view, text) {
+        let me = this;
+        me.textWindow = Ext.create('PVE.meta.TextWindow', { view: view, text: text, tree: me });
+        me.textWindow.on('destroy', function () {
+            me.textWindow = null;
+            me.editorClosed();
+        });
+        me.textWindow.show();
     },
 
     editRow: function (rec) {
@@ -1031,13 +1047,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!props || !Object.keys(props).length) {
             props = { key_name: { type: 'string' } };
         }
-        me.textWindow = Ext.create('PVE.meta.TextWindow', {
-            view: 'schema.properties',
-            text: PVE.meta.Codec.dump(props, 'yaml'),
-            tree: me,
-        });
-        me.textWindow.on('destroy', () => (me.textWindow = null));
-        me.textWindow.show();
+        me.openTextWindow('schema.properties', PVE.meta.Codec.dump(props, 'yaml'));
     },
 
     // `DELETE ?view=<path>`, which takes the key's note with it (`view::remove`). A
@@ -1089,14 +1099,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // that is the document OK writes back to.
         let stored = me.dataOf(me.docId);
         let subtree = view === '' ? stored : PVE.meta.Utils.valueAt(stored, view);
-        me.textWindow = Ext.create('PVE.meta.TextWindow', {
-            view: view,
-            text: PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'),
-            tree: me,
-        });
-        // No reload on close: the write, if there was one, reloads on its own.
-        me.textWindow.on('destroy', () => (me.textWindow = null));
-        me.textWindow.show();
+        me.openTextWindow(view, PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'));
     },
 }, PVE.meta.Doc, PVE.meta.TextCard));
 

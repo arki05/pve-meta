@@ -2204,6 +2204,169 @@ console.log('\n--- a 409 in Text mode keeps the buffer ---');
     });
 }
 
+console.log('\n--- a 409 under an open editor re-reads around it, and the next OK goes through ---');
+{
+    // Since 9825441 a popup stays open until its write answers, and a 409 asked
+    // `reload` to fetch the new digest -- which returns early under an editor. So
+    // OK gave 409 for ever. Blindly refreshing the digest would be worse: the next
+    // OK would write over the other writer's change without a word. The document
+    // is re-read around the editor instead, and the value at the edit's own path
+    // is compared before and after.
+    const stored = (text) => (opts) => opts.success({ result: { data: { digest: 'd9', text: text } } });
+    const openedWins = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = function (xtype, cfg) {
+        const win = {
+            xtype: xtype,
+            cfg: cfg,
+            handlers: {},
+            on(name, fn) { this.handlers[name] = fn; },
+            show() {},
+            close() { this.handlers.destroy(); },
+        };
+        openedWins.push(win);
+        return win;
+    };
+    // A panel whose `reload` is the real one, with the load chain cut at its
+    // first request: what counts is whether the rows were asked for at all.
+    const withEditor = function (read) {
+        const p = panelWith({
+            docId: '201',
+            rendered: true,
+            docState: { 201: { digest: 'd0', data: { a: 1, m: { x: 1 } } } },
+            request: read,
+            setMask() {},
+            loads: 0,
+            loadPrefixes() { this.loads++; },
+        });
+        p.openEditor('PVE.meta.EditValueWindow', { rec: { data: { path: 'a' } } }, 'setvalue', () => {});
+        return p;
+    };
+    const answers = [];
+    const sent = [];
+    const conflictOnce = function (opts) {
+        sent.push(opts);
+        if (sent.length === 1) {
+            opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+        } else {
+            opts.success({});
+        }
+    };
+
+    // The document changed elsewhere, but not at the edited path.
+    ctx.__alerts.splice(0);
+    let p = withEditor(stored('a: 1\nb: 2\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    eq('the 409 answers the editor with a failure, so it stays open', answers.splice(0), [false]);
+    eq('the digest is the one the next OK needs', p.digestOf('201'), 'd9');
+    eq('... and the data too, without the rows being rebuilt under the editor',
+        [p.dataOf('201').b, p.loads, p.reloadPending], [2, 0, true]);
+    let alert = ctx.__alerts.splice(0)[0];
+    eq('the alert says the document changed and the edit can go again as it is',
+        [alert[0], alert[1].indexOf('digest mismatch') === 0, /still the one this editor opened on/.test(alert[1])],
+        ['Conflict', true, true]);
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    eq('the second OK carries the fresh digest and lands', [sent[1].params.digest, answers.splice(0)], ['d9', [true]]);
+    eq('the reload it earned is still owed while the editor is open', [p.loads, p.reloadPending], [0, true]);
+    openedWins.pop().close();
+    eq('... and paid once the editor closes', [p.loads, p.reloadPending, p.editing], [1, false, false]);
+
+    // The edited value itself was changed underneath.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    alert = ctx.__alerts.splice(0)[0];
+    eq('the alert names the value it opened on and the value there now',
+        [alert[0], /it was 1 and is now 7/.test(alert[1]), /writes the value in this editor over the new one/.test(alert[1])],
+        ['Conflict', true, true]);
+    eq('... the editor is still open with the fresh digest', [answers.splice(0), p.editing, p.digestOf('201')], [[false], true, 'd9']);
+    openedWins.pop().close();
+
+    // Add Key: the key was not there, and now it is.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 1\nm:\n  x: 1\nnew: taken\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'new', op: 'set', value: 'mine' }, false, () => {});
+    eq('a key added by both sides is named as not set, then set',
+        /it was not set and is now taken/.test(ctx.__alerts.splice(0)[0][1]), true);
+    openedWins.pop().close();
+
+    // No editor open (Set to Default, Remove): the reload and the message, as before.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\n'));
+    openedWins.pop().close();
+    p.loads = 0;
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 });
+    eq('with nothing open a 409 reloads the tree and says so',
+        [p.loads, ctx.__alerts.splice(0)], [1, [['Conflict', 'digest mismatch']]]);
+
+    // The subtree text window: the same at its view, plus the diff against the
+    // subtree as stored now, which is what the buffer is compared against from
+    // here on. The buffer itself is left alone.
+    const diffs = [];
+    const shown = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    const typed = 'x: 1\ny: typed\n';
+    const textWin = {
+        view: 'm',
+        lang: 'yaml',
+        original: 'x: 1\n',
+        editor: { value: typed, getValue() { return this.value; }, setValue(v) { this.value = v; } },
+        buffer: ctx.PVE.meta.TextWindow.buffer,
+        conflict: ctx.PVE.meta.TextWindow.conflict,
+    };
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 1\nm:\n  x: 2\n'));
+    openedWins.pop().close();
+    p.loads = 0;
+    p.textWindow = textWin;
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
+    alert = ctx.__alerts.splice(0)[0];
+    eq('the text window\'s conflict is answered at its view, with the YAML\'s first lines',
+        [answers.splice(0), /it was x: 1 and is now x: 2/.test(alert[1])], [[false], true]);
+    eq('... the buffer is what was typed', textWin.editor.value, typed);
+    eq('... compared against the subtree as stored now', textWin.original, 'x: 2\n');
+    eq('... and the diff is the buffer against that', diffs.pop(), { title: 'm', original: 'x: 2\n', modified: typed, lang: 'yaml' });
+    eq('... with the rows left for the close', [p.loads, p.reloadPending], [0, true]);
+    p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
+    eq('the next OK carries the fresh digest', [sent[1].params.digest, answers.splice(0)], ['d9', [true]]);
+
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p.docState[201] = { digest: 'd0', data: { a: 1, m: { x: 1 } } };
+    p.request = stored('a: 2\nm:\n  x: 1\n');
+    textWin.original = 'x: 1\n';
+    p.writeSubtree('m', { x: 1, y: 'typed' }, () => {});
+    eq('a change elsewhere in the document opens no diff', [diffs.length, textWin.original], [0, 'x: 1\n']);
+    eq('... and says the view is as it was', /still the one this editor opened on/.test(ctx.__alerts.splice(0)[0][1]), true);
+    ctx.PVE.meta.Monaco.showDiff = shown;
+    delete ctx.Proxmox.Utils.API2Request;
+
+    // New Prefix: the empty digest matched nothing, so the name is taken. The
+    // form stays open with its fields, and the message says that, not "digest
+    // mismatch" about a document the form never read.
+    ctx.__alerts.splice(0);
+    openedWins.length = 0;
+    const grid = { reloads: 0, reload() { this.reloads++; } };
+    ctx.PVE.meta.RegistryGrid.createOne.call(grid);
+    ctx.Proxmox.Utils.API2Request = (opts) => opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    openedWins[0].handlers.create({ id: 'prefixes/homelab', file: 'homelab', content: {} }, (ok) => answers.push(ok));
+    delete ctx.Proxmox.Utils.API2Request;
+    alert = ctx.__alerts.splice(0)[0];
+    eq('a taken name keeps the form open and says whose fault it is',
+        [answers.splice(0), alert[0], /"homelab" already exists/.test(alert[1]), grid.reloads],
+        [[false], 'Conflict', true, 1]);
+    ctx.Ext.create = origCreate;
+}
+
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
 // keys (DESIGN §7) that must become ordinary rows, not resolve through the

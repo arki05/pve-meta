@@ -230,6 +230,20 @@ Ext.define('PVE.meta.RegistryGrid', {
                 }),
                 failure: function (response) {
                     done(false);
+                    // The empty digest matched nothing, so the name is taken: said
+                    // in those words, since "digest mismatch" names a document the
+                    // form never read. The list shows whose it is.
+                    if (String((response.result || {}).status) === '409') {
+                        me.reload();
+                        Ext.Msg.alert(
+                            gettext('Conflict'),
+                            Ext.String.format(
+                                gettext('A prefix named "{0}" already exists; pick another name or edit that one.'),
+                                Ext.htmlEncode(plan.file),
+                            ),
+                        );
+                        return;
+                    }
                     Ext.Msg.alert(
                         gettext('Error'),
                         response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
