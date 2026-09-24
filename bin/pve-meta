@@ -35,8 +35,8 @@ usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
 
   get     print the view; comment keys (key__, a note about key) only with --comments
   set     replace the view with the payload ({} stores an empty map; use delete to remove);
-          it may carry no comment key and keeps the stored ones whose key it keeps, unless
-          --comments makes it the whole subtree, notes included
+          it keeps the stored note of every key it keeps, unless --comments makes it the
+          whole subtree, notes included
   merge   apply the payload as a merge patch (a JSON null deletes a key)
   delete  remove the view and its note (<view>__), or the whole document
   --file  read the payload from a file, or '-' for stdin; .json is JSON, anything else YAML
