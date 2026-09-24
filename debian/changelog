@@ -19,13 +19,13 @@ pve-meta (0.3.1-1) unstable; urgency=medium
 pve-meta (0.3.0-1) unstable; urgency=medium
 
   * Guest files grow a managed plane for operators: manifest records carry
-a `source` (`user/<entry>` or `managed/<operator>/<name>`, pre-source files
-read back as their own entry), entries can be built content-direct
-(`Entry::managed`, `Desired::direct`, `GuestFiles::managed`) and flow
-through the same plan, commit, manifest and lock, a path recorded for
-another source is refused naming both, and tag lists share
-`node::split_tags`. No behaviour change for document readers; the daemon
-never sees managed files. (`docs/GUEST-FILES.md`: Managed files.)
+    a `source` (`user/<entry>` or `managed/<operator>/<name>`, pre-source files
+    read back as their own entry), entries can be built content-direct
+    (`Entry::managed`, `Desired::direct`, `GuestFiles::managed`) and flow
+    through the same plan, commit, manifest and lock, a path recorded for
+    another source is refused naming both, and tag lists share
+    `node::split_tags`. No behaviour change for document readers; the daemon
+    never sees managed files. (`docs/GUEST-FILES.md`: Managed files.)
 
  -- Julius Arkenberg <julius@rkenberg.de>  Mon, 21 Sep 2026 18:30:00 +0200
 
