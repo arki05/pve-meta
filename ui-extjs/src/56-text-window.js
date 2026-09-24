@@ -94,11 +94,15 @@ Ext.define('PVE.meta.TextWindow', {
     // A 409 under this window, with the view changed underneath it as well:
     // `subtree` is the view as stored *now*. The buffer is unwritten work and the
     // only copy of it, so it is left alone; what it is compared against is the
-    // new subtree from here on, and the diff is the buffer against that -- the
-    // question a conflict actually raises.
+    // new subtree from here on.
     conflict: function (subtree) {
+        this.original = PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml');
+    },
+
+    // The buffer against that -- the question a conflict actually raises. Opened by
+    // the panel once its Conflict alert is dismissed.
+    showDiff: function () {
         let me = this;
-        me.original = PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml');
         if (me.editor) {
             PVE.meta.Buffer.diff(me.buffer(), me.view || gettext('(whole document)'));
         }

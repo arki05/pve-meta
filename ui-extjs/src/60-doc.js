@@ -354,6 +354,7 @@ PVE.meta.Doc = {
             let same =
                 before === undefined || after === undefined ? before === after : U.sameValue(before, after);
             let where = Ext.htmlEncode(path || gettext('(whole document)'));
+            let maps = U.kindOf(before) === 'map' && U.kindOf(after) === 'map';
             let lines = [message];
             if (read.parseError) {
                 lines.push(gettext('The document no longer parses as YAML and can only be repaired as text.'));
@@ -361,6 +362,14 @@ PVE.meta.Doc = {
                 lines.push(
                     Ext.String.format(
                         gettext('The value at {0} is still the one this editor opened on: press OK to send the edit again as it is.'),
+                        where,
+                    ),
+                );
+            } else if (maps) {
+                // No line of YAML says how two maps differ; the diff does.
+                lines.push(
+                    Ext.String.format(
+                        gettext('The map at {0} was changed as well; the diff shows how. Pressing OK writes the text in this editor over it.'),
                         where,
                     ),
                 );
@@ -374,22 +383,32 @@ PVE.meta.Doc = {
                     ),
                 );
             }
-            Ext.Msg.alert(gettext('Conflict'), lines.join('<br>'));
-            if (!same && me.textWindow) {
-                me.textWindow.conflict(after);
+            // The subtree window compares against the view as stored now from here
+            // on, and shows the diff once the alert is dismissed, not on top of it.
+            let win = !same && me.textWindow;
+            if (win) {
+                win.conflict(after);
             }
+            Ext.Msg.alert(gettext('Conflict'), lines.join('<br>'), function () {
+                if (win && !win.isDestroyed) {
+                    win.showDiff();
+                }
+            });
         });
     },
 
-    // A stored value in one line of an alert, encoded: a map or an array as its
-    // YAML's first line, since the rest of it is the diff window's to show.
+    // A stored value in one line of an alert, encoded. A map is said to be one: its
+    // first line of YAML and "(+N lines)" told nobody anything, and what is in it is
+    // the diff window's to show.
     storedValueText: function (value) {
         let U = PVE.meta.Utils;
         if (value === undefined) {
             return Ext.htmlEncode(gettext('not set'));
         }
         let kind = U.kindOf(value);
-        let text = kind === 'map' ? PVE.meta.Codec.dump(value, 'yaml') : U.displayValue(value, kind);
-        return Ext.htmlEncode(U.previewText(text));
+        if (kind === 'map') {
+            return Ext.htmlEncode(gettext('a map'));
+        }
+        return Ext.htmlEncode(U.previewText(U.displayValue(value, kind)));
     },
 };

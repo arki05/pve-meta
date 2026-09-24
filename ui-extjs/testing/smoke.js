@@ -95,7 +95,16 @@ const ctx = {
         // The header installs one stylesheet rule for unset rows; record it
         // so the suite can see the rule without a DOM.
         util: { CSS: { createStyleSheet: (css, id) => ctx.__styles.push([id, css]) } },
-        Msg: { alert: (title, msg) => ctx.__alerts.push([title, msg]) },
+        // An alert's callback runs when it is dismissed, which is the test's to do
+        // (`dismissAlerts`): what opens after an alert has to wait for that.
+        Msg: {
+            alert: (title, msg, fn) => {
+                ctx.__alerts.push([title, msg]);
+                if (fn) {
+                    ctx.__dismiss.push(fn);
+                }
+            },
+        },
         window: { Window: {} },
         panel: { Panel: {} },
         button: { Segmented: {} },
@@ -103,6 +112,7 @@ const ctx = {
     Proxmox: { Utils: { format_boolean: (v) => (v ? 'Yes' : 'No') } },
     __defined: [],
     __alerts: [],
+    __dismiss: [],
     __styles: [],
 };
 ctx.PVE = {};
@@ -114,6 +124,7 @@ vm.runInContext(
 );
 
 let fails = 0;
+const dismissAlerts = () => ctx.__dismiss.splice(0).forEach((fn) => fn('ok'));
 const eq = (name, got, want) => {
     const g = JSON.stringify(got);
     const w = JSON.stringify(want);
@@ -2393,18 +2404,20 @@ console.log('\n--- a 409 in Text mode keeps the buffer ---');
         opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
     panelT.applyText();
     delete ctx.Proxmox.Utils.API2Request;
-    ctx.PVE.meta.Monaco.showDiff = shown;
 
     eq('the buffer is still what was typed', editor.value, typed);
     eq('the digest is the one the next Apply needs', panelT.digestOf('201'), 'd9');
     eq('and the buffer is now compared against the new file', panelT.textOriginal, stored);
     eq('the conflict is reported', ctx.__alerts.splice(0), [['Conflict', 'digest mismatch']]);
-    eq('... with the diff against what is in the file now', diffs.pop(), {
+    eq('... and the diff waits for the alert, rather than covering it', diffs.length, 0);
+    dismissAlerts();
+    eq('... then shows the buffer against what is in the file now', diffs.pop(), {
         title: '201',
         original: stored,
         modified: typed,
         lang: 'yaml',
     });
+    ctx.PVE.meta.Monaco.showDiff = shown;
 }
 
 console.log('\n--- a 409 under an open editor re-reads around it, and the next OK goes through ---');
@@ -2544,6 +2557,7 @@ console.log('\n--- a 409 under an open editor re-reads around it, and the next O
         editor: { value: typed, getValue() { return this.value; }, setValue(v) { this.value = v; } },
         buffer: ctx.PVE.meta.TextWindow.buffer,
         conflict: ctx.PVE.meta.TextWindow.conflict,
+        showDiff: ctx.PVE.meta.TextWindow.showDiff,
     };
     sent.length = 0;
     ctx.__alerts.splice(0);
@@ -2554,11 +2568,14 @@ console.log('\n--- a 409 under an open editor re-reads around it, and the next O
     ctx.Proxmox.Utils.API2Request = conflictOnce;
     p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
     alert = ctx.__alerts.splice(0)[0];
-    eq('the text window\'s conflict is answered at its view, with the YAML\'s first lines',
-        [answers.splice(0), /it was x: 1 and is now x: 2/.test(alert[1])], [[false], true]);
+    eq('the text window\'s conflict is answered at its view: a map changed, and the diff says how',
+        [answers.splice(0), /The map at m was changed as well; the diff shows how/.test(alert[1]), /lines\)/.test(alert[1])],
+        [[false], true, false]);
     eq('... the buffer is what was typed', textWin.editor.value, typed);
     eq('... compared against the subtree as stored now', textWin.original, 'x: 2\n');
-    eq('... and the diff is the buffer against that', diffs.pop(), { title: 'm', original: 'x: 2\n', modified: typed, lang: 'yaml' });
+    eq('... the diff waits for the alert', diffs.length, 0);
+    dismissAlerts();
+    eq('... and is the buffer against that', diffs.pop(), { title: 'm', original: 'x: 2\n', modified: typed, lang: 'yaml' });
     eq('... with the rows left for the close', [p.loads, p.reloadPending], [0, true]);
     p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
     eq('the next OK carries the fresh digest', [sent[1].params.digest, answers.splice(0)], ['d9', [true]]);
@@ -2569,6 +2586,7 @@ console.log('\n--- a 409 under an open editor re-reads around it, and the next O
     p.request = stored('a: 2\nm:\n  x: 1\n');
     textWin.original = 'x: 1\n';
     p.writeSubtree('m', { x: 1, y: 'typed' }, () => {});
+    dismissAlerts();
     eq('a change elsewhere in the document opens no diff', [diffs.length, textWin.original], [0, 'x: 1\n']);
     eq('... and says the view is as it was', /still the one this editor opened on/.test(ctx.__alerts.splice(0)[0][1]), true);
     ctx.PVE.meta.Monaco.showDiff = shown;

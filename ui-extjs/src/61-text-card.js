@@ -442,9 +442,10 @@ PVE.meta.TextCard = {
         let me = this;
         me.refreshText({
             keepBuffer: true,
+            // The diff once the alert is dismissed: both are modal, and a diff
+            // opened with it came up on top of the message that explains it.
             then: function () {
-                Ext.Msg.alert(gettext('Conflict'), message);
-                me.showDiff();
+                Ext.Msg.alert(gettext('Conflict'), message, () => me.showDiff());
             },
         });
     },
