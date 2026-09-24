@@ -64,7 +64,8 @@ Ext.define('PVE.meta.NewRegistryWindow', {
             if (v.description) {
                 out.content.description = v.description;
             }
-            out.content.selector = v.selector === 'tag' ? { tag: v.tag } : { all: true };
+            // Trimmed, as `submit` checks it: a tag has no spaces, and ' gpu' reaches nothing.
+            out.content.selector = v.selector === 'tag' ? { tag: String(v.tag || '').trim() } : { all: true };
             return out;
         },
     },

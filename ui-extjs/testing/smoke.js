@@ -1820,6 +1820,7 @@ console.log('\n--- creating a registry file: the least that parses ---');
     eq('a prefix with an "all" selector', plan({ name: 'x', selector: 'all' }).content, { selector: { all: true } });
     eq('it writes the cluster file named after the prefix', plan({ name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
     eq('a prefix with a tag selector', plan({ name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
+    eq('... trimmed, as the form checks it', plan({ name: 'x', selector: 'tag', tag: ' web ' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
         plan({ name: 'x', selector: 'all', description: 'Home' }).content,
