@@ -303,8 +303,19 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
         }
     }
     let written = store.put_raw(&doc_id, &text, None)?;
+    // A restored guest has no snapshots (a backup carries none), so copies
+    // left from the incarnation it replaced belong to nothing: the same
+    // outcome as a restore whose backup carried no block, which purges.
+    let mut dropped = 0;
+    if mode == ImportMode::Restore {
+        for name in store.list_snapshots(vmid)? {
+            if store.delete_snapshot(vmid, &name)? {
+                dropped += 1;
+            }
+        }
+    }
     crate::audit(&format!(
-        "backup notes block imported into {doc_id} (from vmid {}, taken {}): digest {}",
+        "backup notes block imported into {doc_id} (from vmid {}, taken {}, {dropped} old snapshot copies removed): digest {}",
         found
             .header
             .vmid
@@ -489,14 +500,17 @@ mod tests {
         let block = export(&store, 105, 0).unwrap().unwrap();
         let notes = format!("hello\n\n{block}");
 
-        // Restore to another vmid, over an existing document: the block wins.
+        // Restore to another vmid, over an existing document: the block wins,
+        // and the snapshot copies of what it replaced go with it.
         store
             .put_raw(&DocId::Guest(200), "old: true\n", None)
             .unwrap();
+        assert!(store.snapshot(200, "before").unwrap());
         let res = import(&store, 200, &notes, ImportMode::Restore).unwrap();
         assert_eq!(res.action, ImportAction::Imported);
         assert_eq!(res.description.as_deref(), Some("hello"));
         assert_eq!(store.read(&DocId::Guest(200)).unwrap().raw, YAML);
+        assert!(store.list_snapshots(200).unwrap().is_empty());
 
         // Nothing to do on plain notes.
         let res = import(&store, 200, "hello", ImportMode::Restore).unwrap();

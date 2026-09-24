@@ -123,7 +123,8 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decisio
   gate and hands back the notes without any block, and the config lands clean. Should
   the notes hold more than one, the **last** is imported: `assemble` appends its block
   after everything else, so an earlier one is never the backup's. The block wins over whatever document the vmid had: it is the
-  backup being restored. Enforced schemas are not applied, since a restore is not an
+  backup being restored, and that document's snapshot copies go too, since a restored
+  guest has no snapshots — the same outcome as the no-block case below. Enforced schemas are not applied, since a restore is not an
   edit. An error (a block someone mangled, YAML the store refuses) warns and leaves the
   notes as they are, block included, for `pve-meta scan-notes`; nothing here can fail a
   restore. When the marked write carries **no** block and the `.existing` marker says the
