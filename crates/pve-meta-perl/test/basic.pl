@@ -68,6 +68,12 @@ my $res;
 # --- version() ---------------------------------------------------------
 like(PVE::RS::Meta::version(), qr/^\d+\.\d+\.\d+$/, 'version() looks like a semver string');
 
+# --- split_tags() ------------------------------------------------------
+# The rule is pinned in Rust (`tags::split_tags`); this is the boundary:
+# undef in, an array ref out, as parse_tags hands it on.
+is_deeply(PVE::RS::Meta::split_tags(undef), [], 'split_tags(undef) is no tags');
+is_deeply(PVE::RS::Meta::split_tags('a;b,,c d'), [qw(a b c d)], 'split_tags splits the tag string');
+
 # =========================================================================
 # Lifecycle hooks (docs/DESIGN.md §7, docs/LIFECYCLE.md).
 # =========================================================================

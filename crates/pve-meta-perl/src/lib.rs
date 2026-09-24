@@ -206,6 +206,15 @@ mod pve_rs_meta {
         Ok(backup::import(&open_store(), vmid.0, description, mode)?)
     }
 
+    /// A guest's tag string (`;`-separated in its config, `undef` when it has
+    /// none) as a list: [`pve_meta_core::tags::split_tags`], the one
+    /// splitting rule, which a prefix's selector is matched against.
+    /// `PVE::API2::Ext::Meta::parse_tags` is this call.
+    #[export]
+    pub fn split_tags(raw: Option<&str>) -> Vec<String> {
+        pve_meta_core::tags::split_tags(raw.unwrap_or(""))
+    }
+
     /// This crate's version, checked by `test/basic.pl` and by operators
     /// against a running pvedaemon/pveproxy.
     #[export]

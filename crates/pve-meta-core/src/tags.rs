@@ -4,8 +4,8 @@
 
 /// `raw` split into tags: the cluster stores them `;`-separated, and `,` and
 /// whitespace separate too, so a hand-written list still parses. Empty runs
-/// drop out. `PVE::API2::Ext::Meta::parse_tags` is this rule on the Perl side,
-/// where the tag string comes out of the guest's properties.
+/// drop out. `PVE::API2::Ext::Meta::parse_tags`, where the tag string comes
+/// out of the guest's properties, calls this through `PVE::RS::Meta`.
 pub fn split_tags(raw: &str) -> Vec<String> {
     raw.split(|c: char| c == ';' || c == ',' || c.is_whitespace())
         .filter(|t| !t.is_empty())
