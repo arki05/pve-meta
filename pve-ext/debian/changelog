@@ -1,3 +1,39 @@
+pve-ext (0.2.1-1) unstable; urgency=medium
+
+  * The page list is prefetched once at script load instead of fetched
+    synchronously per config panel; a panel built before the answer arrives
+    gets its tabs afterwards, and a failed request is not remembered as an
+    empty list: the next config panel asks again.
+  * The loader's header says why Ext.override cannot be used ('use strict'
+    and callParent), instead of blaming ExtJS.
+  * The loader no longer substitutes {vmid}, {node}, {type}, {theme} or
+    {query} into a page's script URL, nor reads the theme cookie: no page
+    uses them, and a page gets vmid, node and type as its config. It no
+    longer re-checks a manifest's fields, which GET /ext/pages already
+    does.
+  * pve-ext-patch reads JSON manifests (<name>.json, a "files" array of the
+    same fields) with core Perl's JSON::PP instead of a TOML subset in awk;
+    pve-ext's own is pve-manager.json. Breaks pve-meta (<< 0.3.3~), whose
+    older manifest is TOML. A manifest that does not parse stops the
+    command before it touches a file.
+  * pve-ext-patch: a failure is reported on stderr only, no longer also
+    appended to /run/pve-ext-patch/failed and syslog.
+  * pve-ext-patch: apply, verify and status rebuild pristine + diff with one
+    helper; apply patches its scratch copy once instead of a dry run and
+    then the same patch. verify counts a failed hunk once, no longer also
+    by patch's summary line, and a scratch copy that cannot be made is
+    said as such, not as a hunk count.
+  * pve-ext-patch: cmd_status_quiet, which was cmd_status under another
+    name, is gone; apply and remove call cmd_status.
+  * debian/triggers also watches index.html.tpl.pve-ext-orig and
+    API2.pm.pve-ext-orig, the names dpkg writes a pve-manager upgrade to
+    while the files are diverted: the patch is re-applied on the new files
+    again, instead of the old patched copies staying live until a manual
+    pve-ext-patch apply. README ("Managed patches") asks the same of a
+    package using pve-ext-patch.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Fri, 25 Sep 2026 03:32:34 +0200
+
 pve-ext (0.2.0-1) unstable; urgency=medium
 
   * The manifest id, the .claimed-by marker, the manifest-id subcommand and
