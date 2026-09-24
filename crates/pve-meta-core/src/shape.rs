@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{self, Value};
 use crate::path::Path;
-use crate::registry::{by_specificity, PrefixDef};
+use crate::registry::{as_flag, by_specificity, PrefixDef};
 
 /// One declared prefix as a [`Shape`] sees it: where it sits, and what it
 /// says. A [`PrefixDef`] minus where the file came from and which guests it
@@ -306,12 +306,7 @@ impl Shape {
 /// not say. Spelled `true`/`false` or, as this dialect already spells
 /// `optional`/`multiline`, as `1`/`0`.
 fn flag(schema: &Value, key: &str, inherited: bool) -> bool {
-    match schema.get(key) {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) if n.as_i64() == Some(1) => true,
-        Some(Value::Number(n)) if n.as_i64() == Some(0) => false,
-        _ => inherited,
-    }
+    schema.get(key).and_then(as_flag).unwrap_or(inherited)
 }
 
 /// Of the findings a planned document has, the ones an edit is answerable
@@ -390,25 +385,12 @@ fn check_value(schema: &Value, value: &Value) -> Option<String> {
 /// different values.
 fn enum_admits(declared: Option<&str>, member: &Value, value: &Value) -> bool {
     if declared == Some("boolean") {
-        return match (as_bool(member), as_bool(value)) {
+        return match (as_flag(member), as_flag(value)) {
             (Some(m), Some(v)) => m == v,
             _ => false,
         };
     }
     member == value
-}
-
-/// A boolean, spelled as one or as the `1`/`0` of the wire convention.
-fn as_bool(value: &Value) -> Option<bool> {
-    match value {
-        Value::Bool(b) => Some(*b),
-        Value::Number(n) => match n.as_i64() {
-            Some(1) => Some(true),
-            Some(0) => Some(false),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 /// Whether `value` is of the declared `PVE::JSONSchema` type. A boolean
@@ -423,9 +405,7 @@ pub(crate) fn type_matches(declared: &str, value: &Value) -> bool {
         "string" => value.is_string(),
         "integer" => value.is_i64() || value.is_u64(),
         "number" => value.is_number(),
-        "boolean" => {
-            value.is_boolean() || matches!(value.as_i64(), Some(0) | Some(1))
-        }
+        "boolean" => as_flag(value).is_some(),
         "object" => value.is_object(),
         "array" => value.is_array(),
         _ => true,

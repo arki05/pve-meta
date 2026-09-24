@@ -237,8 +237,10 @@ struct RawNodeOverride {
 }
 
 /// A flag value as a `bool`: `true`/`false`, or `1`/`0` as this dialect
-/// already spells `optional` and `multiline`. `None` if `v` is neither.
-fn as_flag(v: &Value) -> Option<bool> {
+/// already spells `optional` and `multiline` and the wire spells a boolean
+/// (`docs/decisions/017-data-is-a-native-structure.md`). `None` if `v` is
+/// neither. The one reading of it, for the loader and [`crate::shape`] alike.
+pub(crate) fn as_flag(v: &Value) -> Option<bool> {
     match v {
         Value::Bool(b) => Some(*b),
         Value::Number(n) if n.as_i64() == Some(1) => Some(true),
