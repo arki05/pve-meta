@@ -70,7 +70,15 @@ const ctx = {
             return Object.assign(object, config || {});
         },
         emptyFn() {},
-        htmlEncode: (s) => String(s),
+        // Ext's own entity table, not the identity: an unencoded path into markup,
+        // or an attribute encoded once too few, has to show up here as a difference.
+        htmlEncode: (s) =>
+            String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;'),
         String: { format: (t, ...a) => t.replace(/\{(\d)\}/g, (m, i) => a[i]) },
         Object: { toQueryString: (o) => new URLSearchParams(o).toString() },
         define(name, cfg) {
@@ -1301,6 +1309,13 @@ console.log('\n--- the registry list ---');
     eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
 
     // An older API returns neither field; the list must still render.
+    {
+        const meta = {};
+        eq('a text cell is encoded, and carries all of itself as its tooltip',
+            [G.textCell('a <b>', meta), meta.tdAttr], ['a &lt;b&gt;', 'data-qtip="a &amp;lt;b&amp;gt;"']);
+        const none = {};
+        eq('... an empty one no tooltip', [G.textCell(undefined, none), none.tdAttr], ['', undefined]);
+    }
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom([{ prefix: 'x' }])[0]), 'cluster');
 
     // A file's per-node overrides ride along on the one row for it, as text --
@@ -1340,9 +1355,11 @@ console.log('\n--- the registry list ---');
         // As Ext does with `statics:`, for the one call `reload` makes.
         ctx.PVE.meta.RegistryGrid.rowsFrom = G.rowsFrom;
         const listing = { result: { data: [{ prefix: 'gpu', selector: { all: true } }] } };
+        const nodesCol = { setHidden(h) { this.hidden = h; } };
         const grid = {
             access: { write: 1 },
             store: { setData: (rows) => (grid.rows = rows) },
+            down: (sel) => (sel === '#nodesCol' ? nodesCol : null),
             syncButtons() {},
             request(opts) {
                 if (opts.url === '/meta/prefixes') {
@@ -1361,6 +1378,10 @@ console.log('\n--- the registry list ---');
         Grid.reload.call(grid);
         eq('... and the next one that works clears it', masks, ['connection error', false]);
         eq('... showing what it loaded', grid.rows.map((r) => r.name), ['gpu']);
+        eq('... without an empty Nodes column when no file overrides a node', nodesCol.hidden, true);
+        listing.result.data.push({ prefix: 'net', selector: { all: true }, nodes: { pve1: { hidden: true } } });
+        Grid.reload.call(grid);
+        eq('... and with it once one does', nodesCol.hidden, false);
         ctx.Proxmox.Utils.setErrorMask = setErrorMask;
         if (!setErrorMask) {
             delete ctx.Proxmox.Utils.setErrorMask;
