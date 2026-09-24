@@ -128,7 +128,10 @@ pvesh get /meta/version                                  # a token; moves when a
 
 Every write leaves one syslog line tagged `pve-meta audit:`.
 
-**Into a container**, with the optional `pve-meta-guest-files` package: a `guest-files` entry
+**Into a container**, with the optional `pve-meta-guest-files` package — **deprecated in
+0.3.3 and removed in 0.4**: pve-meta writes nothing into guests
+([`GUEST-FILES.md`](docs/GUEST-FILES.md) says what to use instead; a service in the
+container reads its document over the API with a scoped token). A `guest-files` entry
 names a view of the container's own document and a path inside it, and a daemon on each
 node writes it there, as YAML or JSON without its comment keys or as verbatim text, on
 change, on container start and against drift. One way; a file edited inside the container is left alone unless the
@@ -146,7 +149,7 @@ guest-files:
 >
 > | integration | what a write to its prefix can do |
 > |---|---|
-> | `pve-meta-guest-files` | root inside that container: any file, any path, any owner and mode, `/etc/shadow` included |
+> | `pve-meta-guest-files` (deprecated, removed in 0.4) | root inside that container: any file, any path, any owner and mode, `/etc/shadow` included |
 > | `pve-compose` (`x-pve.path`, `x-pve.storage`) | host bind mounts and disk allocation, things PVE keeps to `root@pam` |
 > | `pve-meta-traefik` | administrative control of the cluster's Traefik |
 > | `pve-meta-nvidia` | every GPU on the node |

@@ -1,5 +1,22 @@
 # pve-meta-guest-files — specification
 
+> [!WARNING]
+> **Deprecated in 0.3.3, removed in 0.4**, the managed plane included. pve-meta has no
+> effects on guests: structured metadata is not written into containers by pve-meta or
+> any package of it ([decision 029](decisions/029-pve-meta-writes-nothing-into-guests.md)).
+> This daemon was a bootstrap convenience, and it is what turns a per-guest ACL into
+> root inside a container. Instead:
+>
+> * **A consumer is an API client.** A service in the container reads its own document
+>   over `/api2/json/meta` with a token scoped to what it needs — read-only, one guest —
+>   and writes its own file, e.g. a small config-sync service.
+> * **An operator pushes its own files** with `pct push`, as pve-compose now does.
+> * **A separate plugin** that manages files in guests, such as a container file
+>   editor, does so on its own, under its own permissions.
+>
+> Until then it works as specified below and gains nothing new; the daemon logs a
+> deprecation warning when it starts.
+
 A separate binary package from this source, `pve-meta-guest-files`, writes views of a
 container's own document into that container as files: one way, host to guest, so a
 service inside reads configuration kept in pve-meta; nothing of this runs in pveproxy,

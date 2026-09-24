@@ -144,7 +144,9 @@ nothing. Clone is not carried. There is no sweeper: `pve-meta ls --orphans` and
   as everywhere in PVE; a 409 reloads.
 * **pve-ext** (own package): mounts the API module, adds the tabs, applies the patches.
 * **pve-meta-guest-files** (own package): writes views of a container's document into it as
-  files. `GUEST-FILES.md`.
+  files. `GUEST-FILES.md`. **Deprecated in 0.3.3, removed in 0.4**: pve-meta has no
+  effects on guests; a consumer reads its document over the API with a scoped token, or a
+  separate plugin manages what it writes (decision 029).
 
 ## 9. Planned, not in 0.2.0
 

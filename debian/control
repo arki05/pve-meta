@@ -37,7 +37,11 @@ Architecture: any
 Depends: pve-meta (= ${source:Version}),
          pve-container,
          ${shlibs:Depends}, ${misc:Depends}
-Description: Write views of pve-meta documents into LXC containers as files
+Description: Write views of pve-meta documents into LXC containers (deprecated)
+ Deprecated in 0.3.3 and removed in 0.4: pve-meta writes nothing into guests.
+ A service in the container should read its document over the pve-meta API
+ with a scoped token instead, or an operator push its files with pct push.
+ .
  A per-node daemon that reads the guest-files key of each container's pve-meta
  document and writes the views it names into that container as files, one
  way, host to guest, so services inside read configuration managed in
