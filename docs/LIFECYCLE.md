@@ -120,7 +120,9 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decisio
   `PVE::RS::Meta::notes_import($vmid, $notes, 'restore')` under the document's
   `cfs_lock_domain` lock, inside the guest lock the caller holds — the same order
   create and destroy use — which writes the document through the store's own lint
-  gate and hands back the notes without the block, and the config lands clean. The block wins over whatever document the vmid had: it is the
+  gate and hands back the notes without any block, and the config lands clean. Should
+  the notes hold more than one, the **last** is imported: `assemble` appends its block
+  after everything else, so an earlier one is never the backup's. The block wins over whatever document the vmid had: it is the
   backup being restored. Enforced schemas are not applied, since a restore is not an
   edit. An error (a block someone mangled, YAML the store refuses) warns and leaves the
   notes as they are, block included, for `pve-meta scan-notes`; nothing here can fail a

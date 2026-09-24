@@ -140,7 +140,10 @@ pub fn render(vmid: u32, yaml: &str, digest: &str, now: u64) -> Result<String> {
 }
 
 /// Finds the block in a notes text, if there is one. A block is a header
-/// line with an end line somewhere after it; the first such header wins.
+/// line with an end line somewhere after it; the **last** such header wins,
+/// since `assemble` appends its block after whatever notes the guest had --
+/// a block that was already in them (pasted, or left by a restore on a host
+/// without pve-meta) is older than the one the backup was taken with.
 /// A header line with no end line after it is not a block at all — someone
 /// wrote `[pve-meta v1]` in their notes — and is never reported, since the
 /// report would repeat on every config write of that guest. A block whose
@@ -149,15 +152,10 @@ pub fn render(vmid: u32, yaml: &str, digest: &str, now: u64) -> Result<String> {
 /// # Errors
 /// [`Error::Parse`] for a malformed block.
 pub fn find(description: &str) -> Result<Option<Found>> {
-    let Some(start) = line_start_of(description, |l| {
-        l.starts_with(BEGIN_PREFIX) && l.ends_with(']')
-    }) else {
+    let Some(start) = last_header(description) else {
         return Ok(None);
     };
     let rest = &description[start..];
-    if !rest.split('\n').any(|l| l.trim_end() == END_LINE) {
-        return Ok(None);
-    }
     let malformed = |msg: &str| Error::Parse {
         format: crate::format::Format::Yaml,
         msg: format!("malformed pve-meta notes block: {msg}"),
@@ -277,7 +275,9 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
         });
     };
     let doc_id = DocId::Guest(vmid);
-    let stripped = strip(description, &found);
+    // Every block goes, not only the one imported: an older one left behind
+    // would be imported by the next scan-notes, or carried by the next backup.
+    let stripped = strip_all(&strip(description, &found));
     let existing = match mode {
         ImportMode::Restore => false,
         ImportMode::Install => store.digest_of(&doc_id)?.is_some(),
@@ -318,16 +318,32 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
     })
 }
 
-/// Byte offset of the start of the first line for which `pred` holds.
-fn line_start_of(text: &str, pred: impl Fn(&str) -> bool) -> Option<usize> {
+/// Byte offset of the last header line that has an end line after it: the
+/// start of the block [`find`] reads.
+fn last_header(text: &str) -> Option<usize> {
     let mut offset = 0;
+    let (mut header, mut block) = (None, None);
     for line in text.split_inclusive('\n') {
-        if pred(line.trim_end_matches(['\n', '\r'])) {
-            return Some(offset);
+        let l = line.trim_end_matches(['\n', '\r']);
+        if l.starts_with(BEGIN_PREFIX) && l.ends_with(']') {
+            header = Some(offset);
+        } else if l.trim_end() == END_LINE && header.is_some() {
+            block = header;
         }
         offset += line.len();
     }
-    None
+    block
+}
+
+/// The notes with every well-formed block removed, the way [`strip`] removes
+/// one: what a restore leaves in the notes after importing the last.
+/// A malformed block is left where it is, for someone to look at.
+fn strip_all(description: &str) -> String {
+    let mut out = description.to_string();
+    while let Ok(Some(found)) = find(&out) {
+        out = strip(&out, &found);
+    }
+    out
 }
 
 /// `[pve-meta v1 vmid=105 time=… sha256=…]` → [`Header`]. Fields other than
@@ -486,6 +502,32 @@ mod tests {
         let res = import(&store, 200, "hello", ImportMode::Restore).unwrap();
         assert_eq!(res.action, ImportAction::None);
         assert_eq!(res.description, None);
+    }
+
+    #[test]
+    fn the_last_block_is_the_backup_s_and_every_block_leaves_the_notes() {
+        // A block already in the notes -- pasted, or left by a restore on a
+        // host without pve-meta -- comes before the one assemble appends.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetaStore::new(dir.path());
+        let fake = render(1, "fake: injected\n", &digest_of("fake: injected\n"), 0).unwrap();
+        let real = render(105, YAML, &digest_of(YAML), 0).unwrap();
+        let notes = format!("hello\n\n{fake}\n\nmiddle\n\n{real}");
+        assert_eq!(find(&notes).unwrap().unwrap().yaml, YAML.trim_end());
+        // ... with a mention after it, which is no block, still the last one;
+        let mentioned = format!("{notes}\n\nsee [pve-meta v1]");
+        assert_eq!(find(&mentioned).unwrap().unwrap().yaml, YAML.trim_end());
+
+        let res = import(&store, 200, &notes, ImportMode::Restore).unwrap();
+        assert_eq!(res.action, ImportAction::Imported);
+        assert_eq!(res.description.as_deref(), Some("hello\nmiddle"));
+        assert_eq!(store.read(&DocId::Guest(200)).unwrap().raw, YAML);
+
+        assert_eq!(strip_all(&notes), "hello\nmiddle");
+        assert_eq!(strip_all("no block here"), "no block here");
+        // A malformed block stays, for someone to look at.
+        let bad = "a\n[pve-meta v1 vmid=1]\nnot a fence\n[/pve-meta]";
+        assert_eq!(strip_all(bad), bad);
     }
 
     #[test]
