@@ -393,11 +393,36 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return Array.isArray(v) ? v.slice() : [];
     },
 
-    // Writes the list at `path` with member `index` replaced, or dropped when `value`
-    // is undefined. One `replace` of the whole list: a view addresses through maps only.
-    writeListMember: function (path, index, value, onDone) {
-        let list = this.listAt(path);
-        if (index < 0 || index >= list.length) {
+    // Writes the list at `path` with one member replaced, or dropped when `value` is
+    // undefined. One `replace` of the whole list: a view addresses through maps only.
+    // `member` is the member as the row showed it, `{ index, value }`, and the write
+    // is of the list as stored *now* -- which after a 409 is not the list the row came
+    // from. If the member is no longer at its index (the list shrank, or moved under
+    // it), nothing is written: an index alone would replace whatever member is there
+    // now, somebody else's.
+    writeListMember: function (path, member, value, onDone) {
+        let me = this;
+        let list = me.listAt(path);
+        let at = member.index;
+        let there = at >= 0 && at < list.length;
+        if (!there || !PVE.meta.Utils.sameValue(list[at], member.value)) {
+            let where = Ext.htmlEncode(path);
+            Ext.Msg.alert(
+                gettext('Conflict'),
+                there
+                    ? Ext.String.format(
+                          gettext('Member {1} of {0} was {2} when this editor opened and is now {3}. Nothing was written: close this editor and open the member again.'),
+                          where,
+                          at,
+                          me.storedValueText(member.value),
+                          me.storedValueText(list[at]),
+                      )
+                    : Ext.String.format(
+                          gettext('The list at {0} no longer has a member {1}. Nothing was written: close this editor and open the member again.'),
+                          where,
+                          at,
+                      ),
+            );
             // Nothing written, so nothing to wait for: the editor that asked is
             // told, rather than left masked over a write that never happened.
             if (onDone) {
@@ -406,12 +431,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return;
         }
         if (value === undefined) {
-            list.splice(index, 1);
+            list.splice(at, 1);
         } else {
-            list[index] = value;
+            list[at] = value;
         }
-        this.sendEdit({ path: path, op: 'set', value: list }, false, onDone);
+        me.sendEdit({ path: path, op: 'set', value: list }, false, onDone);
     },
+
+    // A list member as `writeListMember` ties an edit to it.
+    memberOf: (rec) => ({ index: rec.data.arrayIndex, value: rec.data.rawItem }),
 
     // A whole subtree, as edited somewhere else: one `replace` at that view, which
     // says everything about what is inside it. What "Edit selection as text" ends
@@ -1050,13 +1078,27 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // for a value.
     addListMember: function (path) {
         let me = this;
-        let list = me.listAt(path);
         me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true, tree: me }, 'addkey', function (
             _path,
             value,
             done,
         ) {
-            me.sendEdit({ path: path, op: 'set', value: list.concat([value]) }, false, done);
+            // The list as stored when OK is pressed, not when the window opened: a 409
+            // re-reads it underneath, and appending to the old copy would drop what
+            // the other writer added.
+            let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), path);
+            if (stored !== undefined && !Array.isArray(stored)) {
+                Ext.Msg.alert(
+                    gettext('Conflict'),
+                    Ext.String.format(
+                        gettext('{0} is no longer a list. Nothing was written.'),
+                        Ext.htmlEncode(path),
+                    ),
+                );
+                done(false);
+                return;
+            }
+            me.sendEdit({ path: path, op: 'set', value: me.listAt(path).concat([value]) }, false, done);
         });
     },
 
@@ -1072,7 +1114,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return;
         }
         me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value, done) =>
-            me.writeListMember(d.path, d.arrayIndex, value, done),
+            me.writeListMember(d.path, me.memberOf(rec), value, done),
         );
     },
 
@@ -1101,15 +1143,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!rec || !rec.data.path) {
             return;
         }
+        let member = rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null;
+        let path = Ext.htmlEncode(rec.data.path);
         Ext.Msg.confirm(
             gettext('Confirm'),
-            Ext.String.format(gettext('Remove "{0}"?'), Ext.htmlEncode(rec.data.path)),
+            member
+                ? Ext.String.format(gettext('Remove member {1} of "{0}"?'), path, rec.data.arrayIndex)
+                : Ext.String.format(gettext('Remove "{0}"?'), path),
             function (btn) {
                 if (btn !== 'yes') {
                     return;
                 }
-                if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
-                    me.writeListMember(rec.data.path, rec.data.arrayIndex, undefined);
+                if (member) {
+                    me.writeListMember(rec.data.path, me.memberOf(rec), undefined);
                     return;
                 }
                 me.sendEdit({ path: rec.data.path, op: 'delete' });

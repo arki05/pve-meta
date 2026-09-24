@@ -1748,20 +1748,48 @@ console.log('\n--- acting on one member rewrites its list ---');
         sendEdit: (edit) => sent.push(edit),
     });
 
+    const m = (index, value) => ({ index: index, value: value });
     eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
-    stub.writeListMember('netbird.groups', 1, 'wlan');
+    stub.writeListMember('netbird.groups', m(1, 'wan'), 'wlan');
     eq('editing a member writes the list', sent.pop(), {
         path: 'netbird.groups',
         op: 'set',
         value: ['lan', 'wlan', 'dmz'],
     });
-    stub.writeListMember('netbird.groups', 0, undefined);
+    stub.writeListMember('netbird.groups', m(0, 'lan'), undefined);
     eq('removing a member writes the list without it', sent.pop().value, ['wan', 'dmz']);
     // An index that is not there changes nothing, rather than growing the list with
-    // a hole in it.
-    stub.writeListMember('netbird.groups', 9, 'nope');
-    stub.writeListMember('netbird.groups', -1, 'nope');
+    // a hole in it -- and says so, instead of an OK that silently does nothing.
+    ctx.__alerts.splice(0);
+    stub.writeListMember('netbird.groups', m(9, 'nope'), 'x');
+    stub.writeListMember('netbird.groups', m(-1, 'nope'), 'x');
     eq('an index that is not there is not a write', sent, []);
+    eq('... and each says why', ctx.__alerts.splice(0).map((a) => /no longer has a member (9|-1)\./.test(a[1])), [true, true]);
+
+    // After a 409 the stored list is not the one the row came from. [lan, wan, dmz]
+    // became [wan, dmz]: index 1 is now dmz, and an edit of wan must not land on it.
+    stub.docState['201'].data = { netbird: { groups: ['wan', 'dmz'] } };
+    const answers = [];
+    stub.writeListMember('netbird.groups', m(1, 'wan'), 'WAN', (ok) => answers.push(ok));
+    eq('a member that moved is not written over another', [sent, answers], [[], [false]]);
+    eq('... and the message names both', /Member 1 of netbird\.groups was wan when this editor opened and is now dmz/.test(ctx.__alerts.splice(0)[0][1]), true);
+    stub.writeListMember('netbird.groups', m(0, 'wan'), 'WAN');
+    eq('a member still where it was is written into the list as it is now', sent.pop().value, ['WAN', 'dmz']);
+
+    // Append, with the list changed between the window opening and OK.
+    const origCreate = ctx.Ext.create;
+    let handler = null;
+    ctx.Ext.create = () => ({ on: (name, fn) => (handler = handler || fn), show() {} });
+    stub.docState['201'].data = { netbird: { groups: [] } };
+    stub.addListMember('netbird.groups');
+    stub.docState['201'].data = { netbird: { groups: ['fromssh'] } };
+    handler('netbird.groups', 'fromui', () => {});
+    eq('an append goes onto the list as stored at OK, keeping the other writer\'s member', sent.pop().value, ['fromssh', 'fromui']);
+    stub.docState['201'].data = { netbird: { groups: { now: 'a map' } } };
+    const appended = [];
+    handler('netbird.groups', 'fromui', (ok) => appended.push(ok));
+    eq('... and is refused where the list became something else', [sent.length, appended, /no longer a list/.test(ctx.__alerts.splice(0)[0][1])], [0, [false], true]);
+    ctx.Ext.create = origCreate;
 }
 
 console.log('\n--- a list is a container, like a map ---');
