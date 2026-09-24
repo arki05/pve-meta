@@ -235,7 +235,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // Revert in Text, and in a window the way out. In the tree there is nothing
-    // unwritten to revert: an edit is a write (DESIGN §6).
+    // unwritten to revert: an edit is a write (decision 026).
     footerSecondary: function () {
         let me = this;
         if (me.mode === 'text') {
@@ -359,7 +359,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // Every path in `docId` whose value does not match its schema, by path -- shown
     // on the rows themselves, from the same Shape the text editor's squiggles use.
     // Advisory, always: an enforcing prefix is the server's 422, not a pre-write
-    // step (DESIGN §4).
+    // step (DESIGN §5).
     findingsFor: function () {
         let out = Object.create(null);
         let shape = this.shapeFor(this.docId);

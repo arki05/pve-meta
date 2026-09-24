@@ -72,12 +72,13 @@ PVE.meta.Utils = {
         return 'string';
     },
 
-    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §8).
+    // What the Value column shows for a value: nothing for a map, which is its rows;
+    // a list as its JSON on the list's own row, above one row per member.
     displayValue: function (value, kind) {
         if (kind === 'map') {
             return '';
         } else if (kind === 'boolean') {
-            // The API's JSON view renders YAML booleans as 1/0 (a Perl artifact).
+            // Yes/No, as PVE shows a boolean everywhere else.
             return Proxmox.Utils.format_boolean(value);
         }
         return kind === 'string' ? String(value) : Ext.encode(value);

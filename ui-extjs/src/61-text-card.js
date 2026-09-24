@@ -1,7 +1,9 @@
 // ---------------------------------------------------------------------------
 // The whole-document Monaco card and the Tree | Text mode switch: the document as
-// one text buffer instead of rows. The one editor that writes **text**, so a `#`
-// comment or key order (outside the document model, DESIGN §2) survives.
+// one text buffer instead of rows. The one editor that writes **text**, so key order
+// (outside the document model, DESIGN §2) survives it. A `#` comment does not: the
+// store re-dumps every write canonically (decision 006), this one included, and a
+// comment kept in text is DESIGN §9's, not this release's.
 // ---------------------------------------------------------------------------
 
 // What each Monaco model's lines mean, by model: the hover provider is registered
@@ -86,7 +88,7 @@ PVE.meta.TextCard = {
             success: function (response) {
                 let d = response.result.data || {};
                 me.setDigest(me.docId, d.digest);
-                // The server's own text, comments and all.
+                // The server's own text, note keys included (`comments=1`).
                 me.textOriginal = d.text || '';
                 me.showTextEditor();
             },
@@ -212,7 +214,7 @@ PVE.meta.TextCard = {
     },
 
     // One write of the whole document at the root view, as **text** -- the only way
-    // a `#` comment or a reordering reaches the file. `force` retries after a 422.
+    // a reordering reaches the file. `force` retries after a 422.
     applyText: function (force) {
         let me = this;
         if (!me.textEditor) {

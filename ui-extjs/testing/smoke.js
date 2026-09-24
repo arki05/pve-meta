@@ -276,7 +276,7 @@ console.log('\n--- selector text (the "Applies to" column) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
 eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');
 
-console.log('\n--- row icons (DESIGN §12) ---');
+console.log('\n--- row icons (DESIGN §8) ---');
 eq('icons', ctx.PVE.meta.Icons, {
     map: 'fa fa-folder',
     mapExpanded: 'fa fa-folder-open',
@@ -659,7 +659,7 @@ eq('declared key is unset', spec.port.present, false);
 eq('display boolean', U.displayValue(1, 'boolean'), 'Yes');
 eq('declared default carried', spec.port.defaultValue, 80);
 eq('declared enum carried', spec.scheme.enumValues, ['http', 'https']);
-// The grammar's description is the tooltip, not the Description column (DESIGN §12).
+// The grammar's description is the tooltip, not the Description column (DESIGN §8).
 eq('grammar description is its own field', spec.host.grammarDescription, 'Public host name');
 eq('grammar description is not the comment', spec.host.description, undefined);
 eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
@@ -2194,7 +2194,7 @@ eq('an empty value is empty', U.previewText(undefined), '');
 
 console.log('\n--- the editor reads and writes the notes: every document request says comments=1 ---');
 // The server leaves comment keys out of a read, and keeps the stored ones through a
-// replace, unless asked (DESIGN §2, §7). This editor shows them as the description
+// replace, unless asked (DESIGN §2). This editor shows them as the description
 // column and edits them, so it asks on every read and every write of a document.
 {
     const sent = [];
@@ -2523,7 +2523,7 @@ console.log('\n--- a 409 under an open editor re-reads around it, and the next O
 
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
-// keys (DESIGN §7) that must become ordinary rows, not resolve through the
+// keys (DESIGN §2) that must become ordinary rows, not resolve through the
 // prototype chain to the page's global Object.
 const protoDoc = { constructor: 'ctor-value', toString: 'tostring-value', hasOwnProperty: 'hop-value' };
 const protoRoot = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };

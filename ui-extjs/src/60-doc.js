@@ -226,7 +226,7 @@ PVE.meta.Doc = {
 
     // --- writes -------------------------------------------------------------
 
-    // The one request an edit is (DESIGN §6): a pure function, tested once rather
+    // The one request an edit is (decision 026): a pure function, tested once rather
     // than assembled at four call sites. An edit is `{ path, op: 'set' | 'delete',
     // value }`; a set is `view::replace` at its own path (which creates the maps
     // above it), the root view named by leaving `view` out; a delete is `DELETE
@@ -294,7 +294,7 @@ PVE.meta.Doc = {
                             return;
                         }
                         // An enforcing prefix refused this write, naming the paths
-                        // (DESIGN §4); the tick makes storing it anyway a deliberate act.
+                        // (DESIGN §5); the tick makes storing it anyway a deliberate act.
                         if (status === '422' && retry) {
                             Ext.Msg.show({
                                 title: gettext('This does not match the schema the operators declare'),
