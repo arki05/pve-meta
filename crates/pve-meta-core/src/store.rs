@@ -215,21 +215,20 @@ impl MetaStore {
     }
 
     /// Where `id` is written (see [`MetaStore::read_path_for`] for reads).
-    fn path_for(&self, id: &DocId) -> Result<PathBuf> {
+    fn path_for(&self, id: &DocId) -> PathBuf {
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-        Ok(match id {
+        match id {
             DocId::Registry(kind, _) => self.registry_write_dir(*kind).join(file),
             DocId::Guest(_) => self.root.join(file),
-        })
+        }
     }
 
     /// Where `id` is read from: [`Registry::locate`]'s file, or [`MetaStore::path_for`] when none has it.
-    fn read_path_for(&self, id: &DocId) -> Result<PathBuf> {
+    fn read_path_for(&self, id: &DocId) -> PathBuf {
         match id {
-            DocId::Registry(kind, name) => match self.registry.locate(*kind, name) {
-                Some(path) => Ok(path),
-                None => self.path_for(id),
-            },
+            DocId::Registry(kind, name) => {
+                self.registry.locate(*kind, name).unwrap_or_else(|| self.path_for(id))
+            }
             DocId::Guest(_) => self.path_for(id),
         }
     }
@@ -326,7 +325,7 @@ impl MetaStore {
     pub fn read(&self, id: &DocId) -> Result<Document> {
         self.check_available()?;
         // No existence check first: that races a concurrent delete into `Io` (500).
-        self.read_document(id, &self.read_path_for(id)?)
+        self.read_document(id, &self.read_path_for(id))
     }
 
     /// `true` if `id` has a file at the path a write lands in: for a registry
@@ -334,13 +333,13 @@ impl MetaStore {
     /// ([`MetaStore::read_path_for`]) and no write can touch (`docs/DESIGN.md` §3).
     pub fn has_own_file(&self, id: &DocId) -> Result<bool> {
         self.check_available()?;
-        Ok(gone_is_none(fs::metadata(self.path_for(id)?))?.is_some())
+        Ok(gone_is_none(fs::metadata(self.path_for(id)))?.is_some())
     }
 
     /// `id`'s current content identity without reading the whole document; see [`identify`].
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
         self.check_available()?;
-        identify(&self.read_path_for(id)?)
+        identify(&self.read_path_for(id))
     }
 
     /// `None` means no precondition; `Some("")` matches a missing document (`docs/DESIGN.md` §5); else must match exactly.
@@ -378,7 +377,7 @@ impl MetaStore {
         expected_digest: Option<&str>,
     ) -> Result<Document> {
         self.check_available()?;
-        let path = self.path_for(id)?;
+        let path = self.path_for(id);
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
 
         let normalized = normalize_trailing_newline(text);
@@ -408,7 +407,7 @@ impl MetaStore {
     /// Deletes `id`'s current document only, never its snapshots ([`MetaStore::purge`]); idempotent.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
         self.check_available()?;
-        Ok(gone_is_none(fs::remove_file(self.path_for(id)?))?.is_some())
+        Ok(gone_is_none(fs::remove_file(self.path_for(id)))?.is_some())
     }
 
     /// Every vmid with any file, sorted; what `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §7).
@@ -496,7 +495,7 @@ impl MetaStore {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))?))? else {
+        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))))? else {
             return Ok(false);
         };
         self.write_atomic(&self.snapshot_path(vmid, name), &bytes)?;
@@ -510,7 +509,7 @@ impl MetaStore {
             return Err(Error::InvalidName(name.to_string()));
         }
         let snap = self.snapshot_path(vmid, name);
-        let target = self.path_for(&DocId::Guest(vmid))?;
+        let target = self.path_for(&DocId::Guest(vmid));
         if let Some(bytes) = gone_is_none(fs::read(&snap))? {
             self.write_atomic(&target, &bytes)?;
             Ok(RollbackOutcome::Restored)
