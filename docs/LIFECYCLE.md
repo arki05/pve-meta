@@ -28,8 +28,11 @@ three functions it touches). The diff:
 Every call runs under the document's own `cfs_lock_domain("pve-meta-<vmid>")`, the lock
 every other writer takes, so a copy, a rollback and an in-flight API or CLI write never
 interleave on the file — `rollback` in particular writes the document without a digest,
-which nothing else would catch. The lock is taken inside the guest lock the caller
-already holds, the order create and destroy use.
+which nothing else would catch. All three run after the `lock_config` around the
+snapshot operation has returned, so the document lock is taken on its own, once the
+guest lock has been released -- unlike create and destroy, whose hooks take it inside
+the guest lock; nothing that touches the document holds the guest lock at the time, so
+there is no order between the two locks for these hooks to keep.
 
 Every call is `eval { ... }; warn ... if $@;` — soft-fail, never blocks the actual
 snapshot/rollback/delete-snapshot operation. A metadata read/write hiccup (disk full, a
