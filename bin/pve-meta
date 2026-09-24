@@ -372,28 +372,28 @@ sub cmd_scan_notes {
 
         my $action = 'none';
         my $import = sub {
-                    $conf = PVE::Cluster::cfs_read_file($path);
-                    return if !$conf || !defined($conf->{description});
-                    return if index($conf->{description}, '[pve-meta v') == -1;
-                    my $res;
-                    PVE::Cluster::cfs_lock_domain(
-                        PVE::API2::Ext::Meta::lock_domain_for($vmid),
-                        $LOCK_TIMEOUT,
-                        sub {
-                            $res = PVE::RS::Meta::notes_import(
-                                $vmid, $conf->{description}, 'install',
-                            );
-                        },
+            $conf = PVE::Cluster::cfs_read_file($path);
+            return if !$conf || !defined($conf->{description});
+            return if index($conf->{description}, '[pve-meta v') == -1;
+            my $res;
+            PVE::Cluster::cfs_lock_domain(
+                PVE::API2::Ext::Meta::lock_domain_for($vmid),
+                $LOCK_TIMEOUT,
+                sub {
+                    $res = PVE::RS::Meta::notes_import(
+                        $vmid, $conf->{description}, 'install',
                     );
-                    die $@ if $@;
-                    $action = $res->{action};
-                    return if !defined($res->{description});
-                    if (length($res->{description})) {
-                        $conf->{description} = $res->{description};
-                    } else {
-                        delete $conf->{description};
-                    }
-                    PVE::Cluster::cfs_write_file($path, $conf);
+                },
+            );
+            die $@ if $@;
+            $action = $res->{action};
+            return if !defined($res->{description});
+            if (length($res->{description})) {
+                $conf->{description} = $res->{description};
+            } else {
+                delete $conf->{description};
+            }
+            PVE::Cluster::cfs_write_file($path, $conf);
         };
         eval {
             if ($node eq $local_node) {
