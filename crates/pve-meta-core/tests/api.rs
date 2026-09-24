@@ -1098,6 +1098,73 @@ fn a_delete_of_a_packaged_only_prefix_removes_nothing_and_says_so() {
 }
 
 #[test]
+fn a_view_delete_that_removes_nothing_writes_nothing() {
+    // `docs/DESIGN.md` §5: a write that changes nothing rewrites nothing. For
+    // a prefix that only exists packaged, the rewrite was a cluster copy of
+    // the packaged file -- shadowing it from then on, over a key that was
+    // never there.
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+    let before = get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest;
+    assert!(!before.is_empty());
+
+    for view in ["nothere", "schema.nothere", "schema.deeper.still"] {
+        let r = del(&store, PutReq { id: "prefixes/compose", view: Some(view), digest: Some(&before), ..Default::default() })
+            .unwrap_or_else(|e| panic!("{view}: {e}"));
+        assert!(r.touched.is_empty(), "{view}");
+        assert_eq!(r.digest, before, "{view}: the digest is the packaged file's still");
+        assert!(!cluster.exists(), "{view} grew a cluster copy");
+    }
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+
+    // A guest document: the same rule, with the file's mtime as the proof.
+    seed(&store, "100", "traefik:\n    spec:\n        host: x\n");
+    let path = dir.path().join("100.yaml");
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let r = del(&store, PutReq { id: "100", view: Some("traefik.spec.port"), ..Default::default() }).unwrap();
+    assert!(r.touched.is_empty());
+    assert_eq!(r.digest, store.digest_of(&DocId::Guest(100)).unwrap().unwrap());
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime, "rewrote the file");
+    assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n    spec:\n        host: x\n");
+}
+
+#[test]
+fn a_put_that_leaves_a_packaged_prefix_as_it_is_writes_no_cluster_copy() {
+    // The `unchanged` check compares the planned text with the bytes the read
+    // saw, which for a packaged-only prefix are the packaged file's: a write
+    // of what is already there lands nowhere.
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+    let before = get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest;
+
+    for (view, mode, data) in [
+        (Some("description"), "replace", "\"packaged\""),
+        (Some("schema"), "replace", r#"{"type":"object"}"#),
+        (Some("schema"), "merge", "{}"),
+        (None, "merge", r#"{"description":"packaged"}"#),
+        (None, "replace", r#"{"selector":{"all":true},"description":"packaged","schema":{"type":"object"}}"#),
+    ] {
+        let r = put(&store, PutReq { id: "prefixes/compose", view, mode, data, digest: Some(&before), ..Default::default() })
+            .unwrap_or_else(|e| panic!("{view:?}/{mode}/{data}: {e}"));
+        assert!(r.touched.is_empty(), "{view:?}/{mode}/{data}");
+        assert_eq!(r.digest, before, "{view:?}/{mode}/{data}");
+        assert!(!cluster.exists(), "{view:?}/{mode}/{data} grew a cluster copy");
+    }
+
+    // One that does change it is the cluster copy, and the packaged file is
+    // not what it wrote.
+    let r = put(&store, PutReq { id: "prefixes/compose", view: Some("description"), data: "\"ours\"", ..Default::default() })
+        .unwrap();
+    assert_eq!(touched_paths(&r), vec!["set description"]);
+    assert!(cluster.exists());
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+}
+
+#[test]
 fn a_registry_document_uses_only_the_acl_it_is_given() {
     let (_dir, store) = store();
     seed(&store, "prefixes/traefik", "selector: {all: true}\n");

@@ -686,6 +686,11 @@ fn check_enforced(
 /// whole-document delete is a 404, a view delete writes the cluster file that
 /// shadows it (`docs/DESIGN.md` §3), and says so in the audit line.
 ///
+/// A view delete that touches nothing -- the key is not there -- writes
+/// nothing and answers with the digest as it stands (`docs/DESIGN.md` §5: a
+/// write that changes nothing rewrites nothing); for a packaged-only prefix
+/// that is what keeps it from growing a cluster copy of the packaged file.
+///
 /// # Errors
 /// `400:` invalid id/view. `404:` only a packaged prefix file is there.
 /// `409:` digest mismatch. `403:` no write access.
@@ -742,6 +747,11 @@ pub fn delete_document(
             crate::audit(&format!("{} removed {doc_id}", acl.authid));
         }
         String::new()
+    } else if touched.is_empty() {
+        // Nothing to remove, so nothing to write: the digest is the one the
+        // read saw, the packaged file's for a prefix that has no cluster copy
+        // -- and must not get one for this.
+        stored.digest.clone()
     } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
         // A partial delete is a write, and a write of a registry document must
