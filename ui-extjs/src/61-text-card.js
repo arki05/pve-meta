@@ -19,6 +19,17 @@ PVE.meta.TextCard = {
             itemId: 'metaText',
             layout: 'fit',
             border: false,
+            // Why this document is only text: a tooltip on the disabled Tree switch
+            // was the only place that said so. Shown by `syncAccessLabel`.
+            dockedItems: [
+                {
+                    xtype: 'component',
+                    dock: 'top',
+                    itemId: 'metaParseNotice',
+                    hidden: true,
+                    padding: '6 10',
+                },
+            ],
             items: [{ xtype: 'component', itemId: 'metaTextMount', style: 'height:100%;width:100%' }],
         };
     },

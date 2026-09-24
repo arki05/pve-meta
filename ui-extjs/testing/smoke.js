@@ -2097,7 +2097,7 @@ console.log('\n--- the panel takes its editors with it, and asks one question on
     // called it a second time on its own.
     let footers = 0;
     const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
-    const stub = { setDisabled() {}, setHidden() {}, setText() {}, setVisible() {} };
+    const stub = { setDisabled() {}, setHidden() {}, setText() {}, setVisible() {}, setHtml() {} };
     const counted = panelWith({
         docId: '201',
         docState: { 201: { digest: 'd', data: {} } },
@@ -2121,6 +2121,7 @@ console.log('\n--- the row toolbar is hidden in Text, not left there disabled --
             setVisible(v) { this.hidden = !v; },
             setText() {},
             setIconCls() {},
+            setHtml() {},
         });
     const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
     const bar = panelWith({
@@ -2350,10 +2351,14 @@ console.log('\n--- a repaired document can go back to the tree ---');
         request: reading('a: 1\nb: [\n'),
     });
 
+    const notice = { hidden: true, html: '', setHidden(h) { this.hidden = h; }, setHtml(h) { this.html = h; } };
+    panelP.down = (sel) => (sel === '#modeBtn' ? modeBtn : sel === '#metaParseNotice' ? notice : null);
     panelP.docParseError = "did not find expected key near '<img src=x>'";
     panelP.syncAccessLabel();
     eq('the Tree segment says why it is off, the parser\'s quote of the file encoded',
         [tree.disabled, /near &#39;&lt;img src=x&gt;&#39;$/.test(tree.tooltip)], [true, true]);
+    eq('... and so does a notice above the buffer, the same words',
+        [notice.hidden, notice.html.indexOf(tree.tooltip) > 0], [false, true]);
     panelP.docParseError = 'mapping values are not allowed here';
     tree.tooltip = null;
 
@@ -2375,6 +2380,7 @@ console.log('\n--- a repaired document can go back to the tree ---');
     eq('a document that parses again clears the error', panelP.docParseError, '');
     eq('... and the Tree segment is live, with no tooltip to explain itself',
         [tree.disabled, tree.tooltip], [false, undefined]);
+    eq('... nor a notice', notice.hidden, true);
 }
 
 console.log('\n--- a 409 in Text mode keeps the buffer ---');

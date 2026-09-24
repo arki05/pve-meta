@@ -669,22 +669,26 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncAccessLabel: function () {
         let me = this;
         let modeBtn = me.down('#modeBtn');
+        // A document that does not parse has no rows to show, and a tree that
+        // showed none would be indistinguishable from an empty document -- one
+        // Apply away from replacing the file with nothing. Text is the only view of
+        // it until it parses, and says so above the buffer as well as on the switch.
+        // Encoded: both are HTML, and a parser's message quotes the file.
+        let why = me.docParseError
+            ? Ext.String.format(
+                  gettext('This document is not valid YAML and can only be repaired as text: {0}'),
+                  Ext.htmlEncode(me.docParseError),
+              )
+            : undefined;
         if (modeBtn && modeBtn.items.getAt(0)) {
-            // A document that does not parse has no rows to show, and a tree that
-            // showed none would be indistinguishable from an empty document -- one
-            // Apply away from replacing the file with nothing. Text is the only
-            // view of it until it parses.
             let tree = modeBtn.items.getAt(0);
-            tree.setDisabled(!!me.docParseError);
-            tree.setTooltip(
-                me.docParseError
-                    ? Ext.String.format(
-                          gettext('This document is not valid YAML and can only be repaired as text: {0}'),
-                          // A tooltip is HTML, and a parser's message quotes the file.
-                          Ext.htmlEncode(me.docParseError),
-                      )
-                    : undefined,
-            );
+            tree.setDisabled(!!why);
+            tree.setTooltip(why);
+        }
+        let notice = me.down('#metaParseNotice');
+        if (notice) {
+            notice.setHtml(why ? '<i class="fa fa-exclamation-triangle warning"></i> ' + why : '');
+            notice.setHidden(!why);
         }
         if (modeBtn && modeBtn.items.getAt(1)) {
             modeBtn.items.getAt(1).setDisabled(!me.access.read);
