@@ -28,11 +28,6 @@ PVE.meta.Doc = {
         return id.indexOf('prefixes/') === 0 ? 'prefix' : 'guest';
     },
 
-    // The file name, which for a prefix is the prefix: whatever follows the last `/`.
-    docTitle: function (id) {
-        return id.slice(id.lastIndexOf('/') + 1);
-    },
-
     // The digest to send with a write, and the parsed document to build rows from.
     // Per document: a shared `digest` field would send one document's digest with
     // a write to another.

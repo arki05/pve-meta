@@ -344,8 +344,6 @@ console.log('\n--- enforce: an enforcing prefix\'s findings say so ---');
     eq('an enforcing prefix flags its findings', strict.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer', enforced: true }]);
     eq('an ordinary one does not', lax.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer' }]);
     eq('Perl\'s 0 is not enforce', new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 0, schema: S }]).findings({ t: { port: 'x' } })[0].enforced, undefined);
-    eq('the banner line says which', U.findingText({ path: 't.port', msg: 'expected integer', enforced: true }), 'enforced: t.port: expected integer');
-    eq('... and stays plain otherwise', U.findingText({ path: 't.port', msg: 'expected integer' }), 't.port: expected integer');
 }
 
 console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
@@ -1153,8 +1151,6 @@ eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
-eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
-eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 {
     // A guest tab asks for its own resolved set by id, and a registry document for
     // every file, as it is.
@@ -1766,9 +1762,6 @@ console.log('\n--- acting on one member rewrites its list ---');
     stub.writeListMember('netbird.groups', -1, 'nope');
     eq('an index that is not there is not a write', sent, []);
 }
-
-console.log('\n--- path helpers ---');
-eq('parentPath', [U.parentPath('a.b.c'), U.parentPath('a'), U.parentPath('')], ['a.b', '', '']);
 
 console.log('\n--- a list is a container, like a map ---');
 {

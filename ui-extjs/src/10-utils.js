@@ -11,17 +11,10 @@ PVE.meta.Icons = {
 };
 
 PVE.meta.Utils = {
-    // One finding as the warning banner lists it; an enforced one says so first.
-    findingText: function (f) {
-        return (f.enforced ? gettext('enforced') + ': ' : '') + f.path + ': ' + f.msg;
-    },
-
     // A key ending in `__` documents its sibling; a bare `__` documents the map.
     isComment: (key) => key.length >= 2 && key.slice(-2) === '__',
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
-    // The path above `path`, or '' for a top-level key (and for the root itself).
-    parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
     // Two document values are the same value: the core's own dump of each, compared.
     sameValue: (a, b) => PVE.meta.Core.call('same', a, b),
