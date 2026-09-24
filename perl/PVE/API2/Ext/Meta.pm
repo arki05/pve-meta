@@ -531,15 +531,12 @@ __PACKAGE__->register_method({
 #             Runs before a read and *inside* the lock before a write, so a
 #             guest destroyed in between is a 404 and not a resurrected file;
 #             and before the ACL is computed, so a 404 costs no ACL lookups.
-#   check_put optional, $param -> the same, for PUT alone and after `check`: what
-#             only creating a file needs.
 #   describe  { get, put, delete } -> the method descriptions
 #   perms     { get, put, delete } -> the permission descriptions
 sub _register_document_methods {
     my ($spec) = @_;
     my ($name, $path, $params) = @$spec{qw(name path params)};
     my $check = $spec->{check} // sub { };
-    my $check_put = $spec->{check_put} // sub { };
 
     my $caller = sub {
         my ($param) = @_;
@@ -597,7 +594,6 @@ sub _register_document_methods {
             my ($param) = @_;
             return _locked($spec->{id}->($param), sub {
                 $check->($param);
-                $check_put->($param);
                 return $put_view->($spec->{id}->($param), $param, $caller->($param));
             });
         },
