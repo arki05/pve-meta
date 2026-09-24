@@ -33,7 +33,7 @@ Ext.define('PVE.meta.EditValueWindow', {
             {
                 xtype: 'displayfield',
                 fieldLabel: gettext('Key'),
-                value: Ext.htmlEncode(d.path),
+                value: Ext.htmlEncode(me.label()),
             },
         ];
         let note = d.description || d.grammarDescription;
@@ -65,10 +65,18 @@ Ext.define('PVE.meta.EditValueWindow', {
         return items;
     },
 
+    // What is being edited: the path, and for a list member which one -- a member
+    // shares its list's path, so the path alone named the whole list.
+    label: function () {
+        let d = this.rec.data;
+        let member = d.arrayIndex !== undefined && d.arrayIndex !== null;
+        return member ? d.path + '[' + d.arrayIndex + ']' : d.path;
+    },
+
     initComponent: function () {
         let me = this;
         let d = me.rec.data;
-        me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(d.path));
+        me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(me.label()));
         if (PVE.meta.Utils.editorKind(d) === 'multiline') {
             me.width = 640; // room for the textarea
         }

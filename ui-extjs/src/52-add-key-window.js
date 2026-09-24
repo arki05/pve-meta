@@ -11,6 +11,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
     primaryText: gettext('Add'),
     parentPath: '', // dotted path of the map the key goes into ('' = the document root)
     list: false, // appending to a list instead: a member has no name to give it
+    kind: 'string', // the Type it opens on: a list's declared item type, say
     // configs: tree (the owning panel), whose document says which keys are taken
 
     // Whether the panel's document already holds something at `path`. Add sends a
@@ -60,7 +61,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
                 xtype: 'proxmoxKVComboBox',
                 name: 'kind',
                 fieldLabel: gettext('Type'),
-                value: 'string',
+                value: me.kind,
                 comboItems: [
                     ['string', gettext('String')],
                     ['number', gettext('Number')],
@@ -72,7 +73,7 @@ Ext.define('PVE.meta.AddKeyWindow', {
                     change: (f, v) => me.down('[name=value]').setDisabled(v === 'map'),
                 },
             },
-            { xtype: 'textfield', name: 'value', fieldLabel: gettext('Value') },
+            { xtype: 'textfield', name: 'value', fieldLabel: gettext('Value'), disabled: me.kind === 'map' },
         ];
     },
 

@@ -145,7 +145,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         return;
                     }
                     if (t.list) {
-                        me.addListMember(t.path);
+                        me.addListMember(t.path, me.itemKind(t.path));
                     } else {
                         me.addKey(t.docId, t.path);
                     }
@@ -176,7 +176,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 itemId: 'declareBtn',
                 iconCls: 'fa fa-tag',
                 hidden: true,
-                handler: () => me.declareKey(me.getSelection()[0]),
+                handler: () => me.declareKey(),
             },
             {
                 text: gettext('Remove'),
@@ -623,9 +623,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             row.defaultValue !== undefined &&
             !(row.present && U.sameValue(row.rawValue, row.defaultValue));
         set('defaultBtn', !offers || !row.editable, !me.hasDefaults);
-        // Declaring a key is a concept of a prefix document only.
-        set('declareBtn', !row || !row.editable, kind !== 'prefix');
-        set('removeBtn', !row || !row.present || !row.editable);
+        // Declaring a key is a concept of a prefix document only, and needs no row:
+        // it always opens `schema.properties`.
+        set('declareBtn', !me.editableFor(), kind !== 'prefix');
+        // A note on a key that is not set is still something stored to remove.
+        set('removeBtn', !row || !(row.present || row.description) || !row.editable);
         set('rowSep');
         set('textSelBtn', !row);
         set('textSep');
@@ -1080,9 +1082,10 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // Appending to a list. A member of a list has no name to give it, so this asks
     // for a value.
-    addListMember: function (path) {
+    addListMember: function (path, kind) {
         let me = this;
-        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true, tree: me }, 'addkey', function (
+        let cfg = { parentPath: path, list: true, tree: me, kind: kind || 'string' };
+        me.openEditor('PVE.meta.AddKeyWindow', cfg, 'addkey', function (
             _path,
             value,
             done,
@@ -1106,6 +1109,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
+    // What a new member of the list at `path` is, as Add Key's Type speaks: the
+    // schema's `items.type` where the list declares one, else a string.
+    itemKind: function (path) {
+        let entry = this.shapeFor(this.docId)
+            .schemaIndex()
+            .filter((e) => e.path === path)[0];
+        let type = entry && entry.schema && entry.schema.items && entry.schema.items.type;
+        if (!type) {
+            return 'string';
+        }
+        return type === 'object' ? 'map' : PVE.meta.Utils.schemaValueKind(type);
+    },
+
     // Editing one member of a list: a scalar gets the ordinary value editor, and
     // anything else with structure gets the text editor on the list it is in --
     // which is where it was before lists had rows at all, so nothing is lost.
@@ -1126,9 +1142,9 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // a map like any other, so this opens it as text (DESIGN §3). An empty map
     // gets a hint instead of a blank buffer, so the first key is not typed from
     // nothing.
-    declareKey: function (rec) {
+    declareKey: function () {
         let me = this;
-        if (!rec || me.docKind(me.docId) !== 'prefix') {
+        if (me.docKind(me.docId) !== 'prefix') {
             return;
         }
         let props = PVE.meta.Utils.valueAt(me.dataOf(me.docId), 'schema.properties');
@@ -1148,12 +1164,21 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             return;
         }
         let member = rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null;
+        // A row that is only its note (`k__` stored, `k` not): the note is what
+        // there is to remove, at its own path.
+        let noteOnly = !member && !rec.data.present && !!rec.data.description;
         let path = Ext.htmlEncode(rec.data.path);
+        let question;
+        if (member) {
+            question = Ext.String.format(gettext('Remove member {1} of "{0}"?'), path, rec.data.arrayIndex);
+        } else if (noteOnly) {
+            question = Ext.String.format(gettext('Remove the note on "{0}"?'), path);
+        } else {
+            question = Ext.String.format(gettext('Remove "{0}"?'), path);
+        }
         Ext.Msg.confirm(
             gettext('Confirm'),
-            member
-                ? Ext.String.format(gettext('Remove member {1} of "{0}"?'), path, rec.data.arrayIndex)
-                : Ext.String.format(gettext('Remove "{0}"?'), path),
+            question,
             function (btn) {
                 if (btn !== 'yes') {
                     return;
@@ -1162,7 +1187,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                     me.writeListMember(rec.data.path, me.memberOf(rec), undefined);
                     return;
                 }
-                me.sendEdit({ path: rec.data.path, op: 'delete' });
+                me.sendEdit({ path: rec.data.path + (noteOnly ? '__' : ''), op: 'delete' });
             },
         );
     },

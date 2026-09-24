@@ -1862,7 +1862,9 @@ console.log('\n--- a list is a container, like a map ---');
 console.log('\n--- an enum row opens on its value, whatever the value\'s type ---');
 {
     const field = (data) =>
-        ctx.PVE.meta.EditValueWindow.formItems.call({ rec: { data: data } }).filter((f) => f.name === 'value')[0];
+        ctx.PVE.meta.EditValueWindow.formItems
+            .call({ rec: { data: data }, label: ctx.PVE.meta.EditValueWindow.label })
+            .filter((f) => f.name === 'value')[0];
     const port = { path: 'p', kind: 'number', present: true, rawValue: 443, valueText: '443', enumValues: [80, 443] };
     const f = field(port);
     eq('a stored number is given to the combobox as the string its store holds',
@@ -1870,6 +1872,43 @@ console.log('\n--- an enum row opens on its value, whatever the value\'s type --
     eq('... and an unset one opens on its default the same way',
         field(Object.assign({}, port, { present: false, defaultValue: 80 })).value, '80');
     eq('... or empty, with no default', field(Object.assign({}, port, { present: false })).value, '');
+}
+
+console.log('\n--- small things a row gets right ---');
+{
+    const EV = ctx.PVE.meta.EditValueWindow;
+    eq('a member\'s editor names which member',
+        [EV.label.call({ rec: { data: { path: 'n.groups', arrayIndex: 2 } } }),
+            EV.label.call({ rec: { data: { path: 'n.groups', arrayIndex: undefined } } })],
+        ['n.groups[2]', 'n.groups']);
+
+    // Append opens on the list's declared item type.
+    const typed = panelWith({
+        docId: '201',
+        prefixes: [{
+            prefix: 'n',
+            selector: { all: true },
+            schema: { type: 'object', properties: { ports: { type: 'array', items: { type: 'integer' } }, tags: { type: 'array' } } },
+        }],
+    });
+    eq('Append\'s Type is the schema\'s item type, else a string',
+        [typed.itemKind('n.ports'), typed.itemKind('n.tags'), typed.itemKind('nowhere')], ['number', 'string', 'string']);
+
+    // A note whose key is not set is removed at the note's own path.
+    const sent = [];
+    const confirm = ctx.Ext.Msg.confirm;
+    const asked = [];
+    ctx.Ext.Msg.confirm = (title, question, fn) => {
+        asked.push(question);
+        fn('yes');
+    };
+    const notes = panelWith({ sendEdit: (edit) => sent.push(edit) });
+    notes.removeKey({ data: { path: 'a.k', present: false, description: 'about k' } });
+    notes.removeKey({ data: { path: 'a.j', present: true, description: 'about j' } });
+    ctx.Ext.Msg.confirm = confirm;
+    eq('a note alone is removed as the note, a key with its note as the key',
+        [asked, sent.map((e) => e.path)],
+        [['Remove the note on "a.k"?', 'Remove "a.j"?'], ['a.k__', 'a.j']]);
 }
 
 console.log('\n--- creating a registry file: the least that parses ---');
@@ -2053,8 +2092,8 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
     eq('an empty map gets a hint, not a blank buffer', Object.keys(Codec.parse(created[0][1].text, 'yaml')).length > 0, true);
 
     created.length = 0;
-    withProps.declareKey(null);
-    eq('nothing to declare on, nothing opens', created.length, 0);
+    withProps.declareKey();
+    eq('it needs no row selected: the button always opens schema.properties', created[0][1].view, 'schema.properties');
     ctx.Ext.create = origCreate;
 }
 
