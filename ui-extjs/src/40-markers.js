@@ -108,5 +108,13 @@ PVE.meta.Markers = {
         }
         return parts.length ? parts.join(' · ') : null;
     },
+
+    // A hover as Monaco takes it: its `contents` are Markdown, and a schema's text is
+    // not -- `host__ and port__` would render as bold, a `[x](url)` as a link. Every
+    // ASCII punctuation character may be backslash-escaped in CommonMark, so escaping
+    // all that Markdown gives a meaning to shows the text exactly as written.
+    hoverMarkdown: function (text) {
+        return String(text).replace(/[\\`*_{}[\]()#+\-.!|<>~]/g, '\\$&');
+    },
 };
 

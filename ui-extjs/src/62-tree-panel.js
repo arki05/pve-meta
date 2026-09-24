@@ -642,7 +642,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 me.docParseError
                     ? Ext.String.format(
                           gettext('This document is not valid YAML and can only be repaired as text: {0}'),
-                          me.docParseError,
+                          // A tooltip is HTML, and a parser's message quotes the file.
+                          Ext.htmlEncode(me.docParseError),
                       )
                     : undefined,
             );
@@ -1084,7 +1085,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         Ext.Msg.confirm(
             gettext('Confirm'),
-            Ext.String.format(gettext('Remove "{0}"?'), rec.data.path),
+            Ext.String.format(gettext('Remove "{0}"?'), Ext.htmlEncode(rec.data.path)),
             function (btn) {
                 if (btn !== 'yes') {
                     return;

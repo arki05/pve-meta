@@ -380,7 +380,7 @@ PVE.meta.TextCard = {
                         position.lineNumber,
                         model.getLineMaxColumn(position.lineNumber),
                     ),
-                    contents: [{ value: text }],
+                    contents: [{ value: PVE.meta.Markers.hoverMarkdown(text) }],
                 };
             },
         });

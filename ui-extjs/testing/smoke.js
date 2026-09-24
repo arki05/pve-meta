@@ -962,6 +962,10 @@ eq('hover: type, format and description',
 eq('hover: an enum', Markers.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null);
+// Monaco renders a hover as Markdown; a schema's description is plain text.
+eq('a hover is escaped for Markdown, so it shows as written',
+    Markers.hoverMarkdown('host__ and *port* [x](javascript:y) <b> 1..2'),
+    'host\\_\\_ and \\*port\\* \\[x\\]\\(javascript:y\\) \\<b\\> 1\\.\\.2');
 
 console.log('\n--- a hover belongs to the model, not to the first panel that asked ---');
 {
