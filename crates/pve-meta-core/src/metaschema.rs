@@ -37,6 +37,7 @@ properties:
   enforce:
     type: boolean
     optional: 1
+    default: false
     description: >-
       Refuse an API write that would leave this prefix's subtree not matching its
       schema, for the paths the write changed; 'force=1' stores it anyway (the
@@ -47,6 +48,7 @@ properties:
   hidden:
     type: boolean
     optional: 1
+    default: false
     description: >-
       Do not offer this prefix's declared-but-unset keys as rows. For a prefix whose
       schema is a vocabulary rather than a handful of keys, where the useful default
@@ -157,6 +159,27 @@ mod tests {
         assert!(!with("{}"), "neither is not");
         assert!(!with("{all: true, tag: web}"), "and both is not");
         assert!(!with("{all: false}"), "nor is 'all: false', which selects nothing");
+    }
+
+    /// An unset optional flag is a row that says "not set (default: ...)" and a
+    /// field that opens on the default -- but only if the schema says what the
+    /// default is; without it the row read "not set" beside a description that
+    /// names one. So every optional boolean or enum declares its `default`, and
+    /// that default is what the parser takes when the key is absent.
+    #[test]
+    fn every_optional_flag_declares_the_default_the_parser_takes() {
+        let schema = prefix();
+        let absent = registry::parse_prefix("x", "selector: {all: true}\n").unwrap();
+        let absent = serde_json::to_value(&absent).unwrap();
+        for (key, optional) in properties(&schema) {
+            let node = &schema["properties"][&key];
+            let flag = node["type"] == "boolean" || node.get("enum").is_some();
+            if !optional || !flag {
+                continue;
+            }
+            let default = node.get("default").unwrap_or_else(|| panic!("'{key}' declares no default"));
+            assert_eq!(&absent[&key], default, "'{key}': the declared default is not what the parser takes");
+        }
     }
 
     #[test]
