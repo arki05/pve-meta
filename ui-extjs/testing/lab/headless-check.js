@@ -267,9 +267,9 @@ async function main() {
         result.checks.afterRemove = (await rows(page)).filter((r) => r.startsWith('added'));
 
         // --- The Text card's Apply sends the buffer --------------------------
-        // The one write that is text rather than a subtree: a `#` comment is not
-        // part of the document model, so it survives only because this path sends
-        // exactly what was typed.
+        // The one write that is text rather than a subtree. The `#` comment typed
+        // with it does not survive: the store re-dumps every write canonically
+        // (decision 006), so the check is that it is gone and the key is there.
         await page.evaluate(() => {
             Ext.ComponentQuery.query('pveMetaTreePanel')[0].down('#modeBtn').setValue('text');
         });
@@ -288,7 +288,7 @@ async function main() {
         result.checks.afterTextApply = await page.evaluate(() => {
             const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
             return {
-                comment: p.textOriginal.indexOf('# written from the text card') === 0,
+                commentDropped: p.textOriginal.indexOf('# written from the text card') === -1,
                 key: p.textOriginal.indexOf('applied_from_text') !== -1,
             };
         });
