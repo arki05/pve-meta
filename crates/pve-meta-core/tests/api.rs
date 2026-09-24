@@ -340,6 +340,22 @@ fn dry_run_validates_exactly_what_the_write_validates() {
 }
 
 #[test]
+fn dry_run_refuses_a_write_above_the_size_cap_like_the_write() {
+    // The cap is put_raw's, which a dry run never reaches: the planned
+    // document has to be measured on the way there instead.
+    let (_dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    let big = format!("{{\"blob\": \"{}\"}}", "x".repeat(pve_meta_core::store::MAX_BYTES as usize));
+
+    let dry = put(&store, PutReq { view: Some("big"), data: &big, dry_run: true, ..Default::default() });
+    let wet = put(&store, PutReq { view: Some("big"), data: &big, ..Default::default() });
+    let (dry, wet) = (dry.unwrap_err(), wet.unwrap_err());
+    assert_eq!((status(&dry), status(&wet)), (400, 400), "{dry} / {wet}");
+    assert!(dry.to_string().contains("too large"), "{dry}");
+    assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: x\n");
+}
+
+#[test]
 fn dry_run_checks_the_digest_and_never_writes() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");

@@ -612,6 +612,11 @@ pub fn put_document(
     let unchanged =
         touched.is_empty() && stored.unrecoverable.is_none() && stored.raw.as_deref() == Some(&text);
     let new_digest = if dry_run || unchanged {
+        // What `put_raw` would refuse, a dry run refuses too; a write that
+        // changes nothing never gets that far, dry or not.
+        if !unchanged {
+            MetaStore::check_size(text.len() as u64)?;
+        }
         crate::digest::digest(text.as_bytes())
     } else {
         let written = store.put_raw(&doc_id, &text, digest)?.digest;

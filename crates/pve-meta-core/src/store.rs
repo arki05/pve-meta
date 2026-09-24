@@ -238,7 +238,10 @@ impl MetaStore {
             .join(format!("{vmid}.{name}.{}", DISK_FORMAT.ext()))
     }
 
-    fn check_size(size: u64) -> Result<()> {
+    /// Refuses a write of `size` bytes above [`MAX_BYTES`], and warns above
+    /// [`WARN_BYTES`]: [`MetaStore::put_raw`]'s gate, and a dry run's, which
+    /// has to answer what the write would without reaching it.
+    pub fn check_size(size: u64) -> Result<()> {
         if size > MAX_BYTES {
             return Err(Error::TooLarge {
                 size,
