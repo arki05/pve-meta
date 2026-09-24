@@ -2024,6 +2024,38 @@ console.log('\n--- the panel takes its editors with it, and asks one question on
     eq('the footer is synced once per button sync', footers, 1);
 }
 
+console.log('\n--- the row toolbar is hidden in Text, not left there disabled ---');
+{
+    const comps = {};
+    const comp = (id) =>
+        (comps[id] = comps[id] || {
+            setDisabled(d) { this.disabled = d; },
+            setHidden(h) { this.hidden = h; },
+            setVisible(v) { this.hidden = !v; },
+            setText() {},
+        });
+    const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
+    const bar = panelWith({
+        docId: '201',
+        access: { read: 1, write: 1 },
+        mode: 'tree',
+        hasDefaults: false,
+        tree: { getSelection: () => [] },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : comp(sel.slice(1))),
+        syncFooter() {},
+    });
+    const shown = () => Object.keys(comps).filter((id) => !comps[id].hidden).sort();
+    bar.syncButtons();
+    eq('in the tree: every row button, the separators and Reload; no default to offer, no Declare',
+        shown(), ['addBtn', 'editBtn', 'metaToolbar', 'reloadBtn', 'removeBtn', 'rowSep', 'textSelBtn', 'textSep']);
+    bar.mode = 'text';
+    bar.syncButtons();
+    eq('in Text: nothing, and with nothing to say the bar goes too', shown(), []);
+    bar.access = { read: 1, write: 0 };
+    bar.syncButtons();
+    eq('... unless it says Read-only', shown(), ['accessText', 'metaToolbar']);
+}
+
 console.log('\n--- one rule for "did this change" ---');
 {
     // The row editor compared `Ext.encode` of each value and `setToDefault` asked

@@ -121,7 +121,18 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         };
     },
 
+    // What the rows can be done to. Text has no rows, so there it is hidden rather
+    // than shown disabled -- all of it but the read-only notice (`syncButtons`).
     buildToolbar: function () {
+        let me = this;
+        return {
+            xtype: 'toolbar',
+            itemId: 'metaToolbar',
+            items: me.buildToolbarItems(),
+        };
+    },
+
+    buildToolbarItems: function () {
         let me = this;
         return [
             {
@@ -174,7 +185,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 disabled: true,
                 handler: () => me.removeKey(me.getSelection()[0]),
             },
-            '-',
+            { xtype: 'tbseparator', itemId: 'rowSep' },
             {
                 text: gettext('Edit selection as text'),
                 itemId: 'textSelBtn',
@@ -182,7 +193,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 disabled: true,
                 handler: () => me.editSelectionAsText(),
             },
-            '-',
+            { xtype: 'tbseparator', itemId: 'textSep' },
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
             // Only shown when the caller is restricted (DESIGN §8).
@@ -556,47 +567,42 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncButtons: function () {
         let me = this;
         let rec = me.getSelection()[0];
-        let d = rec ? rec.data : null;
+        let row = rec ? rec.data : null;
         let U = PVE.meta.Utils;
         let text = me.mode === 'text';
-        let set = function (id, disabled) {
+        let kind = me.docKind(me.docId);
+        // Disabled per row, hidden per document -- and all of it hidden in Text,
+        // which has no rows. Never hidden per row, so buttons beside one do not
+        // shift under the pointer as the selection changes.
+        let set = function (id, disabled, hidden) {
             let btn = me.down('#' + id);
             if (btn) {
-                btn.setDisabled(disabled);
+                btn.setDisabled(!!disabled);
+                btn.setHidden(text || !!hidden);
             }
         };
         let target = me.addTarget();
         // On a prefix definition Add is disabled at its root: the document's own
         // top-level keys are fixed, even though `schema` holds whatever you declare.
-        let kind = me.docKind(me.docId);
-        let fixedRoot = kind === 'prefix' && target && target.path === '';
-        set('addBtn', text || !target || fixedRoot || !me.editableFor());
-        let row = d;
-        set('editBtn', text || !row || !row.editable);
-        set('removeBtn', text || !row || !row.present || !row.editable);
-        set('textSelBtn', text || !row);
-        set('reloadBtn', text);
-        let dflt = me.down('#defaultBtn');
-        if (dflt) {
-            // Hidden when nothing in the document declares a default (a per-document
-            // fact); disabled per row, never hidden per row, so buttons beside it do
-            // not shift under the pointer as the selection changes. Offered on any
-            // row with a default it is not already at -- not just unset ones, since
-            // the value most worth resetting is the one already there and wrong.
-            let offers =
-                !!row &&
-                row.defaultValue !== undefined &&
-                !(row.present && U.sameValue(row.rawValue, row.defaultValue));
-            dflt.setHidden(!me.hasDefaults);
-            dflt.setDisabled(text || !offers || !row.editable);
-        }
+        let fixedRoot = kind === 'prefix' && target.path === '';
+        set('addBtn', fixedRoot || !me.editableFor());
+        set('editBtn', !row || !row.editable);
+        // Offered on any row with a default it is not already at -- not just unset
+        // ones, since the value most worth resetting is the one already there and
+        // wrong. Hidden when nothing in the document declares a default.
+        let offers =
+            !!row &&
+            row.defaultValue !== undefined &&
+            !(row.present && U.sameValue(row.rawValue, row.defaultValue));
+        set('defaultBtn', !offers || !row.editable, !me.hasDefaults);
+        // Declaring a key is a concept of a prefix document only.
+        set('declareBtn', !row || !row.editable, kind !== 'prefix');
+        set('removeBtn', !row || !row.present || !row.editable);
+        set('rowSep');
+        set('textSelBtn', !row);
+        set('textSep');
+        set('reloadBtn');
         me.syncAccessLabel();
-        let declare = me.down('#declareBtn');
-        if (declare) {
-            // Hidden by the document (its kind cannot change mid-tree), disabled by the row.
-            declare.setHidden(me.docKind(me.docId) !== 'prefix');
-            declare.setDisabled(text || !row || !row.editable);
-        }
     },
 
     // One place decides what the footer says, in either mode. Everything on it but
@@ -653,15 +659,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         me.syncFooter();
         let label = me.down('#accessText');
-        if (!label) {
-            return;
+        if (label) {
+            label.setText(gettext('Read-only'));
+            label.setVisible(!me.access.write);
         }
-        if (me.access.write) {
-            label.setVisible(false);
-            return;
+        // In Text the notice is all the bar has left to say; with nothing to say,
+        // the bar goes too.
+        let bar = me.down('#metaToolbar');
+        if (bar) {
+            bar.setHidden(me.mode === 'text' && !!me.access.write);
         }
-        label.setText(gettext('Read-only'));
-        label.setVisible(true);
     },
 
     // --- rows ---------------------------------------------------------------
