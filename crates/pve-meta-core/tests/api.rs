@@ -177,6 +177,20 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
     put(&store, PutReq { prefixes: &[], ..req("traefik.port", r#""x""#, false) }).unwrap();
 }
 
+#[test]
+fn an_enforcing_prefix_refuses_an_array_member_its_items_refuse() {
+    let (_dir, store) = store();
+    let text = "selector: {all: true}\nenforce: true\nschema:\n  type: object\n  properties:\n    lst: {type: array, items: {type: integer, maximum: 5}}\n";
+    let strict = vec![pve_meta_core::registry::parse_prefix("t", text).unwrap()];
+    let req = |data| PutReq { prefixes: &strict, view: Some("t.lst"), data, ..Default::default() };
+    for wrong in [r#"["9"]"#, "[9]"] {
+        let err = put(&store, req(wrong)).unwrap_err();
+        assert_eq!(status(&err), 422, "{wrong}: {err}");
+        assert!(err.msg.contains("t.lst.0"), "{err}");
+    }
+    put(&store, req("[1, 5]")).unwrap();
+}
+
 // -- version polling ----------------------------------------------------
 
 #[test]

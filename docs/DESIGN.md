@@ -70,7 +70,7 @@ nodes:                                # optional: per-node overrides
   replace its top-level ones. The prefix governing a path is the longest declared prefix
   containing it. Schemas never merge.
 * The **selector** decides which guests a prefix reaches (tags come from the cluster's
-  guest properties). Dialect: `type`, `properties`, `description`, `default`, `enum`,
+  guest properties). Dialect: `type`, `properties`, `items`, `description`, `default`, `enum`,
   `minimum`, `maximum`, `format`, and the hints `multiline`, `hidden`, `enforce`; the
   two flags inherit down the schema, an explicit value winning. An unknown `type` does
   not load; an unknown keyword passes through.

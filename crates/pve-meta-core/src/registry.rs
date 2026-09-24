@@ -362,6 +362,13 @@ fn check_schema_dialect(name: &str, at: &str, node: &Value) -> Result<()> {
         }
     }
 
+    if let Some(items) = map.get("items") {
+        if let Some(t) = declared.filter(|t| *t != "array") {
+            return Err(fail(format!("'items' has no meaning for type {t}")));
+        }
+        check_schema_dialect(name, &format!("{at}.items"), items)?;
+    }
+
     if let Some(props) = map.get("properties") {
         let Some(props) = props.as_object() else {
             return Err(fail("'properties' must be a map".into()));
@@ -937,6 +944,8 @@ schema:
             ("schema: {properties: [a]}\n", "schema: 'properties' must be a map", "properties are keyed"),
             ("schema: {type: string, properties: {a: {}}}\n", "schema: 'properties' has no meaning for type string", "a string has no keys"),
             ("schema: {properties: {'a.b': {}}}\n", "schema: property 'a.b' is not a valid key", "a dotted key is two keys"),
+            ("schema: {type: string, items: {}}\n", "schema: 'items' has no meaning for type string", "a string has no members"),
+            ("schema: {type: array, items: {type: nope}}\n", "schema.items: 'type' must be one of", "a member's schema is checked like any node"),
             ("schema: {properties: {a: {properties: {b: {type: nope}}}}}\n",
              "schema.properties.a.properties.b: 'type' must be one of", "the error names the nested place"),
         ];
@@ -952,6 +961,7 @@ schema:
             "schema: {type: object, properties: {on: {type: boolean, default: 1, enum: [true, false]}}}\n",
             "schema: {type: object, hidden: 1, enforce: 0, properties: {x: {pattern: '^a', typetext: xy}}}\n",
             "schema: {minimum: 1, maximum: 2}\n",
+            "schema: {type: array, items: {type: integer, maximum: 5}}\n",
             "schema: {}\n",
         ];
         for text in accepted {

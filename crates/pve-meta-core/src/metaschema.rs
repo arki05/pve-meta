@@ -59,8 +59,8 @@ properties:
     optional: 1
     description: >-
       What the subtree under this prefix looks like, in the PVE::JSONSchema dialect:
-      type, properties, description, default, optional, enum, minimum, maximum,
-      format, plus two editor hints of our own -- 'multiline' (this string is a block
+      type, properties, items, description, default, optional, enum, minimum,
+      maximum, format, plus two editor hints of our own -- 'multiline' (this string is a block
       of text) and 'hidden' (do not offer this as a row until it is set). A node may
       also carry 'enforce'. All three are inherited by everything below the node that
       sets them. Free-form, so it is edited as text.

@@ -286,6 +286,15 @@ impl Shape {
                 value: s.clone(),
             }));
         }
+        // An array's members are not addressable (`docs/DESIGN.md` §2), but
+        // they are checked: `items` describes every one, and a finding names
+        // it by index under the array's path.
+        if let (Some(items), Value::Array(members)) = (schema.get("items"), value) {
+            for (i, member) in members.iter().enumerate() {
+                self.walk(owner, items, member, path.join(i.to_string()), enforce, out);
+            }
+            return;
+        }
         let (Some(props), Value::Object(map)) =
             (schema.get("properties").and_then(Value::as_object), value)
         else {
@@ -748,6 +757,30 @@ mod tests {
         assert!(Shape::rooted(json!({"type": "object", "properties": {"a": {"type": "integer"}}}))
             .enforced_findings(&json!({"a": "x"}))
             .is_empty());
+    }
+
+    /// `items` describes every member of an array; a finding names the
+    /// member by index, and an enforcing prefix enforces it like any other.
+    #[test]
+    fn an_arrays_members_are_checked_against_items() {
+        let schema = json!({"type": "object", "properties": {
+            "lst": {"type": "array", "items": {"type": "integer", "maximum": 5}},
+        }});
+        let shape = Shape::new([Declared { enforce: true, ..decl("t", Some(schema)) }]);
+        let doc = json!({"t": {"lst": [1, "9", 9, 5]}});
+        let got: Vec<(String, String)> = shape
+            .enforced_findings(&doc)
+            .into_iter()
+            .map(|f| (f.path.to_string(), f.msg))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("t.lst.1".to_string(), "expected integer".to_string()),
+                ("t.lst.2".to_string(), "must be at most 5".to_string()),
+            ]
+        );
+        assert!(shape.enforced_findings(&json!({"t": {"lst": [1, 2]}})).is_empty());
     }
 
     #[test]
