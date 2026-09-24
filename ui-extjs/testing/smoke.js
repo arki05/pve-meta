@@ -660,7 +660,7 @@ eq('declared enum carried', spec.scheme.enumValues, ['http', 'https']);
 // The grammar's description is the tooltip, not the Description column (DESIGN §8).
 eq('grammar description is its own field', spec.host.grammarDescription, 'Public host name');
 eq('grammar description is not the comment', spec.host.description, undefined);
-eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
+eq('schema kind integer', U.schemaValueKind('integer'), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';

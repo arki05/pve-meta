@@ -14,11 +14,6 @@ Ext.define('PVE.meta.EditValueWindow', {
         let me = this;
         let U = PVE.meta.Utils;
         let d = me.rec.data;
-        if (U.editorKind(d) === 'multiline') {
-            me.width = 640;
-        }
-        me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(d.path));
-
         let value;
         if (d.present) {
             value = d.kind === 'boolean' || d.kind === 'number' ? d.rawValue : d.valueText;
@@ -65,8 +60,14 @@ Ext.define('PVE.meta.EditValueWindow', {
     },
 
     initComponent: function () {
-        this.callParent();
-        this.on('show', () => this.down('#valueField').focus(true, 50));
+        let me = this;
+        let d = me.rec.data;
+        me.title = Ext.String.format(gettext('Edit: {0}'), Ext.htmlEncode(d.path));
+        if (PVE.meta.Utils.editorKind(d) === 'multiline') {
+            me.width = 640; // room for the textarea
+        }
+        me.callParent();
+        me.on('show', () => me.down('#valueField').focus(true, 50));
     },
 
     submit: function () {

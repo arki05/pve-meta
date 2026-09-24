@@ -808,7 +808,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 return;
             }
             // A declared type wins over the type inferred from the stored value.
-            child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
+            child.kind = ps.type ? U.schemaValueKind(ps.type) : child.kind || 'string';
             // First writer wins: the index lists each path once, under the prefix
             // that governs it, so these six fields cannot disagree.
             if (ps.default !== undefined && child.defaultValue === undefined) {
@@ -834,13 +834,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // The declared type as the kind the editor and `parseValue` speak. One mapping:
-    // `Utils.schemaValueKind` had a second copy of it, so adding a type to one and not
-    // the other would have made a row's editor disagree with the parser behind it.
-    schemaKind: function (schema) {
-        return PVE.meta.Utils.schemaValueKind((schema && schema.type) || 'string');
-    },
-
     // The merged rows of ONE document: what is present in it, plus what its grammar
     // declares (DESIGN §8). Two sources, one set of entries.
     documentEntries: function () {
@@ -851,81 +844,95 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return root;
     },
 
-    buildTree: function () {
+    // The node configs for the rows under `entry`, sorted by key. Pure: what a row
+    // shows is the merged entry, the findings at its path and those beneath it.
+    rowNodes: function (entry, docId, findings, below) {
         let me = this;
         let I = PVE.meta.Icons;
-        let findings = me.findingsFor();
-        // What each branch has to answer for: the schema findings beneath it, which
-        // are invisible once the branch is collapsed.
-        let below = PVE.meta.Utils.rollUp(findings);
+        let U = PVE.meta.Utils;
+        let editable = me.editableFor();
+        return Object.keys(entry.children)
+            .sort()
+            .map(function (key) {
+                let c = entry.children[key];
+                let kind = c.kind || 'string';
+                let branch = kind === 'map' || Object.keys(c.children).length > 0;
+                let under = below[c.path] || { count: 0, messages: [] };
+                let node = {
+                    key: key,
+                    text: key,
+                    docId: docId,
+                    path: c.path,
+                    kind: kind,
+                    present: !!c.present,
+                    description: c.description || '',
+                    grammarDescription: c.grammarDescription || '',
+                    defaultValue: c.defaultValue,
+                    enumValues: c.enumValues,
+                    minimum: c.minimum,
+                    maximum: c.maximum,
+                    format: c.format,
+                    multiline: c.multiline,
+                    rawValue: c.value,
+                    arrayIndex: c.arrayIndex,
+                    addressable: c.addressable !== false,
+                    rawItem: c.rawItem,
+                    valueText: c.present ? U.displayValue(c.value, kind) : '',
+                    finding: findings[c.path] || '',
+                    belowCount: under.count,
+                    belowText: under.messages.join('\n'),
+                    editable: editable,
+                    leaf: !branch,
+                };
+                if (branch) {
+                    node.children = me.rowNodes(c, docId, findings, below);
+                    node.expanded = true;
+                    node.iconCls = I.mapExpanded;
+                    node.expandedCls = I.mapExpanded;
+                } else {
+                    node.iconCls = I.leaf;
+                }
+                return node;
+            });
+    },
 
-        let toNodes = function (entry, docId) {
-            return Object.keys(entry.children)
-                .sort()
-                .map(function (key) {
-                    let c = entry.children[key];
-                    let kind = c.kind || 'string';
-                    if (c.defaultValue !== undefined) {
-                        me.hasDefaults = true;
-                    }
-                    let node = {
-                        key: key,
-                        text: key,
-                        docId: docId,
-                        path: c.path,
-                        kind: kind,
-                        present: !!c.present,
-                        description: c.description || '',
-                        grammarDescription: c.grammarDescription || '',
-                        defaultValue: c.defaultValue,
-                        enumValues: c.enumValues,
-                        minimum: c.minimum,
-                        maximum: c.maximum,
-                        format: c.format,
-                        multiline: c.multiline,
-                        rawValue: c.value,
-                        arrayIndex: c.arrayIndex,
-                        addressable: c.addressable !== false,
-                        rawItem: c.rawItem,
-                        valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
-                        finding: findings[c.path] || '',
-                        belowCount: (below[c.path] || {}).count || 0,
-                        belowText: ((below[c.path] || {}).messages || []).join('\n'),
-                        editable: me.editableFor(),
-                        leaf: kind !== 'map' && !Object.keys(c.children).length,
-                    };
-                    if (kind === 'map' || Object.keys(c.children).length) {
-                        node.children = toNodes(c, docId);
-                        node.expanded = true;
-                        node.iconCls = I.mapExpanded;
-                        node.expandedCls = I.mapExpanded;
-                    } else {
-                        node.iconCls = I.leaf;
-                    }
-                    return node;
-                });
-        };
-
-        // Does anything in this document declare a default? If not, "Set to default"
-        // is furniture.
-        me.hasDefaults = false;
-        let children = toNodes(me.documentEntries(), me.docId);
-
-        // Reloading must not fold the tree up, and must not lose the selection
-        // either: both are read off the old tree before the root is replaced.
-        let expanded = Object.create(null);
-        let seen = false;
-        let selected = me.selectionKey();
+    // The branches of the tree as it stands that are open, by row key -- or `null`
+    // when it has no branch at all yet, so the first build keeps every branch open
+    // as `rowNodes` built it.
+    expandedRows: function () {
+        let me = this;
+        let expanded = null;
         me.eachRow(function (n) {
             if (!n.isLeaf()) {
-                seen = true;
+                expanded = expanded || Object.create(null);
                 if (n.isExpanded()) {
                     expanded[me.rowKey(n)] = true;
                 }
             }
         });
+        return expanded;
+    },
+
+    buildTree: function () {
+        let me = this;
+        let findings = me.findingsFor();
+        // What each branch has to answer for: the schema findings beneath it, which
+        // are invisible once the branch is collapsed.
+        let below = PVE.meta.Utils.rollUp(findings);
+        let children = me.rowNodes(me.documentEntries(), me.docId, findings, below);
+
+        // Does anything in this document declare a default? If not, "Set to Default"
+        // is furniture.
+        let declares = (nodes) =>
+            nodes.some((n) => n.defaultValue !== undefined || (!!n.children && declares(n.children)));
+        me.hasDefaults = declares(children);
+
+        // Reloading must not fold the tree up, and must not lose the selection
+        // either: both are read off the old tree before the root is replaced.
+        let selected = me.selectionKey();
+        let expanded = me.expandedRows();
         me.store.setRoot({ expanded: true, children: children });
-        if (seen) {
+        if (expanded) {
             me.eachRow(function (n) {
                 if (!n.isLeaf() && !expanded[me.rowKey(n)]) {
                     n.collapse();

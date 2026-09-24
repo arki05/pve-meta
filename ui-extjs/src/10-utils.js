@@ -163,8 +163,9 @@ PVE.meta.Utils = {
         return Ext.encode(v);
     },
 
-    // A schema `type` as the kind `parseValue` speaks: integers and numbers both
-    // parse as numbers; a map or a list of one is not a scalar to parse at all.
+    // A schema `type` as the kind the row editor and `parseValue` speak: integers and
+    // numbers both parse as numbers, and any other type is edited as a string. The
+    // row builder answers `object` itself, since a map is rows, not a value.
     schemaValueKind: function (type) {
         if (type === 'integer' || type === 'number') {
             return 'number';
