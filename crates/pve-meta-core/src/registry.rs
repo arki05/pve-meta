@@ -620,30 +620,15 @@ fn resolve_for_node(mut def: PrefixDef, node: Option<&NodeName>) -> PrefixDef {
     def
 }
 
-/// Where one directory's files come from: what `load_dirs` stamps on each.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Source {
-    Packaged,
-    Cluster,
-}
-
-impl Source {
-    fn origin(&self) -> Origin {
-        match self {
-            Source::Packaged => Origin::Packaged,
-            Source::Cluster => Origin::Cluster,
-        }
-    }
-}
-
-/// `dirs` (lowest precedence first) as layers: the last one is the cluster's --
+/// `dirs` (lowest precedence first) as layers, each with the [`Origin`]
+/// `load_dirs` stamps on its files: the last one is the cluster's --
 /// [`Registry::write_dir`]'s rule -- and every one below it packaged.
-fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Source)> {
+fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Origin)> {
     dirs.iter()
         .enumerate()
         .map(|(i, dir)| {
-            let source = if i + 1 == dirs.len() { Source::Cluster } else { Source::Packaged };
-            (dir.clone(), source)
+            let origin = if i + 1 == dirs.len() { Origin::Cluster } else { Origin::Packaged };
+            (dir.clone(), origin)
         })
         .collect()
 }
@@ -677,14 +662,14 @@ fn is_file_or_unreadable(path: &FsPath) -> bool {
 type Loaded<T> = (Vec<(String, T)>, Vec<RegistryFailure>);
 
 /// Loads one drop-directory list, later layers overriding earlier by file
-/// name, and stamps each survivor with the [`Source`] of its layer. One row
+/// name, and stamps each survivor with the [`Origin`] of its layer. One row
 /// per name, loaded or failed: only the effective file ([`effective_file`])
 /// is read and parsed, so a file it shadows is neither loaded nor reported.
 fn load_dirs<T>(
-    layers: &[(PathBuf, Source)],
+    layers: &[(PathBuf, Origin)],
     kind: &str,
     parse: impl Fn(&str, &str) -> Result<T>,
-    stamp: impl Fn(&mut T, &Source, bool),
+    stamp: impl Fn(&mut T, Origin, bool),
 ) -> Result<Loaded<T>> {
     let dirs: Vec<PathBuf> = layers.iter().map(|(dir, _)| dir.clone()).collect();
     // Every name, and how many directories hold it -- the `overrides` fact.
@@ -700,12 +685,8 @@ fn load_dirs<T>(
         // The file `yaml_files` just listed can have vanished since; then the
         // name is simply not there to load.
         let Some((index, path)) = effective_file(&dirs, &name) else { continue };
-        let source = &layers[index].1;
-        let fail = |name: String, error: String| RegistryFailure {
-            name,
-            origin: source.origin(),
-            error,
-        };
+        let origin = layers[index].1;
+        let fail = |name: String, error: String| RegistryFailure { name, origin, error };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
@@ -716,7 +697,7 @@ fn load_dirs<T>(
         };
         match parse(&name, &text) {
             Ok(mut parsed) => {
-                stamp(&mut parsed, source, count > 1);
+                stamp(&mut parsed, origin, count > 1);
                 parsed_out.push((name, parsed));
             }
             Err(e) => {
@@ -732,9 +713,9 @@ fn load_dirs<T>(
 /// promises (`docs/DESIGN.md` §6) -- shared by [`load_prefixes`] (which drops
 /// the failures) and the [`Registry`] listings (which keep them), so the
 /// two can never compute the sort differently.
-fn prefixes_with_failures(layers: &[(PathBuf, Source)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
-    let (parsed, failures) = load_dirs(layers, "prefix", parse_prefix, |p, source, over| {
-        p.origin = source.origin();
+fn prefixes_with_failures(layers: &[(PathBuf, Origin)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
+    let (parsed, failures) = load_dirs(layers, "prefix", parse_prefix, |p, origin, over| {
+        p.origin = origin;
         p.overrides = over;
     })?;
     let mut out: Vec<PrefixDef> = parsed.into_iter().map(|(_, ns)| ns).collect();
