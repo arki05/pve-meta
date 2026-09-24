@@ -116,7 +116,7 @@ Ext.define('PVE.meta.TextWindow', {
     // parse we say so and stay put; the server remains the YAML authority.
     switchLang: function (lang) {
         let me = this;
-        if (!me.editor || lang === me.lang) {
+        if (!me.editor || !lang || lang === me.lang) {
             return;
         }
         let value = PVE.meta.Buffer.convert(me.buffer(), lang, me.lookupReference('langbtn'));

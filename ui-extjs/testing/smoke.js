@@ -420,7 +420,12 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     eq('no alert and the toggle was never reset', [alerts(), btn.value, btn.suspended], [[], null, 0]);
     ed = editor('a: [\n');
     eq('convert refuses a buffer that does not parse', Buffer.convert({ editor: ed, lang: 'yaml', original: '' }, 'json', btn), undefined);
-    eq('... puts the toggle back on the current language, events suspended around it', [btn.value, btn.suspended], ['yaml', 0]);
+    eq('... but not from inside the toggle\'s own change handler', btn.value, null);
+    asyncSections.push(async function () {
+        console.log('\n--- a refused YAML | JSON switch puts the toggle back, after its handler ---');
+        await tick();
+        eq('the toggle is back on the current language, events suspended around it', [btn.value, btn.suspended], ['yaml', 0]);
+    });
     eq('... names the target language', alerts().map((a) => a[1].indexOf('Cannot convert to JSON') === 0), [true]);
     eq('... and the buffer is untouched', ed.sets, 0);
 

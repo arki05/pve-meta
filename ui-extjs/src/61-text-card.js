@@ -189,7 +189,7 @@ PVE.meta.TextCard = {
     // rendering fires the change listener that reads it.
     switchTextLang: function (lang) {
         let me = this;
-        if (!me.textEditor || lang === me.textLang) {
+        if (!me.textEditor || !lang || lang === me.textLang) {
             return;
         }
         let value = PVE.meta.Buffer.convert(me.textBuffer(), lang, me.down('#textLangBtn'));

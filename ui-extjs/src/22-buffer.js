@@ -59,7 +59,8 @@ PVE.meta.Buffer = {
     },
 
     // The first half of the YAML | JSON switch: the buffer as a value. If it does
-    // not parse, says so, puts `btn` back, and returns undefined. The caller
+    // not parse, says so, puts `btn` back once its change handler has run, and
+    // returns undefined. The caller
     // records the new language before calling `render`, whose change listeners read it.
     convert: function (buffer, lang, btn) {
         try {
@@ -73,9 +74,19 @@ PVE.meta.Buffer = {
                     Ext.htmlEncode(PVE.meta.Utils.errText(err)),
                 ),
             );
-            btn.suspendEvents();
-            btn.setValue(buffer.lang);
-            btn.resumeEvents();
+            // After the handler, not in it: this runs inside the button's own
+            // `change`, and a value set there is undone as the button finishes
+            // its toggle -- which left it with no value at all, and the next
+            // click handed `null` on as the language.
+            let lang0 = buffer.lang;
+            setTimeout(function () {
+                if (btn.isDestroyed) {
+                    return;
+                }
+                btn.suspendEvents();
+                btn.setValue(lang0);
+                btn.resumeEvents();
+            }, 0);
             return undefined;
         }
     },
