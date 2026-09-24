@@ -225,6 +225,9 @@ PVE.meta.Utils = {
                 queryMode: 'local',
                 editable: false,
                 forceSelection: true,
+                // The list renders each member as markup, and a member is schema
+                // text. The field itself shows it as a value, which needs nothing.
+                listConfig: { getInnerTpl: (field) => '{' + field + ':htmlEncode}' },
             };
         } else if (d.kind === 'boolean') {
             return { xtype: 'proxmoxcheckbox' };

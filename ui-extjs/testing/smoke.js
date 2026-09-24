@@ -241,6 +241,10 @@ eq('valueAt of the root', U.valueAt({ a: 1 }, ''), { a: 1 });
 
 console.log('\n--- the row editor field comes from the grammar first ---');
 eq('editor enum', U.editorFor({ kind: 'string', enumValues: ['a'] }).xtype, 'combobox');
+// A flat array store's one field is `field1`; the list is markup, the member text.
+eq('an enum member is encoded in the list',
+    U.editorFor({ kind: 'string', enumValues: ['<img src=x>'] }).listConfig.getInnerTpl('field1'),
+    '{field1:htmlEncode}');
 eq('editor boolean', U.editorFor({ kind: 'boolean' }).xtype, 'proxmoxcheckbox');
 eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
