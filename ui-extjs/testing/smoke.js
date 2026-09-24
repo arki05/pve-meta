@@ -2269,6 +2269,22 @@ console.log('\n--- a repaired document can go back to the tree ---');
         request: reading('a: 1\nb: [\n'),
     });
 
+    panelP.docParseError = "did not find expected key near '<img src=x>'";
+    panelP.syncAccessLabel();
+    eq('the Tree segment says why it is off, the parser\'s quote of the file encoded',
+        [tree.disabled, /near &#39;&lt;img src=x&gt;&#39;$/.test(tree.tooltip)], [true, true]);
+    panelP.docParseError = 'mapping values are not allowed here';
+    tree.tooltip = null;
+
+    // And the tree's Remove asks about the path as text: the key charset is only
+    // the lint's on a write, and a hand-written file is read whatever it holds.
+    const confirm = ctx.Ext.Msg.confirm;
+    const asked = [];
+    ctx.Ext.Msg.confirm = (title, question) => asked.push(question);
+    panelWith({}).removeKey({ data: { path: 'a<b' } });
+    ctx.Ext.Msg.confirm = confirm;
+    eq('Remove names the path encoded', asked, ['Remove "a&lt;b"?']);
+
     panelP.refreshText();
     eq('text that still does not parse keeps the tree out of reach',
         [panelP.docParseError, tree.tooltip], ['mapping values are not allowed here', null]);
