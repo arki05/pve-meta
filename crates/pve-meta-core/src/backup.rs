@@ -297,8 +297,8 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
         if *expected != actual {
             crate::warn_line!(
                 "backup notes block on {doc_id}: digest {} does not match its text ({}); importing the text as it is",
-                &expected[..12.min(expected.len())],
-                &actual[..12]
+                digest::short(expected),
+                digest::short(&actual)
             );
         }
     }
@@ -310,7 +310,7 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
             .vmid
             .map_or_else(|| "?".to_string(), |v| v.to_string()),
         found.header.time.as_deref().unwrap_or("?"),
-        &written.document.digest[..12],
+        digest::short(&written.document.digest),
     ));
     Ok(Import {
         action: ImportAction::Imported,
@@ -505,6 +505,19 @@ mod tests {
         let res = import(&store, 301, &block, ImportMode::Install).unwrap();
         assert_eq!(res.action, ImportAction::Imported);
         assert_eq!(store.read(&DocId::Guest(301)).unwrap().raw, YAML);
+    }
+
+    #[test]
+    fn a_hand_edited_header_digest_is_reported_not_a_panic() {
+        // The header is notes text anyone with the guest's notes can edit, so
+        // its `sha256` can be anything -- here, a multi-byte character across
+        // the twelfth byte the warning shortens it to.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MetaStore::new(dir.path());
+        let block = format!("[pve-meta v1 vmid=1 sha256=abcdefghijk\u{e9}xyz]\n````yaml\n{}````\n[/pve-meta]", YAML);
+        let res = import(&store, 402, &block, ImportMode::Restore).unwrap();
+        assert_eq!(res.action, ImportAction::Imported);
+        assert_eq!(store.read(&DocId::Guest(402)).unwrap().raw, YAML);
     }
 
     #[test]

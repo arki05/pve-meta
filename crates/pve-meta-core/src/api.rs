@@ -621,7 +621,7 @@ pub fn put_document(
             view_out(view),
             if is_merge { "merge" } else { "replace" },
             touched.len(),
-            &written[..12.min(written.len())],
+            crate::digest::short(&written),
         ));
         written
     };
@@ -772,7 +772,7 @@ pub fn delete_document(
             acl.authid,
             view_out(view),
             touched.len(),
-            &written[..12.min(written.len())],
+            crate::digest::short(&written),
         ));
         written
     } else {
