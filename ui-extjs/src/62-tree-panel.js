@@ -462,6 +462,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return this.store.getRoot();
     },
 
+    // Every row of the tree, never the hidden root it hangs from. ExtJS gives that
+    // root a text of its own (TreeStore's `defaultRootText`, "Root"), so a `data.text`
+    // test took it for a row: the first build then found an "old tree" with nothing
+    // expanded in it and collapsed everything.
+    eachRow: function (fn) {
+        let root = this.store.getRoot();
+        root.cascadeBy(function (n) {
+            if (n !== root) {
+                fn(n);
+            }
+        });
+    },
+
     getSelection: function () {
         return this.tree ? this.tree.getSelection() : [];
     },
@@ -484,10 +497,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!rec) {
             return null;
         }
+        // A top-level row's parent is the hidden root, which is nothing to select.
         let up = rec.parentNode;
         return {
             row: me.rowKey(rec),
-            parent: up && up.data && up.data.text ? me.rowKey(up) : null,
+            parent: up && up.parentNode ? me.rowKey(up) : null,
         };
     },
 
@@ -502,10 +516,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         }
         let row = null;
         let parent = null;
-        me.store.getRoot().cascadeBy(function (n) {
-            if (!n.data.text) {
-                return;
-            }
+        me.eachRow(function (n) {
             let key = me.rowKey(n);
             if (!row && key === want.row) {
                 row = n;
@@ -897,8 +908,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let expanded = Object.create(null);
         let seen = false;
         let selected = me.selectionKey();
-        me.store.getRoot().cascadeBy(function (n) {
-            if (n.data.text && !n.isLeaf()) {
+        me.eachRow(function (n) {
+            if (!n.isLeaf()) {
                 seen = true;
                 if (n.isExpanded()) {
                     expanded[me.rowKey(n)] = true;
@@ -907,8 +918,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
         me.store.setRoot({ expanded: true, children: children });
         if (seen) {
-            me.store.getRoot().cascadeBy(function (n) {
-                if (n.data.text && !n.isLeaf() && !expanded[me.rowKey(n)]) {
+            me.eachRow(function (n) {
+                if (!n.isLeaf() && !expanded[me.rowKey(n)]) {
                     n.collapse();
                     n.set('iconCls', PVE.meta.Icons.map);
                 }

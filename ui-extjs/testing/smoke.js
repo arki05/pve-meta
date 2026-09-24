@@ -580,6 +580,57 @@ function panelWith(overrides) {
 }
 const panel = panelWith({});
 
+// Ext's TreeStore, just enough of it for what buildTree does to the nodes: the
+// root is a node of its own, with the text Ext gives it ("Root", `defaultRootText`)
+// and no parent, and a branch is as open as its config said.
+function fakeTreeStore() {
+    const asNodes = function (children, parent) {
+        return (children || []).map(function (cfg) {
+            const n = { data: cfg, parentNode: parent, open: !!cfg.expanded };
+            n.childNodes = asNodes(cfg.children, n);
+            n.isLeaf = () => !!cfg.leaf;
+            n.isExpanded = () => n.open;
+            n.collapse = () => (n.open = false);
+            n.set = (k, v) => (n.data[k] = v);
+            return n;
+        });
+    };
+    const cascadeBy = function (fn) {
+        const walk = (n) => {
+            fn(n);
+            n.childNodes.forEach(walk);
+        };
+        walk(this);
+    };
+    const store = {
+        root: null,
+        getRoot() { return this.root; },
+        setRoot(cfg) {
+            const r = {
+                data: { text: 'Root' },
+                parentNode: null,
+                cascadeBy,
+                isLeaf: () => false,
+                isExpanded: () => !!cfg.expanded,
+            };
+            r.childNodes = asNodes(cfg.children, r);
+            this.root = r;
+        },
+        // Every row below the root, by path, with whether it is open.
+        branches() {
+            const out = {};
+            this.root.cascadeBy((n) => {
+                if (n !== this.root && !n.isLeaf()) {
+                    out[n.data.path] = n.isExpanded();
+                }
+            });
+            return out;
+        },
+    };
+    store.setRoot({ expanded: true, children: [] });
+    return store;
+}
+
 const shape = panel.shapeFor('200');
 // Most-specific first, then by name: the order the server lists in, and the one
 // the Shape resolves in, whatever order the listing arrived in.
@@ -1761,38 +1812,8 @@ console.log('\n--- a write must not lose the selected row ---');
 {
     // Every write rebuilds the tree, and the rebuilt tree had no selection at all:
     // after Edit, Add or Set to Default the toolbar went dead and the row had to be
-    // hunted down again. A store standing in for Ext's, just enough of a node for
-    // what buildTree does to one.
-    const asNodes = function (children, parent) {
-        return (children || []).map(function (cfg) {
-            const n = { data: cfg, parentNode: parent, open: cfg.expanded !== false };
-            n.childNodes = asNodes(cfg.children, n);
-            n.isLeaf = () => !n.childNodes.length;
-            n.isExpanded = () => n.open;
-            n.collapse = () => (n.open = false);
-            n.set = (k, v) => (n.data[k] = v);
-            return n;
-        });
-    };
-    const store = {
-        root: null,
-        getRoot() { return this.root; },
-        setRoot(cfg) {
-            const r = {
-                data: {},
-                cascadeBy(fn) {
-                    const walk = (n) => {
-                        fn(n);
-                        n.childNodes.forEach(walk);
-                    };
-                    walk(this);
-                },
-            };
-            r.childNodes = asNodes(cfg.children, r);
-            this.root = r;
-        },
-    };
-    store.setRoot({ children: [] });
+    // hunted down again.
+    const store = fakeTreeStore();
     let sel = [];
     const panelS = panelWith({
         docId: '201',
@@ -1836,6 +1857,41 @@ console.log('\n--- a write must not lose the selected row ---');
     panelS.buildTree();
     eq('... so a row of another document matches nothing here',
         panelS.getSelection()[0].data.docId, 'prefixes/x');
+}
+
+console.log('\n--- the tree opens expanded, and a rebuild keeps what was folded ---');
+{
+    // The first build found Ext's hidden root, text "Root", and took it for a row
+    // of an old tree in which nothing was expanded -- so every branch of a freshly
+    // opened tab came up collapsed. headless-check calls expandAll, and the stub
+    // store here used to have a root without a text, so nothing noticed.
+    const store = fakeTreeStore();
+    let sel = [];
+    const panelE = panelWith({
+        docId: '201',
+        prefixes: [],
+        docState: { 201: { digest: 'd', data: { a: { b: { c: 1 } }, m: { x: 1 }, top: 1 } } },
+        store: store,
+        tree: { getSelection: () => sel, setSelection: (rec) => (sel = [rec]) },
+        syncButtons() {},
+    });
+    const find = (path) => {
+        let hit = null;
+        store.getRoot().cascadeBy((n) => (hit = hit || (n.data.path === path ? n : null)));
+        return hit;
+    };
+    panelE.buildTree();
+    eq('the first build leaves every branch open', store.branches(), { a: true, 'a.b': true, m: true });
+    find('m').collapse();
+    panelE.buildTree();
+    eq('a rebuild keeps a folded branch folded, and the rest open', store.branches(), { a: true, 'a.b': true, m: false });
+
+    // A Remove of a top-level row: its parent is the hidden root, which is not a
+    // row to put the selection on.
+    sel = [find('top')];
+    panelE.docState['201'].data = { a: { b: { c: 1 } }, m: { x: 1 } };
+    panelE.buildTree();
+    eq('removing a top-level row does not select the hidden root', sel[0] === store.getRoot(), false);
 }
 
 console.log('\n--- the tree marks a row its schema refuses ---');
