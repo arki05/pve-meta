@@ -2062,6 +2062,7 @@ console.log('\n--- the row toolbar is hidden in Text, not left there disabled --
             setHidden(h) { this.hidden = h; },
             setVisible(v) { this.hidden = !v; },
             setText() {},
+            setIconCls() {},
         });
     const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
     const bar = panelWith({
@@ -2083,6 +2084,20 @@ console.log('\n--- the row toolbar is hidden in Text, not left there disabled --
     bar.access = { read: 1, write: 0 };
     bar.syncButtons();
     eq('... unless it says Read-only', shown(), ['accessText', 'metaToolbar']);
+
+    // The footer, by the same rule the subtree window's OK follows: no Apply for a
+    // caller who may not write, rather than one that is always disabled.
+    delete bar.syncFooter;
+    bar.syncFooter = ctx.PVE.meta.TreePanel.syncFooter;
+    bar.syncFooter();
+    eq('a read-only caller\'s Text has Format and Diff, and no Apply',
+        [comps.metaFormat.hidden, comps.metaDiff.hidden, comps.metaApply.hidden], [false, false, true]);
+    bar.access = { read: 1, write: 1 };
+    bar.syncFooter();
+    eq('... a writer\'s has an Apply that works', [comps.metaApply.hidden, comps.metaApply.disabled], [false, false]);
+    bar.mode = 'tree';
+    bar.syncFooter();
+    eq('... and the tree none of the three', [comps.metaFormat.hidden, comps.metaDiff.hidden, comps.metaApply.hidden], [true, true, true]);
 }
 
 console.log('\n--- one rule for "did this change" ---');

@@ -620,8 +620,12 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let apply = me.down('#metaApply');
         if (apply) {
             // The buffer is the edit, and Apply is offered whenever the document is
-            // writable (DESIGN §4); the diff is what decides if it is worth it.
-            apply.setDisabled(!me.access.write);
+            // writable; the diff is what decides if it is worth it. Where it is not,
+            // there is no Apply at all, as in the subtree window: a button that
+            // exists only to be refused is worse than none (the footer's rule), and
+            // the Read-only notice says why.
+            apply.setDisabled(false);
+            apply.setHidden(!textMode || !me.access.write);
         }
         let second = me.down('#metaSecondary');
         if (second) {
