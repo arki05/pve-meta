@@ -22,6 +22,12 @@ Ext.define('PVE.meta.EditValueWindow', {
         } else {
             value = d.kind === 'boolean' ? false : '';
         }
+        // An enum's combobox holds its members as strings, and matches the value it
+        // is given strictly: a stored `443` against `'443'` opened the field empty,
+        // and OK on it then wrote whatever an empty field parses to.
+        if (d.enumValues && value !== '') {
+            value = String(value);
+        }
 
         let items = [
             {

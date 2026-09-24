@@ -103,8 +103,9 @@ PVE.meta.Utils = {
         if (kind === 'boolean') {
             return text === true || text === 'true' || text === 1 || text === '1';
         } else if (kind === 'number') {
+            // An empty field is no number, not 0: `Number(null)` and `Number('')` are.
             let n = Number(text);
-            if (text === '' || isNaN(n)) {
+            if (text === '' || text === null || text === undefined || isNaN(n)) {
                 throw new Error(gettext('Not a number') + ': ' + text);
             }
             return n;

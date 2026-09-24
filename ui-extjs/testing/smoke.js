@@ -239,6 +239,7 @@ eq('kind map', U.kindOf({}), 'map');
 eq('display string', U.displayValue('a b', 'string'), 'a b');
 eq('display array', U.displayValue(['a', 'b'], 'array'), '["a","b"]');
 eq('parse number', U.parseValue('42', 'number'), 42);
+throws('an empty number field is not 0', () => U.parseValue(null, 'number'), 'Not a number');
 eq('parse bool', U.parseValue('true', 'boolean'), true);
 eq('parse array json', U.parseValue('["a","b"]', 'array'), ['a', 'b']);
 eq('parse array csv', U.parseValue('a, b', 'array'), ['a', 'b']);
@@ -1798,6 +1799,19 @@ console.log('\n--- a list is a container, like a map ---');
     // The summary is presentation only, and describes nothing and constrains nothing.
     eq('an unknown shape is still legible', U.itemSummary({ a: 1 }), '{"a":1}');
     eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
+}
+
+console.log('\n--- an enum row opens on its value, whatever the value\'s type ---');
+{
+    const field = (data) =>
+        ctx.PVE.meta.EditValueWindow.formItems.call({ rec: { data: data } }).filter((f) => f.name === 'value')[0];
+    const port = { path: 'p', kind: 'number', present: true, rawValue: 443, valueText: '443', enumValues: [80, 443] };
+    const f = field(port);
+    eq('a stored number is given to the combobox as the string its store holds',
+        [f.xtype, f.store, f.value], ['combobox', ['80', '443'], '443']);
+    eq('... and an unset one opens on its default the same way',
+        field(Object.assign({}, port, { present: false, defaultValue: 80 })).value, '80');
+    eq('... or empty, with no default', field(Object.assign({}, port, { present: false })).value, '');
 }
 
 console.log('\n--- creating a registry file: the least that parses ---');
