@@ -1,10 +1,13 @@
 // headless-check.js — headless verification of PVE.meta.TreePanel against the real
 // pve-manager SPA on a lab host: open the tab, add a key, edit it, remove it, apply
 // from the Text card, provoke a 409, then the datacenter tab's registry grid.
-// Usage: node headless-check.js <host> <vmid> [light|dark] [--ro]
+// Usage: node headless-check.js <host> <vmid> [light|dark] [--ro] [--popup-conflict]
 // --ro stubs GET /meta/access with full read and no write, so the "Read-only" toolbar
 //   label can be seen without a second lab principal's credentials; implies read-only
 //   (every step that writes is skipped).
+// --popup-conflict provokes the 409 with the row editor open: the value is changed
+//   from the API underneath it, OK must say what changed and stay open, and a second
+//   OK must land. Needs an editor with that handling installed (0.3.3 or later).
 // Needs puppeteer-core and a chromium binary; writes screenshots to /root/headless/shots.
 const puppeteer = require('puppeteer-core');
 const https = require('https');
@@ -13,6 +16,7 @@ const host = process.argv[2] || '10.10.10.154';
 const vmid = process.argv[3] || '201';
 const theme = process.argv[4] === 'dark' ? 'dark' : 'light';
 const readOnly = process.argv.includes('--ro');
+const popupConflict = process.argv.includes('--popup-conflict');
 const ACCESS_STUB = { read: 1, write: 0 };
 const out = '/root/headless/shots';
 
@@ -338,6 +342,72 @@ async function main() {
             };
         });
         await api(`/api2/json/meta/guests/${vmid}?view=reload_probe`, 'DELETE', tk, csrf, '');
+
+        // --- A 409 with the row editor open: re-read around it, say what changed, OK again ---
+        // The popup stays open until its write answers, and a reload under it is
+        // owed, not run: the digest and data are re-read around the editor, the
+        // alert names the value it opened on and the value there now, and the
+        // second OK carries the fresh digest.
+        if (popupConflict) {
+            await api(
+                `/api2/json/meta/guests/${vmid}`,
+                'PUT',
+                tk,
+                csrf,
+                'view=popup_probe&mode=replace&data=' + encodeURIComponent('"before"'),
+            );
+            // The panel's digest is stale from the DELETE above: reload first, so
+            // the conflict below is the one this step makes.
+            await page.evaluate(() => Ext.ComponentQuery.query('pveMetaTreePanel')[0].reload());
+            await sleep(3000);
+            result.checks.popupOpened = await page.evaluate(() => {
+                const p = Ext.ComponentQuery.query('pveMetaTreePanel')[0];
+                let n = null;
+                p.getRootNode().cascadeBy((x) => {
+                    if (x.data.path === 'popup_probe') n = x;
+                });
+                if (!n) return 'row not found';
+                p.editRow(n);
+                return 'opened';
+            });
+            await sleep(800);
+            await page.evaluate(() => {
+                Ext.ComponentQuery.query('pveMetaEditValueWindow')[0].down('#valueField').setValue('from the ui');
+            });
+            await api(
+                `/api2/json/meta/guests/${vmid}`,
+                'PUT',
+                tk,
+                csrf,
+                'view=popup_probe&mode=replace&data=' + encodeURIComponent('"outside"'),
+            );
+            await sleep(500);
+            await page.evaluate(() => Ext.ComponentQuery.query('pveMetaEditValueWindow')[0].submit());
+            await sleep(3000);
+            await page.screenshot({ path: `${out}/extjs-popup-conflict-${theme}.png` });
+            result.checks.popupConflict = await page.evaluate(() => {
+                const b = Ext.ComponentQuery.query('messagebox').find((m) => m.isVisible());
+                const text = b ? b.el.dom.textContent : '';
+                const w = Ext.ComponentQuery.query('pveMetaEditValueWindow')[0];
+                const open = !!w && !w.isDestroyed;
+                if (b) b.close();
+                return {
+                    title: b ? b.title : null,
+                    namesChange: /it was before and is now outside/.test(text),
+                    editorOpen: open,
+                    typed: open ? w.down('#valueField').getValue() : null,
+                };
+            });
+            await sleep(500);
+            await page.evaluate(() => Ext.ComponentQuery.query('pveMetaEditValueWindow')[0].submit());
+            await sleep(4000);
+            result.checks.popupSecondOk = {
+                editorClosed: await page.evaluate(() => Ext.ComponentQuery.query('pveMetaEditValueWindow').length === 0),
+                row: (await rows(page)).filter((r) => r.startsWith('popup_probe')),
+                stored: (await api(`/api2/json/meta/guests/${vmid}?view=popup_probe`, 'GET', tk, csrf, '')).data.data,
+            };
+            await api(`/api2/json/meta/guests/${vmid}?view=popup_probe`, 'DELETE', tk, csrf, '');
+        }
 
         // --- The datacenter tab: the prefix registry list, and no document ---
         await openTab(page, 'dc');
