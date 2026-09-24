@@ -39,21 +39,17 @@ fn read_missing_is_not_found() {
 }
 
 #[test]
-fn put_raw_creates_and_replaces_and_diffs() {
+fn put_raw_creates_and_replaces() {
     let (_dir, store) = store();
     let result = store.put_raw(&DocId::Guest(100), "a: 1\nb: 2\n", None).unwrap();
-    assert_eq!(result.document.value, json!({"a": 1, "b": 2}));
-    assert!(result.document.path.ends_with("100.yaml"));
-    // diff against an empty starting document
-    assert_eq!(result.touched.len(), 2);
+    assert_eq!(result.value, json!({"a": 1, "b": 2}));
+    assert!(result.path.ends_with("100.yaml"));
 
     let result2 = store
-        .put_raw(&DocId::Guest(100), "a: 10\nc: 3\n", Some(&result.document.digest))
+        .put_raw(&DocId::Guest(100), "a: 10\nc: 3\n", Some(&result.digest))
         .unwrap();
-    assert_eq!(result2.document.value, json!({"a": 10, "c": 3}));
-    let mut touched: Vec<String> = result2.touched.iter().map(|t| t.path.to_string()).collect();
-    touched.sort();
-    assert_eq!(touched, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    assert_eq!(result2.value, json!({"a": 10, "c": 3}));
+    assert_eq!(store.read(&DocId::Guest(100)).unwrap(), result2);
 }
 
 #[test]
@@ -72,7 +68,7 @@ fn put_raw_empty_digest_matches_a_missing_document() {
     // the documented GET-then-PUT-with-digest create flow must work.
     let (_dir, store) = store();
     let result = store.put_raw(&DocId::Guest(100), "a: 1\n", Some("")).unwrap();
-    assert_eq!(result.document.value, json!({"a": 1}));
+    assert_eq!(result.value, json!({"a": 1}));
 
     // Once it exists, "" no longer matches.
     let err = store
@@ -81,7 +77,7 @@ fn put_raw_empty_digest_matches_a_missing_document() {
     match err {
         Error::DigestMismatch { expected, actual } => {
             assert_eq!(expected, "");
-            assert_eq!(actual, result.document.digest);
+            assert_eq!(actual, result.digest);
         }
         other => panic!("expected DigestMismatch, got {other:?}"),
     }
@@ -125,9 +121,9 @@ fn put_raw_rejects_invalid_yaml_and_invalid_documents() {
 fn put_raw_normalizes_the_trailing_newline_and_digest_matches_the_file() {
     let (_dir, store) = store();
     let r = store.put_raw(&DocId::Guest(100), "a: 1", None).unwrap();
-    assert_eq!(r.document.raw, "a: 1\n");
-    let on_disk = std::fs::read(&r.document.path).unwrap();
-    assert_eq!(digest(&on_disk), r.document.digest);
+    assert_eq!(r.raw, "a: 1\n");
+    let on_disk = std::fs::read(&r.path).unwrap();
+    assert_eq!(digest(&on_disk), r.digest);
 }
 
 #[test]
@@ -450,7 +446,7 @@ fn reads_never_lint_but_writes_still_do() {
     // pass lint.
     let good = "ok: 1\n";
     let result = store.put_raw(&DocId::Guest(200), good, Some(&doc.digest)).unwrap();
-    assert_eq!(result.document.raw, good);
+    assert_eq!(result.raw, good);
     assert_eq!(store.read(&DocId::Guest(200)).unwrap().value, json!({"ok": 1}));
 
     // ... and the write-time gate is untouched.
@@ -755,7 +751,7 @@ fn a_nested_prefix_is_a_dotted_file_name_and_still_moves_the_token() {
     let before = store.version().unwrap().token;
     let written = store.put_raw(&nested, "selector: {all: true}\n", None).unwrap();
     assert_eq!(
-        written.document.path,
+        written.path,
         cluster_prefix_dir(dir.path()).join("homelab.docker.yaml"),
     );
     assert_ne!(store.version().unwrap().token, before);

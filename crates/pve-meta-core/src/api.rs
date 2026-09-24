@@ -614,7 +614,7 @@ pub fn put_document(
     let new_digest = if dry_run || unchanged {
         crate::digest::digest(text.as_bytes())
     } else {
-        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        let written = store.put_raw(&doc_id, &text, digest)?.digest;
         crate::audit(&format!(
             "{} wrote {doc_id} (view '{}', mode {}): {} path(s) touched, digest {}",
             acl.authid,
@@ -758,7 +758,7 @@ pub fn delete_document(
         // still leave a file its own loader will read: the same rule has to
         // hold on this path as on `put_document`'s.
         check_registry_shape(&doc_id, &text)?;
-        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        let written = store.put_raw(&doc_id, &text, digest)?.digest;
         // Removing a view of a packaged-only prefix edits no packaged file: it
         // writes the cluster file that shadows it, the packaged content minus
         // the view. The audit line names which of the two happened.

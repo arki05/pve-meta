@@ -310,7 +310,7 @@ pub fn import(store: &MetaStore, vmid: u32, description: &str, mode: ImportMode)
             .vmid
             .map_or_else(|| "?".to_string(), |v| v.to_string()),
         found.header.time.as_deref().unwrap_or("?"),
-        digest::short(&written.document.digest),
+        digest::short(&written.digest),
     ));
     Ok(Import {
         action: ImportAction::Imported,

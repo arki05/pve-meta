@@ -16,7 +16,6 @@ use crate::digest;
 use crate::error::{Error, Result};
 use crate::format::{self, Format};
 use crate::model::Value;
-use crate::patch::{self, Touched};
 pub use crate::registry::RegistryKind;
 use crate::registry::Registry;
 
@@ -75,15 +74,6 @@ pub struct Document {
     pub digest: String,
     /// The file's last-modified time.
     pub mtime: SystemTime,
-}
-
-/// The result of [`MetaStore::put_raw`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct PutResult {
-    /// The new document.
-    pub document: Document,
-    /// The paths that changed, relative to the previous document.
-    pub touched: Vec<Touched>,
 }
 
 /// A poll-friendly summary of the whole store's state.
@@ -376,35 +366,27 @@ impl MetaStore {
         Self::check_digest(self.digest_of(id)?.as_deref(), expected)
     }
 
-    /// Replaces `id`'s document with `text` (normalized to one trailing newline), creating it if absent; parses and lints the new text.
+    /// Replaces `id`'s document with `text` (normalized to one trailing
+    /// newline), creating it if absent, and returns what was written. The
+    /// text is parsed and linted first; what it replaces is never read, so a
+    /// file that does not parse is no obstacle to its repair. What changed is
+    /// the caller's to know: the API diffs its own plan.
     pub fn put_raw(
         &self,
         id: &DocId,
         text: &str,
         expected_digest: Option<&str>,
-    ) -> Result<PutResult> {
+    ) -> Result<Document> {
         self.check_available()?;
         let path = self.path_for(id)?;
-        let read_path = self.read_path_for(id)?;
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
-
-        // Old content diffs as empty if unparseable, vanished or oversized:
-        // a repair is never blocked by what it is fixing.
-        let old_value = match self.read_document(id, &read_path) {
-            Ok(doc) => doc.value,
-            Err(Error::NotFound(_) | Error::TooLarge { .. } | Error::Parse { .. }) => {
-                Value::Object(serde_json::Map::new())
-            }
-            Err(e) => return Err(e),
-        };
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
-        let new_value = format::parse(DISK_FORMAT, &normalized)?;
+        let value = format::parse(DISK_FORMAT, &normalized)?;
 
         self.write_atomic(&path, normalized.as_bytes())?;
 
-        let touched = patch::diff(&old_value, &new_value);
         let dig = digest::digest(normalized.as_bytes());
         // The file just written can already be gone again (a race): report
         // this write's own moment rather than a `stat` of nothing.
@@ -412,17 +394,14 @@ impl MetaStore {
             Some(meta) => meta.modified()?,
             None => SystemTime::now(),
         };
-        Ok(PutResult {
-            document: Document {
-                id: id.clone(),
-                path,
-                raw: normalized,
-                value: new_value,
-                parse_error: None,
-                digest: dig,
-                mtime,
-            },
-            touched,
+        Ok(Document {
+            id: id.clone(),
+            path,
+            raw: normalized,
+            value,
+            parse_error: None,
+            digest: dig,
+            mtime,
         })
     }
 
