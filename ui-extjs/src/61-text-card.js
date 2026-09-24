@@ -109,7 +109,7 @@ PVE.meta.TextCard = {
                 }
                 me.setMask(false);
                 if (me.textEditor) {
-                    me.textEditor.setValue(me.textRendered(me.textLang));
+                    PVE.meta.Buffer.load(me.textEditor, me.textRendered(me.textLang));
                     me.annotateText();
                     return;
                 }
@@ -404,7 +404,7 @@ PVE.meta.TextCard = {
                 me.textOriginal = d.text || '';
                 me.clearParseErrorIfSound();
                 if (me.textEditor && !opts.keepBuffer) {
-                    me.textEditor.setValue(me.textRendered(me.textLang));
+                    PVE.meta.Buffer.load(me.textEditor, me.textRendered(me.textLang));
                     me.annotateText();
                 }
                 if (opts.then) {

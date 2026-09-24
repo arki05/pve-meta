@@ -24,9 +24,25 @@ PVE.meta.Buffer = {
     },
 
     // True when the buffer holds exactly what was loaded. A predicate, and only
-    // that: applying an unchanged buffer resolves to nothing to write.
+    // that: applying an unchanged buffer resolves to nothing to write. On an
+    // untouched JSON side the answer is the YAML behind it, which switching back
+    // gives back: an edit JSON cannot show (a `#` comment, a re-indent) is still
+    // an edit, and one Revert or leaving Text must ask about.
     unchanged: function (buffer) {
-        return buffer.editor.getValue() === PVE.meta.Buffer.baseline(buffer).text;
+        let text = buffer.editor.getValue();
+        let held = PVE.meta.Buffer.stashed.get(buffer.editor);
+        if (held && buffer.lang === 'json' && text === held.json) {
+            return held.yaml === buffer.original;
+        }
+        return text === PVE.meta.Buffer.baseline(buffer).text;
+    },
+
+    // Put the stored document into the buffer (a load, a Revert, a re-read after
+    // Apply). What the YAML side held before is not that document's, so it goes:
+    // left in place, switching back from JSON gave the reverted edit back.
+    load: function (editor, text) {
+        PVE.meta.Buffer.stashed.delete(editor);
+        editor.setValue(text);
     },
 
     // The buffer against what was loaded, without committing to it.

@@ -455,6 +455,20 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
         ed.value, Codec.dump({ b: 7, a: ['y', 'x'] }, 'yaml'));
     eq('no alerts through any of that', alerts(), []);
 
+    // An edit JSON cannot show, behind an untouched JSON side, is still an edit.
+    ed = editor('# mine\n' + handWritten);
+    const hidden = { editor: ed, lang: 'json', original: handWritten };
+    Buffer.render(hidden, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    eq('a comment typed on the YAML side keeps the JSON side dirty', Buffer.unchanged(hidden), false);
+    // ... until the stored document is loaded over it (Revert, a re-read): then the
+    // YAML it held is not the document's, and switching back must not bring it back.
+    Buffer.load(ed, Codec.dump(Codec.parse(handWritten, 'yaml'), 'json'));
+    eq('a load drops what the YAML side held', Buffer.unchanged(hidden), true);
+    hidden.lang = 'yaml';
+    Buffer.render(hidden, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('... so Revert in JSON and back to YAML is the stored text, not the reverted edit', ed.value, handWritten);
+    alerts();
+
     // diff
     Buffer.diff({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }, 'the title');
     eq('diff shows the buffer against the baseline', diffs.pop(), { title: 'the title', original: handWritten, modified: 'b: 2\n', lang: 'yaml' });
