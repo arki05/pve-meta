@@ -2341,6 +2341,27 @@ console.log('\n--- a 409 under an open editor re-reads around it, and the next O
     eq('... the editor is still open with the fresh digest', [answers.splice(0), p.editing, p.digestOf('201')], [[false], true, 'd9']);
     openedWins.pop().close();
 
+    // A second 409 under the same editor: the first re-read moved the panel's copy
+    // to a: 7, but the editor still opened on a: 1 -- that is what the value has to
+    // be compared with, not with what the first conflict found.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = function (opts) {
+        sent.push(opts);
+        opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    };
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, () => {});
+    ctx.__alerts.splice(0);
+    p.request = stored('a: 7\nb: 3\nm:\n  x: 1\n');
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, () => {});
+    alert = ctx.__alerts.splice(0)[0];
+    eq('a second 409 still compares with the value the editor opened on',
+        [/it was 1 and is now 7/.test(alert[1]), /still the one this editor opened on/.test(alert[1])],
+        [true, false]);
+    openedWins.pop().close();
+    eq('... which goes with the editor', p.openedOn, null);
+
     // Add Key: the key was not there, and now it is.
     sent.length = 0;
     ctx.__alerts.splice(0);

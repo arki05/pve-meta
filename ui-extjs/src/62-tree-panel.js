@@ -936,6 +936,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     openEditor: function (xtype, cfg, on, handler) {
         let me = this;
         me.editing = true;
+        me.noteOpenedOn();
         let win = Ext.create(xtype, cfg);
         win.on(on, handler);
         // Tracked the way `textWindow` is: a modal outliving its panel is a write
@@ -945,6 +946,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         win.on('destroy', function () {
             me.editing = false;
             me.editors = me.editors.filter((open) => open !== win);
+            me.openedOn = null;
             me.editorClosed();
         });
         win.show();
@@ -957,12 +959,22 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // that is not already owed.
     openTextWindow: function (view, text) {
         let me = this;
+        me.noteOpenedOn();
         me.textWindow = Ext.create('PVE.meta.TextWindow', { view: view, text: text, tree: me });
         me.textWindow.on('destroy', function () {
             me.textWindow = null;
+            me.openedOn = null;
             me.editorClosed();
         });
         me.textWindow.show();
+    },
+
+    // The document as the modal editor about to open sees it: what a 409 under it
+    // compares the stored value against. Not the panel's current copy, which the
+    // first conflict re-reads -- after that, "the value this editor opened on" would
+    // be the value the conflict found.
+    noteOpenedOn: function () {
+        this.openedOn = this.dataOf(this.docId);
     },
 
     editRow: function (rec) {

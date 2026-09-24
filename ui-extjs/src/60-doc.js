@@ -351,7 +351,7 @@ PVE.meta.Doc = {
         let me = this;
         let U = PVE.meta.Utils;
         let path = edit.path || '';
-        let before = U.valueAt(me.dataOf(me.docId), path);
+        let before = U.valueAt(me.openedOn || me.dataOf(me.docId), path);
         me.readDocument(function (read) {
             me.docState[me.docId] = { digest: read.digest, data: read.data };
             me.reloadPending = true;
