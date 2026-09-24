@@ -401,6 +401,24 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
 }
 
 #[test]
+fn a_text_write_stores_the_canonical_dump_so_a_hash_comment_does_not_survive() {
+    // `docs/decisions/006-...`: a document is written canonically from its
+    // value, and a `#` comment is not part of the value -- not even from a
+    // root replace sent as `text`, the one write that carries text at all.
+    // Key order is kept; the comment and the layout are not.
+    let (_dir, store) = store();
+    seed(&store, "100", "a: 1\n");
+    let text = "# why b comes first\nb:   2   # inline\na: 1\n";
+    put(&store, PutReq { fmt: "yaml", data: text, ..Default::default() }).unwrap();
+    assert_eq!(read_raw(&store, "100").unwrap(), "b: 2\na: 1\n");
+
+    // ... and a hand-written file keeps its comment exactly until a write.
+    seed(&store, "100", "# hand-written\nb: 2\na: 1\n");
+    put(&store, PutReq { view: Some("c"), data: "3", ..Default::default() }).unwrap();
+    assert_eq!(read_raw(&store, "100").unwrap(), "b: 2\na: 1\nc: 3\n");
+}
+
+#[test]
 fn a_read_through_an_array_or_a_scalar_is_refused_like_the_write() {
     // `docs/DESIGN.md` §2: array members are not addressable. A read used to
     // answer the empty document here, which a caller cannot tell from "unset".
