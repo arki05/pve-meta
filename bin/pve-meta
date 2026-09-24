@@ -71,30 +71,41 @@ sub acl_for {
     };
 }
 
-# Runs $code under the document's cluster lock, with the same vmlist check the
-# API makes inside it: a write never creates a file for a vmid that does not
-# exist. The digest is re-checked by the Rust call itself.
-sub locked {
+# Prints a failure the way every command reports one -- the message, without
+# the Rust layer's "NNN: " status -- and exits 1.
+sub fail {
+    my ($err) = @_;
+    require PVE::API2::Ext::Meta;
+    my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
+    print STDERR "$SELF: $msg\n";
+    exit 1;
+}
+
+# Runs $code under the document's cluster lock, the API's own lock domain; a
+# die inside it, or a lock that cannot be taken, is a failure.
+sub with_lock {
     my ($id, $code) = @_;
     require PVE::Cluster;
     require PVE::API2::Ext::Meta;
     my $res = PVE::Cluster::cfs_lock_domain(
-        PVE::API2::Ext::Meta::lock_domain_for($id),
-        $LOCK_TIMEOUT,
-        sub {
-            if ($id =~ /^\d+$/) {
-                die "guest '$id' does not exist\n"
-                    if !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
-            }
-            return $code->();
-        },
+        PVE::API2::Ext::Meta::lock_domain_for($id), $LOCK_TIMEOUT, $code,
     );
-    if (my $err = $@) {
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    fail($@) if $@;
     return $res;
+}
+
+# with_lock, plus the vmlist check the API makes inside it: a write never
+# creates a file for a vmid that does not exist. The digest is re-checked by
+# the Rust call itself.
+sub locked {
+    my ($id, $code) = @_;
+    return with_lock($id, sub {
+        if ($id =~ /^\d+$/) {
+            die "guest '$id' does not exist\n"
+                if !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
+        }
+        return $code->();
+    });
 }
 
 # The payload of a set or merge: exactly one of --data (JSON), --text (YAML) or
@@ -187,12 +198,7 @@ sub cmd_delete {
 sub call {
     my ($code) = @_;
     my $res = eval { $code->() };
-    if (my $err = $@) {
-        require PVE::API2::Ext::Meta;
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    fail($@) if $@;
     return $res;
 }
 
@@ -314,28 +320,16 @@ sub cmd_rm {
     usage("'$vmid' is not a vmid") if $vmid !~ /^[1-9][0-9]*$/;
     $vmid = int($vmid);
 
-    require PVE::Cluster;
-    require PVE::API2::Ext::Meta;
-    my $removed;
     # The document's own write lock, with the vmlist re-read inside it: a guest
     # created at this vmid after the check outside the lock would otherwise have
     # its fresh document deleted, with its PUT long since answered 200.
-    PVE::Cluster::cfs_lock_domain(
-        PVE::API2::Ext::Meta::lock_domain_for($vmid),
-        $LOCK_TIMEOUT,
-        sub {
-            my $live = live_vmids();
-            die "the vmlist is empty; refusing to remove anything\n" if !%$live;
-            die "$vmid is a live guest; remove its metadata through the API or the UI\n"
-                if $live->{$vmid};
-            $removed = PVE::RS::Meta::on_destroy($vmid);
-        },
-    );
-    if (my $err = $@) {
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    my $removed = with_lock($vmid, sub {
+        my $live = live_vmids();
+        die "the vmlist is empty; refusing to remove anything\n" if !%$live;
+        die "$vmid is a live guest; remove its metadata through the API or the UI\n"
+            if $live->{$vmid};
+        return PVE::RS::Meta::on_destroy($vmid);
+    });
     if (!$removed) {
         print STDERR "$SELF: nothing stored for $vmid\n";
         exit 2;
