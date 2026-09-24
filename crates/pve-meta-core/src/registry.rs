@@ -397,8 +397,8 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
 /// Whether `name` is a usable registry **file** name (the part before
 /// `.yaml`): one or more [`crate::path::is_valid_segment`] segments joined by
 /// dots -- exactly a prefix, since the file name IS the prefix -- and at
-/// most [`MAX_FILE_NAME_LEN`] long. `parse_id`, `MetaStore::version` and the
-/// loader all need this same rule and must agree on it.
+/// most [`MAX_FILE_NAME_LEN`] long. `api::parse_id`, the loader and the
+/// editor (through the wasm build) all need this same rule and must agree on it.
 pub fn is_valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME_LEN
@@ -748,8 +748,8 @@ fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
         let Some(stem) = file_name.strip_suffix(".yaml") else {
             continue;
         };
-        // Same rule as `api::parse_id`/`store::registry_document_id`: a file
-        // nothing could address must not load either. An entry that cannot be
+        // Same rule as `api::parse_id`: a file nothing could address must
+        // not load either. An entry that cannot be
         // looked at is still listed -- reading it fails, and that is a
         // failure row for its name, not a silently shorter set.
         if !is_valid_file_name(stem) || !is_file_or_unreadable(&entry.path()) {
