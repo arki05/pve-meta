@@ -630,9 +630,11 @@ sub _register_document_methods {
 
 # -- registry documents ------------------------------------------------------
 
-# The same shape `pve_meta_core::registry::is_valid_file_name` accepts (pattern and
-# `MAX_FILE_NAME_LEN`): this schema is the friendly 400, Rust's own re-check on parse
-# is the real one.
+# The shape `registry::is_valid_file_name` accepts (its charset and
+# `MAX_FILE_NAME_LEN`), checked by PVE before the method runs: a write names its
+# cfs lock after the file (`lock_domain_for`) and takes it before `api::parse_id`
+# sees the name, so this is what keeps a name pmxcfs cannot create out of the lock
+# path. `api::parse_id` re-checks it on every call.
 my $REGISTRY_NAME_SCHEMA = {
     type => 'string',
     pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',
