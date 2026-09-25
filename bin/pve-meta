@@ -62,8 +62,8 @@ my $ROOT_ACL = { authid => 'root@pam', read => 1, write => 1, tags => [] };
 
 sub acl_for {
     my ($id) = @_;
-    return $ROOT_ACL if $id !~ /^\d+$/;
     require PVE::API2::Ext::Meta;
+    return $ROOT_ACL if !PVE::API2::Ext::Meta::is_guest_id($id);
     return {
         %$ROOT_ACL,
         tags => PVE::API2::Ext::Meta::guest_tags($id),
@@ -100,10 +100,9 @@ sub with_lock {
 sub locked {
     my ($id, $code) = @_;
     return with_lock($id, sub {
-        if ($id =~ /^\d+$/) {
-            die "guest '$id' does not exist\n"
-                if !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
-        }
+        die "guest '$id' does not exist\n"
+            if PVE::API2::Ext::Meta::is_guest_id($id)
+            && !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
         return $code->();
     });
 }

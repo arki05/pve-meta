@@ -72,11 +72,19 @@ sub guest_node {
     return (vmlist_ids()->{$vmid} // {})->{node};
 }
 
+# Whether a document id names a guest (a vmid) rather than a registry file
+# ('prefixes/<name>'): the one place Perl tells the two apart. Anything else
+# is left to Rust's `api::parse_id`, which refuses it with a 400.
+sub is_guest_id {
+    my ($id) = @_;
+    return $id =~ /^\d+$/;
+}
+
 # The `cfs_lock_domain` name for one document's write lock, held by the API
 # and the CLI alike. $id is a vmid or 'prefixes/<name>'.
 sub lock_domain_for {
     my ($id) = @_;
-    return "pve-meta-$id" if $id =~ /^\d+$/;
+    return "pve-meta-$id" if is_guest_id($id);
     my (undef, $name) = split(m{/}, $id, 2);
     return "pve-meta-prefix-$name";
 }
@@ -413,17 +421,13 @@ __PACKAGE__->register_method({
             my $acl = _registry_acl($rpcenv, $authuser);
             return { read => $acl->{read}, write => $acl->{write} };
         }
-        if ($id =~ m{^prefixes/}) {
-            return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
-        }
-        if ($id =~ m{^\d+$}) {
+        if (is_guest_id($id)) {
             assert_guest_exists($id);
             return _call(
                 \&PVE::RS::Meta::api_access, $id, _guest_acl($rpcenv, $authuser, $id),
             );
         }
-        # Anything else is refused by the one id parser with a 400, rather than
-        # this endpoint growing a second opinion about what an id is.
+        # A prefix file, or an id the one id parser refuses with a 400.
         return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
     },
 });
