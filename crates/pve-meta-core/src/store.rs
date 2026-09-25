@@ -296,12 +296,7 @@ impl MetaStore {
         })?;
         let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
             Ok(value) => (value, None),
-            Err(e) => {
-                crate::warn_line!(
-                    "stored document is not valid YAML; reading it as empty: {id}: {e}"
-                );
-                (Value::Object(serde_json::Map::new()), Some(e.to_string()))
-            }
+            Err(e) => (Value::Object(serde_json::Map::new()), Some(e.to_string())),
         };
         Ok(Document {
             id: id.clone(),

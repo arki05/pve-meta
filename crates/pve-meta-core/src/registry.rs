@@ -674,7 +674,6 @@ type Loaded<T> = (Vec<(String, T)>, Vec<RegistryFailure>);
 /// is read and parsed, so a file it shadows is neither loaded nor reported.
 fn load_dirs<T>(
     layers: &[(PathBuf, Origin)],
-    kind: &str,
     parse: impl Fn(&str, &str) -> Result<T>,
     stamp: impl Fn(&mut T, Origin, bool),
 ) -> Result<Loaded<T>> {
@@ -697,7 +696,6 @@ fn load_dirs<T>(
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                crate::warn_line!("skipping unreadable {kind} file {}: {e}", path.display());
                 failures.push(fail(name, e.to_string()));
                 continue;
             }
@@ -708,7 +706,6 @@ fn load_dirs<T>(
                 parsed_out.push((name, parsed));
             }
             Err(e) => {
-                crate::warn_line!("skipping malformed {kind} file {}: {e}", path.display());
                 failures.push(fail(name, e.to_string()));
             }
         }
@@ -721,7 +718,7 @@ fn load_dirs<T>(
 /// the failures) and the [`Registry`] listings (which keep them), so the
 /// two can never compute the sort differently.
 fn prefixes_with_failures(layers: &[(PathBuf, Origin)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
-    let (parsed, failures) = load_dirs(layers, "prefix", parse_prefix, |p, origin, over| {
+    let (parsed, failures) = load_dirs(layers, parse_prefix, |p, origin, over| {
         p.origin = origin;
         p.overrides = over;
     })?;
