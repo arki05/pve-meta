@@ -92,34 +92,6 @@ impl Selector {
             Selector::Tag(t) => tags.iter().any(|have| have == t),
         }
     }
-
-    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`): the
-    /// same shape [`Selector`] serializes, tolerating Perl's `true` → `1`.
-    /// The rule itself is [`parse_selector`]'s, applied unchanged.
-    ///
-    /// # Errors
-    /// [`Error::Registry`] as [`parse_selector`].
-    pub fn from_wire(v: &Value) -> Result<Selector> {
-        let Some(map) = v.as_object() else {
-            return Err(bad("selector: not a map"));
-        };
-        let all = match map.get("all") {
-            None => None,
-            Some(Value::Bool(b)) => Some(*b),
-            Some(Value::Number(n)) => Some(n.as_i64() == Some(1)),
-            Some(Value::String(s)) => Some(s == "1"),
-            Some(_) => return Err(bad("selector: 'all' is not a boolean")),
-        };
-        let tag = match map.get("tag") {
-            None => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(_) => return Err(bad("selector: 'tag' is not a string")),
-        };
-        if map.keys().any(|k| k != "all" && k != "tag") {
-            return Err(bad("selector: unknown field"));
-        }
-        parse_selector("selector", Some(RawSelector { all, tag }))
-    }
 }
 
 /// Most-specific first (longer prefix, then by name): the order
@@ -844,17 +816,6 @@ schema:
         // nothing is packaged.
         let only = load_prefixes(&[dir.path().join("cluster")]).unwrap();
         assert!(only.iter().all(|p| p.origin == Origin::Cluster));
-    }
-
-    #[test]
-    fn a_wire_selector_is_the_file_selector_after_perls_booleans() {
-        // Perl renders `true` as `1`; the rule is still `parse_selector`'s.
-        assert_eq!(Selector::from_wire(&json!({"all": true})).unwrap(), Selector::All);
-        assert_eq!(Selector::from_wire(&json!({"all": 1})).unwrap(), Selector::All);
-        assert_eq!(Selector::from_wire(&json!({"tag": "t"})).unwrap(), Selector::Tag("t".into()));
-        for bad in [json!({}), json!({"all": 0}), json!({"all": true, "tag": "t"}), json!({"tag": ""}), json!({"pool": "p"}), json!("all")] {
-            assert!(Selector::from_wire(&bad).is_err(), "{bad} should not be a selector");
-        }
     }
 
     #[test]
