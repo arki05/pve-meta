@@ -32,7 +32,8 @@ usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
   <id>    a vmid or 'prefixes/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
-  get     print the view; comment keys (key__, a note about key) only with --comments
+  get     print the view; comment keys (key__, a note about key) only with --comments,
+          which also prints a document that does not parse as its raw text
   set     replace the view with the payload ({} stores an empty map; use delete to remove);
           it keeps the stored note of every key it keeps, unless --comments makes it the
           whole subtree, notes included
@@ -199,7 +200,20 @@ sub cmd_get {
 
     # Read as JSON first: it is the form that says whether the value has
     # structure, which decides how it should be printed.
-    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) });
+    my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) };
+    if (my $err = $@) {
+        # A document that does not parse is a 422 in JSON; as YAML with the
+        # notes it is the raw file and its parse_error, as the API answers
+        # format=yaml&comments=1 (docs/DESIGN.md §5).
+        require PVE::API2::Ext::Meta;
+        my ($status) = PVE::API2::Ext::Meta::parse_rs_error($err);
+        fail($err) if ($status // 0) != 422 || $format ne 'yaml' || !$comments;
+        my $raw = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL, 1) });
+        print STDERR "$SELF: the stored document cannot be rendered: $raw->{parse_error}\n"
+            if defined($raw->{parse_error});
+        print $raw->{text};
+        return;
+    }
     my $data = $doc->{data};
 
     # A view the document does not have comes back as the empty document, same as
