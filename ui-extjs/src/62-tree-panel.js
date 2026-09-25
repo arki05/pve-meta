@@ -63,12 +63,20 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.syncButtons();
         });
         me.on('destroy', function () {
-            if (me.textWindow) {
-                me.textWindow.close();
-            }
-            PVE.meta.Monaco.dispose(me.textEditor);
-            me.textEditor = null;
+            me.closeEditors();
+            me.disposeTextEditor();
         });
+    },
+
+    // Everything this panel has open goes with it: a modal that outlives its panel
+    // edits a document nothing will write, since its OK goes through `me` and
+    // `PVE.meta.request` drops the answer once `me` is destroyed.
+    closeEditors: function () {
+        let me = this;
+        if (me.textWindow) {
+            me.textWindow.close();
+        }
+        (me.editors || []).slice().forEach((win) => win.close());
     },
 
     // --- chrome --------------------------------------------------------------
@@ -113,7 +121,18 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         };
     },
 
+    // What the rows can be done to. Text has no rows, so there it is hidden rather
+    // than shown disabled -- all of it but the read-only notice (`syncButtons`).
     buildToolbar: function () {
+        let me = this;
+        return {
+            xtype: 'toolbar',
+            itemId: 'metaToolbar',
+            items: me.buildToolbarItems(),
+        };
+    },
+
+    buildToolbarItems: function () {
         let me = this;
         return [
             {
@@ -126,7 +145,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                         return;
                     }
                     if (t.list) {
-                        me.addListMember(t.path);
+                        me.addListMember(t.path, me.itemKind(t.path));
                     } else {
                         me.addKey(t.docId, t.path);
                     }
@@ -157,7 +176,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 itemId: 'declareBtn',
                 iconCls: 'fa fa-tag',
                 hidden: true,
-                handler: () => me.declareKey(me.getSelection()[0]),
+                handler: () => me.declareKey(),
             },
             {
                 text: gettext('Remove'),
@@ -166,7 +185,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 disabled: true,
                 handler: () => me.removeKey(me.getSelection()[0]),
             },
-            '-',
+            { xtype: 'tbseparator', itemId: 'rowSep' },
             {
                 text: gettext('Edit selection as text'),
                 itemId: 'textSelBtn',
@@ -174,7 +193,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 disabled: true,
                 handler: () => me.editSelectionAsText(),
             },
-            '-',
+            { xtype: 'tbseparator', itemId: 'textSep' },
             { text: gettext('Reload'), itemId: 'reloadBtn', iconCls: 'fa fa-refresh', handler: () => me.reload() },
             '->',
             // Only shown when the caller is restricted (DESIGN §8).
@@ -216,7 +235,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     },
 
     // Revert in Text, and in a window the way out. In the tree there is nothing
-    // unwritten to revert: an edit is a write (DESIGN §6).
+    // unwritten to revert: an edit is a write (decision 026).
     footerSecondary: function () {
         let me = this;
         if (me.mode === 'text') {
@@ -340,7 +359,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // Every path in `docId` whose value does not match its schema, by path -- shown
     // on the rows themselves, from the same Shape the text editor's squiggles use.
     // Advisory, always: an enforcing prefix is the server's 422, not a pre-write
-    // step (DESIGN §4).
+    // step (DESIGN §5).
     findingsFor: function () {
         let out = Object.create(null);
         let shape = this.shapeFor(this.docId);
@@ -356,12 +375,15 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // --- writes --------------------------------------------------------------
 
     // Sends one edit as one write, and reloads. Every editor here goes through this.
-    sendEdit: function (edit, force) {
+    // `onDone(ok)` is the window that asked for it waiting to hear whether it may
+    // close; "Save anyway" carries the same one, so one retry answers once.
+    sendEdit: function (edit, force, onDone) {
         let me = this;
         me.submit(
             me.writeFor(me.docId, edit, me.digestOf(me.docId), force),
-            undefined,
-            force ? undefined : () => me.sendEdit(edit, true),
+            onDone,
+            force ? undefined : () => me.sendEdit(edit, true, onDone),
+            edit,
         );
     },
 
@@ -371,26 +393,59 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return Array.isArray(v) ? v.slice() : [];
     },
 
-    // Writes the list at `path` with member `index` replaced, or dropped when `value`
-    // is undefined. One `replace` of the whole list: a view addresses through maps only.
-    writeListMember: function (path, index, value) {
-        let list = this.listAt(path);
-        if (index < 0 || index >= list.length) {
+    // Writes the list at `path` with one member replaced, or dropped when `value` is
+    // undefined. One `replace` of the whole list: a view addresses through maps only.
+    // `member` is the member as the row showed it, `{ index, value }`, and the write
+    // is of the list as stored *now* -- which after a 409 is not the list the row came
+    // from. If the member is no longer at its index (the list shrank, or moved under
+    // it), nothing is written: an index alone would replace whatever member is there
+    // now, somebody else's.
+    writeListMember: function (path, member, value, onDone) {
+        let me = this;
+        let list = me.listAt(path);
+        let at = member.index;
+        let there = at >= 0 && at < list.length;
+        if (!there || !PVE.meta.Utils.sameValue(list[at], member.value)) {
+            let where = Ext.htmlEncode(path);
+            Ext.Msg.alert(
+                gettext('Conflict'),
+                there
+                    ? Ext.String.format(
+                          gettext('Member {1} of {0} was {2} when this editor opened and is now {3}. Nothing was written: close this editor and open the member again.'),
+                          where,
+                          at,
+                          me.storedValueText(member.value),
+                          me.storedValueText(list[at]),
+                      )
+                    : Ext.String.format(
+                          gettext('The list at {0} no longer has a member {1}. Nothing was written: close this editor and open the member again.'),
+                          where,
+                          at,
+                      ),
+            );
+            // Nothing written, so nothing to wait for: the editor that asked is
+            // told, rather than left masked over a write that never happened.
+            if (onDone) {
+                onDone(false);
+            }
             return;
         }
         if (value === undefined) {
-            list.splice(index, 1);
+            list.splice(at, 1);
         } else {
-            list[index] = value;
+            list[at] = value;
         }
-        this.sendEdit({ path: path, op: 'set', value: list });
+        me.sendEdit({ path: path, op: 'set', value: list }, false, onDone);
     },
+
+    // A list member as `writeListMember` ties an edit to it.
+    memberOf: (rec) => ({ index: rec.data.arrayIndex, value: rec.data.rawItem }),
 
     // A whole subtree, as edited somewhere else: one `replace` at that view, which
     // says everything about what is inside it. What "Edit selection as text" ends
     // with.
-    writeSubtree: function (view, value) {
-        this.sendEdit({ path: view || '', op: 'set', value: value });
+    writeSubtree: function (view, value, onDone) {
+        this.sendEdit({ path: view || '', op: 'set', value: value }, false, onDone);
     },
 
     // The document a row belongs to; the panel's default for anything with no row.
@@ -446,6 +501,19 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return this.store.getRoot();
     },
 
+    // Every row of the tree, never the hidden root it hangs from. ExtJS gives that
+    // root a text of its own (TreeStore's `defaultRootText`, "Root"), so a `data.text`
+    // test took it for a row: the first build then found an "old tree" with nothing
+    // expanded in it and collapsed everything.
+    eachRow: function (fn) {
+        let root = this.store.getRoot();
+        root.cascadeBy(function (n) {
+            if (n !== root) {
+                fn(n);
+            }
+        });
+    },
+
     getSelection: function () {
         return this.tree ? this.tree.getSelection() : [];
     },
@@ -454,6 +522,53 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (this.tree) {
             this.tree.setSelection(rec);
         }
+    },
+
+    // A row's identity across a rebuild. Keyed by document and path *and* key,
+    // since two group rows can share the empty path and a list member shares the
+    // path of the list it is in; this is what the expansion bookkeeping uses too.
+    rowKey: (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || ''),
+
+    // The selected row, and the row above it for when the write removed it.
+    selectionKey: function () {
+        let me = this;
+        let rec = me.getSelection()[0];
+        if (!rec) {
+            return null;
+        }
+        // A top-level row's parent is the hidden root, which is nothing to select.
+        let up = rec.parentNode;
+        return {
+            row: me.rowKey(rec),
+            parent: up && up.parentNode ? me.rowKey(up) : null,
+        };
+    },
+
+    // Puts the selection back on the tree `buildTree` just replaced: the same row
+    // where it is still there, its parent where a Remove took it. Without this
+    // every write left nothing selected and the toolbar disabled under the pointer
+    // that had just used it.
+    reselect: function (want) {
+        let me = this;
+        if (!want) {
+            return;
+        }
+        let row = null;
+        let parent = null;
+        me.eachRow(function (n) {
+            let key = me.rowKey(n);
+            if (!row && key === want.row) {
+                row = n;
+            }
+            if (!parent && want.parent && key === want.parent) {
+                parent = n;
+            }
+        });
+        let found = row || parent;
+        if (found) {
+            me.setSelection(found);
+        }
+        me.syncButtons();
     },
 
     parentPath: (rec) => (rec.parentNode && rec.parentNode.data.path) || '',
@@ -480,48 +595,44 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncButtons: function () {
         let me = this;
         let rec = me.getSelection()[0];
-        let d = rec ? rec.data : null;
+        let row = rec ? rec.data : null;
         let U = PVE.meta.Utils;
         let text = me.mode === 'text';
-        let set = function (id, disabled) {
+        let kind = me.docKind(me.docId);
+        // Disabled per row, hidden per document -- and all of it hidden in Text,
+        // which has no rows. Never hidden per row, so buttons beside one do not
+        // shift under the pointer as the selection changes.
+        let set = function (id, disabled, hidden) {
             let btn = me.down('#' + id);
             if (btn) {
-                btn.setDisabled(disabled);
+                btn.setDisabled(!!disabled);
+                btn.setHidden(text || !!hidden);
             }
         };
         let target = me.addTarget();
         // On a prefix definition Add is disabled at its root: the document's own
         // top-level keys are fixed, even though `schema` holds whatever you declare.
-        let kind = me.docKind(me.docId);
-        let fixedRoot = kind === 'prefix' && target && target.path === '';
-        set('addBtn', text || !target || fixedRoot || !me.editableFor());
-        let row = d;
-        set('editBtn', text || !row || !row.editable);
-        set('removeBtn', text || !row || !row.present || !row.editable);
-        set('textSelBtn', text || !row);
-        set('reloadBtn', text);
-        me.syncFooter();
-        let dflt = me.down('#defaultBtn');
-        if (dflt) {
-            // Hidden when nothing in the document declares a default (a per-document
-            // fact); disabled per row, never hidden per row, so buttons beside it do
-            // not shift under the pointer as the selection changes. Offered on any
-            // row with a default it is not already at -- not just unset ones, since
-            // the value most worth resetting is the one already there and wrong.
-            let offers =
-                !!row &&
-                row.defaultValue !== undefined &&
-                !(row.present && U.sameValue(row.rawValue, row.defaultValue));
-            dflt.setHidden(!me.hasDefaults);
-            dflt.setDisabled(text || !offers || !row.editable);
-        }
+        let fixedRoot = kind === 'prefix' && target.path === '';
+        set('addBtn', fixedRoot || !me.editableFor());
+        set('editBtn', !row || !row.editable);
+        // Offered on any row with a default it is not already at -- not just unset
+        // ones, since the value most worth resetting is the one already there and
+        // wrong. Hidden when nothing in the document declares a default.
+        let offers =
+            !!row &&
+            row.defaultValue !== undefined &&
+            !(row.present && U.sameValue(row.rawValue, row.defaultValue));
+        set('defaultBtn', !offers || !row.editable, !me.hasDefaults);
+        // Declaring a key is a concept of a prefix document only, and needs no row:
+        // it always opens `schema.properties`.
+        set('declareBtn', !me.editableFor(), kind !== 'prefix');
+        // A note on a key that is not set is still something stored to remove.
+        set('removeBtn', !row || !(row.present || row.description) || !row.editable);
+        set('rowSep');
+        set('textSelBtn', !row);
+        set('textSep');
+        set('reloadBtn');
         me.syncAccessLabel();
-        let declare = me.down('#declareBtn');
-        if (declare) {
-            // Hidden by the document (its kind cannot change mid-tree), disabled by the row.
-            declare.setHidden(me.docKind(me.docId) !== 'prefix');
-            declare.setDisabled(text || !row || !row.editable);
-        }
     },
 
     // One place decides what the footer says, in either mode. Everything on it but
@@ -539,8 +650,12 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let apply = me.down('#metaApply');
         if (apply) {
             // The buffer is the edit, and Apply is offered whenever the document is
-            // writable (DESIGN §4); the diff is what decides if it is worth it.
-            apply.setDisabled(!me.access.write);
+            // writable; the diff is what decides if it is worth it. Where it is not,
+            // there is no Apply at all, as in the subtree window: a button that
+            // exists only to be refused is worse than none (the footer's rule), and
+            // the Read-only notice says why.
+            apply.setDisabled(false);
+            apply.setHidden(!textMode || !me.access.write);
         }
         let second = me.down('#metaSecondary');
         if (second) {
@@ -556,36 +671,42 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     syncAccessLabel: function () {
         let me = this;
         let modeBtn = me.down('#modeBtn');
+        // A document that does not parse has no rows to show, and a tree that
+        // showed none would be indistinguishable from an empty document -- one
+        // Apply away from replacing the file with nothing. Text is the only view of
+        // it until it parses, and says so above the buffer as well as on the switch.
+        // Encoded: both are HTML, and a parser's message quotes the file.
+        let why = me.docParseError
+            ? Ext.String.format(
+                  gettext('This document is not valid YAML and can only be repaired as text: {0}'),
+                  Ext.htmlEncode(me.docParseError),
+              )
+            : undefined;
         if (modeBtn && modeBtn.items.getAt(0)) {
-            // A document that does not parse has no rows to show, and a tree that
-            // showed none would be indistinguishable from an empty document -- one
-            // Apply away from replacing the file with nothing. Text is the only
-            // view of it until it parses.
             let tree = modeBtn.items.getAt(0);
-            tree.setDisabled(!!me.docParseError);
-            tree.setTooltip(
-                me.docParseError
-                    ? Ext.String.format(
-                          gettext('This document is not valid YAML and can only be repaired as text: {0}'),
-                          me.docParseError,
-                      )
-                    : undefined,
-            );
+            tree.setDisabled(!!why);
+            tree.setTooltip(why);
+        }
+        let notice = me.down('#metaParseNotice');
+        if (notice) {
+            notice.setHtml(why ? '<i class="fa fa-exclamation-triangle warning"></i> ' + why : '');
+            notice.setHidden(!why);
         }
         if (modeBtn && modeBtn.items.getAt(1)) {
             modeBtn.items.getAt(1).setDisabled(!me.access.read);
         }
         me.syncFooter();
         let label = me.down('#accessText');
-        if (!label) {
-            return;
+        if (label) {
+            label.setText(gettext('Read-only'));
+            label.setVisible(!me.access.write);
         }
-        if (me.access.write) {
-            label.setVisible(false);
-            return;
+        // In Text the notice is all the bar has left to say; with nothing to say,
+        // the bar goes too.
+        let bar = me.down('#metaToolbar');
+        if (bar) {
+            bar.setHidden(me.mode === 'text' && !!me.access.write);
         }
-        label.setText(gettext('Read-only'));
-        label.setVisible(true);
     },
 
     // --- rows ---------------------------------------------------------------
@@ -725,7 +846,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
                 return;
             }
             // A declared type wins over the type inferred from the stored value.
-            child.kind = ps.type ? me.schemaKind(ps) : child.kind || 'string';
+            child.kind = ps.type ? U.schemaValueKind(ps.type) : child.kind || 'string';
             // First writer wins: the index lists each path once, under the prefix
             // that governs it, so these six fields cannot disagree.
             if (ps.default !== undefined && child.defaultValue === undefined) {
@@ -751,13 +872,6 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         });
     },
 
-    // The declared type as the kind the editor and `parseValue` speak. One mapping:
-    // `Utils.schemaValueKind` had a second copy of it, so adding a type to one and not
-    // the other would have made a row's editor disagree with the parser behind it.
-    schemaKind: function (schema) {
-        return PVE.meta.Utils.schemaValueKind((schema && schema.type) || 'string');
-    },
-
     // The merged rows of ONE document: what is present in it, plus what its grammar
     // declares (DESIGN §8). Two sources, one set of entries.
     documentEntries: function () {
@@ -768,88 +882,103 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         return root;
     },
 
-    buildTree: function () {
+    // The node configs for the rows under `entry`, sorted by key. Pure: what a row
+    // shows is the merged entry, the findings at its path and those beneath it.
+    rowNodes: function (entry, docId, findings, below) {
         let me = this;
         let I = PVE.meta.Icons;
+        let U = PVE.meta.Utils;
+        let editable = me.editableFor();
+        return Object.keys(entry.children)
+            .sort()
+            .map(function (key) {
+                let c = entry.children[key];
+                let kind = c.kind || 'string';
+                let branch = kind === 'map' || Object.keys(c.children).length > 0;
+                let under = below[c.path] || { count: 0, messages: [] };
+                let node = {
+                    key: key,
+                    text: key,
+                    docId: docId,
+                    path: c.path,
+                    kind: kind,
+                    present: !!c.present,
+                    description: c.description || '',
+                    grammarDescription: c.grammarDescription || '',
+                    defaultValue: c.defaultValue,
+                    enumValues: c.enumValues,
+                    minimum: c.minimum,
+                    maximum: c.maximum,
+                    format: c.format,
+                    multiline: c.multiline,
+                    rawValue: c.value,
+                    arrayIndex: c.arrayIndex,
+                    addressable: c.addressable !== false,
+                    rawItem: c.rawItem,
+                    valueText: c.present ? U.displayValue(c.value, kind) : '',
+                    finding: findings[c.path] || '',
+                    belowCount: under.count,
+                    belowText: under.messages.join('\n'),
+                    editable: editable,
+                    leaf: !branch,
+                };
+                if (branch) {
+                    node.children = me.rowNodes(c, docId, findings, below);
+                    node.expanded = true;
+                    node.iconCls = I.mapExpanded;
+                    node.expandedCls = I.mapExpanded;
+                } else {
+                    node.iconCls = I.leaf;
+                }
+                return node;
+            });
+    },
+
+    // The branches of the tree as it stands that are open, by row key -- or `null`
+    // when it has no branch at all yet, so the first build keeps every branch open
+    // as `rowNodes` built it.
+    expandedRows: function () {
+        let me = this;
+        let expanded = null;
+        me.eachRow(function (n) {
+            if (!n.isLeaf()) {
+                expanded = expanded || Object.create(null);
+                if (n.isExpanded()) {
+                    expanded[me.rowKey(n)] = true;
+                }
+            }
+        });
+        return expanded;
+    },
+
+    buildTree: function () {
+        let me = this;
         let findings = me.findingsFor();
         // What each branch has to answer for: the schema findings beneath it, which
         // are invisible once the branch is collapsed.
         let below = PVE.meta.Utils.rollUp(findings);
+        let children = me.rowNodes(me.documentEntries(), me.docId, findings, below);
 
-        let toNodes = function (entry, docId) {
-            return Object.keys(entry.children)
-                .sort()
-                .map(function (key) {
-                    let c = entry.children[key];
-                    let kind = c.kind || 'string';
-                    if (c.defaultValue !== undefined) {
-                        me.hasDefaults = true;
-                    }
-                    let node = {
-                        key: key,
-                        text: key,
-                        docId: docId,
-                        path: c.path,
-                        kind: kind,
-                        present: !!c.present,
-                        description: c.description || '',
-                        grammarDescription: c.grammarDescription || '',
-                        defaultValue: c.defaultValue,
-                        enumValues: c.enumValues,
-                        minimum: c.minimum,
-                        maximum: c.maximum,
-                        format: c.format,
-                        multiline: c.multiline,
-                        rawValue: c.value,
-                        arrayIndex: c.arrayIndex,
-                        addressable: c.addressable !== false,
-                        rawItem: c.rawItem,
-                        valueText: c.present ? PVE.meta.Utils.displayValue(c.value, kind) : '',
-                        finding: findings[c.path] || '',
-                        belowCount: (below[c.path] || {}).count || 0,
-                        belowText: ((below[c.path] || {}).messages || []).join('\n'),
-                        editable: me.editableFor(),
-                        leaf: kind !== 'map' && !Object.keys(c.children).length,
-                    };
-                    if (kind === 'map' || Object.keys(c.children).length) {
-                        node.children = toNodes(c, docId);
-                        node.expanded = true;
-                        node.iconCls = I.mapExpanded;
-                        node.expandedCls = I.mapExpanded;
-                    } else {
-                        node.iconCls = I.leaf;
-                    }
-                    return node;
-                });
-        };
-
-        // Does anything in this document declare a default? If not, "Set to default"
+        // Does anything in this document declare a default? If not, "Set to Default"
         // is furniture.
-        me.hasDefaults = false;
-        let children = toNodes(me.documentEntries(), me.docId);
+        let declares = (nodes) =>
+            nodes.some((n) => n.defaultValue !== undefined || (!!n.children && declares(n.children)));
+        me.hasDefaults = declares(children);
 
-        // Reloading must not fold the tree up. Keyed by document and path, since two
-        // panels (a window and the tab behind it) can each hold a different document.
-        let key = (n) => (n.data.docId || '') + '\u0000' + n.data.path + '\u0000' + (n.data.key || '');
-        let expanded = Object.create(null);
-        let seen = false;
-        me.store.getRoot().cascadeBy(function (n) {
-            if (n.data.text && !n.isLeaf()) {
-                seen = true;
-                if (n.isExpanded()) {
-                    expanded[key(n)] = true;
-                }
-            }
-        });
+        // Reloading must not fold the tree up, and must not lose the selection
+        // either: both are read off the old tree before the root is replaced.
+        let selected = me.selectionKey();
+        let expanded = me.expandedRows();
         me.store.setRoot({ expanded: true, children: children });
-        if (seen) {
-            me.store.getRoot().cascadeBy(function (n) {
-                if (n.data.text && !n.isLeaf() && !expanded[key(n)]) {
+        if (expanded) {
+            me.eachRow(function (n) {
+                if (!n.isLeaf() && !expanded[me.rowKey(n)]) {
                     n.collapse();
                     n.set('iconCls', PVE.meta.Icons.map);
                 }
             });
         }
+        me.reselect(selected);
     },
 
     // --- editing ------------------------------------------------------------
@@ -860,13 +989,45 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     openEditor: function (xtype, cfg, on, handler) {
         let me = this;
         me.editing = true;
+        me.noteOpenedOn();
         let win = Ext.create(xtype, cfg);
         win.on(on, handler);
+        // Tracked the way `textWindow` is: a modal outliving its panel is a write
+        // with nowhere to land.
+        me.editors = me.editors || [];
+        me.editors.push(win);
         win.on('destroy', function () {
             me.editing = false;
+            me.editors = me.editors.filter((open) => open !== win);
+            me.openedOn = null;
+            me.editorClosed();
         });
         win.show();
         return win;
+    },
+
+    // Monaco on one view of this document, in its own modal window, which
+    // `reload` waits for like it waits for the row editors. A write reloads on
+    // its own once the window has closed over it, so closing reloads nothing
+    // that is not already owed.
+    openTextWindow: function (view, text) {
+        let me = this;
+        me.noteOpenedOn();
+        me.textWindow = Ext.create('PVE.meta.TextWindow', { view: view, text: text, tree: me });
+        me.textWindow.on('destroy', function () {
+            me.textWindow = null;
+            me.openedOn = null;
+            me.editorClosed();
+        });
+        me.textWindow.show();
+    },
+
+    // The document as the modal editor about to open sees it: what a 409 under it
+    // compares the stored value against. Not the panel's current copy, which the
+    // first conflict re-reads -- after that, "the value this editor opened on" would
+    // be the value the conflict found.
+    noteOpenedOn: function () {
+        this.openedOn = this.dataOf(this.docId);
     },
 
     editRow: function (rec) {
@@ -885,8 +1046,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.editAsText(rec);
             return;
         }
-        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.sendEdit({ path: rec.data.path, op: 'set', value: value }),
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value, done) =>
+            me.sendEdit({ path: rec.data.path, op: 'set', value: value }, false, done),
         );
     },
 
@@ -897,9 +1058,11 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         let me = this;
         me.openEditor(
             'PVE.meta.AddKeyWindow',
-            { parentPath: parentPath || '' },
+            // The window checks the key against this panel's document: Add never
+            // overwrites what is already at that path.
+            { parentPath: parentPath || '', tree: me },
             'addkey',
-            (path, value) => me.sendEdit({ path: path, op: 'set', value: value }),
+            (path, value, done) => me.sendEdit({ path: path, op: 'set', value: value }, false, done),
         );
     },
 
@@ -919,15 +1082,44 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
 
     // Appending to a list. A member of a list has no name to give it, so this asks
     // for a value.
-    addListMember: function (path) {
+    addListMember: function (path, kind) {
         let me = this;
-        let list = me.listAt(path);
-        me.openEditor('PVE.meta.AddKeyWindow', { parentPath: path, list: true }, 'addkey', function (
+        let cfg = { parentPath: path, list: true, tree: me, kind: kind || 'string' };
+        me.openEditor('PVE.meta.AddKeyWindow', cfg, 'addkey', function (
             _path,
             value,
+            done,
         ) {
-            me.sendEdit({ path: path, op: 'set', value: list.concat([value]) });
+            // The list as stored when OK is pressed, not when the window opened: a 409
+            // re-reads it underneath, and appending to the old copy would drop what
+            // the other writer added.
+            let stored = PVE.meta.Utils.valueAt(me.dataOf(me.docId), path);
+            if (stored !== undefined && !Array.isArray(stored)) {
+                Ext.Msg.alert(
+                    gettext('Conflict'),
+                    Ext.String.format(
+                        gettext('{0} is no longer a list. Nothing was written.'),
+                        Ext.htmlEncode(path),
+                    ),
+                );
+                done(false);
+                return;
+            }
+            me.sendEdit({ path: path, op: 'set', value: me.listAt(path).concat([value]) }, false, done);
         });
+    },
+
+    // What a new member of the list at `path` is, as Add Key's Type speaks: the
+    // schema's `items.type` where the list declares one, else a string.
+    itemKind: function (path) {
+        let entry = this.shapeFor(this.docId)
+            .schemaIndex()
+            .filter((e) => e.path === path)[0];
+        let type = entry && entry.schema && entry.schema.items && entry.schema.items.type;
+        if (!type) {
+            return 'string';
+        }
+        return type === 'object' ? 'map' : PVE.meta.Utils.schemaValueKind(type);
     },
 
     // Editing one member of a list: a scalar gets the ordinary value editor, and
@@ -941,8 +1133,8 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
             me.editAsText(rec);
             return;
         }
-        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value) =>
-            me.writeListMember(d.path, d.arrayIndex, value),
+        me.openEditor('PVE.meta.EditValueWindow', { rec: rec }, 'setvalue', (value, done) =>
+            me.writeListMember(d.path, me.memberOf(rec), value, done),
         );
     },
 
@@ -950,22 +1142,16 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
     // a map like any other, so this opens it as text (DESIGN §3). An empty map
     // gets a hint instead of a blank buffer, so the first key is not typed from
     // nothing.
-    declareKey: function (rec) {
+    declareKey: function () {
         let me = this;
-        if (!rec || me.docKind(me.docId) !== 'prefix') {
+        if (me.docKind(me.docId) !== 'prefix') {
             return;
         }
         let props = PVE.meta.Utils.valueAt(me.dataOf(me.docId), 'schema.properties');
         if (!props || !Object.keys(props).length) {
             props = { key_name: { type: 'string' } };
         }
-        me.textWindow = Ext.create('PVE.meta.TextWindow', {
-            view: 'schema.properties',
-            text: PVE.meta.Codec.dump(props, 'yaml'),
-            tree: me,
-        });
-        me.textWindow.on('destroy', () => (me.textWindow = null));
-        me.textWindow.show();
+        me.openTextWindow('schema.properties', PVE.meta.Codec.dump(props, 'yaml'));
     },
 
     // `DELETE ?view=<path>`, which takes the key's note with it (`view::remove`). A
@@ -977,18 +1163,31 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         if (!rec || !rec.data.path) {
             return;
         }
+        let member = rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null;
+        // A row that is only its note (`k__` stored, `k` not): the note is what
+        // there is to remove, at its own path.
+        let noteOnly = !member && !rec.data.present && !!rec.data.description;
+        let path = Ext.htmlEncode(rec.data.path);
+        let question;
+        if (member) {
+            question = Ext.String.format(gettext('Remove member {1} of "{0}"?'), path, rec.data.arrayIndex);
+        } else if (noteOnly) {
+            question = Ext.String.format(gettext('Remove the note on "{0}"?'), path);
+        } else {
+            question = Ext.String.format(gettext('Remove "{0}"?'), path);
+        }
         Ext.Msg.confirm(
             gettext('Confirm'),
-            Ext.String.format(gettext('Remove "{0}"?'), rec.data.path),
+            question,
             function (btn) {
                 if (btn !== 'yes') {
                     return;
                 }
-                if (rec.data.arrayIndex !== undefined && rec.data.arrayIndex !== null) {
-                    me.writeListMember(rec.data.path, rec.data.arrayIndex, undefined);
+                if (member) {
+                    me.writeListMember(rec.data.path, me.memberOf(rec), undefined);
                     return;
                 }
-                me.sendEdit({ path: rec.data.path, op: 'delete' });
+                me.sendEdit({ path: rec.data.path + (noteOnly ? '__' : ''), op: 'delete' });
             },
         );
     },
@@ -1017,14 +1216,7 @@ Ext.define('PVE.meta.TreePanel', PVE.meta.compose({
         // that is the document OK writes back to.
         let stored = me.dataOf(me.docId);
         let subtree = view === '' ? stored : PVE.meta.Utils.valueAt(stored, view);
-        me.textWindow = Ext.create('PVE.meta.TextWindow', {
-            view: view,
-            text: PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'),
-            tree: me,
-        });
-        // No reload on close: the write, if there was one, reloads on its own.
-        me.textWindow.on('destroy', () => (me.textWindow = null));
-        me.textWindow.show();
+        me.openTextWindow(view, PVE.meta.Codec.dump(subtree === undefined ? {} : subtree, 'yaml'));
     },
 }, PVE.meta.Doc, PVE.meta.TextCard));
 

@@ -28,11 +28,13 @@ sub ext_path { return 'meta' }
 # The CLI is a local reader with no ticket and no pveproxy; it authorizes
 # nothing, so it needs only the lookups below, never `_guest_acl` itself.
 
-# A guest's PVE tags, split from the `;`-separated config string.
+# A guest's PVE tags, split from the `;`-separated config string by
+# `pve_meta_core::tags::split_tags` -- the rule every consumer of a document
+# splits with (pve-meta-guest-files and the operators), so a selector matches
+# the same tags here as there.
 sub parse_tags {
     my ($raw) = @_;
-    return [] if !defined($raw) || $raw eq '';
-    return [grep { length($_) } split(/[;,\s]+/, $raw)];
+    return PVE::RS::Meta::split_tags($raw);
 }
 
 # A guest's tags, read fresh via the cached cluster property fetch.
@@ -70,11 +72,23 @@ sub guest_node {
     return (vmlist_ids()->{$vmid} // {})->{node};
 }
 
+# Whether a document id names a guest (a vmid) rather than a registry file
+# ('prefixes/<name>'): the one place Perl tells the two apart. Anything else
+# is left to Rust's `api::parse_id`, which refuses it with a 400.
+sub is_guest_id {
+    my ($id) = @_;
+    return $id =~ /^\d+$/;
+}
+
 # The `cfs_lock_domain` name for one document's write lock, held by the API
-# and the CLI alike. $id is a vmid or 'prefixes/<name>'.
+# and the CLI alike. $id is a vmid or 'prefixes/<name>', checked first by
+# Rust's `api::parse_id`, which dies "400: ..." like any `api_*` call: the
+# lock is a directory pmxcfs creates under that name, and one it cannot
+# create is a lock timeout.
 sub lock_domain_for {
     my ($id) = @_;
-    return "pve-meta-$id" if $id =~ /^\d+$/;
+    PVE::RS::Meta::check_id($id);
+    return "pve-meta-$id" if is_guest_id($id);
     my (undef, $name) = split(m{/}, $id, 2);
     return "pve-meta-prefix-$name";
 }
@@ -153,7 +167,7 @@ sub _call {
 sub _locked {
     my ($id, $code) = @_;
 
-    my $res = PVE::Cluster::cfs_lock_domain(lock_domain_for($id), 10, $code);
+    my $res = PVE::Cluster::cfs_lock_domain(_call(\&lock_domain_for, $id), 10, $code);
     if (my $err = $@) {
         die $err if ref($err); # a PVE::Exception raised by _call
         my $msg = "$err";
@@ -411,17 +425,13 @@ __PACKAGE__->register_method({
             my $acl = _registry_acl($rpcenv, $authuser);
             return { read => $acl->{read}, write => $acl->{write} };
         }
-        if ($id =~ m{^prefixes/}) {
-            return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
-        }
-        if ($id =~ m{^\d+$}) {
+        if (is_guest_id($id)) {
             assert_guest_exists($id);
             return _call(
                 \&PVE::RS::Meta::api_access, $id, _guest_acl($rpcenv, $authuser, $id),
             );
         }
-        # Anything else is refused by the one id parser with a 400, rather than
-        # this endpoint growing a second opinion about what an id is.
+        # A prefix file, or an id the one id parser refuses with a 400.
         return _call(\&PVE::RS::Meta::api_access, $id, _registry_acl($rpcenv, $authuser));
     },
 });
@@ -528,15 +538,12 @@ __PACKAGE__->register_method({
 #             Runs before a read and *inside* the lock before a write, so a
 #             guest destroyed in between is a 404 and not a resurrected file;
 #             and before the ACL is computed, so a 404 costs no ACL lookups.
-#   check_put optional, $param -> the same, for PUT alone and after `check`: what
-#             only creating a file needs.
 #   describe  { get, put, delete } -> the method descriptions
 #   perms     { get, put, delete } -> the permission descriptions
 sub _register_document_methods {
     my ($spec) = @_;
     my ($name, $path, $params) = @$spec{qw(name path params)};
     my $check = $spec->{check} // sub { };
-    my $check_put = $spec->{check_put} // sub { };
 
     my $caller = sub {
         my ($param) = @_;
@@ -594,7 +601,6 @@ sub _register_document_methods {
             my ($param) = @_;
             return _locked($spec->{id}->($param), sub {
                 $check->($param);
-                $check_put->($param);
                 return $put_view->($spec->{id}->($param), $param, $caller->($param));
             });
         },
@@ -628,9 +634,10 @@ sub _register_document_methods {
 
 # -- registry documents ------------------------------------------------------
 
-# The same shape `pve_meta_core::registry::is_valid_file_name` accepts (pattern and
-# `MAX_FILE_NAME_LEN`): this schema is the friendly 400, Rust's own re-check on parse
-# is the real one.
+# The shape `registry::is_valid_file_name` accepts (its charset and
+# `MAX_FILE_NAME_LEN`), checked by PVE before the method runs, for a 400 naming
+# the parameter. `api::parse_id` re-checks it on every call, and
+# `lock_domain_for` before a write names its cfs lock after the file.
 my $REGISTRY_NAME_SCHEMA = {
     type => 'string',
     pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',

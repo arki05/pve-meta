@@ -13,11 +13,15 @@
  * capturing the original prototype method in a closure and invoking it
  * with a plain Function.prototype.apply(), no Ext class-system machinery
  * involved at all. The obvious alternative - Ext.override(cls, {...})
- * with this.callParent(arguments) inside the replacement - throws in real
- * ExtJS 7 classic (as shipped by PVE), silently killing the *whole*
- * config panel for every guest. The capture-and-apply fix is proven in a
- * real browser against real pve-manager and must not be changed without
- * re-doing that verification.
+ * with this.callParent(arguments) inside the replacement - cannot work
+ * from this file: ExtJS resolves what callParent() is to call through
+ * Function.prototype.caller, and reading .caller from inside a
+ * strict-mode function throws a TypeError. Everything below is
+ * 'use strict', so the override would throw and silently kill the
+ * *whole* config panel for every guest. (Dropping 'use strict' is not
+ * the fix.) The capture-and-apply technique is proven in a real browser
+ * against real pve-manager and must not be changed without re-doing that
+ * verification.
  *
  * Plain ES2017, no build step, no external dependencies.
  */
@@ -80,110 +84,97 @@
         return;
     }
 
-    // --- Theme detection (same logic as pve-meta-loader.js) -------------
-    // Mirrors PVE's PVEThemeCookie ('crisp' -> light, 'proxmox-dark' ->
-    // dark, anything else -> follow the OS/browser preference).
-    function getPveTheme() {
-        var cookieVal = '';
-        try {
-            if (typeof Ext !== 'undefined' && Ext.util && Ext.util.Cookies && typeof Ext.util.Cookies.get === 'function') {
-                cookieVal = Ext.util.Cookies.get('PVEThemeCookie') || '';
-            } else {
-                var match = document.cookie.match(/(?:^|;\s*)PVEThemeCookie=([^;]*)/);
-                cookieVal = match ? decodeURIComponent(match[1]) : '';
-            }
-        } catch (e) {
-            warn('failed to read PVEThemeCookie, falling back to OS preference', e);
-        }
+    // --- GET /ext/pages, prefetched once, asynchronously -----------------
+    //
+    // Started right here at script-load time: this file is injected after
+    // pvemanagerlib.js and before the app starts, so the request is
+    // normally answered long before the first config panel is built, and
+    // that panel gets its tabs from initComponent like any other. A panel
+    // built while the prefetch is still in flight registers a waiter and
+    // is given its tabs when the answer arrives (addTabsWhenPagesArrive,
+    // below, which has to take a different seam). Never synchronous:
+    // an XHR with async=false here froze the UI thread for exactly as
+    // long as pveproxy took to answer.
+    //
+    // index.html.tpl is also rendered pre-login, so the prefetch can
+    // legitimately 401. A failed request is therefore not cached as an
+    // empty list for the session: the next config panel - which can only
+    // be built post-login - asks again.
+    var pagesState = 'idle'; // 'idle' | 'loading' | 'ready' | 'failed'
+    var pagesList = [];
+    var pagesWaiters = [];
 
-        if (cookieVal === 'proxmox-dark') {
-            return 'dark';
-        }
-        if (cookieVal === 'crisp') {
-            return 'light';
-        }
-
-        try {
-            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                return 'dark';
+    function notifyPagesWaiters(pages) {
+        var waiters = pagesWaiters;
+        pagesWaiters = [];
+        for (var i = 0; i < waiters.length; i++) {
+            try {
+                waiters[i](pages);
+            } catch (e) {
+                warn('a panel waiting for ' + PAGES_URL + ' failed to handle the answer', e);
             }
-        } catch (e) {
-            /* matchMedia unsupported - default to light below */
         }
-        return 'light';
     }
 
-    // --- GET /ext/pages, fetched once and cached ------------------------
-    //
-    // Deliberately lazy and synchronous: at script-load time (every
-    // index.html.tpl render, including pre-login) there is no session yet
-    // and the request would just 401; by the time a config panel is
-    // constructed the user is logged in, so a synchronous fetch here has
-    // the tab list ready for that panel's own initComponent with no
-    // async/race complexity. Same-origin call to pveproxy itself
-    // (typically sub-10ms). Cached after the first attempt, never retried.
-    var pagesCache = null;
+    function pagesFailed(reason, err) {
+        pagesState = 'failed';
+        warn(reason + ' - no extension tabs until a config panel asks again', err);
+        notifyPagesWaiters([]);
+    }
 
-    function fetchPagesOnce() {
-        if (pagesCache !== null) {
-            return pagesCache;
-        }
-        pagesCache = [];
+    function requestPages() {
         try {
             var xhr = new XMLHttpRequest();
-            xhr.open('GET', PAGES_URL, false);
+            xhr.open('GET', PAGES_URL, true);
             xhr.setRequestHeader('Accept', 'application/json');
-            xhr.send(null);
-            if (xhr.status >= 200 && xhr.status < 300) {
-                var body = JSON.parse(xhr.responseText);
-                if (body && Ext.isArray(body.data)) {
-                    pagesCache = body.data;
-                } else {
-                    warn('unexpected ' + PAGES_URL + ' response shape, ignoring it');
+            xhr.onload = function () {
+                var pages = null;
+                var reason = PAGES_URL + ' returned HTTP ' + xhr.status;
+                try {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        var body = JSON.parse(xhr.responseText);
+                        if (body && Ext.isArray(body.data)) {
+                            pages = body.data;
+                        } else {
+                            reason = 'unexpected ' + PAGES_URL + ' response shape';
+                        }
+                    }
+                } catch (e) {
+                    reason = PAGES_URL + ' did not answer with parsable JSON';
                 }
-            } else {
-                warn(PAGES_URL + ' returned HTTP ' + xhr.status + ' - no extension tabs will be added this session');
-            }
+                if (pages) {
+                    pagesState = 'ready';
+                    pagesList = pages;
+                    notifyPagesWaiters(pagesList);
+                } else {
+                    pagesFailed(reason);
+                }
+            };
+            xhr.onerror = function () {
+                pagesFailed(PAGES_URL + ' could not be reached');
+            };
+            xhr.send(null);
         } catch (e) {
-            warn('failed to fetch ' + PAGES_URL + ' - no extension tabs will be added this session', e);
+            pagesFailed('failed to request ' + PAGES_URL, e);
         }
-        return pagesCache;
     }
 
-    // --- Placeholder substitution ----------------------------------------
-
-    // {query} is handled separately (expandQueryPlaceholder, below): it
-    // substitutes an already-encoded query string, never re-encoded.
-    function expandUrl(template, vars) {
-        return String(template).replace(/\{(vmid|node|type|theme)\}/g, function (whole, name) {
-            var v = vars[name];
-            return v === undefined || v === null ? '' : encodeURIComponent(v);
-        });
+    function startPagesPrefetch() {
+        if (pagesState === 'idle' || pagesState === 'failed') {
+            pagesState = 'loading';
+            requestPages();
+        }
     }
 
-    function expandQueryPlaceholder(template, query) {
-        return String(template).replace(/\{query\}/g, query);
-    }
-
-    function buildQuery(target, vars) {
-        var theme = encodeURIComponent(vars.theme);
-        if (target === 'dc') {
-            return 'dc=1&theme=' + theme;
+    // Calls cb(pages) - synchronously if the prefetch is already done,
+    // otherwise once it is (with [] if it gave up).
+    function whenPagesReady(cb) {
+        if (pagesState === 'ready') {
+            cb(pagesList);
+            return;
         }
-        if (target === 'node') {
-            return 'node=' + encodeURIComponent(vars.node) + '&theme=' + theme;
-        }
-        // lxc / qemu
-        return (
-            'vmid=' +
-            encodeURIComponent(vars.vmid) +
-            '&type=' +
-            encodeURIComponent(vars.type) +
-            '&node=' +
-            encodeURIComponent(vars.node) +
-            '&theme=' +
-            theme
-        );
+        pagesWaiters.push(cb);
+        startPagesPrefetch();
     }
 
     // ExtJS renders a panel's `title` as markup, so it must be escaped
@@ -357,10 +348,12 @@
         };
     }
 
-    // Builds the list of tab item configs to add to a given PVE.panel.Config
-    // instance, or [] if this instance's class isn't one of our targets, or
-    // no manifest applies to it.
-    function tabsFor(me) {
+    // Everything about a given PVE.panel.Config instance that the tab
+    // configs are built from, or null if this instance's class isn't one
+    // of our targets (or its vmid/node cannot be determined). Resolved
+    // during initComponent, so a panel that has to wait for the prefetch
+    // still describes the guest/node it was built for.
+    function targetContextFor(me) {
         var className = '';
         try {
             if (me && typeof me.$className === 'string' && me.$className) {
@@ -372,15 +365,15 @@
             }
         } catch (e) {
             warn('failed to determine component class name', e);
-            return [];
+            return null;
         }
 
         var target = TARGETS[className];
         if (!target) {
-            return []; // not a panel we care about (pool/storage/sdn/... config)
+            return null; // not a panel we care about (pool/storage/sdn/... config)
         }
 
-        var vars = { theme: getPveTheme() };
+        var vars = {};
         if (target === 'lxc' || target === 'qemu') {
             var selData = me.pveSelNode && me.pveSelNode.data;
             vars.vmid = selData && selData.vmid;
@@ -388,37 +381,39 @@
             vars.type = target;
             if (!vars.vmid || !vars.node) {
                 warn('could not determine vmid/node for ' + className + ' - skipping all extension tabs for this panel.');
-                return [];
+                return null;
             }
         } else if (target === 'node') {
             vars.node = me.pveSelNode && me.pveSelNode.data && me.pveSelNode.data.node;
             vars.type = 'node';
             if (!vars.node) {
                 warn('could not determine node name for ' + className + ' - skipping all extension tabs for this panel.');
-                return [];
+                return null;
             }
         } else {
             // dc
             vars.type = 'dc';
         }
 
-        var query = buildQuery(target, vars);
+        return { target: target, vars: vars };
+    }
 
-        var pages = fetchPagesOnce();
+    // The tab item configs the given pages contribute to that context, in
+    // manifest order - the one order tabs are ever added in, whether they
+    // go into `items` before initComponent or through add() afterwards.
+    function buildTabItems(context, pages) {
+        var target = context.target;
+        var vars = context.vars;
+
         var items = [];
         for (var i = 0; i < pages.length; i++) {
             var manifest = pages[i];
             try {
-                if (!manifest || !manifest.id || !manifest.title || !manifest.script || !manifest.xtype || !Ext.isArray(manifest.targets)) {
-                    warn('ignoring malformed page manifest (missing id/title/script/xtype/targets): ' + JSON.stringify(manifest));
-                    continue;
-                }
+                // PVE::API2::Ext only lists a manifest that has every field.
                 if (manifest.targets.indexOf(target) === -1) {
                     continue;
                 }
-                var scriptSrc = expandUrl(manifest.script, vars);
-                scriptSrc = expandQueryPlaceholder(scriptSrc, query);
-                scriptSrc = withVersion(scriptSrc, manifest.fingerprint);
+                var scriptSrc = withVersion(manifest.script, manifest.fingerprint);
                 var instanceConfig = buildInstanceConfig(target, vars);
                 items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
             } catch (e) {
@@ -426,6 +421,53 @@
             }
         }
         return items;
+    }
+
+    // Tabs for a panel that is still being built: they go into `items`,
+    // before the original initComponent gets to see them.
+    function addTabConfigs(me, tabs) {
+        if (!tabs.length) {
+            return;
+        }
+        me.items = me.items || [];
+        for (var i = 0; i < tabs.length; i++) {
+            var tabItem = tabs[i];
+            if (!me.items.some(function (it) { return it && it.itemId === tabItem.itemId; })) {
+                me.items.push(tabItem);
+            }
+        }
+    }
+
+    // Tabs for a panel that was already built when the answer arrived.
+    // PVE.panel.Config is a card panel with a treelist nav, not a tab
+    // panel: initComponent hands `items` to its own insertNodes(), which
+    // files each one in savedItems and appends a node to the nav store,
+    // and then deletes `items`. A plain add() would therefore install a
+    // card nothing can ever navigate to - the late path has to go through
+    // insertNodes() too. The nav treelist is bound to that store and
+    // picks up the appended node by itself. Appended in manifest order,
+    // so the order is the same as the pre-initComponent path's.
+    function addTabsWhenPagesArrive(me, context) {
+        whenPagesReady(function (pages) {
+            try {
+                if (!pages.length || me.destroying || me.destroyed) {
+                    return;
+                }
+                if (typeof me.insertNodes !== 'function' || !me.savedItems || !me.store) {
+                    warn('this PVE.panel.Config has no insertNodes()/savedItems - pvemanagerlib.js may have changed. Skipping its extension tab(s).');
+                    return;
+                }
+                var tabs = buildTabItems(context, pages);
+                for (var i = 0; i < tabs.length; i++) {
+                    // insertNodes() throws on an itemId it already holds.
+                    if (!me.savedItems[tabs[i].itemId]) {
+                        me.insertNodes([tabs[i]]);
+                    }
+                }
+            } catch (e) {
+                warn('failed to add extension tab(s) to an already-built panel, continuing without them', e);
+            }
+        });
     }
 
     // --- The actual patch -------------------------------------------------
@@ -441,15 +483,11 @@
         configProto.initComponent = function () {
             var me = this;
             try {
-                var tabs = tabsFor(me);
-                if (tabs.length) {
-                    me.items = me.items || [];
-                    for (var i = 0; i < tabs.length; i++) {
-                        var tabItem = tabs[i];
-                        if (!me.items.some(function (it) { return it && it.itemId === tabItem.itemId; })) {
-                            me.items.push(tabItem);
-                        }
-                    }
+                var context = targetContextFor(me);
+                if (context && pagesState === 'ready') {
+                    addTabConfigs(me, buildTabItems(context, pagesList));
+                } else if (context) {
+                    addTabsWhenPagesArrive(me, context);
                 }
             } catch (e) {
                 warn('failed to inject extension tab(s) for this panel, continuing without them', e);
@@ -465,5 +503,6 @@
     }
 
     window.PveExtLoaded = true;
+    startPagesPrefetch();
     info('extension tab injection active.');
 })();

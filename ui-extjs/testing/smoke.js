@@ -31,6 +31,10 @@ const ctx = {
     WebAssembly,
     TextEncoder,
     TextDecoder,
+    // The browser's, which the editor uses for the Monaco load timeout and the
+    // annotation debounce; a fresh vm context has neither.
+    setTimeout,
+    clearTimeout,
     gettext: (s) => s,
     Ext: {
         // Just enough of the VTypes singleton for PVE.meta.Utils.checkFormat: the real
@@ -66,7 +70,15 @@ const ctx = {
             return Object.assign(object, config || {});
         },
         emptyFn() {},
-        htmlEncode: (s) => String(s),
+        // Ext's own entity table, not the identity: an unencoded path into markup,
+        // or an attribute encoded once too few, has to show up here as a difference.
+        htmlEncode: (s) =>
+            String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;'),
         String: { format: (t, ...a) => t.replace(/\{(\d)\}/g, (m, i) => a[i]) },
         Object: { toQueryString: (o) => new URLSearchParams(o).toString() },
         define(name, cfg) {
@@ -83,7 +95,16 @@ const ctx = {
         // The header installs one stylesheet rule for unset rows; record it
         // so the suite can see the rule without a DOM.
         util: { CSS: { createStyleSheet: (css, id) => ctx.__styles.push([id, css]) } },
-        Msg: { alert: (title, msg) => ctx.__alerts.push([title, msg]) },
+        // An alert's callback runs when it is dismissed, which is the test's to do
+        // (`dismissAlerts`): what opens after an alert has to wait for that.
+        Msg: {
+            alert: (title, msg, fn) => {
+                ctx.__alerts.push([title, msg]);
+                if (fn) {
+                    ctx.__dismiss.push(fn);
+                }
+            },
+        },
         window: { Window: {} },
         panel: { Panel: {} },
         button: { Segmented: {} },
@@ -91,6 +112,7 @@ const ctx = {
     Proxmox: { Utils: { format_boolean: (v) => (v ? 'Yes' : 'No') } },
     __defined: [],
     __alerts: [],
+    __dismiss: [],
     __styles: [],
 };
 ctx.PVE = {};
@@ -102,6 +124,7 @@ vm.runInContext(
 );
 
 let fails = 0;
+const dismissAlerts = () => ctx.__dismiss.splice(0).forEach((fn) => fn('ok'));
 const eq = (name, got, want) => {
     const g = JSON.stringify(got);
     const w = JSON.stringify(want);
@@ -112,6 +135,12 @@ const eq = (name, got, want) => {
         console.log(`ok   ${name}`);
     }
 };
+// A section that has to wait for something -- a load promise, a debounced timer --
+// pushes a thunk here. They run in order after everything synchronous, before the
+// summary, so the output stays readable.
+const asyncSections = [];
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
 const throws = (name, fn, contains) => {
     let err = null;
     try {
@@ -221,6 +250,7 @@ eq('kind map', U.kindOf({}), 'map');
 eq('display string', U.displayValue('a b', 'string'), 'a b');
 eq('display array', U.displayValue(['a', 'b'], 'array'), '["a","b"]');
 eq('parse number', U.parseValue('42', 'number'), 42);
+throws('an empty number field is not 0', () => U.parseValue(null, 'number'), 'Not a number');
 eq('parse bool', U.parseValue('true', 'boolean'), true);
 eq('parse array json', U.parseValue('["a","b"]', 'array'), ['a', 'b']);
 eq('parse array csv', U.parseValue('a, b', 'array'), ['a', 'b']);
@@ -231,6 +261,10 @@ eq('valueAt of the root', U.valueAt({ a: 1 }, ''), { a: 1 });
 
 console.log('\n--- the row editor field comes from the grammar first ---');
 eq('editor enum', U.editorFor({ kind: 'string', enumValues: ['a'] }).xtype, 'combobox');
+// A flat array store's one field is `field1`; the list is markup, the member text.
+eq('an enum member is encoded in the list',
+    U.editorFor({ kind: 'string', enumValues: ['<img src=x>'] }).listConfig.getInnerTpl('field1'),
+    '{field1:htmlEncode}');
 eq('editor boolean', U.editorFor({ kind: 'boolean' }).xtype, 'proxmoxcheckbox');
 eq('editor number', U.editorFor({ kind: 'number' }).xtype, 'numberfield');
 eq('editor array', U.editorFor({ kind: 'array' }).xtype, 'textfield');
@@ -254,7 +288,7 @@ console.log('\n--- selector text (the "Applies to" column) ---');
 eq('selector all', U.selectorText({ all: true }), 'all guests');
 eq('selector tag', U.selectorText({ tag: 'traefik' }), 'tag: traefik');
 
-console.log('\n--- row icons (DESIGN §12) ---');
+console.log('\n--- row icons (DESIGN §8) ---');
 eq('icons', ctx.PVE.meta.Icons, {
     map: 'fa fa-folder',
     mapExpanded: 'fa fa-folder-open',
@@ -322,8 +356,6 @@ console.log('\n--- enforce: an enforcing prefix\'s findings say so ---');
     eq('an enforcing prefix flags its findings', strict.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer', enforced: true }]);
     eq('an ordinary one does not', lax.findings({ t: { port: 'x' } }), [{ path: 't.port', msg: 'expected integer' }]);
     eq('Perl\'s 0 is not enforce', new Shape([{ prefix: 't', selector: { all: 1 }, enforce: 0, schema: S }]).findings({ t: { port: 'x' } })[0].enforced, undefined);
-    eq('the banner line says which', U.findingText({ path: 't.port', msg: 'expected integer', enforced: true }), 'enforced: t.port: expected integer');
-    eq('... and stays plain otherwise', U.findingText({ path: 't.port', msg: 'expected integer' }), 't.port: expected integer');
 }
 
 console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
@@ -399,9 +431,54 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     eq('no alert and the toggle was never reset', [alerts(), btn.value, btn.suspended], [[], null, 0]);
     ed = editor('a: [\n');
     eq('convert refuses a buffer that does not parse', Buffer.convert({ editor: ed, lang: 'yaml', original: '' }, 'json', btn), undefined);
-    eq('... puts the toggle back on the current language, events suspended around it', [btn.value, btn.suspended], ['yaml', 0]);
+    eq('... but not from inside the toggle\'s own change handler', btn.value, null);
+    asyncSections.push(async function () {
+        console.log('\n--- a refused YAML | JSON switch puts the toggle back, after its handler ---');
+        await tick();
+        eq('the toggle is back on the current language, events suspended around it', [btn.value, btn.suspended], ['yaml', 0]);
+    });
     eq('... names the target language', alerts().map((a) => a[1].indexOf('Cannot convert to JSON') === 0), [true]);
     eq('... and the buffer is untouched', ed.sets, 0);
+
+    // The toggle must give back what it took. `Codec.render` only knows the text
+    // the document was *loaded* as, and `same` ignores key order, so a reorder or a
+    // `#` comment typed into the buffer compared equal to the loaded document and
+    // was quietly replaced by it -- the concrete way "switching to JSON and back
+    // loses my edits" happened. The switch out of YAML now stashes the exact text.
+    const edited = '# mine\nb:   1\na: [y, x]\n';
+    ed = editor(edited);
+    const round = { editor: ed, lang: 'yaml', original: handWritten };
+    round.lang = 'json';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    eq('the JSON side is the value, which is all JSON can hold', ed.value, Codec.dump({ b: 1, a: ['y', 'x'] }, 'json'));
+    round.lang = 'yaml';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('coming back gives the comment and the order back, exactly', ed.value, edited);
+
+    // ... unless the JSON side was edited, in which case the value is what carries
+    // over and the YAML layout it used to have is not that value's.
+    round.lang = 'json';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    ed.value = Codec.dump({ b: 7, a: ['y', 'x'] }, 'json');
+    round.lang = 'yaml';
+    Buffer.render(round, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('an edited JSON buffer comes back as a dump of what it now says',
+        ed.value, Codec.dump({ b: 7, a: ['y', 'x'] }, 'yaml'));
+    eq('no alerts through any of that', alerts(), []);
+
+    // An edit JSON cannot show, behind an untouched JSON side, is still an edit.
+    ed = editor('# mine\n' + handWritten);
+    const hidden = { editor: ed, lang: 'json', original: handWritten };
+    Buffer.render(hidden, Buffer.convert({ editor: ed, lang: 'yaml', original: handWritten }, 'json', btn));
+    eq('a comment typed on the YAML side keeps the JSON side dirty', Buffer.unchanged(hidden), false);
+    // ... until the stored document is loaded over it (Revert, a re-read): then the
+    // YAML it held is not the document's, and switching back must not bring it back.
+    Buffer.load(ed, Codec.dump(Codec.parse(handWritten, 'yaml'), 'json'));
+    eq('a load drops what the YAML side held', Buffer.unchanged(hidden), true);
+    hidden.lang = 'yaml';
+    Buffer.render(hidden, Buffer.convert({ editor: ed, lang: 'json', original: handWritten }, 'yaml', btn));
+    eq('... so Revert in JSON and back to YAML is the stored text, not the reverted edit', ed.value, handWritten);
+    alerts();
 
     // diff
     Buffer.diff({ editor: editor('b: 2\n'), lang: 'yaml', original: handWritten }, 'the title');
@@ -409,6 +486,20 @@ console.log('\n--- Buffer: what both text editors do to a Monaco buffer ---');
     Buffer.diff({ editor: editor('{}'), lang: 'json', original: 'a: [\n' }, 't');
     eq('... falling back to YAML when the loaded text cannot be shown as JSON', diffs.pop().lang, 'yaml');
     delete ctx.window.monaco;
+}
+
+console.log('\n--- the core and Monaco are fetched under names that change with them ---');
+{
+    // pve-ext fingerprints the script, not what the script fetches for itself, so
+    // `make js` writes in the core's content hash and Monaco's version: a browser
+    // never pairs an upgraded script with a core or a tree it cached before.
+    const M = ctx.PVE.meta;
+    const hash = require('crypto').createHash('sha256').update(fs.readFileSync(WASM)).digest('hex');
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    eq('the core is named by the hash of the .wasm it was built with',
+        M.Core.SRC, '/pve2/js/pve-meta-extjs/pve-meta-core-' + hash.slice(0, 8) + '.wasm');
+    eq('Monaco\'s tree is named by its pinned version',
+        M.Monaco.VS, '/pve2/js/pve-meta-extjs/monaco-' + pkg.dependencies['monaco-editor'] + '/vs');
 }
 
 console.log('\n--- Monaco loads next to ExtJS ---');
@@ -426,6 +517,67 @@ console.log('\n--- Monaco loads next to ExtJS ---');
     eq('... and which Ext still reads', inCtx('(function () {}).$isFunction'), true);
     inCtx('delete Function.prototype.$isFunction');
 }
+
+// A failed load used to be the answer for the rest of the session: `me.promise`
+// was never reset, so one dropped request took Text mode with it until the page
+// was reloaded. And a script that neither loads nor errors left the caller's mask
+// up with nothing to say, which is what the timeout is for.
+asyncSections.push(async function () {
+    console.log('\n--- a failed load is this attempt\'s answer, not the session\'s ---');
+    const M = ctx.PVE.meta;
+
+    // The core, with itself detached for the length of the check.
+    const attached = M.Core.exports;
+    M.Core.exports = null;
+    M.Core.promise = null;
+    ctx.fetch = () => Promise.reject(new Error('offline'));
+    let err = null;
+    await M.Core.load().catch((e) => (err = e));
+    eq('a core that did not load is an error', String(err), 'Error: offline');
+    eq('... and the next caller gets to try again', M.Core.promise, null);
+    delete ctx.fetch;
+    M.Core.exports = attached;
+    M.Core.promise = null;
+
+    // Monaco, with just enough of a page for the loader to run against.
+    delete ctx.window.monaco;
+    let script = null;
+    const listeners = [];
+    ctx.window.location = { origin: 'https://pve.example:8006' };
+    ctx.window.addEventListener = (name, fn) => listeners.push([name, fn]);
+    ctx.window.removeEventListener = (name, fn) => listeners.splice(listeners.findIndex((l) => l[1] === fn), 1);
+    ctx.document.createElement = () => (script = {});
+
+    let failed = null;
+    const first = M.Monaco.load().catch((e) => (failed = e));
+    await tick();
+    eq('the loader script is fetched from the tree the package ships',
+        script.src, 'https://pve.example:8006' + M.Monaco.VS + '/loader.js');
+    script.onerror();
+    await first;
+    eq('a Monaco that did not load is an error', String(failed).indexOf('failed to load') !== -1, true);
+    eq('... and it is not cached either', M.Monaco.promise, null);
+    eq('... with nothing left listening for its chunks', listeners.length, 0);
+
+    // Nothing at all: no load event, no error event. The timer is the only way out.
+    const timers = [];
+    const realSetTimeout = ctx.setTimeout;
+    ctx.setTimeout = (fn, ms) => timers.push([fn, ms]);
+    let timedOut = null;
+    const second = M.Monaco.load().catch((e) => (timedOut = e));
+    await tick();
+    eq('the load is given 30 seconds', timers[0][1], M.Monaco.TIMEOUT);
+    timers[0][0]();
+    await second;
+    eq('... and says so when they pass', String(timedOut), 'Error: Timed out loading the text editor');
+    eq('... without disabling Text mode for good', M.Monaco.promise, null);
+
+    ctx.setTimeout = realSetTimeout;
+    delete ctx.window.location;
+    delete ctx.window.addEventListener;
+    delete ctx.window.removeEventListener;
+    ctx.document.createElement = () => ({});
+});
 
 console.log('\n--- row merge: document + shape ---');
 const P = ctx.PVE.meta.TreePanel;
@@ -469,6 +621,57 @@ function panelWith(overrides) {
 }
 const panel = panelWith({});
 
+// Ext's TreeStore, just enough of it for what buildTree does to the nodes: the
+// root is a node of its own, with the text Ext gives it ("Root", `defaultRootText`)
+// and no parent, and a branch is as open as its config said.
+function fakeTreeStore() {
+    const asNodes = function (children, parent) {
+        return (children || []).map(function (cfg) {
+            const n = { data: cfg, parentNode: parent, open: !!cfg.expanded };
+            n.childNodes = asNodes(cfg.children, n);
+            n.isLeaf = () => !!cfg.leaf;
+            n.isExpanded = () => n.open;
+            n.collapse = () => (n.open = false);
+            n.set = (k, v) => (n.data[k] = v);
+            return n;
+        });
+    };
+    const cascadeBy = function (fn) {
+        const walk = (n) => {
+            fn(n);
+            n.childNodes.forEach(walk);
+        };
+        walk(this);
+    };
+    const store = {
+        root: null,
+        getRoot() { return this.root; },
+        setRoot(cfg) {
+            const r = {
+                data: { text: 'Root' },
+                parentNode: null,
+                cascadeBy,
+                isLeaf: () => false,
+                isExpanded: () => !!cfg.expanded,
+            };
+            r.childNodes = asNodes(cfg.children, r);
+            this.root = r;
+        },
+        // Every row below the root, by path, with whether it is open.
+        branches() {
+            const out = {};
+            this.root.cascadeBy((n) => {
+                if (n !== this.root && !n.isLeaf()) {
+                    out[n.data.path] = n.isExpanded();
+                }
+            });
+            return out;
+        },
+    };
+    store.setRoot({ expanded: true, children: [] });
+    return store;
+}
+
 const shape = panel.shapeFor('200');
 // Most-specific first, then by name: the order the server lists in, and the one
 // the Shape resolves in, whatever order the listing arrived in.
@@ -485,10 +688,10 @@ eq('declared key is unset', spec.port.present, false);
 eq('display boolean', U.displayValue(1, 'boolean'), 'Yes');
 eq('declared default carried', spec.port.defaultValue, 80);
 eq('declared enum carried', spec.scheme.enumValues, ['http', 'https']);
-// The grammar's description is the tooltip, not the Description column (DESIGN §12).
+// The grammar's description is the tooltip, not the Description column (DESIGN §8).
 eq('grammar description is its own field', spec.host.grammarDescription, 'Public host name');
 eq('grammar description is not the comment', spec.host.description, undefined);
-eq('schema kind integer', panel.schemaKind({ type: 'integer' }), 'number');
+eq('schema kind integer', U.schemaValueKind('integer'), 'number');
 
 // A declared type wins over the type inferred from the stored value.
 root.children.traefik.children.spec.children.host.kind = 'number';
@@ -800,6 +1003,85 @@ eq('hover: type, format and description',
 eq('hover: an enum', Markers.hoverText(SCHEMAS['traefik.spec.scheme']),
     'string \u00b7 one of: http, https');
 eq('hover: nothing declared, nothing shown', Markers.hoverText(undefined), null);
+// Monaco renders a hover as Markdown; a schema's description is plain text.
+eq('a hover is escaped for Markdown, so it shows as written',
+    Markers.hoverMarkdown('host__ and *port* [x](javascript:y) <b> 1..2'),
+    'host\\_\\_ and \\*port\\* \\[x\\]\\(javascript:y\\) \\<b\\> 1\\.\\.2');
+
+console.log('\n--- a hover belongs to the model, not to the first panel that asked ---');
+{
+    // Monaco registers a hover provider per *language*, so the one this editor
+    // installs is shared by every buffer on the page. It used to close over the
+    // panel that happened to open Text first: a second panel got no hovers at all,
+    // and once the first was destroyed, neither did anything else.
+    const registered = [];
+    const model = (lines) => ({
+        getLineCount: () => lines,
+        getLineMaxColumn: () => 20,
+    });
+    const editorOn = (text, m) => ({
+        getValue: () => text,
+        getModel: () => m,
+        dispose() {},
+    });
+    const fakeMonaco = {
+        MarkerSeverity: { Error: 8, Warning: 4 },
+        Range: function (line, from, endLine, to) {
+            this.line = line;
+            this.to = to;
+        },
+        editor: { setModelMarkers() {} },
+        languages: { registerHoverProvider: (lang, provider) => registered.push([lang, provider]) },
+    };
+    ctx.monaco = fakeMonaco;
+    ctx.window.monaco = fakeMonaco;
+    ctx.PVE.meta.textHoverRegistered = false;
+
+    const guestYaml = 'traefik:\n  spec:\n    host: a.example\n';
+    const guestModel = model(3);
+    const guest = panelWith({
+        docId: '201',
+        textLang: 'yaml',
+        prefixes: [{ prefix: 'traefik', selector: { all: true }, schema: TRAEFIK_SCHEMA }],
+        textEditor: editorOn(guestYaml, guestModel),
+    });
+
+    const otherYaml = 'netbird:\n  groups:\n  - lan\n';
+    const otherModel = model(3);
+    const other = panelWith({
+        docId: '202',
+        textLang: 'yaml',
+        prefixes: [
+            {
+                prefix: 'netbird',
+                selector: { all: true },
+                schema: { type: 'object', properties: { groups: { type: 'array', description: 'Netbird groups' } } },
+            },
+        ],
+        textEditor: editorOn(otherYaml, otherModel),
+    });
+
+    guest.annotateText();
+    other.annotateText();
+    eq('one provider for the page, however many panels', registered.length, 1);
+    const hover = (m, line) => {
+        const out = registered[0][1].provideHover(m, { lineNumber: line });
+        return out && out.contents[0].value;
+    };
+    eq('the first panel\'s model is described by its own schema',
+        hover(guestModel, 3), 'string \u00b7 Public host name');
+    eq('and the second\'s by its own', hover(otherModel, 2), 'array \u00b7 Netbird groups');
+    eq('a line nothing declares says nothing', hover(guestModel, 9), null);
+
+    // And the map does not outlive the buffer.
+    guest.disposeTextEditor();
+    eq('a disposed buffer takes its hovers with it', hover(guestModel, 3), null);
+    eq('... and leaves the other panel\'s alone', hover(otherModel, 2), 'array \u00b7 Netbird groups');
+    other.disposeTextEditor();
+
+    delete ctx.monaco;
+    delete ctx.window.monaco;
+}
 
 console.log('\n--- nesting: the ROW builder must shadow too, not just the linter ---');
 {
@@ -900,8 +1182,6 @@ eq('a guest id', P.urlFor.call(P, '201'), '/meta/guests/201');
 eq('a prefix id', P.urlFor.call(P, 'prefixes/homelab.docker'), '/meta/prefixes/homelab.docker');
 eq('kind of a guest', P.docKind.call(P, '201'), 'guest');
 eq('kind of a prefix', P.docKind.call(P, 'prefixes/traefik'), 'prefix');
-eq('the title is the file name', P.docTitle.call(P, 'prefixes/homelab.docker'), 'homelab.docker');
-eq('a guest id is its own title', P.docTitle.call(P, '201'), '201');
 {
     // A guest tab asks for its own resolved set by id, and a registry document for
     // every file, as it is.
@@ -1056,6 +1336,13 @@ console.log('\n--- the registry list ---');
     eq('one written over a package\'s', G.originText(rows[2]), 'cluster (overrides packaged)');
 
     // An older API returns neither field; the list must still render.
+    {
+        const meta = {};
+        eq('a text cell is encoded, and carries all of itself as its tooltip',
+            [G.textCell('a <b>', meta), meta.tdAttr], ['a &lt;b&gt;', 'data-qtip="a &amp;lt;b&amp;gt;"']);
+        const none = {};
+        eq('... an empty one no tooltip', [G.textCell(undefined, none), none.tdAttr], ['', undefined]);
+    }
     eq('a row with no origin is treated as the cluster\'s', G.originText(G.rowsFrom([{ prefix: 'x' }])[0]), 'cluster');
 
     // A file's per-node overrides ride along on the one row for it, as text --
@@ -1084,6 +1371,50 @@ console.log('\n--- the registry list ---');
     eq('without it: a cluster file still opens, and is not removable', buttons(clusterRow, false), [true, false, true]);
     eq('a packaged file opens and is never removable', buttons(pkgRow, true), [false, false, true]);
     eq('no selection: nothing to edit or remove', buttons(null, true), [false, true, true]);
+
+    // A listing that failed masks the grid with the reason; the next one that
+    // works has to take it off again, or the grid stays behind the old message
+    // with the rows it just loaded invisible underneath.
+    {
+        const masks = [];
+        const setErrorMask = ctx.Proxmox.Utils.setErrorMask;
+        ctx.Proxmox.Utils.setErrorMask = (comp, msg) => masks.push(msg);
+        // As Ext does with `statics:`, for the one call `reload` makes.
+        ctx.PVE.meta.RegistryGrid.rowsFrom = G.rowsFrom;
+        const listing = { result: { data: [{ prefix: 'gpu', selector: { all: true } }] } };
+        const nodesCol = { setHidden(h) { this.hidden = h; } };
+        const grid = {
+            access: { write: 1 },
+            store: { setData: (rows) => (grid.rows = rows) },
+            down: (sel) => (sel === '#nodesCol' ? nodesCol : null),
+            syncButtons() {},
+            request(opts) {
+                if (opts.url === '/meta/prefixes') {
+                    if (grid.broken) {
+                        opts.failure({ htmlStatus: 'connection error' });
+                    } else {
+                        opts.success(listing);
+                    }
+                }
+            },
+        };
+        grid.broken = true;
+        Grid.reload.call(grid);
+        eq('a failed listing says so on the grid', masks, ['connection error']);
+        grid.broken = false;
+        Grid.reload.call(grid);
+        eq('... and the next one that works clears it', masks, ['connection error', false]);
+        eq('... showing what it loaded', grid.rows.map((r) => r.name), ['gpu']);
+        eq('... without an empty Nodes column when no file overrides a node', nodesCol.hidden, true);
+        listing.result.data.push({ prefix: 'net', selector: { all: true }, nodes: { pve1: { hidden: true } } });
+        Grid.reload.call(grid);
+        eq('... and with it once one does', nodesCol.hidden, false);
+        ctx.Proxmox.Utils.setErrorMask = setErrorMask;
+        if (!setErrorMask) {
+            delete ctx.Proxmox.Utils.setErrorMask;
+        }
+        delete ctx.PVE.meta.RegistryGrid.rowsFrom;
+    }
 
     // Remove asks, then deletes the row's own document.
     const sent = [];
@@ -1185,6 +1516,257 @@ console.log('\n--- one edit, one write (DESIGN §8) ---');
     );
 }
 
+console.log('\n--- Add does not overwrite a key that is there ---');
+{
+    // Add sends a `replace` at the typed path, so it used to replace whatever was
+    // already there without a word -- while Remove asks before it drops a key. The
+    // field says so instead, live, against the document the panel holds.
+    const doc = { traefik: { spec: { host: 'a.example', port: 80 } }, netbird: { groups: ['lan'] } };
+    const owner = { docId: '201', docState: { 201: { digest: 'd', data: doc } }, dataOf: P.dataOf };
+    const keyField = function (cfg) {
+        const w = Object.assign({}, ctx.PVE.meta.AddKeyWindow, { list: false, tree: owner }, cfg);
+        return w.formItems().filter((f) => f.name === 'key')[0];
+    };
+
+    const inSpec = keyField({ parentPath: 'traefik.spec' });
+    eq('a key that is not there is fine', inSpec.validator('scheme'), true);
+    eq('one that is gets a field error, not a silent replace',
+        inSpec.validator('host'), 'This key exists; use Edit to change it');
+    eq('... a bad name is still refused first', typeof inSpec.validator('bad key'), 'string');
+
+    const atRoot = keyField({ parentPath: '' });
+    eq('the check follows the path that would be written', atRoot.validator('host'), true);
+    eq('... including a dotted one', atRoot.validator('traefik.spec.port'),
+        'This key exists; use Edit to change it');
+    eq('... and a key holding a map counts as there', atRoot.validator('netbird'),
+        'This key exists; use Edit to change it');
+
+    // A list member has no name of its own, so there is nothing to collide with.
+    const member = keyField({ parentPath: 'netbird.groups', list: true });
+    eq('appending to a list is never a collision', member.validator(''), true);
+
+    // And the window is given the document to check against.
+    const created = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = (xtype, cfg) => {
+        created.push([xtype, cfg]);
+        return { on: () => {}, show: () => {} };
+    };
+    const adder = panelWith({ docId: '201', docState: owner.docState });
+    adder.addKey('201', 'traefik.spec');
+    eq('Add Key opens against the panel\'s own document',
+        [created[0][1].parentPath, created[0][1].tree === adder], ['traefik.spec', true]);
+    ctx.Ext.create = origCreate;
+}
+
+console.log('\n--- a popup closes when the write lands, not when the button is clicked ---');
+{
+    // Every one of these fired its event and closed in the same breath, so a 400
+    // from the lint, a 403 or a dropped connection threw away what was typed --
+    // for the subtree window, a page of YAML. The window now waits for the write.
+    const win = function () {
+        const w = { masks: [], closed: 0, isDestroyed: false, close() { this.closed++; } };
+        w.body = { mask: () => w.masks.push('on'), unmask: () => w.masks.push('off') };
+        return w;
+    };
+
+    const kept = win();
+    ctx.PVE.meta.writeFromWindow(kept, (done) => (kept.done = done));
+    eq('the body is masked while the write is in flight', kept.masks, ['on']);
+    eq('... the window is not closed on the click', kept.closed, 0);
+    kept.done(false);
+    eq('a failed write unmasks and leaves it open', [kept.masks, kept.closed], [['on', 'off'], 0]);
+    const gone = win();
+    ctx.PVE.meta.writeFromWindow(gone, (done) => done(true));
+    eq('a write that landed closes it', [gone.masks, gone.closed], [['on', 'off'], 1]);
+
+    // Add Key: the edit it fires, and the callback it closes on.
+    const add = Object.assign(win(), {
+        parentPath: 'traefik',
+        list: false,
+        validForm: () => ({ getValues: () => ({ key: 'port', kind: 'number', value: '8080' }) }),
+        fireEvent(name, path, value, done) {
+            this.fired = [name, path, value];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.AddKeyWindow.submit.call(add);
+    eq('Add Key fires the edit at its own path', add.fired, ['addkey', 'traefik.port', 8080]);
+    add.done(false);
+    eq('... and a refused key leaves the form open to be corrected', add.closed, 0);
+    add.done(true);
+    eq('... closing once the key is stored', add.closed, 1);
+
+    // The row editor.
+    const edit = Object.assign(win(), {
+        rec: { data: { path: 'traefik.spec.port', kind: 'number', present: true, rawValue: 80 } },
+        validForm: () => ({}),
+        down: () => ({ getValue: () => '8080' }),
+        fireEvent(name, value, done) {
+            this.fired = [name, value];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.EditValueWindow.submit.call(edit);
+    eq('the row editor fires the value', edit.fired, ['setvalue', 8080]);
+    edit.done(false);
+    eq('... and stays open on a failure', [edit.masks, edit.closed], [['on', 'off'], 0]);
+
+    // "Edit selection as text": the one with a page of YAML to lose.
+    const text = Object.assign(win(), {
+        view: 'traefik',
+        tree: {
+            writeSubtree(view, value, done) {
+                text.wrote = [view, value];
+                text.done = done;
+            },
+        },
+    });
+    ctx.PVE.meta.TextWindow.apply.call(text, 'spec:\n  host: a.example\n', 'yaml');
+    eq('the subtree window writes its view', text.wrote, ['traefik', { spec: { host: 'a.example' } }]);
+    text.done(false);
+    eq('... and keeps the buffer when the write is refused', [text.masks, text.closed], [['on', 'off'], 0]);
+    text.done(true);
+    eq('... closing when it is not', text.closed, 1);
+
+    // New Prefix. (`statics:` is a plain object in the shim; Ext hoists it onto
+    // the class, which is how `submit` reaches `planFrom`.)
+    const New = ctx.PVE.meta.NewRegistryWindow;
+    New.planFrom = New.statics.planFrom;
+    const create = Object.assign(win(), {
+        validForm: () => ({ getValues: () => ({ name: 'gpu', selector: 'all' }) }),
+        fireEvent(name, plan, done) {
+            this.fired = [name, plan.id];
+            this.done = done;
+        },
+    });
+    ctx.PVE.meta.NewRegistryWindow.submit.call(create);
+    eq('New Prefix fires the plan', create.fired, ['create', 'prefixes/gpu']);
+    create.done(false);
+    eq('... and a name the server refuses leaves the form filled in', create.closed, 0);
+    delete New.planFrom;
+}
+
+// A read-only caller could type into "Edit selection as text", press OK and get a
+// 403 for their trouble; and a Monaco that failed to load masked the whole window,
+// Cancel included, with no way out but Escape.
+asyncSections.push(async function () {
+    console.log('\n--- "Edit selection as text" says whether it can be written ---');
+    const M = ctx.PVE.meta;
+    const [realLoad, realCreate] = [M.Monaco.load, M.Monaco.create];
+    const masks = [];
+    ctx.Proxmox.Utils.setErrorMask = (comp, msg) => masks.push([comp.el, msg]);
+    let created = null;
+    M.Monaco.load = () => Promise.resolve();
+    M.Monaco.create = (mount, value, options) => {
+        created = { value: value, options: options };
+        return { getValue: () => value, getModel: () => null, dispose() {} };
+    };
+
+    const open = async function (write) {
+        const handlers = {};
+        const ok = {
+            disabled: true,
+            setDisabled(d) { this.disabled = d; },
+        };
+        const win = Object.assign({}, M.TextWindow, {
+            view: 'traefik',
+            text: 'spec:\n  host: a.example\n',
+            tree: { access: { read: 1, write: write ? 1 : 0 }, writeSubtree: () => (win.wrote = true) },
+            body: 'the-body',
+            el: 'the-window',
+            callParent() {},
+            on(name, fn) { handlers[name] = fn; },
+            lookupReference: () => ({ getEl: () => ({ dom: 'the-mount' }) }),
+            down: () => ok,
+        });
+        win.initComponent();
+        handlers.afterrender();
+        await tick();
+        win.ok = ok;
+        win.applyButton = win.bbar.filter((b) => b && b.itemId === 'metaApply')[0];
+        return win;
+    };
+
+    const editing = await open(true);
+    eq('a writable document is edited', editing.title, 'Edit selection as text: traefik');
+    eq('... with OK offered, and live once there is a buffer',
+        [editing.applyButton.hidden, editing.ok.disabled], [false, false]);
+    eq('... and a buffer that can be typed into', created.options, { readOnly: false });
+
+    const viewing = await open(false);
+    eq('a document that may not be written is viewed', viewing.title, 'View selection as text: traefik');
+    eq('... with no OK to press', viewing.applyButton.hidden, true);
+    eq('... and a read-only buffer', created.options, { readOnly: true });
+    eq('... which OK would not write even if it were pressed',
+        (viewing.submit(), viewing.wrote), undefined);
+
+    eq('the mask goes over the body, so Cancel stays clickable',
+        masks.map((m) => m[0]), ['the-body', 'the-body', 'the-body', 'the-body']);
+
+    M.Monaco.load = realLoad;
+    M.Monaco.create = realCreate;
+    delete ctx.Proxmox.Utils.setErrorMask;
+});
+
+console.log('\n--- what a write answers the editor that started it ---');
+{
+    // `onDone(ok)` is the whole contract: true once the server has it, false on
+    // every failure the editor is left holding. A 422 answers nothing until the
+    // "Save anyway" question is settled, so the window stays masked across it.
+    const answers = [];
+    const shown = [];
+    const panelD = panelWith({ docId: '201', docState: { 201: { digest: 'd0', data: {} } }, reload() {} });
+    const request = ctx.Proxmox.Utils.API2Request;
+    const msgShow = ctx.Ext.Msg.show;
+    let reply = 'no';
+    ctx.Ext.Msg.show = function (cfg) {
+        shown.push(cfg.title);
+        cfg.fn(reply);
+    };
+    const edit = { path: 'a', op: 'set', value: 1 };
+
+    ctx.Proxmox.Utils.API2Request = (opts) => opts.success({});
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('a write that landed says so', answers.splice(0), [true]);
+
+    ctx.__alerts.splice(0);
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 400 }, htmlStatus: 'not a key name' });
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('an error says so, once, and is shown', [answers.splice(0), ctx.__alerts.splice(0).length], [[false], 1]);
+
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 422 }, htmlStatus: 'traefik.spec.port: expected integer' });
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('a 422 asks before it answers', shown.splice(0).length, 1);
+    eq('... and Cancel is a failed write', answers.splice(0), [false]);
+
+    // "Save anyway": the retry carries the same callback, so the window is
+    // answered once, after the forced write -- not unmasked mid-question.
+    reply = 'yes';
+    let forced = null;
+    let first = true;
+    ctx.Proxmox.Utils.API2Request = function (opts) {
+        if (first) {
+            first = false;
+            opts.failure({ result: { status: 422 }, htmlStatus: 'expected integer' });
+            return;
+        }
+        forced = opts.params.force;
+        opts.success({});
+    };
+    panelD.sendEdit(edit, false, (ok) => answers.push(ok));
+    eq('Save anyway retries with force=1', forced, 1);
+    eq('... and answers once, when that write lands', answers.splice(0), [true]);
+
+    ctx.Ext.Msg.show = msgShow;
+    ctx.Proxmox.Utils.API2Request = request;
+    if (!request) {
+        delete ctx.Proxmox.Utils.API2Request;
+    }
+}
+
 console.log('\n--- acting on one member rewrites its list ---');
 {
     // There is no path to `groups[1]`, so every action on a member is one write of
@@ -1196,24 +1778,49 @@ console.log('\n--- acting on one member rewrites its list ---');
         sendEdit: (edit) => sent.push(edit),
     });
 
+    const m = (index, value) => ({ index: index, value: value });
     eq('the list as it stands', stub.listAt('netbird.groups'), ['lan', 'wan', 'dmz']);
-    stub.writeListMember('netbird.groups', 1, 'wlan');
+    stub.writeListMember('netbird.groups', m(1, 'wan'), 'wlan');
     eq('editing a member writes the list', sent.pop(), {
         path: 'netbird.groups',
         op: 'set',
         value: ['lan', 'wlan', 'dmz'],
     });
-    stub.writeListMember('netbird.groups', 0, undefined);
+    stub.writeListMember('netbird.groups', m(0, 'lan'), undefined);
     eq('removing a member writes the list without it', sent.pop().value, ['wan', 'dmz']);
     // An index that is not there changes nothing, rather than growing the list with
-    // a hole in it.
-    stub.writeListMember('netbird.groups', 9, 'nope');
-    stub.writeListMember('netbird.groups', -1, 'nope');
+    // a hole in it -- and says so, instead of an OK that silently does nothing.
+    ctx.__alerts.splice(0);
+    stub.writeListMember('netbird.groups', m(9, 'nope'), 'x');
+    stub.writeListMember('netbird.groups', m(-1, 'nope'), 'x');
     eq('an index that is not there is not a write', sent, []);
-}
+    eq('... and each says why', ctx.__alerts.splice(0).map((a) => /no longer has a member (9|-1)\./.test(a[1])), [true, true]);
 
-console.log('\n--- path helpers ---');
-eq('parentPath', [U.parentPath('a.b.c'), U.parentPath('a'), U.parentPath('')], ['a.b', '', '']);
+    // After a 409 the stored list is not the one the row came from. [lan, wan, dmz]
+    // became [wan, dmz]: index 1 is now dmz, and an edit of wan must not land on it.
+    stub.docState['201'].data = { netbird: { groups: ['wan', 'dmz'] } };
+    const answers = [];
+    stub.writeListMember('netbird.groups', m(1, 'wan'), 'WAN', (ok) => answers.push(ok));
+    eq('a member that moved is not written over another', [sent, answers], [[], [false]]);
+    eq('... and the message names both', /Member 1 of netbird\.groups was wan when this editor opened and is now dmz/.test(ctx.__alerts.splice(0)[0][1]), true);
+    stub.writeListMember('netbird.groups', m(0, 'wan'), 'WAN');
+    eq('a member still where it was is written into the list as it is now', sent.pop().value, ['WAN', 'dmz']);
+
+    // Append, with the list changed between the window opening and OK.
+    const origCreate = ctx.Ext.create;
+    let handler = null;
+    ctx.Ext.create = () => ({ on: (name, fn) => (handler = handler || fn), show() {} });
+    stub.docState['201'].data = { netbird: { groups: [] } };
+    stub.addListMember('netbird.groups');
+    stub.docState['201'].data = { netbird: { groups: ['fromssh'] } };
+    handler('netbird.groups', 'fromui', () => {});
+    eq('an append goes onto the list as stored at OK, keeping the other writer\'s member', sent.pop().value, ['fromssh', 'fromui']);
+    stub.docState['201'].data = { netbird: { groups: { now: 'a map' } } };
+    const appended = [];
+    handler('netbird.groups', 'fromui', (ok) => appended.push(ok));
+    eq('... and is refused where the list became something else', [sent.length, appended, /no longer a list/.test(ctx.__alerts.splice(0)[0][1])], [0, [false], true]);
+    ctx.Ext.create = origCreate;
+}
 
 console.log('\n--- a list is a container, like a map ---');
 {
@@ -1252,12 +1859,65 @@ console.log('\n--- a list is a container, like a map ---');
     eq('a scalar member is itself', U.itemSummary('lan'), 'lan');
 }
 
+console.log('\n--- an enum row opens on its value, whatever the value\'s type ---');
+{
+    const field = (data) =>
+        ctx.PVE.meta.EditValueWindow.formItems
+            .call({ rec: { data: data }, label: ctx.PVE.meta.EditValueWindow.label })
+            .filter((f) => f.name === 'value')[0];
+    const port = { path: 'p', kind: 'number', present: true, rawValue: 443, valueText: '443', enumValues: [80, 443] };
+    const f = field(port);
+    eq('a stored number is given to the combobox as the string its store holds',
+        [f.xtype, f.store, f.value], ['combobox', ['80', '443'], '443']);
+    eq('... and an unset one opens on its default the same way',
+        field(Object.assign({}, port, { present: false, defaultValue: 80 })).value, '80');
+    eq('... or empty, with no default', field(Object.assign({}, port, { present: false })).value, '');
+}
+
+console.log('\n--- small things a row gets right ---');
+{
+    const EV = ctx.PVE.meta.EditValueWindow;
+    eq('a member\'s editor names which member',
+        [EV.label.call({ rec: { data: { path: 'n.groups', arrayIndex: 2 } } }),
+            EV.label.call({ rec: { data: { path: 'n.groups', arrayIndex: undefined } } })],
+        ['n.groups[2]', 'n.groups']);
+
+    // Append opens on the list's declared item type.
+    const typed = panelWith({
+        docId: '201',
+        prefixes: [{
+            prefix: 'n',
+            selector: { all: true },
+            schema: { type: 'object', properties: { ports: { type: 'array', items: { type: 'integer' } }, tags: { type: 'array' } } },
+        }],
+    });
+    eq('Append\'s Type is the schema\'s item type, else a string',
+        [typed.itemKind('n.ports'), typed.itemKind('n.tags'), typed.itemKind('nowhere')], ['number', 'string', 'string']);
+
+    // A note whose key is not set is removed at the note's own path.
+    const sent = [];
+    const confirm = ctx.Ext.Msg.confirm;
+    const asked = [];
+    ctx.Ext.Msg.confirm = (title, question, fn) => {
+        asked.push(question);
+        fn('yes');
+    };
+    const notes = panelWith({ sendEdit: (edit) => sent.push(edit) });
+    notes.removeKey({ data: { path: 'a.k', present: false, description: 'about k' } });
+    notes.removeKey({ data: { path: 'a.j', present: true, description: 'about j' } });
+    ctx.Ext.Msg.confirm = confirm;
+    eq('a note alone is removed as the note, a key with its note as the key',
+        [asked, sent.map((e) => e.path)],
+        [['Remove the note on "a.k"?', 'Remove "a.j"?'], ['a.k__', 'a.j']]);
+}
+
 console.log('\n--- creating a registry file: the least that parses ---');
 {
     const plan = (v) => ctx.PVE.meta.NewRegistryWindow.statics.planFrom(v);
     eq('a prefix with an "all" selector', plan({ name: 'x', selector: 'all' }).content, { selector: { all: true } });
     eq('it writes the cluster file named after the prefix', plan({ name: 'gpu', selector: 'all' }).id, 'prefixes/gpu');
     eq('a prefix with a tag selector', plan({ name: 'x', selector: 'tag', tag: 'web' }).content, { selector: { tag: 'web' } });
+    eq('... trimmed, as the form checks it', plan({ name: 'x', selector: 'tag', tag: ' web ' }).content, { selector: { tag: 'web' } });
     eq(
         'a description when there is one',
         plan({ name: 'x', selector: 'all', description: 'Home' }).content,
@@ -1280,6 +1940,92 @@ console.log('\n--- reloading must not fold the tree up ---');
     const other = { data: { docId: 'prefixes/gpu', path: 'selector', key: 'selector' } };
     const keys = [groupA, groupB, dcRoot, nsRoot, same, other].map(key);
     eq('every row has a key of its own', new Set(keys).size, keys.length);
+}
+
+console.log('\n--- a write must not lose the selected row ---');
+{
+    // Every write rebuilds the tree, and the rebuilt tree had no selection at all:
+    // after Edit, Add or Set to Default the toolbar went dead and the row had to be
+    // hunted down again.
+    const store = fakeTreeStore();
+    let sel = [];
+    const panelS = panelWith({
+        docId: '201',
+        prefixes: [],
+        docState: { 201: { digest: 'd', data: { traefik: { spec: { host: 'a.example', port: 80 } } } } },
+        store: store,
+        tree: { getSelection: () => sel, setSelection: (rec) => (sel = [rec]) },
+        syncButtons() {},
+    });
+    const find = (path) => {
+        let hit = null;
+        store.getRoot().cascadeBy((n) => {
+            if (n.data.path === path) {
+                hit = hit || n;
+            }
+        });
+        return hit;
+    };
+
+    panelS.buildTree();
+    eq('nothing selected, nothing to put back', panelS.getSelection(), []);
+
+    sel = [find('traefik.spec.host')];
+    panelS.buildTree();
+    eq('the row a write touched is selected again, on the new node',
+        [panelS.getSelection()[0].data.path, panelS.getSelection()[0] === sel[0]],
+        ['traefik.spec.host', true]);
+
+    // A Remove: the row is gone, so its parent takes the selection rather than
+    // leaving the toolbar pointing at nothing.
+    panelS.docState['201'].data = { traefik: { spec: { port: 80 } } };
+    panelS.buildTree();
+    eq('a removed row leaves its parent selected', panelS.getSelection()[0].data.path, 'traefik.spec');
+
+    // And a selection in another document is not answered by a row of this one.
+    eq('the key is the document, the path and the key',
+        panelS.rowKey({ data: { docId: '201', path: 'a', key: 'a' } }) ===
+            panelS.rowKey({ data: { docId: 'prefixes/x', path: 'a', key: 'a' } }),
+        false);
+    sel = [{ data: { docId: 'prefixes/x', path: 'traefik.spec.host', key: 'host' }, parentNode: null }];
+    panelS.buildTree();
+    eq('... so a row of another document matches nothing here',
+        panelS.getSelection()[0].data.docId, 'prefixes/x');
+}
+
+console.log('\n--- the tree opens expanded, and a rebuild keeps what was folded ---');
+{
+    // The first build found Ext's hidden root, text "Root", and took it for a row
+    // of an old tree in which nothing was expanded -- so every branch of a freshly
+    // opened tab came up collapsed. headless-check calls expandAll, and the stub
+    // store here used to have a root without a text, so nothing noticed.
+    const store = fakeTreeStore();
+    let sel = [];
+    const panelE = panelWith({
+        docId: '201',
+        prefixes: [],
+        docState: { 201: { digest: 'd', data: { a: { b: { c: 1 } }, m: { x: 1 }, top: 1 } } },
+        store: store,
+        tree: { getSelection: () => sel, setSelection: (rec) => (sel = [rec]) },
+        syncButtons() {},
+    });
+    const find = (path) => {
+        let hit = null;
+        store.getRoot().cascadeBy((n) => (hit = hit || (n.data.path === path ? n : null)));
+        return hit;
+    };
+    panelE.buildTree();
+    eq('the first build leaves every branch open', store.branches(), { a: true, 'a.b': true, m: true });
+    find('m').collapse();
+    panelE.buildTree();
+    eq('a rebuild keeps a folded branch folded, and the rest open', store.branches(), { a: true, 'a.b': true, m: false });
+
+    // A Remove of a top-level row: its parent is the hidden root, which is not a
+    // row to put the selection on.
+    sel = [find('top')];
+    panelE.docState['201'].data = { a: { b: { c: 1 } }, m: { x: 1 } };
+    panelE.buildTree();
+    eq('removing a top-level row does not select the hidden root', sel[0] === store.getRoot(), false);
 }
 
 console.log('\n--- the tree marks a row its schema refuses ---');
@@ -1346,9 +2092,186 @@ console.log('\n--- "Declare Key" opens schema.properties as text ---');
     eq('an empty map gets a hint, not a blank buffer', Object.keys(Codec.parse(created[0][1].text, 'yaml')).length > 0, true);
 
     created.length = 0;
-    withProps.declareKey(null);
-    eq('nothing to declare on, nothing opens', created.length, 0);
+    withProps.declareKey();
+    eq('it needs no row selected: the button always opens schema.properties', created[0][1].view, 'schema.properties');
     ctx.Ext.create = origCreate;
+}
+
+console.log('\n--- the panel takes its editors with it, and asks one question once ---');
+{
+    // A modal that outlives its panel edits a document nothing will write: its OK
+    // goes through the panel, and PVE.meta.request drops the answer once the panel
+    // is destroyed. They are tracked the way the text window already was.
+    const opened = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = function (xtype, cfg) {
+        const win = {
+            xtype: xtype,
+            closed: 0,
+            handlers: {},
+            on(name, fn) { this.handlers[name] = fn; },
+            show() {},
+            close() {
+                this.closed++;
+                this.handlers.destroy();
+            },
+        };
+        opened.push(win);
+        return win;
+    };
+    const host = panelWith({ docId: '201', docState: { 201: { digest: 'd', data: {} } } });
+    host.addKey('201', '');
+    host.addKey('201', 'traefik');
+    eq('every editor it opens is tracked', host.editors.length, 2);
+    opened[0].close();
+    eq('... and one that closes on its own is forgotten', host.editors.length, 1);
+    host.textWindow = { closed: 0, close() { this.closed++; } };
+    const textWindow = host.textWindow;
+    host.closeEditors();
+    eq('destroying the panel closes what is left', [opened[1].closed, textWindow.closed], [1, 1]);
+    eq('... and the editing flag is down again', host.editing, false);
+    ctx.Ext.create = origCreate;
+
+    // One question, one answer: syncAccessLabel calls syncFooter, and syncButtons
+    // called it a second time on its own.
+    let footers = 0;
+    const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
+    const stub = { setDisabled() {}, setHidden() {}, setText() {}, setVisible() {}, setHtml() {} };
+    const counted = panelWith({
+        docId: '201',
+        docState: { 201: { digest: 'd', data: {} } },
+        access: { read: 1, write: 1 },
+        mode: 'tree',
+        tree: { getSelection: () => [] },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : stub),
+        syncFooter: () => footers++,
+    });
+    counted.syncButtons();
+    eq('the footer is synced once per button sync', footers, 1);
+}
+
+console.log('\n--- the row toolbar is hidden in Text, not left there disabled ---');
+{
+    const comps = {};
+    const comp = (id) =>
+        (comps[id] = comps[id] || {
+            setDisabled(d) { this.disabled = d; },
+            setHidden(h) { this.hidden = h; },
+            setVisible(v) { this.hidden = !v; },
+            setText() {},
+            setIconCls() {},
+            setHtml() {},
+        });
+    const modeBtn = { items: { getAt: () => ({ setDisabled() {}, setTooltip() {} }) } };
+    const bar = panelWith({
+        docId: '201',
+        access: { read: 1, write: 1 },
+        mode: 'tree',
+        hasDefaults: false,
+        tree: { getSelection: () => [] },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : comp(sel.slice(1))),
+        syncFooter() {},
+    });
+    const shown = () => Object.keys(comps).filter((id) => !comps[id].hidden).sort();
+    bar.syncButtons();
+    eq('in the tree: every row button, the separators and Reload; no default to offer, no Declare',
+        shown(), ['addBtn', 'editBtn', 'metaToolbar', 'reloadBtn', 'removeBtn', 'rowSep', 'textSelBtn', 'textSep']);
+    bar.mode = 'text';
+    bar.syncButtons();
+    eq('in Text: nothing, and with nothing to say the bar goes too', shown(), []);
+    bar.access = { read: 1, write: 0 };
+    bar.syncButtons();
+    eq('... unless it says Read-only', shown(), ['accessText', 'metaToolbar']);
+
+    // The footer, by the same rule the subtree window's OK follows: no Apply for a
+    // caller who may not write, rather than one that is always disabled.
+    delete bar.syncFooter;
+    bar.syncFooter = ctx.PVE.meta.TreePanel.syncFooter;
+    bar.syncFooter();
+    eq('a read-only caller\'s Text has Format and Diff, and no Apply',
+        [comps.metaFormat.hidden, comps.metaDiff.hidden, comps.metaApply.hidden], [false, false, true]);
+    bar.access = { read: 1, write: 1 };
+    bar.syncFooter();
+    eq('... a writer\'s has an Apply that works', [comps.metaApply.hidden, comps.metaApply.disabled], [false, false]);
+    bar.mode = 'tree';
+    bar.syncFooter();
+    eq('... and the tree none of the three', [comps.metaFormat.hidden, comps.metaDiff.hidden, comps.metaApply.hidden], [true, true, true]);
+}
+
+console.log('\n--- one rule for "did this change" ---');
+{
+    // The row editor compared `Ext.encode` of each value and `setToDefault` asked
+    // the core's `same`: two rules for one question, and the string one made key
+    // order part of the answer, which it is not (DESIGN §2).
+    let fired = 0;
+    const unchanged = Object.assign({}, ctx.PVE.meta.EditValueWindow, {
+        rec: { data: { path: 'netbird.groups', kind: 'array', present: true, rawValue: ['lan', 'wan'] } },
+        closed: 0,
+        validForm: () => ({}),
+        down: () => ({ getValue: () => 'lan, wan' }),
+        fireEvent: () => fired++,
+        close() { this.closed++; },
+    });
+    unchanged.submit();
+    eq('a value that is the value already there is not a write', [fired, unchanged.closed], [0, 1]);
+    const changed = Object.assign({}, unchanged, { closed: 0, down: () => ({ getValue: () => 'lan, dmz' }) });
+    changed.submit();
+    eq('... and one that differs is', fired, 1);
+
+    // And the Text card's own dirty check is `Buffer.unchanged`, which knows the
+    // buffer's language: the same document shown as JSON is not an edit.
+    const card = panelWith({
+        textLang: 'json',
+        textOriginal: 'b:   1\na: [x, y]\n',
+        textEditor: { getValue: () => Codec.dump({ b: 1, a: ['x', 'y'] }, 'json') },
+    });
+    eq('the loaded document, shown as JSON, is nothing to discard', card.textIsDirty(), false);
+    card.textEditor = { getValue: () => '{"b": 2}' };
+    eq('... an edit is', card.textIsDirty(), true);
+    eq('no buffer at all, nothing to lose', panelWith({}).textIsDirty(), false);
+}
+
+console.log('\n--- the squiggles wait for a pause in the typing ---');
+{
+    // annotateText parses the whole buffer and asks the core for every finding;
+    // running that on every keystroke is work nobody asked for, and the answer is
+    // stale before it is drawn. Anything that acts on the buffer flushes it first.
+    const timers = [];
+    const [realSet, realClear] = [ctx.setTimeout, ctx.clearTimeout];
+    ctx.setTimeout = (fn, ms) => timers.push([fn, ms]);
+    ctx.clearTimeout = (id) => (timers[id - 1] = null);
+    const diffs = [];
+    const shownDiff = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    let annotated = 0;
+    const typing = panelWith({
+        docId: '201',
+        docState: { 201: { digest: 'd', data: { a: 1 } } },
+        textLang: 'yaml',
+        textOriginal: 'a: 1\n',
+        textEditor: { getValue: () => 'a: 1\n' },
+        annotateText: () => annotated++,
+    });
+
+    typing.scheduleAnnotate();
+    eq('a keystroke does not run the parser', annotated, 0);
+    eq('... it asks again in 150 ms', timers[0][1], typing.ANNOTATE_DELAY);
+    typing.scheduleAnnotate();
+    eq('... and the next keystroke replaces that timer', [timers[0], timers.length], [null, 2]);
+    timers[1][0]();
+    eq('... one run when the typing stops', annotated, 1);
+
+    typing.scheduleAnnotate();
+    typing.showDiff();
+    eq('Diff sees the buffer as it is now', annotated, 2);
+    eq('... and is still a diff', diffs.length, 1);
+    typing.scheduleAnnotate();
+    typing.applyText();
+    eq('and so does Apply', annotated, 3);
+
+    ctx.PVE.meta.Monaco.showDiff = shownDiff;
+    ctx.setTimeout = realSet;
+    ctx.clearTimeout = realClear;
 }
 
 console.log('\n--- the editor follows the value\'s shape, not a declaration ---');
@@ -1392,7 +2315,7 @@ eq('an empty value is empty', U.previewText(undefined), '');
 
 console.log('\n--- the editor reads and writes the notes: every document request says comments=1 ---');
 // The server leaves comment keys out of a read, and keeps the stored ones through a
-// replace, unless asked (DESIGN §2, §7). This editor shows them as the description
+// replace, unless asked (DESIGN §2). This editor shows them as the description
 // column and edits them, so it asks on every read and every write of a document.
 {
     const sent = [];
@@ -1409,6 +2332,9 @@ console.log('\n--- the editor reads and writes the notes: every document request
             write: T.write,
             writeFor: T.writeFor,
             sendEdit: T.sendEdit,
+            flushAnnotate: T.flushAnnotate,
+            cancelAnnotate: T.cancelAnnotate,
+            clearParseErrorIfSound: T.clearParseErrorIfSound,
             request: (opts) => sent.push(Object.assign({ method: 'GET' }, opts)),
             submit: (opts) => sent.push(opts),
         },
@@ -1438,9 +2364,299 @@ console.log('\n--- the editor reads and writes the notes: every document request
     eq('nothing else was sent', sent.length, 0);
 }
 
+console.log('\n--- a repaired document can go back to the tree ---');
+{
+    // A document that does not parse has no rows, so Text is the only view of it
+    // and the only place it gets repaired. `docParseError` is what disables the
+    // Tree segment, and only `reload` cleared it -- which returns early while the
+    // mode is text, so a repaired document stayed text-only until the page was
+    // reloaded. The read after an Apply is what knows better.
+    const tree = {
+        disabled: true,
+        tooltip: null,
+        setDisabled(d) { this.disabled = d; },
+        setTooltip(t) { this.tooltip = t; },
+    };
+    const modeBtn = { items: { getAt: (i) => (i === 0 ? tree : { setDisabled() {} }) } };
+    const reading = (text) => (opts) => opts.success({ result: { data: { digest: 'd', text: text } } });
+    const panelP = panelWith({
+        docId: '201',
+        mode: 'text',
+        textLang: 'yaml',
+        docParseError: 'mapping values are not allowed here',
+        docState: { 201: { digest: 'd0', data: {} } },
+        down: (sel) => (sel === '#modeBtn' ? modeBtn : null),
+        syncFooter() {},
+        request: reading('a: 1\nb: [\n'),
+    });
+
+    const notice = { hidden: true, html: '', setHidden(h) { this.hidden = h; }, setHtml(h) { this.html = h; } };
+    panelP.down = (sel) => (sel === '#modeBtn' ? modeBtn : sel === '#metaParseNotice' ? notice : null);
+    panelP.docParseError = "did not find expected key near '<img src=x>'";
+    panelP.syncAccessLabel();
+    eq('the Tree segment says why it is off, the parser\'s quote of the file encoded',
+        [tree.disabled, /near &#39;&lt;img src=x&gt;&#39;$/.test(tree.tooltip)], [true, true]);
+    eq('... and so does a notice above the buffer, the same words',
+        [notice.hidden, notice.html.indexOf(tree.tooltip) > 0], [false, true]);
+    panelP.docParseError = 'mapping values are not allowed here';
+    tree.tooltip = null;
+
+    // And the tree's Remove asks about the path as text: the key charset is only
+    // the lint's on a write, and a hand-written file is read whatever it holds.
+    const confirm = ctx.Ext.Msg.confirm;
+    const asked = [];
+    ctx.Ext.Msg.confirm = (title, question) => asked.push(question);
+    panelWith({}).removeKey({ data: { path: 'a<b' } });
+    ctx.Ext.Msg.confirm = confirm;
+    eq('Remove names the path encoded', asked, ['Remove "a&lt;b"?']);
+
+    panelP.refreshText();
+    eq('text that still does not parse keeps the tree out of reach',
+        [panelP.docParseError, tree.tooltip], ['mapping values are not allowed here', null]);
+
+    panelP.request = reading('a: 1\n');
+    panelP.refreshText();
+    eq('a document that parses again clears the error', panelP.docParseError, '');
+    eq('... and the Tree segment is live, with no tooltip to explain itself',
+        [tree.disabled, tree.tooltip], [false, undefined]);
+    eq('... nor a notice', notice.hidden, true);
+}
+
+console.log('\n--- a 409 in Text mode keeps the buffer ---');
+{
+    // The buffer is unwritten work and the only copy of it. A 409 says the file
+    // moved under it, which is a reason to show the difference, not to drop what
+    // was typed on the floor and put the server's text there instead.
+    const typed = '# mine\nb: 2\na: 1\n';
+    const stored = 'a: 1\nc: 3\n';
+    const editor = { value: typed, getValue() { return this.value; }, setValue(v) { this.value = v; } };
+    const diffs = [];
+    const shown = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    ctx.__alerts.splice(0);
+    const panelT = panelWith({
+        docId: '201',
+        mode: 'text',
+        textLang: 'yaml',
+        textOriginal: 'a: 1\n',
+        textEditor: editor,
+        docState: { 201: { digest: 'd0', data: { a: 1 } } },
+        // The re-read a conflict triggers: the document as somebody else left it.
+        request: (opts) => opts.success({ result: { data: { digest: 'd9', text: stored } } }),
+        annotateText: () => {},
+    });
+    ctx.Proxmox.Utils.API2Request = (opts) =>
+        opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    panelT.applyText();
+    delete ctx.Proxmox.Utils.API2Request;
+
+    eq('the buffer is still what was typed', editor.value, typed);
+    eq('the digest is the one the next Apply needs', panelT.digestOf('201'), 'd9');
+    eq('and the buffer is now compared against the new file', panelT.textOriginal, stored);
+    eq('the conflict is reported', ctx.__alerts.splice(0), [['Conflict', 'digest mismatch']]);
+    eq('... and the diff waits for the alert, rather than covering it', diffs.length, 0);
+    dismissAlerts();
+    eq('... then shows the buffer against what is in the file now', diffs.pop(), {
+        title: '201',
+        original: stored,
+        modified: typed,
+        lang: 'yaml',
+    });
+    ctx.PVE.meta.Monaco.showDiff = shown;
+}
+
+console.log('\n--- a 409 under an open editor re-reads around it, and the next OK goes through ---');
+{
+    // Since 9825441 a popup stays open until its write answers, and a 409 asked
+    // `reload` to fetch the new digest -- which returns early under an editor. So
+    // OK gave 409 for ever. Blindly refreshing the digest would be worse: the next
+    // OK would write over the other writer's change without a word. The document
+    // is re-read around the editor instead, and the value at the edit's own path
+    // is compared before and after.
+    const stored = (text) => (opts) => opts.success({ result: { data: { digest: 'd9', text: text } } });
+    const openedWins = [];
+    const origCreate = ctx.Ext.create;
+    ctx.Ext.create = function (xtype, cfg) {
+        const win = {
+            xtype: xtype,
+            cfg: cfg,
+            handlers: {},
+            on(name, fn) { this.handlers[name] = fn; },
+            show() {},
+            close() { this.handlers.destroy(); },
+        };
+        openedWins.push(win);
+        return win;
+    };
+    // A panel whose `reload` is the real one, with the load chain cut at its
+    // first request: what counts is whether the rows were asked for at all.
+    const withEditor = function (read) {
+        const p = panelWith({
+            docId: '201',
+            rendered: true,
+            docState: { 201: { digest: 'd0', data: { a: 1, m: { x: 1 } } } },
+            request: read,
+            setMask() {},
+            loads: 0,
+            loadPrefixes() { this.loads++; },
+        });
+        p.openEditor('PVE.meta.EditValueWindow', { rec: { data: { path: 'a' } } }, 'setvalue', () => {});
+        return p;
+    };
+    const answers = [];
+    const sent = [];
+    const conflictOnce = function (opts) {
+        sent.push(opts);
+        if (sent.length === 1) {
+            opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+        } else {
+            opts.success({});
+        }
+    };
+
+    // The document changed elsewhere, but not at the edited path.
+    ctx.__alerts.splice(0);
+    let p = withEditor(stored('a: 1\nb: 2\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    eq('the 409 answers the editor with a failure, so it stays open', answers.splice(0), [false]);
+    eq('the digest is the one the next OK needs', p.digestOf('201'), 'd9');
+    eq('... and the data too, without the rows being rebuilt under the editor',
+        [p.dataOf('201').b, p.loads, p.reloadPending], [2, 0, true]);
+    let alert = ctx.__alerts.splice(0)[0];
+    eq('the alert says the document changed and the edit can go again as it is',
+        [alert[0], alert[1].indexOf('digest mismatch') === 0, /still the one this editor opened on/.test(alert[1])],
+        ['Conflict', true, true]);
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    eq('the second OK carries the fresh digest and lands', [sent[1].params.digest, answers.splice(0)], ['d9', [true]]);
+    eq('the reload it earned is still owed while the editor is open', [p.loads, p.reloadPending], [0, true]);
+    openedWins.pop().close();
+    eq('... and paid once the editor closes', [p.loads, p.reloadPending, p.editing], [1, false, false]);
+
+    // The edited value itself was changed underneath.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, (ok) => answers.push(ok));
+    alert = ctx.__alerts.splice(0)[0];
+    eq('the alert names the value it opened on and the value there now',
+        [alert[0], /it was 1 and is now 7/.test(alert[1]), /writes the value in this editor over the new one/.test(alert[1])],
+        ['Conflict', true, true]);
+    eq('... the editor is still open with the fresh digest', [answers.splice(0), p.editing, p.digestOf('201')], [[false], true, 'd9']);
+    openedWins.pop().close();
+
+    // A second 409 under the same editor: the first re-read moved the panel's copy
+    // to a: 7, but the editor still opened on a: 1 -- that is what the value has to
+    // be compared with, not with what the first conflict found.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\nm:\n  x: 1\n'));
+    ctx.Proxmox.Utils.API2Request = function (opts) {
+        sent.push(opts);
+        opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    };
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, () => {});
+    ctx.__alerts.splice(0);
+    p.request = stored('a: 7\nb: 3\nm:\n  x: 1\n');
+    p.sendEdit({ path: 'a', op: 'set', value: 5 }, false, () => {});
+    alert = ctx.__alerts.splice(0)[0];
+    eq('a second 409 still compares with the value the editor opened on',
+        [/it was 1 and is now 7/.test(alert[1]), /still the one this editor opened on/.test(alert[1])],
+        [true, false]);
+    openedWins.pop().close();
+    eq('... which goes with the editor', p.openedOn, null);
+
+    // Add Key: the key was not there, and now it is.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 1\nm:\n  x: 1\nnew: taken\n'));
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'new', op: 'set', value: 'mine' }, false, () => {});
+    eq('a key added by both sides is named as not set, then set',
+        /it was not set and is now taken/.test(ctx.__alerts.splice(0)[0][1]), true);
+    openedWins.pop().close();
+
+    // No editor open (Set to Default, Remove): the reload and the message, as before.
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 7\n'));
+    openedWins.pop().close();
+    p.loads = 0;
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.sendEdit({ path: 'a', op: 'set', value: 5 });
+    eq('with nothing open a 409 reloads the tree and says so',
+        [p.loads, ctx.__alerts.splice(0)], [1, [['Conflict', 'digest mismatch']]]);
+
+    // The subtree text window: the same at its view, plus the diff against the
+    // subtree as stored now, which is what the buffer is compared against from
+    // here on. The buffer itself is left alone.
+    const diffs = [];
+    const shown = ctx.PVE.meta.Monaco.showDiff;
+    ctx.PVE.meta.Monaco.showDiff = (cfg) => diffs.push(cfg);
+    const typed = 'x: 1\ny: typed\n';
+    const textWin = {
+        view: 'm',
+        lang: 'yaml',
+        original: 'x: 1\n',
+        editor: { value: typed, getValue() { return this.value; }, setValue(v) { this.value = v; } },
+        buffer: ctx.PVE.meta.TextWindow.buffer,
+        conflict: ctx.PVE.meta.TextWindow.conflict,
+        showDiff: ctx.PVE.meta.TextWindow.showDiff,
+    };
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p = withEditor(stored('a: 1\nm:\n  x: 2\n'));
+    openedWins.pop().close();
+    p.loads = 0;
+    p.textWindow = textWin;
+    ctx.Proxmox.Utils.API2Request = conflictOnce;
+    p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
+    alert = ctx.__alerts.splice(0)[0];
+    eq('the text window\'s conflict is answered at its view: a map changed, and the diff says how',
+        [answers.splice(0), /The map at m was changed as well; the diff shows how/.test(alert[1]), /lines\)/.test(alert[1])],
+        [[false], true, false]);
+    eq('... the buffer is what was typed', textWin.editor.value, typed);
+    eq('... compared against the subtree as stored now', textWin.original, 'x: 2\n');
+    eq('... the diff waits for the alert', diffs.length, 0);
+    dismissAlerts();
+    eq('... and is the buffer against that', diffs.pop(), { title: 'm', original: 'x: 2\n', modified: typed, lang: 'yaml' });
+    eq('... with the rows left for the close', [p.loads, p.reloadPending], [0, true]);
+    p.writeSubtree('m', { x: 1, y: 'typed' }, (ok) => answers.push(ok));
+    eq('the next OK carries the fresh digest', [sent[1].params.digest, answers.splice(0)], ['d9', [true]]);
+
+    sent.length = 0;
+    ctx.__alerts.splice(0);
+    p.docState[201] = { digest: 'd0', data: { a: 1, m: { x: 1 } } };
+    p.request = stored('a: 2\nm:\n  x: 1\n');
+    textWin.original = 'x: 1\n';
+    p.writeSubtree('m', { x: 1, y: 'typed' }, () => {});
+    dismissAlerts();
+    eq('a change elsewhere in the document opens no diff', [diffs.length, textWin.original], [0, 'x: 1\n']);
+    eq('... and says the view is as it was', /still the one this editor opened on/.test(ctx.__alerts.splice(0)[0][1]), true);
+    ctx.PVE.meta.Monaco.showDiff = shown;
+    delete ctx.Proxmox.Utils.API2Request;
+
+    // New Prefix: the empty digest matched nothing, so the name is taken. The
+    // form stays open with its fields, and the message says that, not "digest
+    // mismatch" about a document the form never read.
+    ctx.__alerts.splice(0);
+    openedWins.length = 0;
+    const grid = { reloads: 0, reload() { this.reloads++; } };
+    ctx.PVE.meta.RegistryGrid.createOne.call(grid);
+    ctx.Proxmox.Utils.API2Request = (opts) => opts.failure({ result: { status: 409 }, htmlStatus: 'digest mismatch' });
+    openedWins[0].handlers.create({ id: 'prefixes/homelab', file: 'homelab', content: {} }, (ok) => answers.push(ok));
+    delete ctx.Proxmox.Utils.API2Request;
+    alert = ctx.__alerts.splice(0)[0];
+    eq('a taken name keeps the form open and says whose fault it is',
+        [answers.splice(0), alert[0], /"homelab" already exists/.test(alert[1]), grid.reloads],
+        [[false], 'Conflict', true, 1]);
+    ctx.Ext.create = origCreate;
+}
+
 console.log('\n--- S3: document keys colliding with Object.prototype members ---');
 // `constructor`/`toString`/`hasOwnProperty` are ordinary, unreserved document
-// keys (DESIGN §7) that must become ordinary rows, not resolve through the
+// keys (DESIGN §2) that must become ordinary rows, not resolve through the
 // prototype chain to the page's global Object.
 const protoDoc = { constructor: 'ctor-value', toString: 'tostring-value', hasOwnProperty: 'hop-value' };
 const protoRoot = { key: '', path: '', children: Object.create(null), present: true, kind: 'map' };
@@ -1460,5 +2676,10 @@ eq('global Object untouched', typeof Object.create, 'function');
 // And they cross the ABI as keys, both ways.
 eq('proto-named keys survive the core', Codec.parse(Codec.dump(protoDoc, 'yaml'), 'yaml'), protoDoc);
 
-console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
-process.exit(fails ? 1 : 0);
+(async function () {
+    for (const section of asyncSections) {
+        await section();
+    }
+    console.log(fails ? `\n${fails} FAILURE(S)` : '\nall passed');
+    process.exit(fails ? 1 : 0);
+})();

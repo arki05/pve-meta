@@ -66,11 +66,15 @@ fn descend_creating<'a>(doc: &'a mut Value, path: &Path) -> Result<&'a mut Value
 }
 
 /// Extracts the subtree at `prefix` (the prefix itself is not part of the
-/// result). The root prefix returns the whole document, unchanged. `None` if
-/// nothing exists there, or if `prefix` runs through an array or a scalar (a
-/// view prefix only ever addresses into maps).
-pub fn extract(doc: &Value, prefix: &Path) -> Option<Value> {
-    descend(doc, prefix).ok().flatten().cloned()
+/// result). The root prefix returns the whole document, unchanged.
+/// `Ok(None)` if nothing exists there.
+///
+/// # Errors
+/// [`Error::InvalidPath`] if `prefix` runs through an array or a scalar: a
+/// view addresses maps only, on the read side as on the write side
+/// (`docs/DESIGN.md` §2).
+pub fn extract(doc: &Value, prefix: &Path) -> Result<Option<Value>> {
+    Ok(descend(doc, prefix)?.cloned())
 }
 
 /// Replaces the subtree at `prefix` with `subtree` wholesale (not a merge),
@@ -373,11 +377,23 @@ mod tests {
             (json!({"a": 1, "b": {"c": 2}}), "", Some(json!({"a": 1, "b": {"c": 2}}))),
             (json!({"traefik": {"spec": {"host": "x"}}}), "traefik.spec", Some(json!({"host": "x"}))),
             (json!({"a": 1}), "missing", None),
-            (json!({"a": 1}), "a.deeper", None),
-            (json!({"a": [1, 2, 3]}), "a.0", None), // a view addresses maps only, never an array
+            (json!({"a": {"b": 1}}), "a.missing.deeper", None),
             (json!({"a": notes}), "a", Some(json!({"__": "doc", "x__": "about x", "x": 1}))), // comment keys travel with the subtree
         ] {
-            assert_eq!(extract(&doc, &p(prefix)), expected, "{prefix}");
+            assert_eq!(extract(&doc, &p(prefix)).unwrap(), expected, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn extract_through_array_or_scalar_is_invalid_path() {
+        // A read refuses what a write refuses: a view addresses maps only
+        // (`docs/DESIGN.md` §2), and saying "nothing there" would be a lie.
+        for (doc, prefix) in [
+            (json!({"a": [1, 2, 3]}), "a.0"),
+            (json!({"a": [1, 2, 3]}), "a.0.b"),
+            (json!({"a": "scalar"}), "a.b"),
+        ] {
+            assert!(matches!(extract(&doc, &p(prefix)), Err(Error::InvalidPath(_))), "{prefix}");
         }
     }
 

@@ -3,7 +3,13 @@
 // ---------------------------------------------------------------------------
 
 PVE.meta.Monaco = {
-    VS: '/pve2/js/pve-meta-extjs/vs',
+    // Under Monaco's version (`make js` writes it in), so an upgrade is a new tree
+    // and never half-cached.
+    VS: '/pve2/js/pve-meta-extjs/@MONACO_DIR@/vs',
+    // A script that neither loads nor errors -- a proxy that swallows it, a
+    // truncated response -- would otherwise leave the caller's mask up for the
+    // life of the page, with nothing to say.
+    TIMEOUT: 30000,
     promise: null,
 
     // ExtJS marks every function with an *enumerable* `Function.prototype.$isFunction`,
@@ -20,54 +26,70 @@ PVE.meta.Monaco = {
 
     load: function () {
         let me = PVE.meta.Monaco;
-        me.promise =
-            me.promise ||
+        if (!me.promise) {
             // Every caller of Monaco also needs the codec, so load it first.
-            PVE.meta.Core.load().then(
-                () =>
-                    new Promise(function (resolve, reject) {
-                        if (window.monaco && window.monaco.editor) {
-                            resolve(window.monaco);
-                            return;
-                        }
-                        me.hideExtFunctionMarker();
-                        // Absolute: a language worker resolves its own scripts against
-                        // this and has no page URL to make a relative path absolute with.
-                        let vs = window.location.origin + me.VS;
-                        // A Monaco chunk that throws does so in its own `<script>`, out
-                        // of reach of the loader's errback: without this the promise
-                        // never settles and the caller's mask never comes off.
-                        let onError = function (event) {
-                            if (String(event.filename || '').indexOf(vs) === 0) {
-                                done(reject, event.error || new Error(event.message));
-                            }
-                        };
-                        let done = function (settle, value) {
-                            window.removeEventListener('error', onError);
-                            settle(value);
-                        };
-                        window.addEventListener('error', onError);
-                        window.MonacoEnvironment = { baseUrl: vs };
-                        let script = document.createElement('script');
-                        script.src = vs + '/loader.js';
-                        script.onload = function () {
-                            try {
-                                window.require.config({ paths: { vs: vs } });
-                                window.require(
-                                    ['vs/editor/editor.main'],
-                                    () => done(resolve, window.monaco),
-                                    (err) => done(reject, err),
-                                );
-                            } catch (err) {
-                                done(reject, err);
-                            }
-                        };
-                        script.onerror = () =>
-                            done(reject, new Error('failed to load ' + script.src));
-                        document.head.appendChild(script);
-                    }),
-            );
+            me.promise = PVE.meta.Core.load()
+                .then(() => me.loadEditor())
+                // As the core: a failed load is this attempt's answer, not the
+                // session's. Text mode is one Monaco away, and one dropped request
+                // must not be the end of it until the page is reloaded.
+                .catch(function (err) {
+                    me.promise = null;
+                    throw err;
+                });
+        }
         return me.promise;
+    },
+
+    // The AMD tree itself, once the core is there. Settles exactly once, whichever
+    // of the four ways it ends: loaded, a chunk that threw, a script that 404ed,
+    // or nothing at all inside `TIMEOUT`.
+    loadEditor: function () {
+        let me = PVE.meta.Monaco;
+        return new Promise(function (resolve, reject) {
+            if (window.monaco && window.monaco.editor) {
+                resolve(window.monaco);
+                return;
+            }
+            me.hideExtFunctionMarker();
+            // Absolute: a language worker resolves its own scripts against
+            // this and has no page URL to make a relative path absolute with.
+            let vs = window.location.origin + me.VS;
+            // A Monaco chunk that throws does so in its own `<script>`, out
+            // of reach of the loader's errback: without this the promise
+            // never settles and the caller's mask never comes off.
+            let onError = function (event) {
+                if (String(event.filename || '').indexOf(vs) === 0) {
+                    done(reject, event.error || new Error(event.message));
+                }
+            };
+            let timer = setTimeout(function () {
+                done(reject, new Error(gettext('Timed out loading the text editor')));
+            }, me.TIMEOUT);
+            let done = function (settle, value) {
+                clearTimeout(timer);
+                window.removeEventListener('error', onError);
+                settle(value);
+            };
+            window.addEventListener('error', onError);
+            window.MonacoEnvironment = { baseUrl: vs };
+            let script = document.createElement('script');
+            script.src = vs + '/loader.js';
+            script.onload = function () {
+                try {
+                    window.require.config({ paths: { vs: vs } });
+                    window.require(
+                        ['vs/editor/editor.main'],
+                        () => done(resolve, window.monaco),
+                        (err) => done(reject, err),
+                    );
+                } catch (err) {
+                    done(reject, err);
+                }
+            };
+            script.onerror = () => done(reject, new Error('failed to load ' + script.src));
+            document.head.appendChild(script);
+        });
     },
 
     // Monaco does not inherit the page's CSS, so pick its built-in theme from the
@@ -90,16 +112,23 @@ PVE.meta.Monaco = {
             : 'vs';
     },
 
-    // A standalone editor with the options every text buffer in this editor shares.
-    create: function (mount, value) {
-        return window.monaco.editor.create(mount, {
-            value: value,
-            language: 'yaml',
-            theme: PVE.meta.Monaco.theme(),
-            automaticLayout: true,
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-        });
+    // A standalone editor with the options every text buffer in this editor shares;
+    // `options` is what one of them differs on (a read-only caller's `readOnly`).
+    create: function (mount, value, options) {
+        return window.monaco.editor.create(
+            mount,
+            Ext.apply(
+                {
+                    value: value,
+                    language: 'yaml',
+                    theme: PVE.meta.Monaco.theme(),
+                    automaticLayout: true,
+                    minimap: { enabled: false },
+                    scrollBeyondLastLine: false,
+                },
+                options,
+            ),
+        );
     },
 
     dispose: function (editor) {

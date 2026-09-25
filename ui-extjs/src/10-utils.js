@@ -11,17 +11,10 @@ PVE.meta.Icons = {
 };
 
 PVE.meta.Utils = {
-    // One finding as the warning banner lists it; an enforced one says so first.
-    findingText: function (f) {
-        return (f.enforced ? gettext('enforced') + ': ' : '') + f.path + ': ' + f.msg;
-    },
-
     // A key ending in `__` documents its sibling; a bare `__` documents the map.
     isComment: (key) => key.length >= 2 && key.slice(-2) === '__',
     commentTarget: (key) => key.slice(0, -2),
     joinPath: (prefix, key) => (prefix ? prefix + '.' + key : key),
-    // The path above `path`, or '' for a top-level key (and for the root itself).
-    parentPath: (path) => (path && path.indexOf('.') !== -1 ? path.slice(0, path.lastIndexOf('.')) : ''),
 
     // Two document values are the same value: the core's own dump of each, compared.
     sameValue: (a, b) => PVE.meta.Core.call('same', a, b),
@@ -72,12 +65,13 @@ PVE.meta.Utils = {
         return 'string';
     },
 
-    // What the Value column shows for a leaf. Arrays are one text leaf (DESIGN §8).
+    // What the Value column shows for a value: nothing for a map, which is its rows;
+    // a list as its JSON on the list's own row, above one row per member.
     displayValue: function (value, kind) {
         if (kind === 'map') {
             return '';
         } else if (kind === 'boolean') {
-            // The API's JSON view renders YAML booleans as 1/0 (a Perl artifact).
+            // Yes/No, as PVE shows a boolean everywhere else.
             return Proxmox.Utils.format_boolean(value);
         }
         return kind === 'string' ? String(value) : Ext.encode(value);
@@ -109,8 +103,9 @@ PVE.meta.Utils = {
         if (kind === 'boolean') {
             return text === true || text === 'true' || text === 1 || text === '1';
         } else if (kind === 'number') {
+            // An empty field is no number, not 0: `Number(null)` and `Number('')` are.
             let n = Number(text);
-            if (text === '' || isNaN(n)) {
+            if (text === '' || text === null || text === undefined || isNaN(n)) {
                 throw new Error(gettext('Not a number') + ': ' + text);
             }
             return n;
@@ -169,8 +164,9 @@ PVE.meta.Utils = {
         return Ext.encode(v);
     },
 
-    // A schema `type` as the kind `parseValue` speaks: integers and numbers both
-    // parse as numbers; a map or a list of one is not a scalar to parse at all.
+    // A schema `type` as the kind the row editor and `parseValue` speak: integers and
+    // numbers both parse as numbers, and any other type is edited as a string. The
+    // row builder answers `object` itself, since a map is rows, not a value.
     schemaValueKind: function (type) {
         if (type === 'integer' || type === 'number') {
             return 'number';
@@ -225,6 +221,9 @@ PVE.meta.Utils = {
                 queryMode: 'local',
                 editable: false,
                 forceSelection: true,
+                // The list renders each member as markup, and a member is schema
+                // text. The field itself shows it as a value, which needs nothing.
+                listConfig: { getInnerTpl: (field) => '{' + field + ':htmlEncode}' },
             };
         } else if (d.kind === 'boolean') {
             return { xtype: 'proxmoxcheckbox' };

@@ -177,6 +177,20 @@ fn an_enforcing_prefix_refuses_what_the_write_gets_wrong_and_only_that() {
     put(&store, PutReq { prefixes: &[], ..req("traefik.port", r#""x""#, false) }).unwrap();
 }
 
+#[test]
+fn an_enforcing_prefix_refuses_an_array_member_its_items_refuse() {
+    let (_dir, store) = store();
+    let text = "selector: {all: true}\nenforce: true\nschema:\n  type: object\n  properties:\n    lst: {type: array, items: {type: integer, maximum: 5}}\n";
+    let strict = vec![pve_meta_core::registry::parse_prefix("t", text).unwrap()];
+    let req = |data| PutReq { prefixes: &strict, view: Some("t.lst"), data, ..Default::default() };
+    for wrong in [r#"["9"]"#, "[9]"] {
+        let err = put(&store, req(wrong)).unwrap_err();
+        assert_eq!(status(&err), 422, "{wrong}: {err}");
+        assert!(err.msg.contains("t.lst.0"), "{err}");
+    }
+    put(&store, req("[1, 5]")).unwrap();
+}
+
 // -- version polling ----------------------------------------------------
 
 #[test]
@@ -340,6 +354,22 @@ fn dry_run_validates_exactly_what_the_write_validates() {
 }
 
 #[test]
+fn dry_run_refuses_a_write_above_the_size_cap_like_the_write() {
+    // The cap is put_raw's, which a dry run never reaches: the planned
+    // document has to be measured on the way there instead.
+    let (_dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    let big = format!("{{\"blob\": \"{}\"}}", "x".repeat(pve_meta_core::store::MAX_BYTES as usize));
+
+    let dry = put(&store, PutReq { view: Some("big"), data: &big, dry_run: true, ..Default::default() });
+    let wet = put(&store, PutReq { view: Some("big"), data: &big, ..Default::default() });
+    let (dry, wet) = (dry.unwrap_err(), wet.unwrap_err());
+    assert_eq!((status(&dry), status(&wet)), (400, 400), "{dry} / {wet}");
+    assert!(dry.to_string().contains("too large"), "{dry}");
+    assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n  host: x\n");
+}
+
+#[test]
 fn dry_run_checks_the_digest_and_never_writes() {
     let (_dir, store) = store();
     seed(&store, "100", "traefik:\n  host: x\n");
@@ -382,6 +412,47 @@ fn a_full_read_of_the_root_view_returns_the_files_own_text() {
         get(&store, "100", Some("alpha"), "yaml", &full()).unwrap().text.as_deref(),
         Some("2\n")
     );
+}
+
+#[test]
+fn a_text_write_stores_the_canonical_dump_so_a_hash_comment_does_not_survive() {
+    // `docs/decisions/006-...`: a document is written canonically from its
+    // value, and a `#` comment is not part of the value -- not even from a
+    // root replace sent as `text`, the one write that carries text at all.
+    // Key order is kept; the comment and the layout are not.
+    let (_dir, store) = store();
+    seed(&store, "100", "a: 1\n");
+    let text = "# why b comes first\nb:   2   # inline\na: 1\n";
+    put(&store, PutReq { fmt: "yaml", data: text, ..Default::default() }).unwrap();
+    assert_eq!(read_raw(&store, "100").unwrap(), "b: 2\na: 1\n");
+
+    // ... and a hand-written file keeps its comment exactly until a write.
+    seed(&store, "100", "# hand-written\nb: 2\na: 1\n");
+    put(&store, PutReq { view: Some("c"), data: "3", ..Default::default() }).unwrap();
+    assert_eq!(read_raw(&store, "100").unwrap(), "b: 2\na: 1\nc: 3\n");
+}
+
+#[test]
+fn a_read_through_an_array_or_a_scalar_is_refused_like_the_write() {
+    // `docs/DESIGN.md` §2: array members are not addressable. A read used to
+    // answer the empty document here, which a caller cannot tell from "unset".
+    let (_dir, store) = store();
+    seed(&store, "100", "traefik:\n  routers:\n  - name: web\n  host: x\n");
+    for view in ["traefik.routers.0", "traefik.routers.0.name", "traefik.host.deeper"] {
+        for fmt in ["json", "yaml"] {
+            let err = get(&store, "100", Some(view), fmt, &full())
+                .map(|ok| panic!("{view} as {fmt} was answered: {ok:?}"))
+                .unwrap_err();
+            assert_eq!(status(&err), 400, "{view} as {fmt}: {err}");
+            assert!(err.msg.contains(view), "{view} as {fmt}: {err}");
+        }
+        let err = put(&store, PutReq { view: Some(view), data: "{}", ..Default::default() })
+            .map(|ok| panic!("{view} was written: {ok:?}"))
+            .unwrap_err();
+        assert_eq!(status(&err), 400, "{view}: {err}");
+    }
+    // A path the document simply does not have is still the empty document.
+    assert_eq!(get(&store, "100", Some("nothing.here"), "json", &full()).unwrap().data, Some(json!({})));
 }
 
 // -- comment keys are notes (docs/DESIGN.md §2, §5) ---------------------
@@ -877,6 +948,30 @@ fn list_guests_uses_the_rows_perl_passes_and_gates_on_read_access() {
 }
 
 #[test]
+fn a_listing_reports_the_same_digest_whether_or_not_it_filters() {
+    let (dir, store) = store();
+    seed(&store, "100", "traefik:\n  host: x\n");
+    // A document a read could not recover is still a row with its digest:
+    // a listing without `has` never parses one.
+    std::fs::write(dir.path().join("101.yaml"), "a: [\n").unwrap();
+    let rows = vec![
+        GuestInput { vmid: 100, read: true, ..Default::default() },
+        GuestInput { vmid: 101, read: true, ..Default::default() },
+    ];
+
+    let listed = list_guests(&store, &rows, None).unwrap();
+    assert_eq!(listed.iter().map(|g| g.vmid).collect::<Vec<_>>(), vec![100, 101]);
+    for row in &listed {
+        let id = row.vmid.to_string();
+        assert_eq!(row.digest, store.digest_of(&parse_id(&id).unwrap()).unwrap().unwrap(), "{id}");
+    }
+    // ... the same digest the filtering listing reports for the one it keeps.
+    let filtered = list_guests(&store, &rows, Some("traefik")).unwrap();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].digest, listed[0].digest);
+}
+
+#[test]
 fn access_reflects_the_acl_it_is_given() {
     let (_dir, store) = store();
     let a = access(&store, &full()).unwrap();
@@ -999,6 +1094,122 @@ fn a_prefix_is_read_and_written_like_any_other_document() {
     assert_eq!(ns.prefix.to_string(), "homelab");
     assert_eq!(ns.description.as_deref(), Some("Home"));
     assert_eq!(ns.schema.unwrap()["type"], json!("object"));
+}
+
+/// A store whose registry is the two directories production has: a packaged
+/// one below the cluster one a write lands in (`docs/DESIGN.md` §3).
+fn store_with_packaged() -> (tempfile::TempDir, MetaStore, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let packaged = dir.path().join("registry/packaged");
+    let store = MetaStore::with_registry_dirs(
+        dir.path(),
+        vec![packaged.clone(), dir.path().join("registry/prefixes")],
+    );
+    std::fs::create_dir_all(&packaged).unwrap();
+    (dir, store, packaged)
+}
+
+#[test]
+fn a_delete_of_a_packaged_only_prefix_removes_nothing_and_says_so() {
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+
+    // The whole document: the delete would unlink a cluster file that is not
+    // there, so answering 200 with the packaged file's content as `touched`
+    // reports a removal that did not happen.
+    let err = del(&store, PutReq { id: "prefixes/compose", ..Default::default() }).unwrap_err();
+    assert_eq!(status(&err), 404, "{err}");
+    assert!(err.msg.contains("compose"), "{err}");
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+    assert!(!cluster.exists());
+
+    // A view delete does land: it writes the cluster file that shadows the
+    // packaged one, and the result is that file's digest and what it dropped.
+    let r = del(&store, PutReq { id: "prefixes/compose", view: Some("description"), ..Default::default() })
+        .unwrap();
+    assert_eq!(touched_paths(&r), vec!["delete description"]);
+    assert_eq!(std::fs::read_to_string(&cluster).unwrap(), "selector:\n  all: true\nschema:\n  type: object\n");
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+    assert_eq!(get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest, r.digest);
+
+    // With a cluster file there, the whole-document delete removes it and the
+    // packaged file is what a read falls back to.
+    let r = del(&store, PutReq { id: "prefixes/compose", ..Default::default() }).unwrap();
+    assert_eq!(r.digest, "");
+    assert!(!cluster.exists());
+    assert_eq!(
+        get(&store, "prefixes/compose", None, "yaml", &full()).unwrap().text.as_deref(),
+        Some(text),
+    );
+}
+
+#[test]
+fn a_view_delete_that_removes_nothing_writes_nothing() {
+    // `docs/DESIGN.md` §5: a write that changes nothing rewrites nothing. For
+    // a prefix that only exists packaged, the rewrite was a cluster copy of
+    // the packaged file -- shadowing it from then on, over a key that was
+    // never there.
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+    let before = get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest;
+    assert!(!before.is_empty());
+
+    for view in ["nothere", "schema.nothere", "schema.deeper.still"] {
+        let r = del(&store, PutReq { id: "prefixes/compose", view: Some(view), digest: Some(&before), ..Default::default() })
+            .unwrap_or_else(|e| panic!("{view}: {e}"));
+        assert!(r.touched.is_empty(), "{view}");
+        assert_eq!(r.digest, before, "{view}: the digest is the packaged file's still");
+        assert!(!cluster.exists(), "{view} grew a cluster copy");
+    }
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
+
+    // A guest document: the same rule, with the file's mtime as the proof.
+    seed(&store, "100", "traefik:\n    spec:\n        host: x\n");
+    let path = dir.path().join("100.yaml");
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let r = del(&store, PutReq { id: "100", view: Some("traefik.spec.port"), ..Default::default() }).unwrap();
+    assert!(r.touched.is_empty());
+    assert_eq!(r.digest, store.digest_of(&DocId::Guest(100)).unwrap().unwrap());
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime, "rewrote the file");
+    assert_eq!(read_raw(&store, "100").unwrap(), "traefik:\n    spec:\n        host: x\n");
+}
+
+#[test]
+fn a_put_that_leaves_a_packaged_prefix_as_it_is_writes_no_cluster_copy() {
+    // The `unchanged` check compares the planned text with the bytes the read
+    // saw, which for a packaged-only prefix are the packaged file's: a write
+    // of what is already there lands nowhere.
+    let (dir, store, packaged) = store_with_packaged();
+    let text = "selector:\n  all: true\ndescription: packaged\nschema:\n  type: object\n";
+    std::fs::write(packaged.join("compose.yaml"), text).unwrap();
+    let cluster = dir.path().join("registry/prefixes/compose.yaml");
+    let before = get(&store, "prefixes/compose", None, "json", &full()).unwrap().digest;
+
+    for (view, mode, data) in [
+        (Some("description"), "replace", "\"packaged\""),
+        (Some("schema"), "replace", r#"{"type":"object"}"#),
+        (Some("schema"), "merge", "{}"),
+        (None, "merge", r#"{"description":"packaged"}"#),
+        (None, "replace", r#"{"selector":{"all":true},"description":"packaged","schema":{"type":"object"}}"#),
+    ] {
+        let r = put(&store, PutReq { id: "prefixes/compose", view, mode, data, digest: Some(&before), ..Default::default() })
+            .unwrap_or_else(|e| panic!("{view:?}/{mode}/{data}: {e}"));
+        assert!(r.touched.is_empty(), "{view:?}/{mode}/{data}");
+        assert_eq!(r.digest, before, "{view:?}/{mode}/{data}");
+        assert!(!cluster.exists(), "{view:?}/{mode}/{data} grew a cluster copy");
+    }
+
+    // One that does change it is the cluster copy, and the packaged file is
+    // not what it wrote.
+    let r = put(&store, PutReq { id: "prefixes/compose", view: Some("description"), data: "\"ours\"", ..Default::default() })
+        .unwrap();
+    assert_eq!(touched_paths(&r), vec!["set description"]);
+    assert!(cluster.exists());
+    assert_eq!(std::fs::read_to_string(packaged.join("compose.yaml")).unwrap(), text);
 }
 
 #[test]

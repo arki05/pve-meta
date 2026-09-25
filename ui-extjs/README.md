@@ -44,10 +44,17 @@ ABI of five exports (`pm_alloc`/`pm_free` for the request, `pm_call` to run it,
 `pm_output` for the response, `pm_abi` for the version the glue checks on attach), built
 with a plain `cargo build --target wasm32-unknown-unknown --profile wasm` and nothing
 else -- no wasm-bindgen, no generated glue. It installs next to the panel as
-`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm` and is loaded lazily by
+`/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core-<hash>.wasm` and is loaded lazily by
 `PVE.meta.Core.load()` — `WebAssembly.instantiateStreaming` where pveproxy serves the
 file as `application/wasm`, falling back to `fetch` + `WebAssembly.instantiate` where
 it does not — the same way Monaco is.
+
+Both are installed under names that change with their content: the core under the first
+eight hex digits of its SHA-256, Monaco's tree under `monaco-<version>/vs`, the version
+`package.json` pins. `make js` writes both names into the script (`@WASM_NAME@`,
+`@MONACO_DIR@` in the sources). pve-ext fingerprints the script itself, so a new script
+always names the core and the tree it was built with, and a browser never pairs it with
+a `.wasm` it cached before an upgrade, whose ABI `attach` would refuse.
 
 `PVE.meta.Core.call(name, ...args)` is the whole glue: encode `{fn, args}` as UTF-8 into
 a buffer the module hands out, call, decode the response, and turn an `err` into a
@@ -92,7 +99,7 @@ datacenter tab are different panels (DESIGN §8):
 loader fetches a `script` once per URL, so the second manifest costs no second download.
 
 The file installs to `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-tree.js` with
-`pve-meta-core.wasm` next to it, which pveproxy serves at the `script` path above
+the core and Monaco next to it, which pveproxy serves at the `script` path above
 (top-level `Makefile`, `install` target).
 
 **The contract this panel expects from the loader.** The loader loads the script once
@@ -112,7 +119,7 @@ first, which is what its `waitForXtype()` does.
 * `make js` — generates `pve-meta-tree.js` and runs `node --check` on it.
 * `node testing/smoke.js` — offline, no DOM, after `make wasm js` (`make check` runs it
   when `node` is present). It loads the real file into `node:vm` behind a small
-  `Ext`/`Proxmox` shim, instantiates the *built* `pve-meta-core.wasm` synchronously and
+  `Ext`/`Proxmox` shim, instantiates the *built* core synchronously and
   hands it to `PVE.meta.Core.attach`, so the shipped bytes and the shipped glue are what
   gets tested: the raw ABI (a megabyte through the buffer, a memory growth, non-ASCII,
   error locations, a trap-vs-error distinction), one marshaling spot-check per wasm

@@ -1,6 +1,7 @@
 # 023 — Publishing into containers is a separate package that pushes files one way
 
-**Status:** accepted.
+**Status:** superseded by [029](029-pve-meta-writes-nothing-into-guests.md): the package
+is deprecated in 0.3.3, and this record goes with it in 0.4.
 
 ## Context
 

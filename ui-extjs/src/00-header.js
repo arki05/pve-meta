@@ -1,5 +1,5 @@
 /*
- * pve-meta-tree.js — the ExtJS editor for one metadata document (DESIGN.md §6).
+ * pve-meta-tree.js — the ExtJS editor for one metadata document (DESIGN.md §8).
  * A tree of rows (`PVE.meta.TreePanel`, composed from `PVE.meta.Doc`'s transport
  * and `PVE.meta.TextCard`'s Monaco view) and a whole-document Monaco buffer,
  * switched by the footer. A tree edit is one write with the digest and a

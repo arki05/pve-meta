@@ -43,6 +43,14 @@ impl RegistryKind {
             RegistryKind::PrefixDef => "prefixes",
         }
     }
+
+    /// The singular noun for one file of this kind, as an error message about
+    /// that file spells it: `prefix`.
+    pub fn noun(&self) -> &'static str {
+        match self {
+            RegistryKind::PrefixDef => "prefix",
+        }
+    }
 }
 
 impl fmt::Display for RegistryKind {
@@ -83,34 +91,6 @@ impl Selector {
             Selector::All => true,
             Selector::Tag(t) => tags.iter().any(|have| have == t),
         }
-    }
-
-    /// Reads a selector as the API *lists* it (`GET /meta/prefixes`): the
-    /// same shape [`Selector`] serializes, tolerating Perl's `true` → `1`.
-    /// The rule itself is [`parse_selector`]'s, applied unchanged.
-    ///
-    /// # Errors
-    /// [`Error::Registry`] as [`parse_selector`].
-    pub fn from_wire(v: &Value) -> Result<Selector> {
-        let Some(map) = v.as_object() else {
-            return Err(bad("selector: not a map"));
-        };
-        let all = match map.get("all") {
-            None => None,
-            Some(Value::Bool(b)) => Some(*b),
-            Some(Value::Number(n)) => Some(n.as_i64() == Some(1)),
-            Some(Value::String(s)) => Some(s == "1"),
-            Some(_) => return Err(bad("selector: 'all' is not a boolean")),
-        };
-        let tag = match map.get("tag") {
-            None => None,
-            Some(Value::String(s)) => Some(s.clone()),
-            Some(_) => return Err(bad("selector: 'tag' is not a string")),
-        };
-        if map.keys().any(|k| k != "all" && k != "tag") {
-            return Err(bad("selector: unknown field"));
-        }
-        parse_selector("selector", Some(RawSelector { all, tag }))
     }
 }
 
@@ -229,8 +209,10 @@ struct RawNodeOverride {
 }
 
 /// A flag value as a `bool`: `true`/`false`, or `1`/`0` as this dialect
-/// already spells `optional` and `multiline`. `None` if `v` is neither.
-fn as_flag(v: &Value) -> Option<bool> {
+/// already spells `optional` and `multiline` and the wire spells a boolean
+/// (`docs/decisions/017-data-is-a-native-structure.md`). `None` if `v` is
+/// neither. The one reading of it, for the loader and [`crate::shape`] alike.
+pub(crate) fn as_flag(v: &Value) -> Option<bool> {
     match v {
         Value::Bool(b) => Some(*b),
         Value::Number(n) if n.as_i64() == Some(1) => Some(true),
@@ -352,6 +334,13 @@ fn check_schema_dialect(name: &str, at: &str, node: &Value) -> Result<()> {
         }
     }
 
+    if let Some(items) = map.get("items") {
+        if let Some(t) = declared.filter(|t| *t != "array") {
+            return Err(fail(format!("'items' has no meaning for type {t}")));
+        }
+        check_schema_dialect(name, &format!("{at}.items"), items)?;
+    }
+
     if let Some(props) = map.get("properties") {
         let Some(props) = props.as_object() else {
             return Err(fail("'properties' must be a map".into()));
@@ -387,8 +376,8 @@ fn parse_selector(where_: &str, raw: Option<RawSelector>) -> Result<Selector> {
 /// Whether `name` is a usable registry **file** name (the part before
 /// `.yaml`): one or more [`crate::path::is_valid_segment`] segments joined by
 /// dots -- exactly a prefix, since the file name IS the prefix -- and at
-/// most [`MAX_FILE_NAME_LEN`] long. `parse_id`, `MetaStore::version` and the
-/// loader all need this same rule and must agree on it.
+/// most [`MAX_FILE_NAME_LEN`] long. `api::parse_id`, the loader and the
+/// editor (through the wasm build) all need this same rule and must agree on it.
 pub fn is_valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME_LEN
@@ -610,30 +599,15 @@ fn resolve_for_node(mut def: PrefixDef, node: Option<&NodeName>) -> PrefixDef {
     def
 }
 
-/// Where one directory's files come from: what `load_dirs` stamps on each.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Source {
-    Packaged,
-    Cluster,
-}
-
-impl Source {
-    fn origin(&self) -> Origin {
-        match self {
-            Source::Packaged => Origin::Packaged,
-            Source::Cluster => Origin::Cluster,
-        }
-    }
-}
-
-/// `dirs` (lowest precedence first) as layers: the last one is the cluster's --
+/// `dirs` (lowest precedence first) as layers, each with the [`Origin`]
+/// `load_dirs` stamps on its files: the last one is the cluster's --
 /// [`Registry::write_dir`]'s rule -- and every one below it packaged.
-fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Source)> {
+fn cluster_layers(dirs: &[PathBuf]) -> Vec<(PathBuf, Origin)> {
     dirs.iter()
         .enumerate()
         .map(|(i, dir)| {
-            let source = if i + 1 == dirs.len() { Source::Cluster } else { Source::Packaged };
-            (dir.clone(), source)
+            let origin = if i + 1 == dirs.len() { Origin::Cluster } else { Origin::Packaged };
+            (dir.clone(), origin)
         })
         .collect()
 }
@@ -667,14 +641,13 @@ fn is_file_or_unreadable(path: &FsPath) -> bool {
 type Loaded<T> = (Vec<(String, T)>, Vec<RegistryFailure>);
 
 /// Loads one drop-directory list, later layers overriding earlier by file
-/// name, and stamps each survivor with the [`Source`] of its layer. One row
+/// name, and stamps each survivor with the [`Origin`] of its layer. One row
 /// per name, loaded or failed: only the effective file ([`effective_file`])
 /// is read and parsed, so a file it shadows is neither loaded nor reported.
 fn load_dirs<T>(
-    layers: &[(PathBuf, Source)],
-    kind: &str,
+    layers: &[(PathBuf, Origin)],
     parse: impl Fn(&str, &str) -> Result<T>,
-    stamp: impl Fn(&mut T, &Source, bool),
+    stamp: impl Fn(&mut T, Origin, bool),
 ) -> Result<Loaded<T>> {
     let dirs: Vec<PathBuf> = layers.iter().map(|(dir, _)| dir.clone()).collect();
     // Every name, and how many directories hold it -- the `overrides` fact.
@@ -690,27 +663,21 @@ fn load_dirs<T>(
         // The file `yaml_files` just listed can have vanished since; then the
         // name is simply not there to load.
         let Some((index, path)) = effective_file(&dirs, &name) else { continue };
-        let source = &layers[index].1;
-        let fail = |name: String, error: String| RegistryFailure {
-            name,
-            origin: source.origin(),
-            error,
-        };
+        let origin = layers[index].1;
+        let fail = |name: String, error: String| RegistryFailure { name, origin, error };
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                crate::warn_line!("skipping unreadable {kind} file {}: {e}", path.display());
                 failures.push(fail(name, e.to_string()));
                 continue;
             }
         };
         match parse(&name, &text) {
             Ok(mut parsed) => {
-                stamp(&mut parsed, source, count > 1);
+                stamp(&mut parsed, origin, count > 1);
                 parsed_out.push((name, parsed));
             }
             Err(e) => {
-                crate::warn_line!("skipping malformed {kind} file {}: {e}", path.display());
                 failures.push(fail(name, e.to_string()));
             }
         }
@@ -722,9 +689,9 @@ fn load_dirs<T>(
 /// promises (`docs/DESIGN.md` §6) -- shared by [`load_prefixes`] (which drops
 /// the failures) and the [`Registry`] listings (which keep them), so the
 /// two can never compute the sort differently.
-fn prefixes_with_failures(layers: &[(PathBuf, Source)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
-    let (parsed, failures) = load_dirs(layers, "prefix", parse_prefix, |p, source, over| {
-        p.origin = source.origin();
+fn prefixes_with_failures(layers: &[(PathBuf, Origin)]) -> Result<(Vec<PrefixDef>, Vec<RegistryFailure>)> {
+    let (parsed, failures) = load_dirs(layers, parse_prefix, |p, origin, over| {
+        p.origin = origin;
         p.overrides = over;
     })?;
     let mut out: Vec<PrefixDef> = parsed.into_iter().map(|(_, ns)| ns).collect();
@@ -757,8 +724,8 @@ fn yaml_files(dir: &FsPath) -> Result<Vec<(String, PathBuf)>> {
         let Some(stem) = file_name.strip_suffix(".yaml") else {
             continue;
         };
-        // Same rule as `api::parse_id`/`store::registry_document_id`: a file
-        // nothing could address must not load either. An entry that cannot be
+        // Same rule as `api::parse_id`: a file nothing could address must
+        // not load either. An entry that cannot be
         // looked at is still listed -- reading it fails, and that is a
         // failure row for its name, not a silently shorter set.
         if !is_valid_file_name(stem) || !is_file_or_unreadable(&entry.path()) {
@@ -852,17 +819,6 @@ schema:
     }
 
     #[test]
-    fn a_wire_selector_is_the_file_selector_after_perls_booleans() {
-        // Perl renders `true` as `1`; the rule is still `parse_selector`'s.
-        assert_eq!(Selector::from_wire(&json!({"all": true})).unwrap(), Selector::All);
-        assert_eq!(Selector::from_wire(&json!({"all": 1})).unwrap(), Selector::All);
-        assert_eq!(Selector::from_wire(&json!({"tag": "t"})).unwrap(), Selector::Tag("t".into()));
-        for bad in [json!({}), json!({"all": 0}), json!({"all": true, "tag": "t"}), json!({"tag": ""}), json!({"pool": "p"}), json!("all")] {
-            assert!(Selector::from_wire(&bad).is_err(), "{bad} should not be a selector");
-        }
-    }
-
-    #[test]
     fn a_registry_file_name_is_a_dotted_prefix_and_never_a_path() {
         for good in ["traefik", "homelab.docker", "a-b_c", "svc@pve!t1"] {
             assert!(is_valid_file_name(good), "{good} was refused");
@@ -946,6 +902,8 @@ schema:
             ("schema: {properties: [a]}\n", "schema: 'properties' must be a map", "properties are keyed"),
             ("schema: {type: string, properties: {a: {}}}\n", "schema: 'properties' has no meaning for type string", "a string has no keys"),
             ("schema: {properties: {'a.b': {}}}\n", "schema: property 'a.b' is not a valid key", "a dotted key is two keys"),
+            ("schema: {type: string, items: {}}\n", "schema: 'items' has no meaning for type string", "a string has no members"),
+            ("schema: {type: array, items: {type: nope}}\n", "schema.items: 'type' must be one of", "a member's schema is checked like any node"),
             ("schema: {properties: {a: {properties: {b: {type: nope}}}}}\n",
              "schema.properties.a.properties.b: 'type' must be one of", "the error names the nested place"),
         ];
@@ -961,6 +919,7 @@ schema:
             "schema: {type: object, properties: {on: {type: boolean, default: 1, enum: [true, false]}}}\n",
             "schema: {type: object, hidden: 1, enforce: 0, properties: {x: {pattern: '^a', typetext: xy}}}\n",
             "schema: {minimum: 1, maximum: 2}\n",
+            "schema: {type: array, items: {type: integer, maximum: 5}}\n",
             "schema: {}\n",
         ];
         for text in accepted {

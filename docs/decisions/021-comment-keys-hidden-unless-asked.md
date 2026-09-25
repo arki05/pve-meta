@@ -12,11 +12,12 @@ notes into it, and every other consumer had to learn the rule or carry them alon
 ## Decision
 
 A read without `comments=1` omits every `k__` at any depth, in `data` and in `text`,
-which is then the canonical dump of what is left; a view naming one is a 400. A
-`replace` that did not ask for comments must not destroy notes it never saw: it keeps
-the stored `k__` of every map key `k` it keeps, drops one whose subject it drops, and
-keeps nothing inside a list. Deleting `k` deletes `k__`. With `comments=1` a read and a
-write are what they were: the payload is the subtree, notes included.
+which is then the canonical dump of what is left; a view naming one finds nothing, like
+any other absent path. A `replace` that did not ask for comments must not destroy notes
+it never saw: it keeps the stored `k__` of every map key `k` it keeps, drops one whose
+subject it drops, and keeps nothing inside a list. Deleting `k` deletes `k__`. With
+`comments=1` a read and a write are what they were: the payload is the subtree, notes
+included.
 
 ## Consequences
 

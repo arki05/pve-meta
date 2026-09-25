@@ -1,0 +1,26 @@
+{
+    "description": "pve-meta's guest-lifecycle patch: wires PVE::RS::Meta into stock PVE (docs/LIFECYCLE.md). Clone is not carried (decisions 008 and 019).",
+    "files": [
+        {
+            "path": "/usr/share/perl5/PVE/AbstractConfig.pm",
+            "package": "libpve-guest-common-perl",
+            "diff": "lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff",
+            "marker": "use PVE::RS::Meta;",
+            "check": "perl"
+        },
+        {
+            "path": "/usr/share/perl5/PVE/VZDump/QemuServer.pm",
+            "package": "qemu-server",
+            "diff": "lifecycle/qemu-server_VZDump-QemuServer.pm.diff",
+            "marker": "use PVE::RS::Meta;",
+            "check": "perl"
+        },
+        {
+            "path": "/usr/share/perl5/PVE/VZDump/LXC.pm",
+            "package": "pve-container",
+            "diff": "lifecycle/pve-container_VZDump-LXC.pm.diff",
+            "marker": "use PVE::RS::Meta;",
+            "check": "perl"
+        }
+    ]
+}

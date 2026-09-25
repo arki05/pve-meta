@@ -7,7 +7,7 @@ Ext.define('PVE.meta.Footer', {
     singleton: true,
 
     // cfg: { format: handler?, diff: handler?, apply: handler, applyText?,
-    //        applyDisabled, secondary: handler, secondaryText }
+    //        applyDisabled, applyHidden, secondary: handler, secondaryText }
     actions: function (cfg) {
         let out = [];
         if (cfg.format) {
@@ -37,6 +37,9 @@ Ext.define('PVE.meta.Footer', {
             itemId: 'metaApply',
             iconCls: 'fa fa-check',
             disabled: !!cfg.applyDisabled,
+            // Not offered at all where the caller may not write: a button that
+            // exists only to be refused is worse than no button (DESIGN §4).
+            hidden: !!cfg.applyHidden,
             handler: cfg.apply,
         });
         out.push({

@@ -1,14 +1,15 @@
 --- a/usr/share/perl5/PVE/AbstractConfig.pm
 +++ b/usr/share/perl5/PVE/AbstractConfig.pm
-@@ -12,6 +12,7 @@
+@@ -12,6 +12,8 @@
  use PVE::GuestHelpers qw(typesafe_ne);
  use PVE::ReplicationConfig;
  use PVE::Replication;
 +use PVE::RS::Meta;
++use PVE::Meta::Hooks;
  
  my $nodename = PVE::INotify::nodename();
  
-@@ -65,6 +66,49 @@
+@@ -65,6 +67,52 @@
  sub write_config {
      my ($class, $vmid, $conf) = @_;
  
@@ -23,42 +24,45 @@
 +    # write that carries a block, or by the first write of an unlocked config, and by
 +    # nothing in between. A create that carried no block ends with an unlocked write,
 +    # so it leaves nothing behind for a later paste to use.
-+    # The import runs under the document's own lock, the one every other writer takes,
++    # The import runs under the document's own lock (PVE::Meta::Hooks::locked_warn),
 +    # inside the guest lock the caller holds, the same order create and destroy use.
 +    # An error leaves the notes as they are, block included, and never fails the write.
++    # The companion marker, <vmid>.existing, says the create was a restore *over* an
++    # existing guest; it is taken in the same moment as the marker itself, so the two
++    # never drift apart across the several writes one restore makes.
 +    my $meta_block = defined($conf->{description})
 +        && index($conf->{description}, '[pve-meta v') != -1;
 +    my $meta_created;
++    my $meta_existing;
 +    if ($meta_block || !$conf->{lock}) {
 +        $meta_created = eval { PVE::RS::Meta::take_created($vmid) };
 +        warn "pve-meta: take_created($vmid) failed: $@" if $@;
++        $meta_existing = $meta_created && unlink("/run/pve-meta/$vmid.existing");
 +    }
 +    if ($meta_created && $meta_block) {
-+        my $meta_err;
-+        eval {
-+            PVE::Cluster::cfs_lock_domain(
-+                "pve-meta-$vmid",
-+                10,
-+                sub {
-+                    my $res = PVE::RS::Meta::notes_import($vmid, $conf->{description}, 'restore');
-+                    return if !defined($res->{description});
-+                    if (length($res->{description})) {
-+                        $conf->{description} = $res->{description};
-+                    } else {
-+                        delete $conf->{description};
-+                    }
-+                },
-+            );
-+            $meta_err = $@;
-+        };
-+        $meta_err = $@ if !$meta_err;
-+        warn "pve-meta: notes_import($vmid) failed: $meta_err" if $meta_err;
++        PVE::Meta::Hooks::locked_warn($vmid, "notes_import($vmid)", sub {
++            my $res = PVE::RS::Meta::notes_import($vmid, $conf->{description}, 'restore');
++            return if !defined($res->{description});
++            if (length($res->{description})) {
++                $conf->{description} = $res->{description};
++            } else {
++                delete $conf->{description};
++            }
++        });
++    } elsif ($meta_created && $meta_existing) {
++        # pve-meta: a restore *over* an existing guest of a backup that carries no
++        # document. After the restore the guest is the backup, so the document of the
++        # incarnation it replaced goes with it, snapshot copies included -- keeping it
++        # would hand a stale ingress route or compose stack to a guest that no longer
++        # runs them. Same lock and same soft-fail as the import above.
++        my $what = "clearing $vmid after a restore that carried no document";
++        PVE::Meta::Hooks::locked_warn($vmid, $what, sub { PVE::RS::Meta::on_create($vmid) });
 +    }
 +
      my $cfspath = $class->cfs_config_path($vmid);
  
      PVE::Cluster::cfs_write_file($cfspath, $conf);
-@@ -267,6 +311,41 @@
+@@ -267,6 +315,43 @@
              $class->write_config($vmid, $conf);
          },
      );
@@ -68,27 +72,12 @@
 +    # this vmid was free -- a restore *over* an existing guest keeps its document here;
 +    # the restore then replaces it from the backup's notes block (write_config below),
 +    # or leaves it if the backup carried none.
++    # Under the document's own lock, so a stalled API write cannot land on the new
++    # guest's slot carrying the old guest's metadata: the vmid-reuse window these
++    # hooks exist to close.
 +    if (!$allow_existing) {
-+        # pve-meta: under the document's own lock -- the one every other writer
-+        # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`). Without it the
-+        # hook races an in-flight write: the write passes its checks, this purge
-+        # runs, the vmid is reused, and the stalled write lands on the new guest's
-+        # slot carrying the old guest's metadata. That is the vmid-reuse window
-+        # these hooks exist to close, so they have to close it against writers too.
-+        #
-+        # `cfs_lock_domain` reports the callback's die through `$@` rather than
-+        # raising, so `$@` is read inside the eval, before leaving it clears it.
-+        # The eval is for `cfs_lock_domain` itself: cleaning up metadata must never
-+        # be able to fail a guest create or destroy.
-+        my $meta_err;
-+        eval {
-+            PVE::Cluster::cfs_lock_domain(
-+                "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_create($vmid) },
-+            );
-+            $meta_err = $@;
-+        };
-+        $meta_err = $@ if !$meta_err;
-+        warn "pve-meta: on_create($vmid) failed: $meta_err" if $meta_err;
++        PVE::Meta::Hooks::locked_warn($vmid, "on_create($vmid)",
++            sub { PVE::RS::Meta::on_create($vmid) });
 +    }
 +
 +    # pve-meta: the next write of this config is the one a restore ends in, so mark the
@@ -97,10 +86,27 @@
 +    # imported by an ordinary config write; `pve-meta scan-notes` is the way in.
 +    eval { PVE::RS::Meta::mark_created($vmid) };
 +    warn "pve-meta: mark_created($vmid) failed: $@" if $@;
++
++    # pve-meta: and the one fact only this call knows -- whether the vmid was already
++    # taken, which happens on a restore over an existing guest and nowhere else. A
++    # restore whose backup carries no document must clear the one the guest had
++    # (write_config above); a plain create clears the mark so a create that follows a
++    # half-finished restore cannot inherit it. Node-local, beside the marker, written
++    # from here rather than through the store: it is about this node's next write.
++    eval {
++        my $existing = "/run/pve-meta/$vmid.existing";
++        if ($allow_existing) {
++            open(my $fh, '>', $existing) or die "$existing: $!\n";
++            close($fh);
++        } else {
++            unlink($existing);
++        }
++    };
++    warn "pve-meta: marking $vmid as a restore over an existing guest failed: $@" if $@;
  }
  
  # destroys configuration, only applicable for configs owned by the callers node.
-@@ -276,6 +355,31 @@
+@@ -276,6 +361,14 @@
  
      my $config_fn = $class->config_file($vmid, $nodename);
      unlink $config_fn or die "failed to remove config file: $!\n";
@@ -109,56 +115,45 @@
 +    # Every destroy path funnels through here (primary destroy, create/restore failure
 +    # cleanup, clone failure cleanup, remote-migration abort), and this runs only after
 +    # the unlink above succeeded: while the config still exists, so does the guest.
-+    # pve-meta: under the document's own lock -- the one every other writer
-+    # takes (`PVE::API2::Ext::Meta::_locked`, `pve-meta rm`). Without it the
-+    # hook races an in-flight write: the write passes its checks, this purge
-+    # runs, the vmid is reused, and the stalled write lands on the new guest's
-+    # slot carrying the old guest's metadata. That is the vmid-reuse window
-+    # these hooks exist to close, so they have to close it against writers too.
-+    #
-+    # `cfs_lock_domain` reports the callback's die through `$@` rather than
-+    # raising, so `$@` is read inside the eval, before leaving it clears it.
-+    # The eval is for `cfs_lock_domain` itself: cleaning up metadata must never
-+    # be able to fail a guest create or destroy.
-+    my $meta_err;
-+    eval {
-+        PVE::Cluster::cfs_lock_domain(
-+            "pve-meta-$vmid", 10, sub { PVE::RS::Meta::on_destroy($vmid) },
-+        );
-+        $meta_err = $@;
-+    };
-+    $meta_err = $@ if !$meta_err;
-+    warn "pve-meta: on_destroy($vmid) failed: $meta_err" if $meta_err;
++    # Under the document's own lock, like create.
++    PVE::Meta::Hooks::locked_warn($vmid, "on_destroy($vmid)",
++        sub { PVE::RS::Meta::on_destroy($vmid) });
  }
  
  # moves configuration owned by calling node to the target node.
-@@ -876,6 +980,9 @@
+@@ -876,6 +969,11 @@
      }
  
      $class->__snapshot_commit($vmid, $snapname);
 +
-+    eval { PVE::RS::Meta::on_snapshot($vmid, $snapname) };
-+    warn "pve-meta: on_snapshot($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: copy the document under its own lock, so the copy, a rollback and an
++    # in-flight API write can never interleave on the file.
++    PVE::Meta::Hooks::locked_warn($vmid, "on_snapshot($vmid, $snapname)",
++        sub { PVE::RS::Meta::on_snapshot($vmid, $snapname) });
  }
  
  # Check if the snapshot might still be needed by a replication job.
-@@ -1052,6 +1159,9 @@
+@@ -1052,6 +1150,10 @@
              $class->write_config($vmid, $conf);
          },
      );
 +
-+    eval { PVE::RS::Meta::on_delsnap($vmid, $snapname) };
-+    warn "pve-meta: on_delsnap($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: under the document's own lock, like `snapshot_create`'s copy.
++    PVE::Meta::Hooks::locked_warn($vmid, "on_delsnap($vmid, $snapname)",
++        sub { PVE::RS::Meta::on_delsnap($vmid, $snapname) });
  }
  
  # Remove replication snapshots to make a rollback possible.
-@@ -1214,6 +1324,9 @@
+@@ -1214,6 +1316,12 @@
  
      $prepare = 0;
      $class->lock_config($vmid, $updatefn);
 +
-+    eval { PVE::RS::Meta::on_rollback($vmid, $snapname) };
-+    warn "pve-meta: on_rollback($vmid, $snapname) failed: $@" if $@;
++    # pve-meta: under the document's own lock, like `snapshot_create`'s copy --
++    # this one writes the document without a digest, so it must not land on top
++    # of an API write that read it a moment earlier.
++    PVE::Meta::Hooks::locked_warn($vmid, "on_rollback($vmid, $snapname)",
++        sub { PVE::RS::Meta::on_rollback($vmid, $snapname) });
  }
  
  # Calculate a derived property from a configuration. Derived properties are:

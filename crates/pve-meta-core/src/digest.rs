@@ -8,6 +8,14 @@ pub fn digest(bytes: &[u8]) -> String {
     hex::encode(hash)
 }
 
+/// The first twelve characters of `d`, the length a log line shows a digest
+/// at. By characters, not bytes: a digest read back out of notes text (a
+/// backup block's header) is whatever someone typed there, and a byte slice
+/// through a multi-byte character would panic.
+pub fn short(d: &str) -> &str {
+    d.char_indices().nth(12).map_or(d, |(i, _)| &d[..i])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -27,6 +35,14 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn short_is_twelve_characters_or_all_of_a_shorter_one() {
+        assert_eq!(short(&digest(b"")), "e3b0c44298fc");
+        assert_eq!(short("abc"), "abc");
+        assert_eq!(short(""), "");
+        assert_eq!(short("abcdefghijk\u{e9}xyz"), "abcdefghijk\u{e9}");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 # postinst for the pve-ext package.
 #
 # Applies (or re-applies) pve-ext's own two-line pve-manager patch
-# (index.html.tpl / PVE/API2.pm - see patches/pve-manager.toml) on initial
+# (index.html.tpl / PVE/API2.pm - see patches/pve-manager.json) on initial
 # configure, and again whenever dpkg triggers us because pve-manager
 # shipped a new copy of either file (see debian/triggers). Re-running
 # `pve-ext-patch apply` is safe and idempotent: it reuses the existing

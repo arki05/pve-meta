@@ -73,6 +73,7 @@ pub mod path;
 pub mod registry;
 pub mod shape;
 pub mod store;
+pub mod tags;
 pub mod view;
 
 pub use error::{Error, Result};

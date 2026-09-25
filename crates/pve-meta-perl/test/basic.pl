@@ -68,6 +68,12 @@ my $res;
 # --- version() ---------------------------------------------------------
 like(PVE::RS::Meta::version(), qr/^\d+\.\d+\.\d+$/, 'version() looks like a semver string');
 
+# --- split_tags() ------------------------------------------------------
+# The rule is pinned in Rust (`tags::split_tags`); this is the boundary:
+# undef in, an array ref out, as parse_tags hands it on.
+is_deeply(PVE::RS::Meta::split_tags(undef), [], 'split_tags(undef) is no tags');
+is_deeply(PVE::RS::Meta::split_tags('a;b,,c d'), [qw(a b c d)], 'split_tags splits the tag string');
+
 # =========================================================================
 # Lifecycle hooks (docs/DESIGN.md §7, docs/LIFECYCLE.md).
 # =========================================================================
@@ -158,6 +164,8 @@ is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200, 999500],
 is(PVE::RS::Meta::on_destroy(999500), 2, 'on_destroy removes a stale document and its snapshot copy');
 is_deeply(PVE::RS::Meta::stored_vmids(), [9100, 9200], '... and the vmid leaves the list');
 ok(file_exists('datacenter.yaml'), 'a stray file with no vmid in its name is never a guest');
+is_deeply(PVE::RS::Meta::unknown_files(), ['datacenter.yaml'],
+    '... and unknown_files names it, the row `pve-meta ls` prints as unknown/<file>');
 
 unlink("$root/datacenter.yaml", "$root/9100.yaml", "$root/9100.keep.yaml", "$root/9200.old.yaml");
 
@@ -269,6 +277,13 @@ like($v->{token}, qr/^[0-9a-f]{64}$/, '... a sha256 hex string');
 
 dies_with(400, sub { PVE::RS::Meta::api_get('not-a-vmid', undef, 'json', $FULL) },
     'api_get for an id that is neither a vmid nor a registry id');
+
+# check_id: api::parse_id's verdict, which lock_domain_for asks before a lock
+# is named after the id.
+ok(eval { PVE::RS::Meta::check_id($_); 1 }, "check_id accepts '$_'")
+    for ('100', 'prefixes/homelab.docker');
+dies_with(400, sub { PVE::RS::Meta::check_id('abc'); 1 }, "check_id('abc')");
+dies_with(400, sub { PVE::RS::Meta::check_id('prefixes/a/b'); 1 }, "check_id('prefixes/a/b')");
 
 # api_put's `data` is the one JSON string; the payload and the result --
 # including `touched`, a native array of { path, op } hashes -- are native
@@ -396,5 +411,42 @@ write_file('9700.yaml', "a: 1\n");
     unlink("$root/local");
 }
 unlink("$root/9700.yaml");
+
+# PVE::Meta::Hooks::locked_warn, against a stand-in for cfs_lock_domain that
+# reports as PVE::Cluster's cfs_lock does: it never dies, it returns undef with
+# $@ set -- to the callback's die, or to "cfs-lock '...' error: ..." for a lock
+# it could not take. Either way the hook warns and returns.
+{
+    no warnings 'once';
+    local $INC{'PVE/Cluster.pm'} = __FILE__;
+    my ($lock_dies, $domain) = (0);
+    local *PVE::Cluster::cfs_lock_domain = sub {
+        my ($name, undef, $code) = @_;
+        $domain = $name;
+        if ($lock_dies) {
+            $@ = "cfs-lock 'domain-$name' error: got lock request timeout\n";
+            return undef;
+        }
+        my $res = eval { $code->() };
+        return $res;
+    };
+    require PVE::Meta::Hooks;
+    my @warned;
+    local $SIG{__WARN__} = sub { push @warned, $_[0] };
+
+    my $ran = 0;
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { $ran = 1 });
+    ok($ran && !@warned, 'locked_warn runs the hook, quietly when it succeeds');
+    is($domain, 'pve-meta-9800', '... under the guest document\'s lock domain');
+
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { die "boom\n" });
+    like(shift(@warned) // '', qr/^pve-meta: on_x\(9800\) failed: boom$/, 'a hook that dies is a warning');
+
+    $lock_dies = 1;
+    $ran = 0;
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { $ran = 1 });
+    ok(!$ran, 'a lock that cannot be taken does not run the hook');
+    like(shift(@warned) // '', qr/^pve-meta: on_x\(9800\) failed: cfs-lock/, '... and is a warning');
+}
 
 done_testing();

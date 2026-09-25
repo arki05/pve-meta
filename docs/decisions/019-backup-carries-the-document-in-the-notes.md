@@ -14,7 +14,8 @@ hook script (no restore-side seam); the firewall file (rewritten by any firewall
 
 The document travels in the guest config, which every archive kind carries. `assemble`
 in each vzdump plugin appends it to the archive's copy of the notes as one marked block,
-plain YAML; the live config never carries it. `write_config`, which every restore path
+plain YAML; the live config never carries it. A restore imports the last block, the one
+`assemble` wrote. `write_config`, which every restore path
 ends in, reads the block into the store and strips it, winning over whatever document
 the vmid had. A host without pve-meta restores it as readable notes text; `scan-notes`
 imports it later, gated by a node-local marker so an ordinary write never imports one.

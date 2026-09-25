@@ -1,3 +1,97 @@
+pve-meta (0.3.3-1) unstable; urgency=medium
+
+  * API and CLI:
+    - A read through an array or a scalar is a 400, like the write.
+    - DELETE ?view= of a key that is not there writes nothing and answers
+      with the current digest; a packaged-only prefix no longer grows a
+      cluster copy of itself over it.
+    - Deleting a packaged-only prefix whole removes nothing and says 404.
+    - GET /meta/guests without has= reads each guest's digest, not its
+      document.
+    - `pve-meta ls` lists a file that is neither a document nor a snapshot,
+      as unknown/<file>.
+    - An array's members are checked against its schema's `items`.
+    - A dry run refuses a write above the size cap, as the write does.
+    - A prefix file that does not load, or a guest document that does not
+      parse, is no longer logged to syslog on every read of it: the
+      listing's failure row, the read's parse_error or its 422 already
+      say so.
+    - `pve-meta set` no longer reads the view back to print "kept N
+      note(s)"; a replace keeps the notes it did not carry, as before.
+    - A notes block header whose digest holds a multi-byte character no
+      longer panics the restore that imports it.
+    - `pve-meta get --comments` prints a document that does not parse as
+      its raw text, with the parse error on stderr, as the 422's message
+      says; before, the read was the 422 whatever the options.
+    - `pve-meta set`, `merge` and `delete` refuse an id that is neither a
+      vmid nor prefixes/<name> before taking the lock, instead of waiting
+      out its 30 s timeout or warning about an undefined value.
+  * Lifecycle:
+    - The snapshot, delete-snapshot and rollback hooks take the document
+      lock, like create and destroy, so a copy or a rollback never
+      interleaves with an in-flight write.
+    - A forced restore of a backup that carries no block replaces the
+      document: the one the guest had, and its snapshot copies, are
+      removed.
+    - A restore imports the last notes block, the one the backup wrote, and
+      strips every block from the notes; a block pasted into them earlier
+      no longer wins. The snapshot copies of the document it replaced are
+      removed.
+    - The hooks take the document lock through one soft-fail helper,
+      PVE::Meta::Hooks::locked_warn, shipped in libpve-meta-rs-perl,
+      instead of seven copies of it in the patch.
+  * Guest files:
+    - pve-meta-guest-files is deprecated, managed plane included, and is
+      removed in 0.4: pve-meta writes nothing into guests (decision 029,
+      superseding 023). A service in a container reads its document over
+      the API with a scoped token instead; an operator pushes its own
+      files with pct push. The daemon logs a warning when it starts.
+  * Editor:
+    - A popup (Edit, Add Key, Edit selection as text, New Prefix) stays
+      open on a failed write, with what was typed, instead of closing over
+      a 400 or a 403.
+    - A 409 with a popup open re-reads the document around it: the alert
+      says whether the edited value itself changed, naming both values if
+      so, and the next OK carries the fresh digest. A 409 in Text mode
+      keeps the buffer and diffs it against the file as it is now. New
+      Prefix says the name exists.
+    - Add refuses a key the document already holds instead of replacing
+      its value.
+    - The YAML | JSON toggle gives back the exact text it took.
+    - A repaired document goes back to the tree without a page reload.
+    - A write keeps the row that was selected.
+    - The wasm core is installed under its content hash and Monaco under
+      its version, so a browser never pairs an upgraded script with a
+      cached core.
+    - A failed core or Monaco load is retried on the next use; a Monaco
+      load that never answers times out after 30 seconds.
+    - Hovers work in every text buffer, not only the first panel's; the
+      prefixes grid comes back from a failed Reload; the subtree window
+      of a read-only document is a view, without OK; the panel closes its
+      editors with it; schema squiggles wait for a pause in the typing.
+    - A parse error, a removed path, a hover and an enum member in the row
+      editor's list are shown as text, not markup. A document that does
+      not parse says so above its text.
+    - New Prefix writes the tag it checked, trimmed. A number enum opens on
+      its value, and an empty number field writes nothing. Append opens on
+      the list's item type; Declare Key needs no selected row; a note
+      whose key is not set can be removed.
+    - Revert in JSON stays reverted, and a YAML-only edit behind JSON
+      counts as a change. A read-only caller's Text card has no Apply.
+  * Packaging:
+    - Depends on pve-ext (>= 0.2.1): the lifecycle manifest is JSON now,
+      installed as pve-meta-lifecycle.json, and id-less.
+    - The triggers also watch each patched file's .pve-ext-orig name,
+      which dpkg writes an upgrade to while the file is diverted: an
+      upgrade of libpve-guest-common-perl, qemu-server or pve-container
+      re-applies the lifecycle patch on the new file, instead of leaving
+      the old patched copy live until a manual pve-ext-patch apply.
+    - The regex crate is no longer a dependency.
+    - docs/LIFECYCLE.md: the snapshot hooks take the document lock on
+      its own, after the guest lock.
+
+ -- Julius Arkenberg <julius@rkenberg.de>  Fri, 25 Sep 2026 03:32:34 +0200
+
 pve-meta (0.3.2-1) unstable; urgency=medium
 
   * Managed syncs never collect: a present file the call did not ask for
@@ -19,13 +113,13 @@ pve-meta (0.3.1-1) unstable; urgency=medium
 pve-meta (0.3.0-1) unstable; urgency=medium
 
   * Guest files grow a managed plane for operators: manifest records carry
-a `source` (`user/<entry>` or `managed/<operator>/<name>`, pre-source files
-read back as their own entry), entries can be built content-direct
-(`Entry::managed`, `Desired::direct`, `GuestFiles::managed`) and flow
-through the same plan, commit, manifest and lock, a path recorded for
-another source is refused naming both, and tag lists share
-`node::split_tags`. No behaviour change for document readers; the daemon
-never sees managed files. (`docs/GUEST-FILES.md`: Managed files.)
+    a `source` (`user/<entry>` or `managed/<operator>/<name>`, pre-source files
+    read back as their own entry), entries can be built content-direct
+    (`Entry::managed`, `Desired::direct`, `GuestFiles::managed`) and flow
+    through the same plan, commit, manifest and lock, a path recorded for
+    another source is refused naming both, and tag lists share
+    `node::split_tags`. No behaviour change for document readers; the daemon
+    never sees managed files. (`docs/GUEST-FILES.md`: Managed files.)
 
  -- Julius Arkenberg <julius@rkenberg.de>  Mon, 21 Sep 2026 18:30:00 +0200
 

@@ -10,7 +10,6 @@ use warnings;
 
 use Getopt::Long qw(GetOptionsFromArray);
 use JSON::PP;
-use List::Util;
 
 use PVE::RS::Meta;
 
@@ -33,15 +32,19 @@ usage: $SELF get <id> [<view>] [--format yaml|json] [--comments]
   <id>    a vmid or 'prefixes/<name>'
   <view>  a dotted key path inside the document; omit for all of it
 
-  get     print the view; comment keys (key__, a note about key) only with --comments
+  get     print the view; comment keys (key__, a note about key) only with --comments,
+          which also prints a document that does not parse as its raw text
   set     replace the view with the payload ({} stores an empty map; use delete to remove);
-          it may carry no comment key and keeps the stored ones whose key it keeps, unless
-          --comments makes it the whole subtree, notes included
+          it keeps the stored note of every key it keeps, unless --comments makes it the
+          whole subtree, notes included
   merge   apply the payload as a merge patch (a JSON null deletes a key)
   delete  remove the view and its note (<view>__), or the whole document
   --file  read the payload from a file, or '-' for stdin; .json is JSON, anything else YAML
   --force store the result even where a prefix's schema is enforced and it does not match
 
+  ls            every document, plus every file under /etc/pve/meta that is neither a
+                document nor a snapshot copy, as 'unknown/<file>': never touched, never
+                an orphan, but a typo'd name is only visible here
   ls --orphans  only vmids the store holds files for that are not in the vmlist
   rm <vmid>     remove an orphan's document and snapshot copies; refuses a live guest
   scan-notes    read every backup notes block in the cluster's guest configs into the
@@ -59,8 +62,8 @@ my $ROOT_ACL = { authid => 'root@pam', read => 1, write => 1, tags => [] };
 
 sub acl_for {
     my ($id) = @_;
-    return $ROOT_ACL if $id !~ /^\d+$/;
     require PVE::API2::Ext::Meta;
+    return $ROOT_ACL if !PVE::API2::Ext::Meta::is_guest_id($id);
     return {
         %$ROOT_ACL,
         tags => PVE::API2::Ext::Meta::guest_tags($id),
@@ -68,30 +71,40 @@ sub acl_for {
     };
 }
 
-# Runs $code under the document's cluster lock, with the same vmlist check the
-# API makes inside it: a write never creates a file for a vmid that does not
-# exist. The digest is re-checked by the Rust call itself.
-sub locked {
+# Prints a failure the way every command reports one -- the message, without
+# the Rust layer's "NNN: " status -- and exits 1.
+sub fail {
+    my ($err) = @_;
+    require PVE::API2::Ext::Meta;
+    my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
+    print STDERR "$SELF: $msg\n";
+    exit 1;
+}
+
+# Runs $code under the document's cluster lock, the API's own lock domain; an
+# id the API would refuse, a die inside it, or a lock that cannot be taken, is a
+# failure. The id is refused before the lock is tried, not after its timeout.
+sub with_lock {
     my ($id, $code) = @_;
     require PVE::Cluster;
     require PVE::API2::Ext::Meta;
-    my $res = PVE::Cluster::cfs_lock_domain(
-        PVE::API2::Ext::Meta::lock_domain_for($id),
-        $LOCK_TIMEOUT,
-        sub {
-            if ($id =~ /^\d+$/) {
-                die "guest '$id' does not exist\n"
-                    if !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
-            }
-            return $code->();
-        },
-    );
-    if (my $err = $@) {
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    my $domain = call(sub { PVE::API2::Ext::Meta::lock_domain_for($id) });
+    my $res = PVE::Cluster::cfs_lock_domain($domain, $LOCK_TIMEOUT, $code);
+    fail($@) if $@;
     return $res;
+}
+
+# with_lock, plus the vmlist check the API makes inside it: a write never
+# creates a file for a vmid that does not exist. The digest is re-checked by
+# the Rust call itself.
+sub locked {
+    my ($id, $code) = @_;
+    return with_lock($id, sub {
+        die "guest '$id' does not exist\n"
+            if PVE::API2::Ext::Meta::is_guest_id($id)
+            && !PVE::API2::Ext::Meta::vmlist_ids(1)->{$id};
+        return $code->();
+    });
 }
 
 # The payload of a set or merge: exactly one of --data (JSON), --text (YAML) or
@@ -149,21 +162,6 @@ sub cmd_write {
         );
     });
     report_write($opts{dry_run} ? 'would write' : 'wrote', $id, $view, $res);
-
-    # A replace without --comments keeps the notes it did not carry; say so, since
-    # the file still holds something the payload did not.
-    if ($mode eq 'set' && !$opts{comments} && !$opts{dry_run}) {
-        my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, 1) };
-        my $kept = $doc ? count_notes($doc->{data}) : 0;
-        print STDERR "$SELF: kept $kept note(s) (use --comments to replace them)\n" if $kept;
-    }
-}
-
-sub count_notes {
-    my ($v) = @_;
-    return 0 if !ref($v);
-    return List::Util::sum(0, map { count_notes($_) } @$v) if ref($v) eq 'ARRAY';
-    return List::Util::sum(0, map { (/__$/ ? 1 : 0) + count_notes($v->{$_}) } keys %$v);
 }
 
 sub cmd_delete {
@@ -184,12 +182,7 @@ sub cmd_delete {
 sub call {
     my ($code) = @_;
     my $res = eval { $code->() };
-    if (my $err = $@) {
-        require PVE::API2::Ext::Meta;
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    fail($@) if $@;
     return $res;
 }
 
@@ -207,7 +200,20 @@ sub cmd_get {
 
     # Read as JSON first: it is the form that says whether the value has
     # structure, which decides how it should be printed.
-    my $doc = call(sub { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) });
+    my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, $comments) };
+    if (my $err = $@) {
+        # A document that does not parse is a 422 in JSON; as YAML with the
+        # notes it is the raw file and its parse_error, as the API answers
+        # format=yaml&comments=1 (docs/DESIGN.md §5).
+        require PVE::API2::Ext::Meta;
+        my ($status) = PVE::API2::Ext::Meta::parse_rs_error($err);
+        fail($err) if ($status // 0) != 422 || $format ne 'yaml' || !$comments;
+        my $raw = call(sub { PVE::RS::Meta::api_get($id, $view, 'yaml', $ROOT_ACL, 1) });
+        print STDERR "$SELF: the stored document cannot be rendered: $raw->{parse_error}\n"
+            if defined($raw->{parse_error});
+        print $raw->{text};
+        return;
+    }
     my $data = $doc->{data};
 
     # A view the document does not have comes back as the empty document, same as
@@ -287,9 +293,14 @@ sub cmd_ls {
     # not, plus every prefix file, unscoped.
     my $vmids = call(sub { PVE::RS::Meta::stored_vmids() });
     my $prefixes = call(sub { PVE::RS::Meta::api_prefixes(undef, undef) });
+    # A file the store cannot classify is listed too, flagged: it is nobody's
+    # document, `rm` will not take it and `--orphans` will not name it, so this
+    # is the only place a typo'd file name shows up.
+    my $unknown = call(sub { PVE::RS::Meta::unknown_files() });
     my @docs = (
         (map { { id => "$_" } } sort { $a <=> $b } @$vmids),
         (map { { id => "prefixes/$_->{prefix}" } } @$prefixes),
+        (map { { id => "unknown/$_", unknown => JSON::PP::true } } @$unknown),
     );
     if ($format eq 'json') {
         print JSON::PP->new->canonical->encode(\@docs), "\n";
@@ -306,28 +317,16 @@ sub cmd_rm {
     usage("'$vmid' is not a vmid") if $vmid !~ /^[1-9][0-9]*$/;
     $vmid = int($vmid);
 
-    require PVE::Cluster;
-    require PVE::API2::Ext::Meta;
-    my $removed;
     # The document's own write lock, with the vmlist re-read inside it: a guest
     # created at this vmid after the check outside the lock would otherwise have
     # its fresh document deleted, with its PUT long since answered 200.
-    PVE::Cluster::cfs_lock_domain(
-        PVE::API2::Ext::Meta::lock_domain_for($vmid),
-        $LOCK_TIMEOUT,
-        sub {
-            my $live = live_vmids();
-            die "the vmlist is empty; refusing to remove anything\n" if !%$live;
-            die "$vmid is a live guest; remove its metadata through the API or the UI\n"
-                if $live->{$vmid};
-            $removed = PVE::RS::Meta::on_destroy($vmid);
-        },
-    );
-    if (my $err = $@) {
-        my (undef, $msg) = PVE::API2::Ext::Meta::parse_rs_error($err);
-        print STDERR "$SELF: $msg\n";
-        exit 1;
-    }
+    my $removed = with_lock($vmid, sub {
+        my $live = live_vmids();
+        die "the vmlist is empty; refusing to remove anything\n" if !%$live;
+        die "$vmid is a live guest; remove its metadata through the API or the UI\n"
+            if $live->{$vmid};
+        return PVE::RS::Meta::on_destroy($vmid);
+    });
     if (!$removed) {
         print STDERR "$SELF: nothing stored for $vmid\n";
         exit 2;
@@ -370,28 +369,28 @@ sub cmd_scan_notes {
 
         my $action = 'none';
         my $import = sub {
-                    $conf = PVE::Cluster::cfs_read_file($path);
-                    return if !$conf || !defined($conf->{description});
-                    return if index($conf->{description}, '[pve-meta v') == -1;
-                    my $res;
-                    PVE::Cluster::cfs_lock_domain(
-                        PVE::API2::Ext::Meta::lock_domain_for($vmid),
-                        $LOCK_TIMEOUT,
-                        sub {
-                            $res = PVE::RS::Meta::notes_import(
-                                $vmid, $conf->{description}, 'install',
-                            );
-                        },
+            $conf = PVE::Cluster::cfs_read_file($path);
+            return if !$conf || !defined($conf->{description});
+            return if index($conf->{description}, '[pve-meta v') == -1;
+            my $res;
+            PVE::Cluster::cfs_lock_domain(
+                PVE::API2::Ext::Meta::lock_domain_for($vmid),
+                $LOCK_TIMEOUT,
+                sub {
+                    $res = PVE::RS::Meta::notes_import(
+                        $vmid, $conf->{description}, 'install',
                     );
-                    die $@ if $@;
-                    $action = $res->{action};
-                    return if !defined($res->{description});
-                    if (length($res->{description})) {
-                        $conf->{description} = $res->{description};
-                    } else {
-                        delete $conf->{description};
-                    }
-                    PVE::Cluster::cfs_write_file($path, $conf);
+                },
+            );
+            die $@ if $@;
+            $action = $res->{action};
+            return if !defined($res->{description});
+            if (length($res->{description})) {
+                $conf->{description} = $res->{description};
+            } else {
+                delete $conf->{description};
+            }
+            PVE::Cluster::cfs_write_file($path, $conf);
         };
         eval {
             if ($node eq $local_node) {

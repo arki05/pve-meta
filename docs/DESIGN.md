@@ -70,7 +70,7 @@ nodes:                                # optional: per-node overrides
   replace its top-level ones. The prefix governing a path is the longest declared prefix
   containing it. Schemas never merge.
 * The **selector** decides which guests a prefix reaches (tags come from the cluster's
-  guest properties). Dialect: `type`, `properties`, `description`, `default`, `enum`,
+  guest properties). Dialect: `type`, `properties`, `items`, `description`, `default`, `enum`,
   `minimum`, `maximum`, `format`, and the hints `multiline`, `hidden`, `enforce`; the
   two flags inherit down the schema, an explicit value winning. An unknown `type` does
   not load; an unknown keyword passes through.
@@ -78,6 +78,9 @@ nodes:                                # optional: per-node overrides
   the editor marks mismatches. `hidden: true` offers no declared-but-unset row.
 * A prefix file is itself a document, id `prefixes/<name>`, through the same read/write
   machinery. Writes land in the cluster directory, and the result must load as a prefix.
+  The packaged file is never written or removed: a `DELETE` of a prefix that has no
+  cluster file is a 404, and deleting a view of one writes the cluster file that shadows
+  it, packaged content minus the view.
   `GET /meta/schemas` describes the file format to the editor.
 
 ## 4. Access
@@ -126,7 +129,8 @@ plugins. Create clears leftovers for the vmid; destroy removes the document and 
 snapshot copies; snapshot, rollback and delsnapshot copy, restore and remove
 `<vmid>.<snapname>.yaml`. A backup carries the document as one marked block in the
 archive's copy of the guest's notes; the restore's first config write imports it and
-strips it; `pve-meta scan-notes` picks up a block a restore left behind. Migration needs
+strips it, and a restore *over* an existing guest whose backup carried no block removes
+the document it replaced — after a restore the guest is the backup; `pve-meta scan-notes` picks up a block a restore left behind. Migration needs
 nothing. Clone is not carried. There is no sweeper: `pve-meta ls --orphans` and
 `pve-meta rm <vmid>`. Details: `LIFECYCLE.md`.
 
@@ -140,7 +144,9 @@ nothing. Clone is not carried. There is no sweeper: `pve-meta ls --orphans` and
   as everywhere in PVE; a 409 reloads.
 * **pve-ext** (own package): mounts the API module, adds the tabs, applies the patches.
 * **pve-meta-guest-files** (own package): writes views of a container's document into it as
-  files. `GUEST-FILES.md`.
+  files. `GUEST-FILES.md`. **Deprecated in 0.3.3, removed in 0.4**: pve-meta has no
+  effects on guests; a consumer reads its document over the API with a scoped token, or a
+  separate plugin manages what it writes (decision 029).
 
 ## 9. Planned, not in 0.2.0
 

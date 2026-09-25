@@ -323,13 +323,20 @@ pub fn list_guests(
             continue;
         }
 
-        let stored = read_stored(store, &DocId::Guest(guest.vmid))?;
-
-        if let Some(path) = &has_path {
-            if model::get_path(&view::strip_comments(&stored.value), path).is_none() {
-                continue;
+        let id = DocId::Guest(guest.vmid);
+        let digest = match &has_path {
+            // The filter is the only thing a listing needs the content for.
+            Some(path) => {
+                let stored = read_stored(store, &id)?;
+                if model::get_path(&view::strip_comments(&stored.value), path).is_none() {
+                    continue;
+                }
+                stored.digest
             }
-        }
+            // Without it, the row carries the digest and nothing else, and
+            // that is a `stat` and a hash rather than a YAML parse per guest.
+            None => store.digest_of(&id)?.unwrap_or_default(),
+        };
 
         out.push(GuestListEntry {
             vmid: guest.vmid,
@@ -337,7 +344,7 @@ pub fn list_guests(
             kind: guest.kind.clone(),
             name: guest.name.clone(),
             tags: guest.tags.clone(),
-            digest: stored.digest,
+            digest,
         });
     }
     Ok(out)
@@ -358,8 +365,9 @@ pub fn list_guests(
 /// other absent path. `digest` is the file's either way.
 ///
 /// # Errors
-/// `400:` invalid id/view/format. `403:` no read access. `422:` the stored
-/// document's content could not be recovered.
+/// `400:` invalid id/view/format, including a view through an array or a
+/// scalar. `403:` no read access. `422:` the stored document's content could
+/// not be recovered.
 pub fn get_document(
     store: &MetaStore,
     id: &str,
@@ -406,7 +414,10 @@ pub fn get_document(
     // as any other absent path, with no rule of its own (`docs/DESIGN.md` §2).
     let base = if comments { stored.value.clone() } else { view::strip_comments(&stored.value) };
     let result_value = if view.is_some() {
-        view::extract(&base, &view_path).unwrap_or_else(|| Value::Object(Map::new()))
+        // A view that runs through an array or a scalar is refused here as it
+        // is on a write (400); only a *missing* path reads as the empty
+        // document.
+        view::extract(&base, &view_path)?.unwrap_or_else(|| Value::Object(Map::new()))
     } else {
         base
     };
@@ -505,12 +516,10 @@ fn check_registry_shape(doc_id: &DocId, text: &str) -> Result<(), ApiError> {
         RegistryKind::PrefixDef => registry::parse_prefix(name, text).map(|_| ()),
     };
     parsed.map_err(|e| {
-        let kind = match kind {
-            RegistryKind::PrefixDef => "prefix",
-        };
         bad_request(format!(
-            "the result would not be a valid {kind}: {e} \
-             (the loader would skip the file, so the write is refused instead)"
+            "the result would not be a valid {}: {e} \
+             (the loader would skip the file, so the write is refused instead)",
+            kind.noun(),
         ))
     })
 }
@@ -582,7 +591,7 @@ pub fn put_document(
         if is_merge {
             view::merge(v, &view_path, &payload_value).map_err(ApiError::from)
         } else {
-            let subtree = match view::extract(v, &view_path) {
+            let subtree = match view::extract(v, &view_path)? {
                 Some(old) if keep_notes => view::keep_comments(&old, payload_value.clone()),
                 _ => payload_value.clone(),
             };
@@ -603,16 +612,21 @@ pub fn put_document(
     let unchanged =
         touched.is_empty() && stored.unrecoverable.is_none() && stored.raw.as_deref() == Some(&text);
     let new_digest = if dry_run || unchanged {
+        // What `put_raw` would refuse, a dry run refuses too; a write that
+        // changes nothing never gets that far, dry or not.
+        if !unchanged {
+            MetaStore::check_size(text.len() as u64)?;
+        }
         crate::digest::digest(text.as_bytes())
     } else {
-        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        let written = store.put_raw(&doc_id, &text, digest)?.digest;
         crate::audit(&format!(
             "{} wrote {doc_id} (view '{}', mode {}): {} path(s) touched, digest {}",
             acl.authid,
             view_out(view),
             if is_merge { "merge" } else { "replace" },
             touched.len(),
-            &written[..12.min(written.len())],
+            crate::digest::short(&written),
         ));
         written
     };
@@ -673,8 +687,18 @@ fn check_enforced(
 /// snapshot hooks and are never touched from the REST API
 /// (`docs/DESIGN.md` §7).
 ///
+/// A prefix that only exists as a packaged file has nothing to remove: a
+/// whole-document delete is a 404, a view delete writes the cluster file that
+/// shadows it (`docs/DESIGN.md` §3), and says so in the audit line.
+///
+/// A view delete that touches nothing -- the key is not there -- writes
+/// nothing and answers with the digest as it stands (`docs/DESIGN.md` §5: a
+/// write that changes nothing rewrites nothing); for a packaged-only prefix
+/// that is what keeps it from growing a cluster copy of the packaged file.
+///
 /// # Errors
-/// `400:` invalid id/view. `409:` digest mismatch. `403:` no write access.
+/// `400:` invalid id/view. `404:` only a packaged prefix file is there.
+/// `409:` digest mismatch. `403:` no write access.
 pub fn delete_document(
     store: &MetaStore,
     id: &str,
@@ -693,6 +717,26 @@ pub fn delete_document(
     // document exactly like a root replace does.
     check_repairable(&stored, &view_path, false)?;
 
+    // What the read saw and what a write could touch are two files for a
+    // registry document (`docs/DESIGN.md` §3). A whole-document delete of a
+    // prefix that only exists packaged would otherwise diff the packaged
+    // content, unlink nothing and answer 200 for a file still on disk.
+    let own_file = store.has_own_file(&doc_id)?;
+    let packaged_only = match &doc_id {
+        DocId::Registry(kind, name) => (!own_file).then(|| (kind.noun(), name.clone())),
+        DocId::Guest(_) => None,
+    };
+    if let Some((noun, name)) = &packaged_only {
+        if view_path.is_root() && !stored.digest.is_empty() {
+            return Err(ApiError {
+                status: 404,
+                msg: format!(
+                    "no cluster file for {noun} '{name}' (the packaged file cannot be removed)"
+                ),
+            });
+        }
+    }
+
     let mut planned = stored.value.clone();
     let touched = plan_write(&mut planned, false, |v| {
         view::remove(v, &view_path).map_err(ApiError::from)
@@ -708,19 +752,32 @@ pub fn delete_document(
             crate::audit(&format!("{} removed {doc_id}", acl.authid));
         }
         String::new()
+    } else if touched.is_empty() {
+        // Nothing to remove, so nothing to write: the digest is the one the
+        // read saw, the packaged file's for a prefix that has no cluster copy
+        // -- and must not get one for this.
+        stored.digest.clone()
     } else if existed {
         let text = format::dump(DISK_FORMAT, &planned);
         // A partial delete is a write, and a write of a registry document must
         // still leave a file its own loader will read: the same rule has to
         // hold on this path as on `put_document`'s.
         check_registry_shape(&doc_id, &text)?;
-        let written = store.put_raw(&doc_id, &text, digest)?.document.digest;
+        let written = store.put_raw(&doc_id, &text, digest)?.digest;
+        // Removing a view of a packaged-only prefix edits no packaged file: it
+        // writes the cluster file that shadows it, the packaged content minus
+        // the view. The audit line names which of the two happened.
+        let shadowing = if packaged_only.is_some() {
+            " as a new cluster file shadowing the packaged one"
+        } else {
+            ""
+        };
         crate::audit(&format!(
-            "{} removed view '{}' of {doc_id}: {} path(s) touched, digest {}",
+            "{} removed view '{}' of {doc_id}{shadowing}: {} path(s) touched, digest {}",
             acl.authid,
             view_out(view),
             touched.len(),
-            &written[..12.min(written.len())],
+            crate::digest::short(&written),
         ));
         written
     } else {

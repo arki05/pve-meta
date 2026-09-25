@@ -1,10 +1,18 @@
-# Guest-lifecycle managed patch (see patches/lifecycle.toml, patches/lifecycle/,
+# Guest-lifecycle managed patch (see patches/lifecycle.json, patches/lifecycle/,
 # applied via pve-ext-patch): re-run whenever one of the packages reships a
 # file it patches, so the patch survives their upgrades. postinst calls
 # pve-ext-patch tolerantly (no-op if it, or a target file, is absent).
 #
+# Each file twice: while pve-ext's diversion is in place dpkg writes the
+# upgraded file to <path>.pve-ext-orig, and a file trigger matches the name
+# dpkg writes; <path> itself is written before the first apply diverts it,
+# or after one that failed and rolled its diversion back.
+#
 # Note: index.html.tpl and PVE/API2.pm are not this package's concern --
 # pve-ext owns those triggers (see pve-ext/debian/triggers).
 interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm
+interest-noawait /usr/share/perl5/PVE/AbstractConfig.pm.pve-ext-orig
 interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm
+interest-noawait /usr/share/perl5/PVE/VZDump/QemuServer.pm.pve-ext-orig
 interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm
+interest-noawait /usr/share/perl5/PVE/VZDump/LXC.pm.pve-ext-orig

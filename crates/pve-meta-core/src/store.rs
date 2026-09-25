@@ -9,14 +9,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
 use sha2::{Digest as _, Sha256};
 
 use crate::digest;
 use crate::error::{Error, Result};
 use crate::format::{self, Format};
 use crate::model::Value;
-use crate::patch::{self, Touched};
 pub use crate::registry::RegistryKind;
 use crate::registry::Registry;
 
@@ -77,15 +75,6 @@ pub struct Document {
     pub mtime: SystemTime,
 }
 
-/// The result of [`MetaStore::put_raw`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct PutResult {
-    /// The new document.
-    pub document: Document,
-    /// The paths that changed, relative to the previous document.
-    pub touched: Vec<Touched>,
-}
-
 /// A poll-friendly summary of the whole store's state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreVersion {
@@ -105,15 +94,13 @@ pub enum RollbackOutcome {
     NoOp,
 }
 
-fn snapshot_name_regex() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_-]*$").unwrap())
-}
-
 /// `true` for a valid snapshot name: `^[A-Za-z][A-Za-z0-9_-]*$`, excluding a
 /// format extension (so a snapshot file can't be mistaken for a live one).
 pub fn is_valid_snapshot_name(name: &str) -> bool {
-    snapshot_name_regex().is_match(name) && Format::from_ext(name).is_none()
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && Format::from_ext(name).is_none()
 }
 
 /// `Ok(None)` for not-found (it may just have vanished), `Ok(Some(v))` otherwise, anything else an error.
@@ -225,21 +212,20 @@ impl MetaStore {
     }
 
     /// Where `id` is written (see [`MetaStore::read_path_for`] for reads).
-    fn path_for(&self, id: &DocId) -> Result<PathBuf> {
+    fn path_for(&self, id: &DocId) -> PathBuf {
         let file = format!("{}.{}", id.base_name(), DISK_FORMAT.ext());
-        Ok(match id {
+        match id {
             DocId::Registry(kind, _) => self.registry_write_dir(*kind).join(file),
             DocId::Guest(_) => self.root.join(file),
-        })
+        }
     }
 
     /// Where `id` is read from: [`Registry::locate`]'s file, or [`MetaStore::path_for`] when none has it.
-    fn read_path_for(&self, id: &DocId) -> Result<PathBuf> {
+    fn read_path_for(&self, id: &DocId) -> PathBuf {
         match id {
-            DocId::Registry(kind, name) => match self.registry.locate(*kind, name) {
-                Some(path) => Ok(path),
-                None => self.path_for(id),
-            },
+            DocId::Registry(kind, name) => {
+                self.registry.locate(*kind, name).unwrap_or_else(|| self.path_for(id))
+            }
             DocId::Guest(_) => self.path_for(id),
         }
     }
@@ -249,7 +235,10 @@ impl MetaStore {
             .join(format!("{vmid}.{name}.{}", DISK_FORMAT.ext()))
     }
 
-    fn check_size(size: u64) -> Result<()> {
+    /// Refuses a write of `size` bytes above [`MAX_BYTES`], and warns above
+    /// [`WARN_BYTES`]: [`MetaStore::put_raw`]'s gate, and a dry run's, which
+    /// has to answer what the write would without reaching it.
+    pub fn check_size(size: u64) -> Result<()> {
         if size > MAX_BYTES {
             return Err(Error::TooLarge {
                 size,
@@ -294,23 +283,18 @@ impl MetaStore {
         let Some(bytes) = gone_is_none(fs::read(path))? else {
             return Err(Error::NotFound(id.clone()));
         };
+        let dig = digest::digest(&bytes);
         // Not UTF-8 is the one read failure that is not a parse_error: there
         // is no `raw` to report.
-        let raw = String::from_utf8(bytes.clone()).map_err(|e| Error::Parse {
+        let raw = String::from_utf8(bytes).map_err(|e| Error::Parse {
             format: DISK_FORMAT,
             msg: format!("invalid utf-8: {e}"),
             at: None,
         })?;
         let (value, parse_error) = match format::parse_raw(DISK_FORMAT, &raw) {
             Ok(value) => (value, None),
-            Err(e) => {
-                crate::warn_line!(
-                    "stored document is not valid YAML; reading it as empty: {id}: {e}"
-                );
-                (Value::Object(serde_json::Map::new()), Some(e.to_string()))
-            }
+            Err(e) => (Value::Object(serde_json::Map::new()), Some(e.to_string())),
         };
-        let dig = digest::digest(&bytes);
         Ok(Document {
             id: id.clone(),
             path: path.to_path_buf(),
@@ -336,13 +320,21 @@ impl MetaStore {
     pub fn read(&self, id: &DocId) -> Result<Document> {
         self.check_available()?;
         // No existence check first: that races a concurrent delete into `Io` (500).
-        self.read_document(id, &self.read_path_for(id)?)
+        self.read_document(id, &self.read_path_for(id))
+    }
+
+    /// `true` if `id` has a file at the path a write lands in: for a registry
+    /// document its cluster file, never the packaged file a read falls back to
+    /// ([`MetaStore::read_path_for`]) and no write can touch (`docs/DESIGN.md` §3).
+    pub fn has_own_file(&self, id: &DocId) -> Result<bool> {
+        self.check_available()?;
+        Ok(gone_is_none(fs::metadata(self.path_for(id)))?.is_some())
     }
 
     /// `id`'s current content identity without reading the whole document; see [`identify`].
     pub fn digest_of(&self, id: &DocId) -> Result<Option<String>> {
         self.check_available()?;
-        identify(&self.read_path_for(id)?)
+        identify(&self.read_path_for(id))
     }
 
     /// `None` means no precondition; `Some("")` matches a missing document (`docs/DESIGN.md` §5); else must match exactly.
@@ -368,35 +360,27 @@ impl MetaStore {
         Self::check_digest(self.digest_of(id)?.as_deref(), expected)
     }
 
-    /// Replaces `id`'s document with `text` (normalized to one trailing newline), creating it if absent; parses and lints the new text.
+    /// Replaces `id`'s document with `text` (normalized to one trailing
+    /// newline), creating it if absent, and returns what was written. The
+    /// text is parsed and linted first; what it replaces is never read, so a
+    /// file that does not parse is no obstacle to its repair. What changed is
+    /// the caller's to know: the API diffs its own plan.
     pub fn put_raw(
         &self,
         id: &DocId,
         text: &str,
         expected_digest: Option<&str>,
-    ) -> Result<PutResult> {
+    ) -> Result<Document> {
         self.check_available()?;
-        let path = self.path_for(id)?;
-        let read_path = self.read_path_for(id)?;
+        let path = self.path_for(id);
         Self::check_digest(self.digest_of(id)?.as_deref(), expected_digest)?;
-
-        // Old content diffs as empty if unparseable, vanished or oversized:
-        // a repair is never blocked by what it is fixing.
-        let old_value = match self.read_document(id, &read_path) {
-            Ok(doc) => doc.value,
-            Err(Error::NotFound(_) | Error::TooLarge { .. } | Error::Parse { .. }) => {
-                Value::Object(serde_json::Map::new())
-            }
-            Err(e) => return Err(e),
-        };
 
         let normalized = normalize_trailing_newline(text);
         Self::check_size(normalized.len() as u64)?;
-        let new_value = format::parse(DISK_FORMAT, &normalized)?;
+        let value = format::parse(DISK_FORMAT, &normalized)?;
 
         self.write_atomic(&path, normalized.as_bytes())?;
 
-        let touched = patch::diff(&old_value, &new_value);
         let dig = digest::digest(normalized.as_bytes());
         // The file just written can already be gone again (a race): report
         // this write's own moment rather than a `stat` of nothing.
@@ -404,60 +388,73 @@ impl MetaStore {
             Some(meta) => meta.modified()?,
             None => SystemTime::now(),
         };
-        Ok(PutResult {
-            document: Document {
-                id: id.clone(),
-                path,
-                raw: normalized,
-                value: new_value,
-                parse_error: None,
-                digest: dig,
-                mtime,
-            },
-            touched,
+        Ok(Document {
+            id: id.clone(),
+            path,
+            raw: normalized,
+            value,
+            parse_error: None,
+            digest: dig,
+            mtime,
         })
     }
 
     /// Deletes `id`'s current document only, never its snapshots ([`MetaStore::purge`]); idempotent.
     pub fn delete(&self, id: &DocId) -> Result<bool> {
         self.check_available()?;
-        Ok(gone_is_none(fs::remove_file(self.path_for(id)?))?.is_some())
+        Ok(gone_is_none(fs::remove_file(self.path_for(id)))?.is_some())
     }
 
     /// Every vmid with any file, sorted; what `pve-meta ls --orphans` subtracts the vmlist from (`docs/DESIGN.md` §7).
     pub fn stored_vmids(&self) -> Result<Vec<u32>> {
-        self.check_available()?;
         let mut out = std::collections::BTreeSet::new();
+        for (_, vmid) in self.classified_root()? {
+            if let Some(vmid) = vmid {
+                out.insert(vmid);
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
+    /// Every file in the root this store cannot name -- neither `<vmid>.yaml`
+    /// nor `<vmid>.<snapname>.yaml` -- by file name, sorted. [`MetaStore::stored_vmids`]
+    /// passes them over and [`MetaStore::version`] hashes them, so without
+    /// this a typo'd file name is invisible; `pve-meta ls` lists them, and
+    /// nothing removes them or counts them as an orphan.
+    pub fn unknown_files(&self) -> Result<Vec<String>> {
+        let mut out: Vec<String> = self
+            .classified_root()?
+            .into_iter()
+            .filter(|(_, vmid)| vmid.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Every regular, non-hidden file in the root with the vmid its name
+    /// carries, or `None` for a name this store does not give out: the one
+    /// classification both listings read.
+    fn classified_root(&self) -> Result<Vec<(String, Option<u32>)>> {
+        self.check_available()?;
+        let mut out = Vec::new();
         let Some(entries) = gone_is_none(fs::read_dir(&self.root))? else {
-            return Ok(Vec::new());
+            return Ok(out);
         };
-        let suffix = format!(".{}", DISK_FORMAT.ext());
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(file_type) = gone_is_none(entry.file_type())? else {
                 continue;
             };
+            // A dot file is this store's own write-in-progress temp name.
             if name.starts_with('.') || !file_type.is_file() {
                 continue;
             }
-            // `<vmid>.yaml` or `<vmid>.<snapname>.yaml`: the vmid is the
-            // first dot-separated component either way.
-            let Some(stem) = name.strip_suffix(&suffix) else {
-                continue;
-            };
-            let (head, snap) = match stem.split_once('.') {
-                Some((head, snap)) => (head, Some(snap)),
-                None => (stem, None),
-            };
-            if snap.is_some_and(|s| !is_valid_snapshot_name(s)) {
-                continue;
-            }
-            if let Ok(vmid) = head.parse::<u32>() {
-                out.insert(vmid);
-            }
+            let vmid = vmid_of_file(&name);
+            out.push((name, vmid));
         }
-        Ok(out.into_iter().collect())
+        Ok(out)
     }
 
     /// Lists a guest's snapshot names, sorted.
@@ -493,7 +490,7 @@ impl MetaStore {
         if !is_valid_snapshot_name(name) {
             return Err(Error::InvalidName(name.to_string()));
         }
-        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))?))? else {
+        let Some(bytes) = gone_is_none(fs::read(self.path_for(&DocId::Guest(vmid))))? else {
             return Ok(false);
         };
         self.write_atomic(&self.snapshot_path(vmid, name), &bytes)?;
@@ -507,7 +504,7 @@ impl MetaStore {
             return Err(Error::InvalidName(name.to_string()));
         }
         let snap = self.snapshot_path(vmid, name);
-        let target = self.path_for(&DocId::Guest(vmid))?;
+        let target = self.path_for(&DocId::Guest(vmid));
         if let Some(bytes) = gone_is_none(fs::read(&snap))? {
             self.write_atomic(&target, &bytes)?;
             Ok(RollbackOutcome::Restored)
@@ -595,6 +592,21 @@ impl MetaStore {
     }
 }
 
+/// The vmid `name` names: `<vmid>.yaml` or `<vmid>.<snapname>.yaml`, the vmid
+/// being the first dot-separated component either way. `None` for anything
+/// else under the store's root.
+fn vmid_of_file(name: &str) -> Option<u32> {
+    let stem = name.strip_suffix(&format!(".{}", DISK_FORMAT.ext()))?;
+    let (head, snap) = match stem.split_once('.') {
+        Some((head, snap)) => (head, Some(snap)),
+        None => (stem, None),
+    };
+    if snap.is_some_and(|s| !is_valid_snapshot_name(s)) {
+        return None;
+    }
+    head.parse::<u32>().ok()
+}
+
 /// A filesystem-safe node tag for temp file names; falls back to `"node"`.
 fn hostname_tag() -> String {
     let raw = std::env::var("HOSTNAME")
@@ -630,7 +642,12 @@ mod tests {
     fn snapshot_name_validation() {
         assert!(is_valid_snapshot_name("before-upgrade"));
         assert!(is_valid_snapshot_name("a"));
+        assert!(is_valid_snapshot_name("A_b-9"));
+        assert!(!is_valid_snapshot_name(""));
         assert!(!is_valid_snapshot_name("1abc"));
+        assert!(!is_valid_snapshot_name("_a"));
+        assert!(!is_valid_snapshot_name("a.b"));
+        assert!(!is_valid_snapshot_name("caf\u{e9}"));
         assert!(!is_valid_snapshot_name("bad name"));
         assert!(!is_valid_snapshot_name("yaml"));
         assert!(!is_valid_snapshot_name("json"));

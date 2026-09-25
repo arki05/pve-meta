@@ -41,7 +41,7 @@ gated and installed is `docs/BUILD.md`.
     be installed on the build host (`rustup target add wasm32-unknown-unknown`; see
     `docs/BUILD.md`) or `make build` fails before this crate is reached. The `.wasm`
     is the **`pve-meta`** package's file, not this one's — it ships as
-    `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core.wasm` next to the editor
+    `/usr/share/pve-manager/js/pve-meta-extjs/pve-meta-core-<hash>.wasm` next to the editor
     — but the two share one `cargo`, so the target is a build-host requirement of
     the source package as a whole.
 * **`crates/pve-meta-perl`'s own `install:` target** (invoked by `debian/rules` with its

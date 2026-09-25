@@ -14,6 +14,7 @@ Depends: pve-manager (>= 9.0),
          init-system-helpers (>= 1.54~),
          ${misc:Depends},
          ${perl:Depends}
+Breaks: pve-meta (<< 0.3.3~)
 Description: Generic extension layer for the Proxmox VE web UI and API
  pve-ext provides three small, reusable seams so that adding an API module
  or a UI page to Proxmox VE never needs another one-off patch:
@@ -26,8 +27,8 @@ Description: Generic extension layer for the Proxmox VE web UI and API
     the matching LXC/QEMU/node/Datacenter config panel, as a native ExtJS
     panel.
   * Managed patches: pve-ext-patch applies, verifies, removes and reports
-    on a set of dpkg-diverted file patches described by TOML manifests
-    under /usr/share/pve-ext/patches/*.toml.
+    on a set of dpkg-diverted file patches described by JSON manifests
+    under /usr/share/pve-ext/patches/*.json.
  .
  pve-ext ships its own two-file manifest (the one-line hooks into
  index.html.tpl and PVE/API2.pm this whole layer depends on); other

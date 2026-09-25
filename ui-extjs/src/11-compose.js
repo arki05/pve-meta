@@ -18,6 +18,32 @@ PVE.meta.compose = function (...parts) {
     return out;
 };
 
+// One write on behalf of a modal editor. `write(done)` starts it; the window's
+// **body** is masked while it is in flight -- the body, not the window, so Cancel
+// stays clickable (60-doc.js `setMask` says the same of the panel) -- and the window
+// closes only when `done(true)` says the server took it. Any failure leaves it open
+// with what was typed still in it, beside the message saying why.
+PVE.meta.writeFromWindow = function (win, write) {
+    let mask = function (on) {
+        let el = win.isDestroyed ? null : win.body;
+        if (!el) {
+            return;
+        }
+        if (on) {
+            el.mask(gettext('Please wait...'));
+        } else {
+            el.unmask();
+        }
+    };
+    mask(true);
+    write(function (ok) {
+        mask(false);
+        if (ok) {
+            win.close();
+        }
+    });
+};
+
 // One API request on behalf of a component that may be destroyed before the answer
 // lands (a tab switch tears the panel down mid-flight): `success`/`failure` become
 // no-ops once `owner` is gone. Everything else in `opts` goes to `API2Request` as given.

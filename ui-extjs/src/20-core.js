@@ -15,7 +15,9 @@ PVE.meta.CoreError.prototype = Object.create(Error.prototype);
 PVE.meta.CoreError.prototype.constructor = PVE.meta.CoreError;
 
 PVE.meta.Core = {
-    SRC: '/pve2/js/pve-meta-extjs/pve-meta-core.wasm',
+    // `make js` writes in the name the core is installed under: its content hash,
+    // so a browser never pairs this script with a core it cached before an upgrade.
+    SRC: '/pve2/js/pve-meta-extjs/@WASM_NAME@',
     ABI: 3,
     exports: null,
     promise: null,
@@ -33,12 +35,19 @@ PVE.meta.Core = {
                 typeof WebAssembly.instantiateStreaming === 'function'
                     ? WebAssembly.instantiateStreaming(fetch(me.SRC), {}).catch(buffered)
                     : buffered();
-            me.promise = me.exports
+            me.promise = (me.exports
                 ? Promise.resolve(me)
                 : streaming().then(function (result) {
                       me.attach(result.instance);
                       return me;
-                  });
+                  })
+            ).catch(function (err) {
+                // Not the answer for the rest of the session: one lost request
+                // would leave the panel without a core until the page is reloaded.
+                // The next caller asks again.
+                me.promise = null;
+                throw err;
+            });
         }
         return me.promise;
     },

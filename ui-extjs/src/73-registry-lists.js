@@ -51,6 +51,17 @@ Ext.define('PVE.meta.RegistryGrid', {
             });
         },
 
+        // A text cell: encoded, with the whole of it as the cell's tooltip, since a
+        // flexed column cuts off exactly the long ones. The tooltip is HTML inside
+        // an attribute, so the encoded text is encoded once more for the attribute.
+        textCell: function (value, meta) {
+            let html = Ext.htmlEncode(value === undefined || value === null ? '' : String(value));
+            if (html && meta) {
+                meta.tdAttr = 'data-qtip="' + Ext.htmlEncode(html) + '"';
+            }
+            return html;
+        },
+
         // What the Origin column says. A cluster file that displaced a package's is
         // the one where Remove does not remove anything -- it reverts to what the
         // package ships.
@@ -70,13 +81,18 @@ Ext.define('PVE.meta.RegistryGrid', {
             sorters: [{ property: 'name' }],
         });
         me.access = { write: 0 };
+        let cell = (v, meta) => PVE.meta.RegistryGrid.textCell(v, meta);
 
         Ext.apply(me, {
+            // Text flexes, flags do not: the prefix, what it is for and what it
+            // reaches are what gets cut off, and a yes/empty column needs no more
+            // than its header. Nodes shows only when some file has overrides.
             columns: [
                 {
                     text: gettext('Prefix'),
                     dataIndex: 'name',
                     flex: 2,
+                    minWidth: 120,
                     // The same marker the tree puts on a row whose value does not match
                     // its schema, one step further out: this whole file does not match
                     // the format it is in. The Description column carries the parser's
@@ -87,35 +103,49 @@ Ext.define('PVE.meta.RegistryGrid', {
                             : Ext.htmlEncode(v),
                 },
                 {
-                    text: gettext('Nodes'),
-                    dataIndex: 'nodes',
-                    width: 110,
-                    renderer: Ext.htmlEncode,
-                    tooltip: gettext('Nodes this file overrides schema, enforcement or visibility for'),
+                    text: gettext('Description'),
+                    dataIndex: 'description',
+                    flex: 3,
+                    minWidth: 160,
+                    renderer: cell,
                 },
-                { text: gettext('Applies to'), dataIndex: 'selector', flex: 1, renderer: Ext.htmlEncode },
-                { text: gettext('Schema'), dataIndex: 'schema', width: 90, renderer: Ext.htmlEncode },
+                {
+                    text: gettext('Applies to'),
+                    dataIndex: 'selector',
+                    flex: 2,
+                    minWidth: 110,
+                    renderer: cell,
+                },
+                { text: gettext('Schema'), dataIndex: 'schema', width: 75, renderer: Ext.htmlEncode },
                 {
                     text: gettext('Enforced'),
                     dataIndex: 'enforce',
-                    width: 90,
+                    width: 85,
                     renderer: Ext.htmlEncode,
                     tooltip: gettext('A write that would not match the schema is refused unless saved anyway'),
                 },
                 {
                     text: gettext('Hidden'),
                     dataIndex: 'hidden',
-                    width: 80,
+                    width: 75,
                     renderer: Ext.htmlEncode,
                     tooltip: gettext('Declared keys are not offered as rows until something is stored there'),
                 },
-                { text: gettext('Description'), dataIndex: 'description', flex: 2, renderer: Ext.htmlEncode },
+                {
+                    text: gettext('Nodes'),
+                    itemId: 'nodesCol',
+                    dataIndex: 'nodes',
+                    width: 100,
+                    hidden: true,
+                    renderer: cell,
+                    tooltip: gettext('Nodes this file overrides schema, enforcement or visibility for'),
+                },
                 {
                     text: gettext('Origin'),
                     dataIndex: 'origin',
-                    width: 200,
+                    width: 190,
                     renderer: (v, meta, rec) =>
-                        Ext.htmlEncode(PVE.meta.RegistryGrid.originText(rec.data)),
+                        PVE.meta.RegistryGrid.textCell(PVE.meta.RegistryGrid.originText(rec.data), meta),
                 },
             ],
             tbar: [
@@ -191,7 +221,15 @@ Ext.define('PVE.meta.RegistryGrid', {
             // Every file, as it is, rather than a guest's resolved set.
             params: {},
             success: function (response) {
-                me.store.setData(PVE.meta.RegistryGrid.rowsFrom(response.result.data || []));
+                // The failure below masks the grid with its message; nothing else
+                // ever took it off, so one failed Reload hid every later one.
+                Proxmox.Utils.setErrorMask(me, false);
+                let rows = PVE.meta.RegistryGrid.rowsFrom(response.result.data || []);
+                me.store.setData(rows);
+                let nodes = me.down('#nodesCol');
+                if (nodes) {
+                    nodes.setHidden(!rows.some((r) => r.nodes));
+                }
                 me.syncButtons();
             },
             failure: (response) =>
@@ -215,7 +253,7 @@ Ext.define('PVE.meta.RegistryGrid', {
     createOne: function () {
         let me = this;
         let win = Ext.create('PVE.meta.NewRegistryWindow', {});
-        win.on('create', function (plan) {
+        win.on('create', function (plan, done) {
             Proxmox.Utils.API2Request({
                 url: PVE.meta.Doc.urlFor(plan.id),
                 method: 'PUT',
@@ -225,12 +263,29 @@ Ext.define('PVE.meta.RegistryGrid', {
                     mode: 'replace',
                     digest: '',
                 }),
-                failure: (response) =>
+                failure: function (response) {
+                    done(false);
+                    // The empty digest matched nothing, so the name is taken: said
+                    // in those words, since "digest mismatch" names a document the
+                    // form never read. The list shows whose it is.
+                    if (String((response.result || {}).status) === '409') {
+                        me.reload();
+                        Ext.Msg.alert(
+                            gettext('Conflict'),
+                            Ext.String.format(
+                                gettext('A prefix named "{0}" already exists; pick another name or edit that one.'),
+                                Ext.htmlEncode(plan.file),
+                            ),
+                        );
+                        return;
+                    }
                     Ext.Msg.alert(
                         gettext('Error'),
                         response.htmlStatus || Proxmox.Utils.getResponseErrorMessage(response),
-                    ),
+                    );
+                },
                 success: function () {
+                    done(true);
                     me.reload();
                     me.editOne({ data: { id: plan.id } });
                 },

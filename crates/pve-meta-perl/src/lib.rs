@@ -118,10 +118,11 @@ mod pve_rs_meta {
         Ok(open_store().delete_snapshot(vmid.0, snapname)?)
     }
 
-    /// Clears any metadata at `$vmid`. Called from
-    /// `create_and_lock_config` only when it just asserted the vmid unused,
-    /// so a restore over an existing guest keeps its document instead
-    /// (`docs/decisions/009-no-sweeper.md`). Returns the files removed.
+    /// Clears any metadata at `$vmid`: the document and its snapshot copies.
+    /// Called from `create_and_lock_config` when it just asserted the vmid
+    /// unused (`docs/decisions/009-no-sweeper.md`), and from the patched
+    /// `write_config` for a restore over an existing guest whose backup
+    /// carried no document (`docs/LIFECYCLE.md`). Returns the files removed.
     #[export]
     pub fn on_create(vmid: Vmid) -> Result<usize, Error> {
         Ok(open_store().purge(vmid.0)?)
@@ -170,6 +171,15 @@ mod pve_rs_meta {
         Ok(open_store().stored_vmids()?)
     }
 
+    /// Every file in the store's root that is neither a document nor a
+    /// snapshot copy, by file name, sorted. `pve-meta ls` lists them as
+    /// `unknown/<file>`; nothing removes them or calls them orphans
+    /// (`docs/DESIGN.md` §8).
+    #[export]
+    pub fn unknown_files() -> Result<Vec<String>, Error> {
+        Ok(open_store().unknown_files()?)
+    }
+
     /// The notes block for `$vmid`'s current document, or `undef` if none.
     /// Called from the patched vzdump `assemble` of both guest types
     /// (`docs/LIFECYCLE.md`). Dies for a document too large or unparsable to
@@ -194,6 +204,15 @@ mod pve_rs_meta {
     ) -> Result<backup::Import, Error> {
         let mode = backup::ImportMode::parse(mode)?;
         Ok(backup::import(&open_store(), vmid.0, description, mode)?)
+    }
+
+    /// A guest's tag string (`;`-separated in its config, `undef` when it has
+    /// none) as a list: [`pve_meta_core::tags::split_tags`], the one
+    /// splitting rule, which a prefix's selector is matched against.
+    /// `PVE::API2::Ext::Meta::parse_tags` is this call.
+    #[export]
+    pub fn split_tags(raw: Option<&str>) -> Vec<String> {
+        pve_meta_core::tags::split_tags(raw.unwrap_or(""))
     }
 
     /// This crate's version, checked by `test/basic.pl` and by operators
@@ -235,6 +254,14 @@ mod pve_rs_meta {
     #[export]
     pub fn api_schemas() -> Result<pve_meta_core::model::Value, Error> {
         Ok(api::schemas())
+    }
+
+    /// Dies with `400:` unless `$id` is one [`api::parse_id`] accepts: a
+    /// vmid or `prefixes/<name>`. `PVE::API2::Ext::Meta::lock_domain_for`
+    /// checks with it, before a lock is named after the id.
+    #[export]
+    pub fn check_id(id: &str) -> Result<(), api::ApiError> {
+        api::parse_id(id).map(|_| ())
     }
 
     /// `GET /meta/access` -> `{ read, write }` for one document, exactly

@@ -165,6 +165,7 @@ impl Daemon {
             timing.poll.as_secs(),
             timing.drift.as_secs()
         );
+        eprintln!("warning: deprecated, removed in 0.4: pve-meta writes nothing into guests");
         let mut d = Daemon::default();
         loop {
             d.tick(&store, &node, timing, Instant::now());

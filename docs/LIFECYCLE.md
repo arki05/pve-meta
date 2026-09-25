@@ -25,14 +25,24 @@ three functions it touches). The diff:
   copy over the current document (or removes the current document if the guest had none
   at snapshot time).
 
-Every call is `eval { ... }; warn ... if $@;` — soft-fail, never blocks the actual
+Every call runs under the document's own `cfs_lock_domain("pve-meta-<vmid>")`, the lock
+every other writer takes, so a copy, a rollback and an in-flight API or CLI write never
+interleave on the file — `rollback` in particular writes the document without a digest,
+which nothing else would catch. All three run after the `lock_config` around the
+snapshot operation has returned, so the document lock is taken on its own, once the
+guest lock has been released -- unlike create and destroy, whose hooks take it inside
+the guest lock; nothing that touches the document holds the guest lock at the time, so
+there is no order between the two locks for these hooks to keep.
+
+Every call goes through `PVE::Meta::Hooks::locked_warn`, which takes that lock and
+warns instead of dying — soft-fail, never blocks the actual
 snapshot/rollback/delete-snapshot operation. A metadata read/write hiccup (disk full, a
 corrupt document, the library not yet installed mid-upgrade) must never take down a
 guest operation over a sidecar file, exactly as PVE already treats
 `/etc/pve/firewall/*.fw` tolerantly in the same code paths.
 
 How the diff reaches the installed file is not this document's subject: the manifest
-(`patches/lifecycle.toml`) and the one diff
+(`patches/lifecycle.json`) and the one diff
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
 `pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst`, and
 `pve-ext/README.md` ("Managed patches") owns the tool, its diversions and its limits. What each hook does is
@@ -63,8 +73,11 @@ target, `qm`/`pct` CLI, both remote-migration inbound paths). It opens with
 `PVE::Cluster::check_vmid_unused($vmid, $allow_existing)`, which is what makes the hook
 precise rather than a guess: when `$allow_existing` is false, PVE has just asserted this
 vmid was free, so anything still under `/etc/pve/meta/<vmid>.*` is a leftover and is
-cleared. When it is true — a restore *over* an existing guest — the document is kept,
-because a backup does not carry one and clearing would be data loss.
+cleared. When it is true — a restore *over* an existing guest, the only case that reaches
+it — nothing is cleared here; the hook records the fact in a second node-local marker,
+`/run/pve-meta/<vmid>.existing`, beside the restore marker, and the restore's own
+`write_config` decides from the notes (below). A plain create removes that marker instead,
+so a half-finished restore can never hand its mark to the next guest at that vmid.
 
 This replaces the hourly GC, and it is not merely faster. A sweep nominates vmids that are
 missing from the vmlist; a guest destroyed and recreated at the same vmid between two
@@ -108,11 +121,19 @@ carry arbitrary text. That is the whole mechanism (`docs/DESIGN.md` §7; decisio
   `PVE::RS::Meta::notes_import($vmid, $notes, 'restore')` under the document's
   `cfs_lock_domain` lock, inside the guest lock the caller holds — the same order
   create and destroy use — which writes the document through the store's own lint
-  gate and hands back the notes without the block, and the config lands clean. The block wins over whatever document the vmid had: it is the
-  backup being restored. Enforced schemas are not applied, since a restore is not an
+  gate and hands back the notes without any block, and the config lands clean. Should
+  the notes hold more than one, the **last** is imported: `assemble` appends its block
+  after everything else, so an earlier one is never the backup's. The block wins over whatever document the vmid had: it is the
+  backup being restored, and that document's snapshot copies go too, since a restored
+  guest has no snapshots — the same outcome as the no-block case below. Enforced schemas are not applied, since a restore is not an
   edit. An error (a block someone mangled, YAML the store refuses) warns and leaves the
   notes as they are, block included, for `pve-meta scan-notes`; nothing here can fail a
-  restore. Until that scan, a clone of such a guest copies the block and imports it on
+  restore. When the marked write carries **no** block and the `.existing` marker says the
+  restore went over an existing guest, that guest's document and its snapshot copies are
+  removed under the same lock: after a restore the guest is the backup, and a document the
+  backup did not carry is the previous incarnation's — a stale ingress route or compose
+  stack for something that no longer runs. A plain create takes this path too and finds
+  nothing: `create_and_lock_config` cleared the vmid a moment earlier. Until that scan, a clone of such a guest copies the block and imports it on
   its own first write, since a clone begins with a create too.
 * **Restore on a host without pve-meta.** The block stays in the notes. It renders on
   the Summary panel as a marked YAML code block, so the operator can see what the guest

@@ -61,7 +61,7 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
 | `title` | yes | Tab title. |
 | `iconCls` | no | ExtJS/FontAwesome icon class (default: `fa fa-puzzle-piece`). |
 | `targets` | yes | Any of `lxc`, `qemu`, `node`, `dc` — which config panel(s) get the tab. |
-| `script` | yes | URL of a JS file defining an ExtJS class (placeholders substituted, below), loaded once and instantiated as the tab's content. |
+| `script` | yes | URL of a JS file defining an ExtJS class, loaded once and instantiated as the tab's content. |
 | `xtype` | yes | The `xtype` the script registers; the tab becomes `{ xtype, vmid, type, node, dc }` (whichever apply to the target). |
 | `fingerprint` | — | **Server-added.** A content hash of `script`, appended by the loader as `?ver=` (cache busting: pveproxy serves static files with `Last-Modified` and no `ETag`, and dpkg clamps mtimes for reproducible builds, so a rebuilt file of the same version would otherwise revalidate to a stale cached copy). |
 
@@ -71,23 +71,32 @@ a manifest that doesn't is skipped with one `warn`, never breaking the
 endpoint for the others. A duplicate `id` (first one wins, by sorted
 filename) is likewise skipped with a `warn`.
 
+A manifest carries no access control and the loader gates on nothing: the
+tab is offered to everyone who can load the UI, and keeping a page's data
+and actions to those allowed them is the job of that page's own backend
+API, in its `permissions`, exactly as for any other PVE endpoint.
+
 `pve-ext-loader.js` (loaded via a `<script>` tag dpkg-diverted into stock
-`index.html.tpl`, right after `pvemanagerlib.js`) fetches that endpoint once
-and, for every manifest whose `targets` includes the panel being built, adds
-a `layout: 'fit'` tab that inserts a `<script>` for `script` (once per URL,
+`index.html.tpl`, right after `pvemanagerlib.js`) prefetches that endpoint
+once, asynchronously, at script load — before the app starts, so the list is
+normally there long before the first config panel is built. For every
+manifest whose `targets` includes the panel being built it adds a
+`layout: 'fit'` tab that inserts a `<script>` for `script` (once per URL,
 cached), waits for `xtype` to resolve to a defined class, and replaces its
-own content with `{ xtype, vmid, type, node, dc }`. Adding a tab works by
+own content with `{ xtype, vmid, type, node, dc }`. A panel built while the
+prefetch is still in flight gets its tabs afterwards, through that panel's
+own `insertNodes()` (the seam its `initComponent` hands `items` to), in the
+same manifest order. `index.html.tpl` is also rendered pre-login, so
+a prefetch that fails (a 401, most likely) is warned about and never cached
+as an empty list for the session: the next config panel asks again. Adding
+a tab works by
 patching `PVE.panel.Config.prototype.initComponent` directly (capture the
 original, call it, then add tabs) — see the file's header comment for why
-this, and not `Ext.override`, is required on ExtJS 7 classic. Every seam
+this, and not `Ext.override` + `callParent`, is the only thing that works
+from a `'use strict'` file. Every seam
 this script touches is individually `try`/`catch`-guarded, degrading to
 "that one thing doesn't happen" — it must never be possible for a broken
 manifest or script to break the PVE UI itself.
-
-Placeholders substituted into `script` (and into `{query}`, a ready-made
-query string): `{vmid}`/`{node}`/`{type}` (guest vmid/node/`lxc`|`qemu`, or
-just `node`/`dc` for those targets), and `{theme}` (`light`/`dark`,
-mirroring the admin's PVE color theme).
 
 pveproxy already maps `/pve2/js/` to `/usr/share/pve-manager/js/` — ship
 your page's static files under `/usr/share/pve-manager/js/<your-app>/`, and
@@ -98,23 +107,31 @@ main PVE UI's own assets).
 
 For anything that isn't "add an API module" or "add a UI tab" — most
 commonly, hooking a few lines into stock PVE Perl at points with no plugin
-seam — ship a TOML manifest at `/usr/share/pve-ext/patches/<name>.toml`:
+seam — ship a JSON manifest at `/usr/share/pve-ext/patches/<name>.json`:
 
-```toml
-[[file]]
-path = "/usr/share/perl5/PVE/API2.pm"
-package = "pve-manager"
-diff = "pve-manager_API2.pm.diff"     # relative to the manifest's own directory
-marker = "PVE::API2::Ext->register_all();"
-check = "perl"                         # perl -c gate; or "template" for HTML
+```json
+{
+    "description": "What this patch is for; free text, not read by the tool.",
+    "files": [
+        {
+            "path": "/usr/share/perl5/PVE/API2.pm",
+            "package": "pve-manager",
+            "diff": "pve-manager_API2.pm.diff",
+            "marker": "PVE::API2::Ext->register_all();",
+            "check": "perl"
+        }
+    ]
+}
 ```
+
+Each entry of `files`:
 
 | Field | Required | Meaning |
 |---|---|---|
 | `path` | yes | Absolute path of the file to patch. |
 | `package` | no | The upstream package that ships `path` — informational, shown in `status`. |
 | `diff` | yes | A unified diff (`a/`/`b/` headers using `path` minus its leading `/`), applied with `patch -p1`, relative to the manifest's own directory. |
-| `marker` | yes | A literal string `status`/`verify` grep for, and, for `check = "template"`, the tag expected exactly once in the output. |
+| `marker` | yes | A literal string `status`/`verify` grep for, and, for `"check": "template"`, the tag expected exactly once in the output. |
 | `check` | no (default `perl`) | `perl` gates on `perl -c` reporting `syntax OK` last; `template` gates on `marker` appearing exactly once and `</body>` still present. |
 
 `pve-ext-patch apply|remove|verify|status [--root DIR] [manifest...]`
@@ -129,21 +146,20 @@ check = "perl"                         # perl -c gate; or "template" for HTML
   touch it — a real accident, never a case pve-ext caused itself.
 - The patched file is regenerated from that pristine backup + the diff, in
   a scratch copy, never in place — so re-running `apply` is idempotent.
-- `patch -p1 --fuzz=0 --dry-run` gates the real `patch -p1 --fuzz=0`
-  (`--fuzz=0`: default fuzz can slide a hunk onto the wrong one of several
-  near-identical anchors and report success); the result is only
-  `install`ed after it also passes its `check`.
+- Every hunk has to apply with `patch -p1 --fuzz=0` (`--fuzz=0`: default
+  fuzz can slide a hunk onto the wrong one of several near-identical
+  anchors and report success); the result is only `install`ed after it
+  also passes its `check`.
 - On any failure after a diversion that already existed (a re-apply after
   an upstream upgrade replaced the pristine), `apply` restores the
-  *current* pristine rather than leaving stale patched content, and
-  records the failure to syslog and `<ROOT_DIR>/run/pve-ext-patch/failed`
-  (never only stderr, which a postinst commonly swallows).
+  *current* pristine rather than leaving stale patched content, and says
+  why on stderr; `status` shows what is applied at any time.
 - Best-effort per file, across every file in every selected manifest: one
   file's anchors moving must never block patching the others.
 - `remove` restores every entry's pristine file and removes its diversion.
 
 With no manifest named, `apply`/`remove`/`verify`/`status` act on every
-`*.toml` under `/usr/share/pve-ext/patches/` (or, in a checkout, `../patches`
+`*.json` under `/usr/share/pve-ext/patches/` (or, in a checkout, `../patches`
 next to the script).
 
 Using it from your own package: ship your diffs and manifest under
@@ -152,10 +168,16 @@ Using it from your own package: ship your diffs and manifest under
 (best-effort, never fails your install); your `prerm`, on `remove`, runs
 `pve-ext-patch remove <manifest-name>` **before** dpkg deletes your
 package's files (ordering falls out of `Depends: pve-ext`); your
-`debian/triggers` declares `interest-noawait` on every path you patch, so
-it survives upgrades of whatever package ships those files. `pve-meta`'s
-own `patches/lifecycle.toml` (installed as
-`/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`) is a worked example;
+`debian/triggers` declares `interest-noawait` on every path you patch and
+on its `<path>.pve-ext-orig`, so it survives upgrades of whatever package
+ships those files. Both names are needed: a file trigger matches the name
+dpkg writes, which is `<path>.pve-ext-orig` while the diversion is in place
+and `<path>` before the first `apply` (or after one that rolled its
+diversion back). The `triggered` re-apply then rebuilds `<path>` from the
+new pristine copy, or, if the diff no longer applies to it, installs that
+pristine copy and says why. `pve-meta`'s
+own `patches/lifecycle.json` (installed as
+`/usr/share/pve-ext/patches/pve-meta-lifecycle.json`) is a worked example;
 see `docs/LIFECYCLE.md`.
 
 ## Summary: what pve-ext ships
@@ -166,12 +188,12 @@ perl/PVE/API2/Ext.pm             -> /usr/share/perl5/PVE/API2/Ext.pm
 js/pve-ext-loader.js             -> /usr/share/pve-manager/js/pve-ext-loader.js
 bin/pve-ext-patch                -> /usr/sbin/pve-ext-patch
 man/pve-ext-patch.8              -> /usr/share/man/man8/pve-ext-patch.8
-patches/pve-manager.toml + diffs -> /usr/share/pve-ext/patches/
+patches/pve-manager.json + diffs -> /usr/share/pve-ext/patches/
 (empty dir, for consumers)       -> /usr/share/pve-ext/pages/
 ```
 
 pve-ext's own `debian/postinst`/`debian/prerm` apply/remove exactly its own
-`pve-manager.toml` manifest; every other manifest, page and API module comes
+`pve-manager.json` manifest; every other manifest, page and API module comes
 from whatever package depends on `pve-ext` and drops it in. `make deb` runs
 `lintian` against the built `.deb`: fatal when `$CI` is set, advisory
 otherwise.

@@ -5,6 +5,13 @@
 // ---------------------------------------------------------------------------
 
 PVE.meta.Buffer = {
+    // What the YAML side held when the JSON side was entered. A switch to JSON and
+    // back is a presentation toggle and has to give back exactly the text it took:
+    // key order and `#` comments are not values, so nothing that went through JSON
+    // can carry them back. Keyed by the Monaco editor, since a `buffer` is built
+    // fresh for every call; a WeakMap, so a disposed editor needs no bookkeeping.
+    stashed: new WeakMap(),
+
     // The loaded text as the buffer's language shows it, for a diff or a "did
     // anything change"; falls back to YAML if it cannot be rendered as JSON.
     // Returns `{ lang, text }`.
@@ -17,9 +24,25 @@ PVE.meta.Buffer = {
     },
 
     // True when the buffer holds exactly what was loaded. A predicate, and only
-    // that: applying an unchanged buffer resolves to nothing to write.
+    // that: applying an unchanged buffer resolves to nothing to write. On an
+    // untouched JSON side the answer is the YAML behind it, which switching back
+    // gives back: an edit JSON cannot show (a `#` comment, a re-indent) is still
+    // an edit, and one Revert or leaving Text must ask about.
     unchanged: function (buffer) {
-        return buffer.editor.getValue() === PVE.meta.Buffer.baseline(buffer).text;
+        let text = buffer.editor.getValue();
+        let held = PVE.meta.Buffer.stashed.get(buffer.editor);
+        if (held && buffer.lang === 'json' && text === held.json) {
+            return held.yaml === buffer.original;
+        }
+        return text === PVE.meta.Buffer.baseline(buffer).text;
+    },
+
+    // Put the stored document into the buffer (a load, a Revert, a re-read after
+    // Apply). What the YAML side held before is not that document's, so it goes:
+    // left in place, switching back from JSON gave the reverted edit back.
+    load: function (editor, text) {
+        PVE.meta.Buffer.stashed.delete(editor);
+        editor.setValue(text);
     },
 
     // The buffer against what was loaded, without committing to it.
@@ -52,7 +75,8 @@ PVE.meta.Buffer = {
     },
 
     // The first half of the YAML | JSON switch: the buffer as a value. If it does
-    // not parse, says so, puts `btn` back, and returns undefined. The caller
+    // not parse, says so, puts `btn` back once its change handler has run, and
+    // returns undefined. The caller
     // records the new language before calling `render`, whose change listeners read it.
     convert: function (buffer, lang, btn) {
         try {
@@ -66,18 +90,49 @@ PVE.meta.Buffer = {
                     Ext.htmlEncode(PVE.meta.Utils.errText(err)),
                 ),
             );
-            btn.suspendEvents();
-            btn.setValue(buffer.lang);
-            btn.resumeEvents();
+            // After the handler, not in it: this runs inside the button's own
+            // `change`, and a value set there is undone as the button finishes
+            // its toggle -- which left it with no value at all, and the next
+            // click handed `null` on as the language.
+            let lang0 = buffer.lang;
+            setTimeout(function () {
+                if (btn.isDestroyed) {
+                    return;
+                }
+                btn.suspendEvents();
+                btn.setValue(lang0);
+                btn.resumeEvents();
+            }, 0);
             return undefined;
         }
     },
 
-    // The second half: show `value` in `buffer.lang`, via `Codec.render` so a
-    // no-op toggle back to YAML never becomes a whitespace diff.
+    // The second half: show `value` in `buffer.lang`. The text being left goes with
+    // it, since leaving YAML is the only chance to remember how it looked.
     render: function (buffer, value) {
+        let leaving = buffer.editor.getValue();
         window.monaco.editor.setModelLanguage(buffer.editor.getModel(), buffer.lang);
-        buffer.editor.setValue(PVE.meta.Codec.render(value, buffer.lang, buffer.original));
+        buffer.editor.setValue(PVE.meta.Buffer.rendered(buffer, value, leaving));
+    },
+
+    // What that shows. Into JSON: the dump, with the YAML it replaced stashed.
+    // Back into YAML: that exact text, if the JSON side was never touched -- once
+    // it was, the value is all that carries over, and the layout it used to have is
+    // not that value's. Then it is `Codec.render`, which still prefers the text the
+    // document was loaded as when the value is the one it was loaded with.
+    rendered: function (buffer, value, leaving) {
+        let me = PVE.meta.Buffer;
+        if (buffer.lang === 'json') {
+            let json = PVE.meta.Codec.dump(value, 'json');
+            me.stashed.set(buffer.editor, { yaml: leaving, json: json });
+            return json;
+        }
+        let held = me.stashed.get(buffer.editor);
+        me.stashed.delete(buffer.editor);
+        if (held && held.json === leaving) {
+            return held.yaml;
+        }
+        return PVE.meta.Codec.render(value, 'yaml', buffer.original);
     },
 };
 
