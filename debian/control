@@ -10,7 +10,7 @@ Homepage: https://github.com/arki05/pve-meta
 Package: pve-meta
 Architecture: all
 Depends: pve-manager (>= 9.0),
-         pve-ext (>= 0.2.0),
+         pve-ext (>= 0.2.1),
          libpve-meta-rs-perl (= ${binary:Version}),
          init-system-helpers (>= 1.54~),
          ${misc:Depends}, ${perl:Depends}

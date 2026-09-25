@@ -18,7 +18,7 @@ install:
 	install -D -m 0755 bin/pve-ext-patch $(DESTDIR)$(PREFIX)/sbin/pve-ext-patch
 	install -D -m 0644 man/pve-ext-patch.8 $(DESTDIR)$(PREFIX)/share/man/man8/pve-ext-patch.8
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches
-	cp patches/pve-manager.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/
+	cp patches/pve-manager.json $(DESTDIR)$(PREFIX)/share/pve-ext/patches/
 	cp patches/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/pages
 	mkdir -p $(DESTDIR)$(PREFIX)/share/perl5/PVE/API2/Ext

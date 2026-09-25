@@ -107,23 +107,31 @@ main PVE UI's own assets).
 
 For anything that isn't "add an API module" or "add a UI tab" — most
 commonly, hooking a few lines into stock PVE Perl at points with no plugin
-seam — ship a TOML manifest at `/usr/share/pve-ext/patches/<name>.toml`:
+seam — ship a JSON manifest at `/usr/share/pve-ext/patches/<name>.json`:
 
-```toml
-[[file]]
-path = "/usr/share/perl5/PVE/API2.pm"
-package = "pve-manager"
-diff = "pve-manager_API2.pm.diff"     # relative to the manifest's own directory
-marker = "PVE::API2::Ext->register_all();"
-check = "perl"                         # perl -c gate; or "template" for HTML
+```json
+{
+    "description": "What this patch is for; free text, not read by the tool.",
+    "files": [
+        {
+            "path": "/usr/share/perl5/PVE/API2.pm",
+            "package": "pve-manager",
+            "diff": "pve-manager_API2.pm.diff",
+            "marker": "PVE::API2::Ext->register_all();",
+            "check": "perl"
+        }
+    ]
+}
 ```
+
+Each entry of `files`:
 
 | Field | Required | Meaning |
 |---|---|---|
 | `path` | yes | Absolute path of the file to patch. |
 | `package` | no | The upstream package that ships `path` — informational, shown in `status`. |
 | `diff` | yes | A unified diff (`a/`/`b/` headers using `path` minus its leading `/`), applied with `patch -p1`, relative to the manifest's own directory. |
-| `marker` | yes | A literal string `status`/`verify` grep for, and, for `check = "template"`, the tag expected exactly once in the output. |
+| `marker` | yes | A literal string `status`/`verify` grep for, and, for `"check": "template"`, the tag expected exactly once in the output. |
 | `check` | no (default `perl`) | `perl` gates on `perl -c` reporting `syntax OK` last; `template` gates on `marker` appearing exactly once and `</body>` still present. |
 
 `pve-ext-patch apply|remove|verify|status [--root DIR] [manifest...]`
@@ -151,7 +159,7 @@ check = "perl"                         # perl -c gate; or "template" for HTML
 - `remove` restores every entry's pristine file and removes its diversion.
 
 With no manifest named, `apply`/`remove`/`verify`/`status` act on every
-`*.toml` under `/usr/share/pve-ext/patches/` (or, in a checkout, `../patches`
+`*.json` under `/usr/share/pve-ext/patches/` (or, in a checkout, `../patches`
 next to the script).
 
 Using it from your own package: ship your diffs and manifest under
@@ -162,8 +170,8 @@ Using it from your own package: ship your diffs and manifest under
 package's files (ordering falls out of `Depends: pve-ext`); your
 `debian/triggers` declares `interest-noawait` on every path you patch, so
 it survives upgrades of whatever package ships those files. `pve-meta`'s
-own `patches/lifecycle.toml` (installed as
-`/usr/share/pve-ext/patches/pve-meta-lifecycle.toml`) is a worked example;
+own `patches/lifecycle.json` (installed as
+`/usr/share/pve-ext/patches/pve-meta-lifecycle.json`) is a worked example;
 see `docs/LIFECYCLE.md`.
 
 ## Summary: what pve-ext ships
@@ -174,12 +182,12 @@ perl/PVE/API2/Ext.pm             -> /usr/share/perl5/PVE/API2/Ext.pm
 js/pve-ext-loader.js             -> /usr/share/pve-manager/js/pve-ext-loader.js
 bin/pve-ext-patch                -> /usr/sbin/pve-ext-patch
 man/pve-ext-patch.8              -> /usr/share/man/man8/pve-ext-patch.8
-patches/pve-manager.toml + diffs -> /usr/share/pve-ext/patches/
+patches/pve-manager.json + diffs -> /usr/share/pve-ext/patches/
 (empty dir, for consumers)       -> /usr/share/pve-ext/pages/
 ```
 
 pve-ext's own `debian/postinst`/`debian/prerm` apply/remove exactly its own
-`pve-manager.toml` manifest; every other manifest, page and API module comes
+`pve-manager.json` manifest; every other manifest, page and API module comes
 from whatever package depends on `pve-ext` and drops it in. `make deb` runs
 `lintian` against the built `.deb`: fatal when `$CI` is set, advisory
 otherwise.

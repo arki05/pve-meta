@@ -1,4 +1,4 @@
-# Guest-lifecycle managed patch (see patches/lifecycle.toml, patches/lifecycle/,
+# Guest-lifecycle managed patch (see patches/lifecycle.json, patches/lifecycle/,
 # applied via pve-ext-patch): re-run whenever one of the packages reships a
 # file it patches, so the patch survives their upgrades. postinst calls
 # pve-ext-patch tolerantly (no-op if it, or a target file, is absent).

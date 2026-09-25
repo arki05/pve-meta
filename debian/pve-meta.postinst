@@ -1,6 +1,6 @@
 #!/bin/sh
 # postinst for the pve-meta package: applies the guest-lifecycle managed
-# patch (patches/lifecycle.toml) via pve-ext-patch, and runs the one-time
+# patch (patches/lifecycle.json) via pve-ext-patch, and runs the one-time
 # notes scan. Never allowed to fail the package install/configure.
 set -e
 

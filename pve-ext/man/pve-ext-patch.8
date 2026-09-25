@@ -20,8 +20,8 @@ pve\-ext\-patch \- apply, verify, remove and report pve\-ext managed patches
 dpkg\-diverts a stock Proxmox VE file away, regenerates the real path as
 pristine original plus a manifest's unified diff in a scratch copy, gates
 installation on a syntax/template check, and only then installs the
-result. Manifests are TOML files under
-.IR /usr/share/pve\-ext/patches/ *.toml .
+result. Manifests are JSON files under
+.IR /usr/share/pve\-ext/patches/ *.json .
 See
 .I pve\-ext/README.md
 in the pve\-meta source tree for the manifest format and worked examples.
@@ -60,11 +60,11 @@ in sync with pristine\ +\ diff.
 With no
 .I manifest
 arguments, every command acts on every
-.I *.toml
+.I *.json
 file under the manifest directory. A
 .I manifest
 argument is either a bare name (resolved to
-.IR name .toml
+.IR name .json
 under that directory) or a path to a manifest file directly.
 .SH OPTIONS
 .TP
@@ -84,11 +84,11 @@ Print usage and exit.
 .B 0
 on success. Non\-zero if any selected file failed to apply/remove/verify,
 if no manifest or no
-.B [[file]]
+.B files
 entries were found, or for a usage error.
 .SH FILES
 .TP
-.I /usr/share/pve\-ext/patches/*.toml
+.I /usr/share/pve\-ext/patches/*.json
 Installed manifests; in a checkout, falls back to
 .I ../patches
 next to this script.

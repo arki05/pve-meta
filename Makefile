@@ -92,7 +92,7 @@ install: js
 		echo "warning: perl/PVE/API2/Ext/Meta.pm not present yet, skipping" >&2; \
 	fi
 	# The lifecycle patch manifest, under the name the maintainer scripts apply it by.
-	install -D -m 0644 patches/lifecycle.toml $(DESTDIR)$(PREFIX)/share/pve-ext/patches/pve-meta-lifecycle.toml
+	install -D -m 0644 patches/lifecycle.json $(DESTDIR)$(PREFIX)/share/pve-ext/patches/pve-meta-lifecycle.json
 	mkdir -p $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle
 	cp patches/lifecycle/*.diff $(DESTDIR)$(PREFIX)/share/pve-ext/patches/lifecycle/
 	# In sbin, not an API client's path: it reads /etc/pve/meta directly, often

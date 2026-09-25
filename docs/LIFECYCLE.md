@@ -41,7 +41,7 @@ guest operation over a sidecar file, exactly as PVE already treats
 `/etc/pve/firewall/*.fw` tolerantly in the same code paths.
 
 How the diff reaches the installed file is not this document's subject: the manifest
-(`patches/lifecycle.toml`) and the one diff
+(`patches/lifecycle.json`) and the one diff
 (`patches/lifecycle/libpve-guest-common-perl_AbstractConfig.pm.diff`) are applied by
 `pve-ext-patch apply pve-meta-lifecycle` from `debian/pve-meta.postinst`, and
 `pve-ext/README.md` ("Managed patches") owns the tool, its diversions and its limits. What each hook does is

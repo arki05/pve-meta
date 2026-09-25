@@ -14,7 +14,7 @@ use base qw(PVE::RESTHandler);
 
 # The generic Proxmox VE extension layer (see pve-ext/README.md).
 # `require`d, then explicitly driven by one `PVE::API2::Ext->register_all();`
-# call, from the very end of stock `PVE/API2.pm` (see patches/pve-manager.toml).
+# call, from the very end of stock `PVE/API2.pm` (see patches/pve-manager.json).
 # register_all() mounts this module at `ext` and scans
 # `/usr/share/perl5/PVE/API2/Ext/*.pm`, mounting each at its own `ext_path`.
 
@@ -116,7 +116,7 @@ sub _scan_and_register {
 
 # The single entry point stock PVE/API2.pm calls, once, after all of
 # PVE::API2's own core `register_method` calls -- so a core/extension
-# ext_path collision always resolves in core's favor (see patches/pve-manager.toml).
+# ext_path collision always resolves in core's favor (see patches/pve-manager.json).
 sub register_all {
     my ($class) = @_;
 

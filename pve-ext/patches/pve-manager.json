@@ -1,0 +1,19 @@
+{
+    "description": "pve-ext's own managed patch: the two hooks into stock pve-manager (pve-ext/README.md, \"Managed patches\").",
+    "files": [
+        {
+            "path": "/usr/share/pve-manager/index.html.tpl",
+            "package": "pve-manager",
+            "diff": "pve-manager_index.html.tpl.diff",
+            "marker": "<script type=\"text/javascript\" src=\"/pve2/js/pve-ext-loader.js\"></script>",
+            "check": "template"
+        },
+        {
+            "path": "/usr/share/perl5/PVE/API2.pm",
+            "package": "pve-manager",
+            "diff": "pve-manager_API2.pm.diff",
+            "marker": "PVE::API2::Ext->register_all();",
+            "check": "perl"
+        }
+    ]
+}
