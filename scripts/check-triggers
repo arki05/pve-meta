@@ -1,0 +1,29 @@
+#!/bin/sh
+# Checks each package's debian triggers file against its patch manifests:
+# only comments, blank lines and `interest-noawait <absolute path>`, and every
+# file a manifest patches named twice -- as <path>, and as the
+# <path>.pve-ext-orig dpkg writes an upgrade of it to while pve-ext-patch has
+# it diverted (pve-ext/README.md, "Managed patches"). Run from the top of the
+# checkout, by `make check-perl`.
+set -eu
+
+check() {
+    triggers="$1"
+    manifests="$2"
+    if grep -Evn '^(#.*|interest-noawait /[^ ]+)?$' "$triggers"; then
+        echo "$triggers: the line(s) above are not interest-noawait <path>" >&2
+        exit 1
+    fi
+    for path in $(perl -MJSON::PP -0777 -ne 'print "$_->{path}\n" for @{ decode_json($_)->{files} }' "$manifests"/*.json); do
+        for name in "$path" "$path.pve-ext-orig"; do
+            grep -qxF "interest-noawait $name" "$triggers" || {
+                echo "$triggers: no 'interest-noawait $name'" >&2
+                exit 1
+            }
+        done
+    done
+}
+
+check debian/pve-meta.triggers patches
+check pve-ext/debian/triggers pve-ext/patches
+echo "triggers: every patched file is watched under both names"

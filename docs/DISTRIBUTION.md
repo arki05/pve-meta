@@ -76,9 +76,10 @@ There is no scheduled check against upstream Proxmox releases; nothing pins or b
 
 Instead, the managed patches tell the admin at the moment it matters. `pve-meta`'s
 `debian/triggers` declares `interest-noawait` on the files its lifecycle patch touches,
-so upgrading any of the three packages above fires `pve-meta.postinst`'s `triggered`
-case in the same `apt` transaction, which re-runs `pve-ext-patch apply
-pve-meta-lifecycle`. If the patch no longer applies cleanly, `apply` restores the
+and on the `<path>.pve-ext-orig` name dpkg writes each to while it is diverted, so
+upgrading any of the three packages above fires `pve-meta.postinst`'s `triggered` case
+in the same `apt` transaction, which re-runs `pve-ext-patch apply pve-meta-lifecycle`
+on the new pristine file. If the patch no longer applies cleanly, `apply` restores the
 pristine file, never leaves one patched against stale content, and says so on the
 postinst's stderr; `pve-ext-patch status` shows what is applied at any time.
 `pve-ext/README.md` ("Managed patches") owns the mechanism; `pve-ext-patch verify` runs

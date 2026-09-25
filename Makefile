@@ -161,9 +161,10 @@ check: doc wasm js
 
 # Every shell and Perl file, compiled but not run, against stubbed PVE modules
 # (scripts/perl-stubs) so this runs on a laptop and in CI's plain Debian
-# container too.
+# container too; and the triggers files against the patch manifests.
 check-perl:
-	shellcheck pve-ext/bin/pve-ext-patch
+	shellcheck pve-ext/bin/pve-ext-patch scripts/check-triggers
+	scripts/check-triggers
 	@for f in perl/PVE/API2/Ext/Meta.pm pve-ext/perl/PVE/API2/Ext.pm \
 	          crates/pve-meta-perl/perl/PVE/Meta/Hooks.pm \
 	          bin/pve-meta examples/maintenance-hook.pl; do \

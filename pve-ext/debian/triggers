@@ -1,5 +1,12 @@
 # pve-ext's own two-file pve-manager patch (see patches/pve-manager.json):
 # re-run pve-ext-patch whenever pve-manager reships either patched file,
 # so the patch survives pve-manager upgrades.
+#
+# Each file twice: while the diversion is in place dpkg writes the upgraded
+# file to <path>.pve-ext-orig, and a file trigger matches the name dpkg
+# writes; <path> itself is written before the first apply diverts it, or
+# after one that failed and rolled its diversion back.
 interest-noawait /usr/share/pve-manager/index.html.tpl
+interest-noawait /usr/share/pve-manager/index.html.tpl.pve-ext-orig
 interest-noawait /usr/share/perl5/PVE/API2.pm
+interest-noawait /usr/share/perl5/PVE/API2.pm.pve-ext-orig

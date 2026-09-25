@@ -168,8 +168,14 @@ Using it from your own package: ship your diffs and manifest under
 (best-effort, never fails your install); your `prerm`, on `remove`, runs
 `pve-ext-patch remove <manifest-name>` **before** dpkg deletes your
 package's files (ordering falls out of `Depends: pve-ext`); your
-`debian/triggers` declares `interest-noawait` on every path you patch, so
-it survives upgrades of whatever package ships those files. `pve-meta`'s
+`debian/triggers` declares `interest-noawait` on every path you patch and
+on its `<path>.pve-ext-orig`, so it survives upgrades of whatever package
+ships those files. Both names are needed: a file trigger matches the name
+dpkg writes, which is `<path>.pve-ext-orig` while the diversion is in place
+and `<path>` before the first `apply` (or after one that rolled its
+diversion back). The `triggered` re-apply then rebuilds `<path>` from the
+new pristine copy, or, if the diff no longer applies to it, installs that
+pristine copy and says why. `pve-meta`'s
 own `patches/lifecycle.json` (installed as
 `/usr/share/pve-ext/patches/pve-meta-lifecycle.json`) is a worked example;
 see `docs/LIFECYCLE.md`.
