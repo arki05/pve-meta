@@ -479,10 +479,7 @@
         for (var i = 0; i < pages.length; i++) {
             var manifest = pages[i];
             try {
-                if (!manifest || !manifest.id || !manifest.title || !manifest.script || !manifest.xtype || !Ext.isArray(manifest.targets)) {
-                    warn('ignoring malformed page manifest (missing id/title/script/xtype/targets): ' + JSON.stringify(manifest));
-                    continue;
-                }
+                // PVE::API2::Ext only lists a manifest that has every field.
                 if (manifest.targets.indexOf(target) === -1) {
                     continue;
                 }
