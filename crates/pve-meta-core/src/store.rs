@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
 use sha2::{Digest as _, Sha256};
 
 use crate::digest;
@@ -95,15 +94,13 @@ pub enum RollbackOutcome {
     NoOp,
 }
 
-fn snapshot_name_regex() -> &'static Regex {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Za-z][A-Za-z0-9_-]*$").unwrap())
-}
-
 /// `true` for a valid snapshot name: `^[A-Za-z][A-Za-z0-9_-]*$`, excluding a
 /// format extension (so a snapshot file can't be mistaken for a live one).
 pub fn is_valid_snapshot_name(name: &str) -> bool {
-    snapshot_name_regex().is_match(name) && Format::from_ext(name).is_none()
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && Format::from_ext(name).is_none()
 }
 
 /// `Ok(None)` for not-found (it may just have vanished), `Ok(Some(v))` otherwise, anything else an error.
@@ -645,7 +642,12 @@ mod tests {
     fn snapshot_name_validation() {
         assert!(is_valid_snapshot_name("before-upgrade"));
         assert!(is_valid_snapshot_name("a"));
+        assert!(is_valid_snapshot_name("A_b-9"));
+        assert!(!is_valid_snapshot_name(""));
         assert!(!is_valid_snapshot_name("1abc"));
+        assert!(!is_valid_snapshot_name("_a"));
+        assert!(!is_valid_snapshot_name("a.b"));
+        assert!(!is_valid_snapshot_name("caf\u{e9}"));
         assert!(!is_valid_snapshot_name("bad name"));
         assert!(!is_valid_snapshot_name("yaml"));
         assert!(!is_valid_snapshot_name("json"));

@@ -16,7 +16,6 @@ serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
 hex.workspace = true
-regex.workspace = true
 saphyr-parser.workspace = true
 libc.workspace = true
 
