@@ -278,6 +278,13 @@ like($v->{token}, qr/^[0-9a-f]{64}$/, '... a sha256 hex string');
 dies_with(400, sub { PVE::RS::Meta::api_get('not-a-vmid', undef, 'json', $FULL) },
     'api_get for an id that is neither a vmid nor a registry id');
 
+# check_id: api::parse_id's verdict, which lock_domain_for asks before a lock
+# is named after the id.
+ok(eval { PVE::RS::Meta::check_id($_); 1 }, "check_id accepts '$_'")
+    for ('100', 'prefixes/homelab.docker');
+dies_with(400, sub { PVE::RS::Meta::check_id('abc'); 1 }, "check_id('abc')");
+dies_with(400, sub { PVE::RS::Meta::check_id('prefixes/a/b'); 1 }, "check_id('prefixes/a/b')");
+
 # api_put's `data` is the one JSON string; the payload and the result --
 # including `touched`, a native array of { path, op } hashes -- are native
 # structures both ways.

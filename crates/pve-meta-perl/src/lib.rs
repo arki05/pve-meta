@@ -256,6 +256,14 @@ mod pve_rs_meta {
         Ok(api::schemas())
     }
 
+    /// Dies with `400:` unless `$id` is one [`api::parse_id`] accepts: a
+    /// vmid or `prefixes/<name>`. `PVE::API2::Ext::Meta::lock_domain_for`
+    /// checks with it, before a lock is named after the id.
+    #[export]
+    pub fn check_id(id: &str) -> Result<(), api::ApiError> {
+        api::parse_id(id).map(|_| ())
+    }
+
     /// `GET /meta/access` -> `{ read, write }` for one document, exactly
     /// `$acl`'s own answers. `$id` is only parsed, for a 400 on a garbage id.
     #[export]

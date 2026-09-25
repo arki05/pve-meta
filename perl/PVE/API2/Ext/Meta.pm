@@ -81,9 +81,13 @@ sub is_guest_id {
 }
 
 # The `cfs_lock_domain` name for one document's write lock, held by the API
-# and the CLI alike. $id is a vmid or 'prefixes/<name>'.
+# and the CLI alike. $id is a vmid or 'prefixes/<name>', checked first by
+# Rust's `api::parse_id`, which dies "400: ..." like any `api_*` call: the
+# lock is a directory pmxcfs creates under that name, and one it cannot
+# create is a lock timeout.
 sub lock_domain_for {
     my ($id) = @_;
+    PVE::RS::Meta::check_id($id);
     return "pve-meta-$id" if is_guest_id($id);
     my (undef, $name) = split(m{/}, $id, 2);
     return "pve-meta-prefix-$name";
@@ -163,7 +167,7 @@ sub _call {
 sub _locked {
     my ($id, $code) = @_;
 
-    my $res = PVE::Cluster::cfs_lock_domain(lock_domain_for($id), 10, $code);
+    my $res = PVE::Cluster::cfs_lock_domain(_call(\&lock_domain_for, $id), 10, $code);
     if (my $err = $@) {
         die $err if ref($err); # a PVE::Exception raised by _call
         my $msg = "$err";
@@ -631,10 +635,9 @@ sub _register_document_methods {
 # -- registry documents ------------------------------------------------------
 
 # The shape `registry::is_valid_file_name` accepts (its charset and
-# `MAX_FILE_NAME_LEN`), checked by PVE before the method runs: a write names its
-# cfs lock after the file (`lock_domain_for`) and takes it before `api::parse_id`
-# sees the name, so this is what keeps a name pmxcfs cannot create out of the lock
-# path. `api::parse_id` re-checks it on every call.
+# `MAX_FILE_NAME_LEN`), checked by PVE before the method runs, for a 400 naming
+# the parameter. `api::parse_id` re-checks it on every call, and
+# `lock_domain_for` before a write names its cfs lock after the file.
 my $REGISTRY_NAME_SCHEMA = {
     type => 'string',
     pattern => '[A-Za-z0-9_@!-]+(\.[A-Za-z0-9_@!-]+)*',

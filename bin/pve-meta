@@ -81,15 +81,15 @@ sub fail {
     exit 1;
 }
 
-# Runs $code under the document's cluster lock, the API's own lock domain; a
-# die inside it, or a lock that cannot be taken, is a failure.
+# Runs $code under the document's cluster lock, the API's own lock domain; an
+# id the API would refuse, a die inside it, or a lock that cannot be taken, is a
+# failure. The id is refused before the lock is tried, not after its timeout.
 sub with_lock {
     my ($id, $code) = @_;
     require PVE::Cluster;
     require PVE::API2::Ext::Meta;
-    my $res = PVE::Cluster::cfs_lock_domain(
-        PVE::API2::Ext::Meta::lock_domain_for($id), $LOCK_TIMEOUT, $code,
-    );
+    my $domain = call(sub { PVE::API2::Ext::Meta::lock_domain_for($id) });
+    my $res = PVE::Cluster::cfs_lock_domain($domain, $LOCK_TIMEOUT, $code);
     fail($@) if $@;
     return $res;
 }
