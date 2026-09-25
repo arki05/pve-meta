@@ -61,7 +61,7 @@ Drop a manifest at `/usr/share/pve-ext/pages/<id>.json`:
 | `title` | yes | Tab title. |
 | `iconCls` | no | ExtJS/FontAwesome icon class (default: `fa fa-puzzle-piece`). |
 | `targets` | yes | Any of `lxc`, `qemu`, `node`, `dc` — which config panel(s) get the tab. |
-| `script` | yes | URL of a JS file defining an ExtJS class (placeholders substituted, below), loaded once and instantiated as the tab's content. |
+| `script` | yes | URL of a JS file defining an ExtJS class, loaded once and instantiated as the tab's content. |
 | `xtype` | yes | The `xtype` the script registers; the tab becomes `{ xtype, vmid, type, node, dc }` (whichever apply to the target). |
 | `fingerprint` | — | **Server-added.** A content hash of `script`, appended by the loader as `?ver=` (cache busting: pveproxy serves static files with `Last-Modified` and no `ETag`, and dpkg clamps mtimes for reproducible builds, so a rebuilt file of the same version would otherwise revalidate to a stale cached copy). |
 
@@ -97,11 +97,6 @@ from a `'use strict'` file. Every seam
 this script touches is individually `try`/`catch`-guarded, degrading to
 "that one thing doesn't happen" — it must never be possible for a broken
 manifest or script to break the PVE UI itself.
-
-Placeholders substituted into `script` (and into `{query}`, a ready-made
-query string): `{vmid}`/`{node}`/`{type}` (guest vmid/node/`lxc`|`qemu`, or
-just `node`/`dc` for those targets), and `{theme}` (`light`/`dark`,
-mirroring the admin's PVE color theme).
 
 pveproxy already maps `/pve2/js/` to `/usr/share/pve-manager/js/` — ship
 your page's static files under `/usr/share/pve-manager/js/<your-app>/`, and

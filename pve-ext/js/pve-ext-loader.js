@@ -84,39 +84,6 @@
         return;
     }
 
-    // --- Theme detection -------------------------------------------------
-    // Mirrors PVE's PVEThemeCookie ('crisp' -> light, 'proxmox-dark' ->
-    // dark, anything else -> follow the OS/browser preference).
-    function getPveTheme() {
-        var cookieVal = '';
-        try {
-            if (typeof Ext !== 'undefined' && Ext.util && Ext.util.Cookies && typeof Ext.util.Cookies.get === 'function') {
-                cookieVal = Ext.util.Cookies.get('PVEThemeCookie') || '';
-            } else {
-                var match = document.cookie.match(/(?:^|;\s*)PVEThemeCookie=([^;]*)/);
-                cookieVal = match ? decodeURIComponent(match[1]) : '';
-            }
-        } catch (e) {
-            warn('failed to read PVEThemeCookie, falling back to OS preference', e);
-        }
-
-        if (cookieVal === 'proxmox-dark') {
-            return 'dark';
-        }
-        if (cookieVal === 'crisp') {
-            return 'light';
-        }
-
-        try {
-            if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                return 'dark';
-            }
-        } catch (e) {
-            /* matchMedia unsupported - default to light below */
-        }
-        return 'light';
-    }
-
     // --- GET /ext/pages, prefetched once, asynchronously -----------------
     //
     // Started right here at script-load time: this file is injected after
@@ -208,42 +175,6 @@
         }
         pagesWaiters.push(cb);
         startPagesPrefetch();
-    }
-
-    // --- Placeholder substitution ----------------------------------------
-
-    // {query} is handled separately (expandQueryPlaceholder, below): it
-    // substitutes an already-encoded query string, never re-encoded.
-    function expandUrl(template, vars) {
-        return String(template).replace(/\{(vmid|node|type|theme)\}/g, function (whole, name) {
-            var v = vars[name];
-            return v === undefined || v === null ? '' : encodeURIComponent(v);
-        });
-    }
-
-    function expandQueryPlaceholder(template, query) {
-        return String(template).replace(/\{query\}/g, query);
-    }
-
-    function buildQuery(target, vars) {
-        var theme = encodeURIComponent(vars.theme);
-        if (target === 'dc') {
-            return 'dc=1&theme=' + theme;
-        }
-        if (target === 'node') {
-            return 'node=' + encodeURIComponent(vars.node) + '&theme=' + theme;
-        }
-        // lxc / qemu
-        return (
-            'vmid=' +
-            encodeURIComponent(vars.vmid) +
-            '&type=' +
-            encodeURIComponent(vars.type) +
-            '&node=' +
-            encodeURIComponent(vars.node) +
-            '&theme=' +
-            theme
-        );
     }
 
     // ExtJS renders a panel's `title` as markup, so it must be escaped
@@ -442,7 +373,7 @@
             return null; // not a panel we care about (pool/storage/sdn/... config)
         }
 
-        var vars = { theme: getPveTheme() };
+        var vars = {};
         if (target === 'lxc' || target === 'qemu') {
             var selData = me.pveSelNode && me.pveSelNode.data;
             vars.vmid = selData && selData.vmid;
@@ -464,7 +395,7 @@
             vars.type = 'dc';
         }
 
-        return { target: target, vars: vars, query: buildQuery(target, vars) };
+        return { target: target, vars: vars };
     }
 
     // The tab item configs the given pages contribute to that context, in
@@ -473,7 +404,6 @@
     function buildTabItems(context, pages) {
         var target = context.target;
         var vars = context.vars;
-        var query = context.query;
 
         var items = [];
         for (var i = 0; i < pages.length; i++) {
@@ -483,9 +413,7 @@
                 if (manifest.targets.indexOf(target) === -1) {
                     continue;
                 }
-                var scriptSrc = expandUrl(manifest.script, vars);
-                scriptSrc = expandQueryPlaceholder(scriptSrc, query);
-                scriptSrc = withVersion(scriptSrc, manifest.fingerprint);
+                var scriptSrc = withVersion(manifest.script, manifest.fingerprint);
                 var instanceConfig = buildInstanceConfig(target, vars);
                 items.push(buildScriptTabItem(manifest, scriptSrc, instanceConfig));
             } catch (e) {
