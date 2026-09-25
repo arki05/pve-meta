@@ -10,7 +10,6 @@ use warnings;
 
 use Getopt::Long qw(GetOptionsFromArray);
 use JSON::PP;
-use List::Util;
 
 use PVE::RS::Meta;
 
@@ -162,21 +161,6 @@ sub cmd_write {
         );
     });
     report_write($opts{dry_run} ? 'would write' : 'wrote', $id, $view, $res);
-
-    # A replace without --comments keeps the notes it did not carry; say so, since
-    # the file still holds something the payload did not.
-    if ($mode eq 'set' && !$opts{comments} && !$opts{dry_run}) {
-        my $doc = eval { PVE::RS::Meta::api_get($id, $view, 'json', $ROOT_ACL, 1) };
-        my $kept = $doc ? count_notes($doc->{data}) : 0;
-        print STDERR "$SELF: kept $kept note(s) (use --comments to replace them)\n" if $kept;
-    }
-}
-
-sub count_notes {
-    my ($v) = @_;
-    return 0 if !ref($v);
-    return List::Util::sum(0, map { count_notes($_) } @$v) if ref($v) eq 'ARRAY';
-    return List::Util::sum(0, map { (/__$/ ? 1 : 0) + count_notes($v->{$_}) } keys %$v);
 }
 
 sub cmd_delete {
