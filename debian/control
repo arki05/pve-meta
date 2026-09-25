@@ -30,7 +30,8 @@ Description: pve-meta store bindings for PVE (Rust, perlmod)
  PVE::RS::Meta, a Perl binding (via perlmod) to pve-meta's guest metadata
  store: the lifecycle hooks called from libpve-guest-common-perl, the backup
  hooks called from qemu-server and pve-container, and the api_* functions
- behind PVE::API2::Ext::Meta.
+ behind PVE::API2::Ext::Meta. Also PVE::Meta::Hooks, the lock helper the
+ lifecycle hooks run under.
 
 Package: pve-meta-guest-files
 Architecture: any

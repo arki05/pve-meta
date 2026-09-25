@@ -34,7 +34,8 @@ guest lock has been released -- unlike create and destroy, whose hooks take it i
 the guest lock; nothing that touches the document holds the guest lock at the time, so
 there is no order between the two locks for these hooks to keep.
 
-Every call is `eval { ... }; warn ... if $@;` — soft-fail, never blocks the actual
+Every call goes through `PVE::Meta::Hooks::locked_warn`, which takes that lock and
+warns instead of dying — soft-fail, never blocks the actual
 snapshot/rollback/delete-snapshot operation. A metadata read/write hiccup (disk full, a
 corrupt document, the library not yet installed mid-upgrade) must never take down a
 guest operation over a sidecar file, exactly as PVE already treats

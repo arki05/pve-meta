@@ -405,4 +405,41 @@ write_file('9700.yaml', "a: 1\n");
 }
 unlink("$root/9700.yaml");
 
+# PVE::Meta::Hooks::locked_warn, against a stand-in for cfs_lock_domain that
+# reports as PVE::Cluster's cfs_lock does: it never dies, it returns undef with
+# $@ set -- to the callback's die, or to "cfs-lock '...' error: ..." for a lock
+# it could not take. Either way the hook warns and returns.
+{
+    no warnings 'once';
+    local $INC{'PVE/Cluster.pm'} = __FILE__;
+    my ($lock_dies, $domain) = (0);
+    local *PVE::Cluster::cfs_lock_domain = sub {
+        my ($name, undef, $code) = @_;
+        $domain = $name;
+        if ($lock_dies) {
+            $@ = "cfs-lock 'domain-$name' error: got lock request timeout\n";
+            return undef;
+        }
+        my $res = eval { $code->() };
+        return $res;
+    };
+    require PVE::Meta::Hooks;
+    my @warned;
+    local $SIG{__WARN__} = sub { push @warned, $_[0] };
+
+    my $ran = 0;
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { $ran = 1 });
+    ok($ran && !@warned, 'locked_warn runs the hook, quietly when it succeeds');
+    is($domain, 'pve-meta-9800', '... under the guest document\'s lock domain');
+
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { die "boom\n" });
+    like(shift(@warned) // '', qr/^pve-meta: on_x\(9800\) failed: boom$/, 'a hook that dies is a warning');
+
+    $lock_dies = 1;
+    $ran = 0;
+    PVE::Meta::Hooks::locked_warn(9800, 'on_x(9800)', sub { $ran = 1 });
+    ok(!$ran, 'a lock that cannot be taken does not run the hook');
+    like(shift(@warned) // '', qr/^pve-meta: on_x\(9800\) failed: cfs-lock/, '... and is a warning');
+}
+
 done_testing();

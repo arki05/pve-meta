@@ -60,6 +60,8 @@ install: ../../target/release/libpve_meta_rs.so Proxmox/Lib/PVEMeta.pm $(PERLMOD
 	install -d -m755 $(DESTDIR)$(PERL_INSTALLVENDORLIB)/Proxmox/Lib
 	install -m644 Proxmox/Lib/PVEMeta.pm $(DESTDIR)$(PERL_INSTALLVENDORLIB)/Proxmox/Lib/PVEMeta.pm
 	find $(PM_DIR) \! -type d -print -exec install -Dm644 '{}' $(DESTDIR)$(PERL_INSTALLVENDORLIB)'/{}' ';'
+	# Plain Perl beside the binding: the lock helper the lifecycle patch calls.
+	install -Dm644 perl/PVE/Meta/Hooks.pm $(DESTDIR)$(PERL_INSTALLVENDORLIB)/PVE/Meta/Hooks.pm
 
 .PHONY: clean
 clean:

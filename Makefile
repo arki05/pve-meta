@@ -165,6 +165,7 @@ check: doc wasm js
 check-perl:
 	shellcheck pve-ext/bin/pve-ext-patch
 	@for f in perl/PVE/API2/Ext/Meta.pm pve-ext/perl/PVE/API2/Ext.pm \
+	          crates/pve-meta-perl/perl/PVE/Meta/Hooks.pm \
 	          bin/pve-meta examples/maintenance-hook.pl; do \
 		perl -Iscripts/perl-stubs -c $$f || exit 1; \
 	done

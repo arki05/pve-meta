@@ -1,7 +1,7 @@
 .PHONY: test
 test: Proxmox/Lib/PVEMeta.pm
 	@echo "-- running pve-meta-rs (PVE::RS::Meta) tests --"
-	perl -I. -I.. ./basic.pl
+	perl -I. -I.. -I../perl ./basic.pl
 
 # The test stub, we don't know where to look for the library from in here!
 Proxmox/Lib/PVEMeta.pm:
