@@ -138,10 +138,10 @@ check = "perl"                         # perl -c gate; or "template" for HTML
   touch it — a real accident, never a case pve-ext caused itself.
 - The patched file is regenerated from that pristine backup + the diff, in
   a scratch copy, never in place — so re-running `apply` is idempotent.
-- `patch -p1 --fuzz=0 --dry-run` gates the real `patch -p1 --fuzz=0`
-  (`--fuzz=0`: default fuzz can slide a hunk onto the wrong one of several
-  near-identical anchors and report success); the result is only
-  `install`ed after it also passes its `check`.
+- Every hunk has to apply with `patch -p1 --fuzz=0` (`--fuzz=0`: default
+  fuzz can slide a hunk onto the wrong one of several near-identical
+  anchors and report success); the result is only `install`ed after it
+  also passes its `check`.
 - On any failure after a diversion that already existed (a re-apply after
   an upstream upgrade replaced the pristine), `apply` restores the
   *current* pristine rather than leaving stale patched content, and says

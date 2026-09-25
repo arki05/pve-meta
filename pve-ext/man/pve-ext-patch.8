@@ -29,8 +29,8 @@ in the pve\-meta source tree for the manifest format and worked examples.
 .TP
 .BI apply\ [manifest...]
 Diverts each entry's file (if not already), applies its diff with
-.B "patch \-p1 \-\-fuzz=0" ,
-gates on a clean \fB\-\-dry\-run\fR then the entry's
+.B "patch \-p1 \-\-fuzz=0"
+into a scratch copy, gates on every hunk applying, then on the entry's
 .B check
 (perl\ \-c, or a template marker/\fB</body>\fR check), then
 .BR install (1)s
@@ -46,9 +46,8 @@ root, unless
 is given.
 .TP
 .BI verify\ [manifest...]
-Dry\-runs
-.RI ( "patch \-\-dry\-run" )
-each entry's diff against its pristine copy and reports hunks\-would\-apply
+Applies each entry's diff to a scratch copy of its pristine file and
+reports hunks\-would\-apply
 versus hunks\-failed. Makes no changes; safe to run unprivileged and
 against
 .BR \-\-root .

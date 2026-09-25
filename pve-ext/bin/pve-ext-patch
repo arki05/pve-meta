@@ -190,6 +190,21 @@ diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
 # from a diff's a/ b/ headers.
 relpath_for() { echo "${1#/}"; }
 
+# Rebuilds pristine + diff as <work>/<rel>, a scratch copy at the path
+# `patch -p1` reconstructs, never the file itself. Prints patch's output
+# and fails with patch's status if a hunk does. A copy that fails is its
+# own error, and status 3, which patch never returns: no hunk was tried.
+# --fuzz=0: default fuzz can slide a hunk onto the wrong one of several
+# near-identical anchors and report success.
+patch_into_scratch() {
+    # $1 = pristine, $2 = work dir, $3 = rel, $4 = diff path
+    if ! mkdir -p "$(dirname "$2/$3")" || ! cp "$1" "$2/$3"; then
+        err "could not copy $1 into the scratch area"
+        return 3
+    fi
+    (cd "$2" && patch -p1 --fuzz=0 <"$4" 2>&1)
+}
+
 # --- failure rollback ----------------------------------------------------
 
 # On failure: undo a diversion this run just created (restores $real
@@ -328,30 +343,13 @@ apply_one() {
         fi
     fi
 
-    mkdir -p "$(dirname "${work}/${rel}")" || {
-        err "$mpath: mkdir scratch dir failed"
-        return 1
-    }
-    if ! cp "$diverted" "${work}/${rel}"; then
-        err "$mpath: failed to copy pristine into scratch area"
-        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        return 1
-    fi
-
-    local dry_out
-    # --fuzz=0: default fuzz can slide a hunk onto the wrong one of
-    # several near-identical anchors and report success.
-    if ! dry_out="$(cd "$work" && patch -p1 --fuzz=0 --dry-run <"$diff_path" 2>&1)"; then
-        err "$mpath: patch --dry-run failed - anchors may have moved upstream"
-        printf '%s\n' "$dry_out" >&2
-        restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        return 1
-    fi
-
-    local apply_out
-    if ! apply_out="$(cd "$work" && patch -p1 --fuzz=0 <"$diff_path" 2>&1)"; then
-        err "$mpath: real patch application failed after a clean dry-run (unexpected)"
-        printf '%s\n' "$apply_out" >&2
+    local patch_out prc=0
+    patch_out="$(patch_into_scratch "$diverted" "$work" "$rel" "$diff_path")" || prc=$?
+    if [ "$prc" -ne 0 ]; then
+        if [ "$prc" -ne 3 ]; then
+            err "$mpath: the diff does not apply to the pristine copy - anchors may have moved upstream"
+            printf '%s\n' "$patch_out" >&2
+        fi
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
         return 1
     fi
@@ -488,20 +486,12 @@ verify_one() {
         return 1
     }
 
-    mkdir -p "$(dirname "${work}/${rel}")" || {
-        err "$mpath: mkdir scratch dir failed"
-        return 1
-    }
-    cp "$pristine" "${work}/${rel}" || {
-        err "$mpath: failed to copy $pristine into scratch area"
-        return 1
-    }
-
-    local dry_out rc total_hunks fail_hunks ok_hunks
-    dry_out="$(cd "$work" && patch -p1 --fuzz=0 --dry-run <"$diff_path" 2>&1)"
+    local patch_out rc total_hunks fail_hunks ok_hunks
+    patch_out="$(patch_into_scratch "$pristine" "$work" "$rel" "$diff_path")"
     rc=$?
+    [ "$rc" -ne 3 ] || return 1
     total_hunks=$(grep -c '^@@ ' "$diff_path")
-    fail_hunks=$(printf '%s\n' "$dry_out" | grep -c 'FAILED')
+    fail_hunks=$(printf '%s\n' "$patch_out" | grep -c '^Hunk #[0-9]* FAILED')
     if [ "$rc" -eq 0 ]; then
         ok_hunks="$total_hunks"
     else
@@ -513,7 +503,7 @@ verify_one() {
         return 0
     else
         err "$mpath: FAIL - ${ok_hunks}/${total_hunks} hunks would apply, ${fail_hunks} failed, against ${source_desc}"
-        printf '%s\n' "$dry_out" >&2
+        printf '%s\n' "$patch_out" >&2
         return 1
     fi
 }
@@ -570,12 +560,9 @@ status_one() {
         local rel work
         rel="$(relpath_for "$mpath")"
         work="${SCRATCH_ROOT}/$(echo "$mpath" | tr '/' '_').status"
-        mkdir -p "$(dirname "${work}/${rel}")" 2>/dev/null
-        if cp "$diverted" "${work}/${rel}" 2>/dev/null; then
-            if (cd "$work" && patch -p1 --fuzz=0 <"$diff_path") >/dev/null 2>&1; then
-                insync_checked=1
-                cmp -s "${work}/${rel}" "$real" && insync_flag=1
-            fi
+        if patch_into_scratch "$diverted" "$work" "$rel" "$diff_path" >/dev/null; then
+            insync_checked=1
+            cmp -s "${work}/${rel}" "$real" && insync_flag=1
         fi
     fi
 
@@ -632,7 +619,7 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...
 
   apply [manifest...]   Divert each entry's file (if not already), apply its
                         diff (patch -p1 --fuzz=0) into a scratch copy, gate
-                        on a clean dry-run then the entry's check ('perl'
+                        on every hunk applying, then the entry's check ('perl'
                         -c, or 'template': marker present exactly once +
                         </body> present), then install. Best-effort per
                         file: one file's anchors moving does not block the
@@ -640,8 +627,8 @@ Usage: $(basename "$0") [--root <dir>] <apply|remove|verify|status> [manifest...
                         a different package.
   remove [manifest...]  Restore each entry's pristine file and remove its
                         diversion.
-  verify [manifest...]  'patch --dry-run' each entry's diff against its
-                        pristine copy (the diverted backup if applied, else
+  verify [manifest...]  Apply each entry's diff to a scratch copy of its
+                        pristine file (the diverted backup if applied, else
                         the live file) and report hunks-would-apply vs.
                         hunks-failed. Makes no changes.
   status [manifest...]  Report per-file diversion/patched/in-sync state.
