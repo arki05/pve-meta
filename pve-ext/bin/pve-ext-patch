@@ -190,26 +190,7 @@ diverted_path_for() { echo "$(real_path_for "$1").pve-ext-orig"; }
 # from a diff's a/ b/ headers.
 relpath_for() { echo "${1#/}"; }
 
-# --- failure reporting ---------------------------------------------------
-
-# postinst/prerm swallow our exit code, so a failure needs a trail besides
-# stderr: syslog, and a status file an admin can check without having
-# captured the original output. A function, not a top-level assignment, so
-# it re-reads ROOT_DIR (set later, in main()) on every call.
-failure_marker_dir() { echo "${ROOT_DIR}/run/pve-ext-patch"; }
-
-record_failure() {
-    # $1 = mpath, $2 = message
-    local dir
-    dir="$(failure_marker_dir)"
-    mkdir -p "$dir" 2>/dev/null
-    printf '%s %s: %s\n' "$(date -Is 2>/dev/null || date)" "$1" "$2" \
-        >>"${dir}/failed" 2>/dev/null
-    # Never touch the real syslog under --root (a scratch/CI tree).
-    if [ -z "$ROOT_DIR" ] && command -v logger >/dev/null 2>&1; then
-        logger -t pve-ext-patch -p user.err -- "$1: $2" 2>/dev/null || true
-    fi
-}
+# --- failure rollback ----------------------------------------------------
 
 # On failure: undo a diversion this run just created (restores $real
 # exactly as found); otherwise restore the *current* pristine over $real,
@@ -225,7 +206,6 @@ restore_on_failure() {
         rm -f "$real"
         if ! dpkg_divert_remove "$mpath" >/dev/null 2>&1; then
             err "$mpath: FAILED to roll back the diversion just created - dpkg-divert --remove failed; the diversion is still in dpkg's database (owned by ${PKG}) and $real is now missing"
-            record_failure "$mpath" "failed to roll back a freshly created diversion after a later failure - diversion still registered, $real missing"
         fi
         return
     fi
@@ -308,27 +288,23 @@ apply_one() {
 
     [ -f "$diff_path" ] || {
         err "$mpath: diff not found: $diff_path"
-        record_failure "$mpath" "diff not found: $diff_path"
         return 1
     }
 
     if is_diverted "$mpath"; then
         if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to touch it"
-            record_failure "$mpath" "diverted by a different package - refused to touch it"
             return 1
         fi
         log "$mpath: diversion already in place (owned by ${PKG}); reusing pristine copy at $diverted"
     else
         [ -f "$real" ] || {
             err "$mpath: expected file not found: $real (owning package: ${mpkg:-unknown})"
-            record_failure "$mpath" "expected file not found: $real (owning package: ${mpkg:-unknown})"
             return 1
         }
         log "$mpath: diverting $real -> $diverted"
         if ! dpkg_divert_add "$mpath"; then
             err "$mpath: dpkg-divert --add failed"
-            record_failure "$mpath" "dpkg-divert --add failed"
             return 1
         fi
         created_divert=1
@@ -337,7 +313,6 @@ apply_one() {
     if [ ! -f "$diverted" ]; then
         err "$mpath: pristine backup not found at $diverted after diversion - aborting this file"
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        record_failure "$mpath" "pristine backup missing after diversion"
         return 1
     fi
 
@@ -349,20 +324,17 @@ apply_one() {
         if ! cp "$diverted" "$real"; then
             err "$mpath: failed to restore pristine placeholder at $real for the duration of the check"
             restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-            record_failure "$mpath" "failed to restore pristine placeholder"
             return 1
         fi
     fi
 
     mkdir -p "$(dirname "${work}/${rel}")" || {
         err "$mpath: mkdir scratch dir failed"
-        record_failure "$mpath" "mkdir scratch dir failed"
         return 1
     }
     if ! cp "$diverted" "${work}/${rel}"; then
         err "$mpath: failed to copy pristine into scratch area"
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        record_failure "$mpath" "failed to copy pristine into scratch area"
         return 1
     fi
 
@@ -373,7 +345,6 @@ apply_one() {
         err "$mpath: patch --dry-run failed - anchors may have moved upstream"
         printf '%s\n' "$dry_out" >&2
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        record_failure "$mpath" "patch --dry-run failed (anchors may have moved upstream)"
         return 1
     fi
 
@@ -382,7 +353,6 @@ apply_one() {
         err "$mpath: real patch application failed after a clean dry-run (unexpected)"
         printf '%s\n' "$apply_out" >&2
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        record_failure "$mpath" "patch apply failed after a clean dry-run"
         return 1
     fi
 
@@ -390,14 +360,12 @@ apply_one() {
         err "$mpath: '$check' check failed: $(check_verdict "$check")"
         [ "$check" = "perl" ] && printf '%s\n' "$LAST_PERL_CHECK_OUTPUT" >&2
         restore_on_failure "$mpath" "$real" "$diverted" "$created_divert"
-        record_failure "$mpath" "'$check' check failed: $(check_verdict "$check")"
         return 1
     fi
     log "$mpath: $check check OK ($(check_verdict "$check"))"
 
     if ! install -m 0644 "${work}/${rel}" "$real"; then
         err "$mpath: failed to install patched file to $real"
-        record_failure "$mpath" "install of patched file failed"
         return 1
     fi
     log "$mpath: patched and installed."
@@ -446,7 +414,6 @@ remove_one() {
     if is_diverted "$mpath"; then
         if ! diversion_owned_by_us "$mpath"; then
             err "$mpath: diverted by a DIFFERENT package - refusing to remove"
-            record_failure "$mpath" "diverted by a different package - refused to remove it"
             return 1
         fi
         log "$mpath: restoring pristine file and removing diversion"
@@ -458,9 +425,6 @@ remove_one() {
             if [ -f "$diverted" ] && [ ! -f "$real" ]; then
                 err "$mpath: recovering: restoring from $diverted manually"
                 cp -a "$diverted" "$real"
-                record_failure "$mpath" "dpkg-divert --remove failed; pristine restored by hand from $diverted, diversion still registered"
-            else
-                record_failure "$mpath" "dpkg-divert --remove failed; diversion still registered"
             fi
             return 1
         fi

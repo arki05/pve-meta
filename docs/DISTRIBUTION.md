@@ -79,8 +79,8 @@ Instead, the managed patches tell the admin at the moment it matters. `pve-meta`
 so upgrading any of the three packages above fires `pve-meta.postinst`'s `triggered`
 case in the same `apt` transaction, which re-runs `pve-ext-patch apply
 pve-meta-lifecycle`. If the patch no longer applies cleanly, `apply` restores the
-pristine file, never leaves one patched against stale content, and logs the failure to
-syslog and to `<root>/run/pve-ext-patch/failed` rather than only to a postinst's stderr.
+pristine file, never leaves one patched against stale content, and says so on the
+postinst's stderr; `pve-ext-patch status` shows what is applied at any time.
 `pve-ext/README.md` ("Managed patches") owns the mechanism; `pve-ext-patch verify` runs
 the same check by hand, without writing anything, for a human confirming a fix.
 

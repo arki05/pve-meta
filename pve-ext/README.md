@@ -144,9 +144,8 @@ check = "perl"                         # perl -c gate; or "template" for HTML
   `install`ed after it also passes its `check`.
 - On any failure after a diversion that already existed (a re-apply after
   an upstream upgrade replaced the pristine), `apply` restores the
-  *current* pristine rather than leaving stale patched content, and
-  records the failure to syslog and `<ROOT_DIR>/run/pve-ext-patch/failed`
-  (never only stderr, which a postinst commonly swallows).
+  *current* pristine rather than leaving stale patched content, and says
+  why on stderr; `status` shows what is applied at any time.
 - Best-effort per file, across every file in every selected manifest: one
   file's anchors moving must never block patching the others.
 - `remove` restores every entry's pristine file and removes its diversion.
